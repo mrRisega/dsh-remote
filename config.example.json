@@ -1,0 +1,16 @@
+{
+  "host": "0.0.0.0",
+  "port": 3443,
+  "upstream": "http://127.0.0.1:3080",
+  "password": "在这里填写你的强口令(推荐至少 12 位;或改用 passwordHash)",
+  "sessionTtlHours": 12,
+  "rateLimit": {
+    "max": 5,
+    "windowMs": 900000
+  },
+  "allowIps": [],
+  "tls": {
+    "cert": "/绝对/路径/server.crt",
+    "key": "/绝对/路径/server.key"
+  }
+}

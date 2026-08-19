@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  dsh-remote launchd 服务模板(macOS 自启)
+
+  __INSTALL_DIR__ / __NODE_BIN__ 为占位符,由 scripts/install-macos.sh 替换。
+  口令以 scrypt 哈希存于项目 config.json(权限 600),不进 plist。
+
+  手动安装:
+    1) 复制本项目到目标目录,填写 config.json
+    2) sed 替换占位符,或直接运行 ./scripts/install-macos.sh
+    3) cp 到 ~/Library/LaunchAgents/ 并 launchctl load
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.dshremote.daemon</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__NODE_BIN__</string>
+    <string>__INSTALL_DIR__/bin/dsh-remote.js</string>
+    <string>start</string>
+    <string>--config</string>
+    <string>__INSTALL_DIR__/config.json</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__INSTALL_DIR__</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/dsh-remote.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/dsh-remote.err.log</string>
+</dict>
+</plist>

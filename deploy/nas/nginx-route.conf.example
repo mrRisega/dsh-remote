@@ -1,0 +1,72 @@
+# dsh-remote · Nginx 反向代理片段(通用模板)
+#
+# 适用于任何已有 Nginx 的环境(例如 fnOS NAS 的 fast-note-sync-proxy 容器,
+# 或其他服务器的 nginx)。按你的环境修改占位符后,追加到 nginx.conf 的 http{} 块。
+#
+# 占位符说明:
+#   __DOMAIN__         你的域名,如 example.com(证书需覆盖该域名)
+#   __PUBLIC_PORT__    对外端口,如 13443
+#   __GATEWAY_BACKEND__ dsh-remote 网关地址:
+#                       - 同一局域网直连:  http://<Mac-LAN-IP>:3443
+#                       - SSH 反向隧道:     http://127.0.0.1:13443
+#   __CERT_DIR__       证书目录(nginx 容器内可见路径)
+#
+# 注意:
+#   - 遵守 single-nginx 规则:只扩展现有 Nginx 配置,不新建第二个 Nginx。
+#   - 修改前先备份,nginx -t 校验通过后再 reload/recreate。
+#   - 不要使用 server_name _ 或通配符把未知域名代理到网关。
+
+# ============ 追加到 nginx.conf 的 http{} 块内 ============
+
+# 拒绝块:未知 Host 一律 444(防 DNS rebinding 扫描)
+server {
+    listen __PUBLIC_PORT__ ssl default_server;
+    server_name "";
+    ssl_certificate     __CERT_DIR__/fullchain.crt;
+    ssl_certificate_key __CERT_DIR__/private.key;
+    return 444;
+}
+
+# 主块:域名隔离,反代到 dsh-remote 网关
+server {
+    listen __PUBLIC_PORT__ ssl;
+    http2 on;
+    server_name __DOMAIN__;
+
+    ssl_certificate     __CERT_DIR__/fullchain.crt;
+    ssl_certificate_key __CERT_DIR__/private.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    client_max_body_size 200m;
+
+    # 网关需要感知真实客户端 IP(限流/审计)
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header X-Forwarded-Proto https;
+
+    # WebSocket 与 SSE 长连接
+    proxy_http_version 1.1;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-Host $http_host;
+    proxy_set_header X-Forwarded-Port $server_port;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+
+    location / {
+        proxy_pass __GATEWAY_BACKEND__;
+    }
+}
+
+# ============ 端口映射(Docker Compose) ============
+# 在 compose.yaml 的 ports 增加:
+#   - "__PUBLIC_PORT__:__PUBLIC_PORT__"
+#
+# 若 nginx.conf 尚无 $connection_upgrade 的 map,加入:
+#   map $http_upgrade $connection_upgrade {
+#       default upgrade;
+#       ''      close;
+#   }

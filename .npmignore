@@ -1,0 +1,9 @@
+# npm 发布忽略清单(若发布到 npm)
+config.json
+certs/
+install.sh
+uninstall.sh
+deploy/
+scripts/
+.DS_Store
+*.log
