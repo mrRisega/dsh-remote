@@ -56,6 +56,22 @@ dsh-remote 是 **DeepSeek Harness 插件生态**的一员,已在以下渠道可�
 > 给 DeepSeek Harness 开发插件?给仓库打上 [`dsh-plugin`](https://github.com/topics/dsh-plugin)
 > topic 即可被社区搜索到,并可提交到上述 awesome 列表。
 
+### 与同类方案对比
+
+生态中已有若干"DSH 远程访问"方案,多数是**加载进 `dsh web` 的 Cordis 插件**。
+dsh-remote 采用**独立的网关架构**,关键差异:
+
+| 能力 | **dsh-remote**(独立网关) | 插件式方案(如 xgone/dsh-remote 等) |
+|---|---|---|
+| 特权方法(`settings.*` / `credentials.*` / agent 预设等) | ✅ **loopback 伪装,全覆盖** | ❌ 受 `dsh web` 信任围栏限制(仅 loopback 放行) |
+| 对 DSH 的侵入 | 零(不改任何代码/配置) | 需安装进 `dsh web` 的插件体系 |
+| WebSocket 事件流 | 原生透传 | 走插件通道 |
+| 登录安全 | 口令 + 限流 + 可选白名单/TLS | 视插件实现 |
+| 升级影响 | 与 DSH 版本解耦 | 随 DSH 插件体系升级 |
+
+> 一句话:插件式方案能"给 DSH 加登录";dsh-remote 能让你**像坐在电脑前一样
+> 完整操作 DSH**(包括改设置、管凭据),这在插件式方案中受信任围栏限制无法实现。
+
 ## 界面预览
 <img width="1172" height="2748" alt="f00289aec93e179421ec8fd86373877a" src="https://github.com/user-attachments/assets/4b7a7375-e867-452c-8cbb-7bd1767dc2fe" />
 <img width="1365" height="1279" alt="40acf7db474c69cd1ecb1dd52d786d29" src="https://github.com/user-attachments/assets/fc24000a-0650-4908-b922-9a4bf3aa0b26" />
