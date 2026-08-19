@@ -18,11 +18,18 @@
     "deepseek",
     "deepseek-harness",
     "dsh",
+    "dsh-plugin",
+    "cordis",
     "remote",
     "remote-control",
     "mobile",
+    "mobile-web",
+    "phone",
     "reverse-proxy",
-    "web-ui"
+    "secure-gateway",
+    "web-ui",
+    "pwa",
+    "self-hosted"
   ],
   "repository": {
     "type": "git",

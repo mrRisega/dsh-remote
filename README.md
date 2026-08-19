@@ -4,7 +4,16 @@
 
 **在手机浏览器上全功能远程控制 DeepSeek Harness(`dsh web`)**
 
+*Remote control for DeepSeek Harness (DSH) from any phone browser — mobile web client, secure gateway, full feature coverage.*
+
 零侵入 · 功能全覆盖 · 端到端直达 · 安全默认
+
+[![DeepSeek Harness](https://img.shields.io/badge/DeepSeek%20Harness-plugin-4f8cff?style=flat-square)](https://github.com/deepseek-ai/deepseek-harness)
+[![dsh-plugin](https://img.shields.io/badge/topic-dsh--plugin-blueviolet?style=flat-square)](https://github.com/topics/dsh-plugin)
+[![License](https://img.shields.io/badge/License-PolyForm%20Noncommercial-2ea44f?style=flat-square)](./LICENSE)
+[![Node](https://img.shields.io/badge/Node.js-%3E%3D20-339933?style=flat-square&logo=node.js&logoColor=white)](https://nodejs.org)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-8A2BE2?style=flat-square)](#-快速开始一键安装)
+[![GitHub stars](https://img.shields.io/github/stars/mrgaoang/dsh-remote?style=flat-square)](https://github.com/mrgaoang/dsh-remote/stargazers)
 
 > 📄 **License**:个人/非商业免费(PolyForm Noncommercial 1.0.0)
 > · 商业用途需[商业授权](./COMMERCIAL-LICENSE.md) · 修改须署名
@@ -12,6 +21,9 @@
 `dsh-remote` 是一个**安全反向代理网关**:在运行 `dsh web` 的电脑上启动它,
 手机浏览器即可登录并**全功能接管**桌面端 DeepSeek Harness —— 发消息、看工具
 执行、审批权限、改设置、管凭据,与本地浏览器能力完全一致(含特权操作)。
+
+**关键词**:DeepSeek Harness · DSH · dsh-plugin · 手机远程控制 · 移动端 ·
+反向代理 · remote control · mobile web · secure gateway · Cordis
 
 </div>
 
@@ -29,6 +41,21 @@
 - **移动端优先**:深色终端美学的登录页 + PWA 能力,手机"添加到主屏幕"即用。
 - **零运行时依赖**:纯 Node.js 原生模块(`node:http` / `https` / `crypto`),
   无 npm install、无外部服务。
+
+## 🔍 生态与发现
+
+dsh-remote 是 **DeepSeek Harness 插件生态**的一员,已在以下渠道可被发现:
+
+- GitHub Topic:[`dsh-plugin`](https://github.com/topics/dsh-plugin)(DSH 社区官方推荐标签)
+- Awesome 列表:
+  - [awesome-dsh-plugin](https://github.com/Anil-matcha/awesome-dsh-plugin)
+  - [Awesome-DeepSeek-Harness-Plugins](https://github.com/web-casa/Awesome-DeepSeek-Harness-Plugins)
+  - [awesome-deepseek-harness](https://github.com/0xsline/awesome-deepseek-harness)
+- 相关生态:[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) · [Cordis](https://github.com/cordiverse/cordis)
+
+> 给 DeepSeek Harness 开发插件?给仓库打上 [`dsh-plugin`](https://github.com/topics/dsh-plugin)
+> topic 即可被社区搜索到,并可提交到上述 awesome 列表。
+
 ## 界面预览
 <img width="1172" height="2748" alt="f00289aec93e179421ec8fd86373877a" src="https://github.com/user-attachments/assets/4b7a7375-e867-452c-8cbb-7bd1767dc2fe" />
 <img width="1365" height="1279" alt="40acf7db474c69cd1ecb1dd52d786d29" src="https://github.com/user-attachments/assets/fc24000a-0650-4908-b922-9a4bf3aa0b26" />
