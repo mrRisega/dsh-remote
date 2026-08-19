@@ -33,7 +33,7 @@
 
 ```bash
 # macOS / Linux 通用
-curl -fsSL https://raw.githubusercontent.com/<你的用户名>/dsh-remote/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/mrgaoang/dsh-remote/main/install.sh | bash
 ```
 
 非交互式(环境变量方式,适合脚本化):
@@ -41,7 +41,7 @@ curl -fsSL https://raw.githubusercontent.com/<你的用户名>/dsh-remote/main/i
 ```bash
 DSH_REMOTE_PASSWORD='你的强口令' \
 DSH_REMOTE_PORT=3443 \
-bash <(curl -fsSL https://raw.githubusercontent.com/<你的用户名>/dsh-remote/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/mrgaoang/dsh-remote/main/install.sh)
 ```
 
 安装脚本会:
@@ -57,7 +57,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/<你的用户名>/dsh-remote
 ## 🚀 手动启动
 
 ```bash
-git clone https://github.com/<你的用户名>/dsh-remote.git
+git clone https://github.com/mrgaoang/dsh-remote.git
 cd dsh-remote
 
 # 生成自签证书(可选,局域网 HTTPS)

@@ -1,6 +1,6 @@
 {
   "name": "dsh-remote",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Secure reverse-proxy gateway: remotely control DeepSeek Harness (dsh web) from a phone browser, with full feature coverage and loopback masquerading.",
   "type": "module",
   "bin": {
@@ -26,7 +26,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/<你的用户名>/dsh-remote.git"
+    "url": "https://github.com/mrgaoang/dsh-remote.git"
   },
   "license": "MIT",
   "dependencies": {}

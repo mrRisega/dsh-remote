@@ -4,14 +4,14 @@
 #
 # 用法(任选其一):
 #   1) 直接运行(交互式问答,自动写 config.json + 安装系统服务):
-#        curl -fsSL https://raw.githubusercontent.com/<你的用户名>/dsh-remote/main/install.sh | bash
+#        curl -fsSL https://raw.githubusercontent.com/mrgaoang/dsh-remote/main/install.sh | bash
 #
 #   2) 环境变量方式(非交互,适合脚本化):
 #        DSH_REMOTE_PASSWORD='强口令' \
 #        DSH_REMOTE_PORT=3443 \
 #        DSH_REMOTE_UPSTREAM=http://127.0.0.1:3080 \
 #        DSH_REMOTE_INSTALL_DIR=$HOME/dsh-remote \
-#        bash <(curl -fsSL https://raw.githubusercontent.com/<你的用户名>/dsh-remote/main/install.sh)
+#        bash <(curl -fsSL https://raw.githubusercontent.com/mrgaoang/dsh-remote/main/install.sh)
 #
 #   3) 本地仓库运行(开发/离线):
 #        DSH_REMOTE_SOURCE_DIR=. DSH_REMOTE_PASSWORD='x' ./install.sh
@@ -43,7 +43,7 @@ set -euo pipefail
 
 # ---------- 解析输入 ----------
 INSTALL_DIR="${DSH_REMOTE_INSTALL_DIR:-$HOME/.dsh-remote}"
-REPO_URL="${DSH_REMOTE_REPO_URL:-https://github.com/<你的用户名>/dsh-remote.git}"
+REPO_URL="${DSH_REMOTE_REPO_URL:-https://github.com/mrgaoang/dsh-remote.git}"
 REPO_BRANCH="${DSH_REMOTE_REPO_BRANCH:-main}"
 PORT="${DSH_REMOTE_PORT:-3443}"
 UPSTREAM="${DSH_REMOTE_UPSTREAM:-http://127.0.0.1:3080}"

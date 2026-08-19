@@ -10,7 +10,7 @@
 ## 本地开发
 
 ```bash
-git clone https://github.com/<你的用户名>/dsh-remote.git
+git clone https://github.com/mrgaoang/dsh-remote.git
 cd dsh-remote
 
 # 用测试口令启动一个实例(指向本地 dsh web)
