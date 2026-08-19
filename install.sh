@@ -69,6 +69,33 @@ detect_os() {
   esac
 }
 
+# 从 tarball 解压安装(自动选择可达的下载源)
+fetch_tarball() {
+  local dir="$1" tarball_url="" ok=""
+  # 依次尝试:ghproxy 镜像(国内快) → github.com 官方 → GitHub API
+  for url in \
+    "https://ghproxy.net/https://github.com/mrgaoang/dsh-remote/archive/refs/heads/$REPO_BRANCH.tar.gz" \
+    "https://github.com/mrgaoang/dsh-remote/archive/refs/heads/$REPO_BRANCH.tar.gz" \
+    "https://api.github.com/repos/mrgaoang/dsh-remote/tarball/$REPO_BRANCH"; do
+    log "尝试下载: $url"
+    if curl -fsSL --connect-timeout 8 --max-time 60 "$url" -o /tmp/dsh-remote.tar.gz 2>/dev/null \
+       && [ -s /tmp/dsh-remote.tar.gz ]; then
+      # 确认是 gzip 而非错误页
+      if file /tmp/dsh-remote.tar.gz 2>/dev/null | grep -q "gzip"; then
+        tarball_url="$url"
+        ok="1"
+        break
+      fi
+      rm -f /tmp/dsh-remote.tar.gz
+    fi
+  done
+  [ -n "$ok" ] || return 1
+  mkdir -p "$dir"
+  tar -xzf /tmp/dsh-remote.tar.gz -C "$dir" --strip-components=1
+  rm -f /tmp/dsh-remote.tar.gz
+  log "tarball 下载并解压完成($tarball_url)"
+}
+
 # ---------- 前置检查 ----------
 need_cmd node
 NODE_MAJOR="$(node -e 'console.log(process.versions.node.split(".")[0])')"
@@ -81,7 +108,7 @@ OS="$(detect_os)"
 log "检测到系统: $OS"
 
 # ---------- 获取项目文件 ----------
-# 优先级: 1) 本地源码目录 2) 已存在安装目录 3) git clone 4) tarball
+# 优先级: 1) 本地源码目录 2) 已存在安装目录 3) git clone 4) 多源 tarball
 if [ -n "${DSH_REMOTE_SOURCE_DIR:-}" ] && [ -d "$DSH_REMOTE_SOURCE_DIR" ]; then
   log "从本地目录复制: $DSH_REMOTE_SOURCE_DIR → $INSTALL_DIR"
   mkdir -p "$INSTALL_DIR"
@@ -95,16 +122,16 @@ elif [ -d "$INSTALL_DIR" ] && [ -f "$INSTALL_DIR/package.json" ]; then
 else
   log "获取项目文件 → $INSTALL_DIR"
   mkdir -p "$(dirname "$INSTALL_DIR")"
-  if command -v git >/dev/null 2>&1; then
-    git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" "$INSTALL_DIR" \
-      || fail "git clone 失败: $REPO_URL"
+  if command -v git >/dev/null 2>&1 && [ -z "${DSH_REMOTE_NO_GIT:-}" ]; then
+    log "尝试 git clone: $REPO_URL"
+    if git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" "$INSTALL_DIR" 2>/dev/null; then
+      log "git clone 完成"
+    else
+      warn "git clone 失败,改用 tarball 下载"
+      fetch_tarball "$INSTALL_DIR" || fail "所有下载源均失败,请检查网络后重试"
+    fi
   elif command -v curl >/dev/null 2>&1; then
-    TARBALL="${DSH_REMOTE_TARBALL_URL:-}"
-    [ -n "$TARBALL" ] || fail "未安装 git 且未设置 DSH_REMOTE_TARBALL_URL,无法获取源码"
-    curl -fsSL "$TARBALL" -o /tmp/dsh-remote.tar.gz || fail "下载失败"
-    mkdir -p "$INSTALL_DIR"
-    tar -xzf /tmp/dsh-remote.tar.gz -C "$INSTALL_DIR" --strip-components=1
-    rm -f /tmp/dsh-remote.tar.gz
+    fetch_tarball "$INSTALL_DIR" || fail "所有下载源均失败,请检查网络后重试"
   else
     fail "需要 git 或 curl 之一来获取源码"
   fi
