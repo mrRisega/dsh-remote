@@ -2,6 +2,16 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 风格。
 
+## [Unreleased]
+
+### 变更
+
+- **许可协议变更**:由 MIT 改为**双许可模式** ——
+  [PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0)
+  (个人/非商业免费)+ [商业授权](./COMMERCIAL-LICENSE.md)(商业用途付费)。
+  个人可自由修改、二次开发,但须保留出处署名(`Required Notice`)。
+  贡献者提交 PR 即同意按此许可发布(见 CONTRIBUTING.md)。
+
 ## [1.0.0] - 2026-08-20
 
 首个可发布版本:完整的手机远程控制能力,一键安装,已公网验证。

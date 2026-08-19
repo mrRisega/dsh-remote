@@ -6,6 +6,9 @@
 
 零侵入 · 功能全覆盖 · 端到端直达 · 安全默认
 
+> 📄 **License**:个人/非商业免费(PolyForm Noncommercial 1.0.0)
+> · 商业用途需[商业授权](./COMMERCIAL-LICENSE.md) · 修改须署名
+
 `dsh-remote` 是一个**安全反向代理网关**:在运行 `dsh web` 的电脑上启动它,
 手机浏览器即可登录并**全功能接管**桌面端 DeepSeek Harness —— 发消息、看工具
 执行、审批权限、改设置、管凭据,与本地浏览器能力完全一致(含特权操作)。
@@ -182,9 +185,24 @@ Android Chrome),建议添加到主屏幕获得全屏体验。
 **Q: 多人可以用吗?**
 当前为单口令共享。如需多用户独立账号,可扩展 `lib/auth.js` 的用户表。
 
-## 📄 License
+## 📄 License(双许可 / Fair-code)
 
-[MIT](./LICENSE)
+dsh-remote 采用 **双许可模式**(Fair-code / Source-available,非传统 OSI 开源):
+
+| 场景 | 许可 | 费用 |
+|---|---|---|
+| 个人学习 / 研究 / 非商业用途 | [PolyForm Noncommercial License 1.0.0](./LICENSE) | 免费 |
+| 个人修改、二次开发(须署名) | 同上 | 免费 |
+| 商业用途 | [商业授权](./COMMERCIAL-LICENSE.md) | 付费 |
+
+- **免费使用**:个人、教育、研究、非营利组织的非商业用途,完全免费;
+- **自由改造**:个人可自由修改、二次开发,但按 `Notices` 条款**必须保留出处署名**:
+  `Required Notice: Copyright (c) 2026 dsh-remote contributors (https://github.com/mrgaoang/dsh-remote)`;
+- **商业付费**:任何商业用途(公司生产环境、商业产品集成、SaaS 等)需
+  购买[商业授权](./COMMERCIAL-LICENSE.md)。
+
+> 这不是 MIT/Apache 类开源许可证,而是"源码可得 / 公平代码"许可,
+> 以保护作者的商业权益。详见 [COMMERCIAL-LICENSE.md](./COMMERCIAL-LICENSE.md)。
 
 ## 🙏 致谢
 
