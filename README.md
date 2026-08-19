@@ -26,6 +26,10 @@
 - **移动端优先**:深色终端美学的登录页 + PWA 能力,手机"添加到主屏幕"即用。
 - **零运行时依赖**:纯 Node.js 原生模块(`node:http` / `https` / `crypto`),
   无 npm install、无外部服务。
+## 界面预览
+<img width="1172" height="2748" alt="f00289aec93e179421ec8fd86373877a" src="https://github.com/user-attachments/assets/4b7a7375-e867-452c-8cbb-7bd1767dc2fe" />
+<img width="1365" height="1279" alt="40acf7db474c69cd1ecb1dd52d786d29" src="https://github.com/user-attachments/assets/fc24000a-0650-4908-b922-9a4bf3aa0b26" />
+
 
 ## 📦 快速开始(一键安装)
 
