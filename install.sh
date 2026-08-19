@@ -126,6 +126,7 @@ else
     log "尝试 git clone: $REPO_URL"
     if git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" "$INSTALL_DIR" 2>/dev/null; then
       log "git clone 完成"
+      rm -rf "$INSTALL_DIR/.git"  # 安装不需要 git 历史
     else
       warn "git clone 失败,改用 tarball 下载"
       fetch_tarball "$INSTALL_DIR" || fail "所有下载源均失败,请检查网络后重试"
