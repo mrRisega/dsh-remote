@@ -135,7 +135,9 @@ node bin/dsh-remote.js start
 | `passwordHash` | `DSH_REMOTE_PASSWORD_HASH` | — | scrypt 哈希(推荐) |
 | `sessionTtlHours` | `DSH_REMOTE_SESSION_TTL_HOURS` | `12` | 会话有效期(小时) |
 | `rateLimit` | `DSH_REMOTE_RATE_LIMIT` | `5:900000` | 登录失败限流(次数:窗口ms) |
-| `allowIps` | `DSH_REMOTE_ALLOW_IPS` | `[]` | IP 白名单(空=不限) |
+| `allowIps` | `DSH_REMOTE_ALLOW_IPS` | `[]` | IP 白名单,支持精确 IP 与 CIDR(如 `10.0.0.0/8`);空=不限 |
+| `trustProxy` | `DSH_REMOTE_TRUST_PROXY` | `false` | 网关位于反向代理之后时设为 `true`,白名单改用 `X-Forwarded-For` 判断真实客户端 IP |
+| `sessionFile` | `DSH_REMOTE_SESSION_FILE` | — | 会话持久化文件路径;配置后登录会话在网关重启后仍有效 |
 | `tls.cert/key` | `DSH_REMOTE_TLS_CERT/KEY` | — | HTTPS 证书/私钥路径 |
 | `distDir` | `DSH_REMOTE_DIST_DIR` | 包内 `public/` | 登录页静态资源目录 |
 

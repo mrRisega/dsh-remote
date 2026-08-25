@@ -17,7 +17,9 @@ const HELP = `dsh-remote — 远程控制 DeepSeek Harness 的安全网关
   DSH_REMOTE_PASSWORD     访问口令(明文,生产建议用 hash-password)
   DSH_REMOTE_TLS_CERT     TLS 证书路径(可选)
   DSH_REMOTE_TLS_KEY      TLS 私钥路径(可选)
-  DSH_REMOTE_ALLOW_IPS    IP 白名单(逗号分隔,空=不限)
+  DSH_REMOTE_ALLOW_IPS    IP 白名单(逗号分隔,支持精确 IP 与 CIDR,空=不限)
+  DSH_REMOTE_TRUST_PROXY  网关在反代之后设为 true,白名单改用 X-Forwarded-For
+  DSH_REMOTE_SESSION_FILE 会话持久化文件路径(可选,重启后仍保持登录)
   DSH_REMOTE_SESSION_TTL_HOURS  会话有效期小时数(默认 12)
   DSH_REMOTE_RATE_LIMIT   登录限流 "max:windowMs"(默认 5:900000)
   DSH_REMOTE_DIST_DIR     登录页静态资源目录(可选)

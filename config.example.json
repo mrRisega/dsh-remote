@@ -9,8 +9,10 @@
     "windowMs": 900000
   },
   "allowIps": [],
+  "trustProxy": false,
   "tls": {
     "cert": "/绝对/路径/server.crt",
     "key": "/绝对/路径/server.key"
-  }
+  },
+  "sessionFile": ""
 }
