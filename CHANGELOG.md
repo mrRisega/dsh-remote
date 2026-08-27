@@ -3,6 +3,17 @@
 All notable changes to dsh-relay are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.1] - 2026-08-28
+
+### Fixed
+
+- `setup` / settings page now fetch the server-issued `bridge_secret` from
+  `public-config` automatically, so a fresh one-command install can sign in to
+  the cloud service without manual configuration.
+- Bridge no longer misreports `device_limit_exceeded` (409) as "device bound to
+  another account"; it now prints the server's actual message with guidance to
+  remove the old device first.
+
 ## [0.2.0] - 2026-08-27
 
 First public release of the tunnel-mode architecture.
