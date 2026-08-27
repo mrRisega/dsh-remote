@@ -1,0 +1,22 @@
+{
+  "name": "@dsh-relay/router",
+  "version": "0.1.0",
+  "description": "dsh-relay multi-device router: bridge registry + per-device HTTP/WS transparent proxy + bandwidth/traffic quota (NAS side)",
+  "type": "module",
+  "main": "src/index.mjs",
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "start": "node src/index.mjs",
+    "check": "node --check src/index.mjs && node --check src/jwt.mjs && node --check src/quotas.mjs"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "dependencies": {
+    "ws": "^8.21.3"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}

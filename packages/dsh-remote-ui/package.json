@@ -1,0 +1,26 @@
+{
+  "name": "dsh-remote-ui",
+  "version": "0.1.0",
+  "description": "dsh web 远程控制插件：设置页「远程控制」栏目（settings.section 官方扩展点，位于 Agent 预设下方）+ 配置面板 + bridge 启停 + 反馈/邀请/满意度（双半插件：node 半提供 /dsh-remote 宿主 API，浏览器半提供 UI）",
+  "type": "module",
+  "private": true,
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime"
+      ]
+    }
+  },
+  "license": "PolyForm-Noncommercial-1.0.0"
+}

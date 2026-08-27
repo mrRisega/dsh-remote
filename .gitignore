@@ -1,0 +1,20 @@
+# 运行时/本地
+node_modules/
+*.log
+*.db
+.env
+data/
+*.local
+
+# 系统
+.DS_Store
+.dsh-config.json
+.dsh-config.backups/
+.gstack/
+*.tgz
+
+# 本地开发文档与个人环境脚本（AI Agent 迭代用，禁止提交公开仓库）
+docs/PROJECT-ENV.md
+docs/PROJECT-LOG.md
+scripts/dsh-net-hosts.sh
+scripts/dsh-net-hosts-install.sh

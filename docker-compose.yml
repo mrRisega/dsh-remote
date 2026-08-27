@@ -1,0 +1,34 @@
+# dsh-relay self-hosted router — one-command container deployment (tunnel mode)
+#
+#   docker compose up -d
+#   curl http://127.0.0.1:13444/_devices     # expect 401 (auth required)
+#
+# Environment:
+#   DSH_LOCAL_JWT_SECRET     secret for local JWTs (self-hosted auth)
+#   DSH_LOCAL_ACCESS_KEYS    comma-separated access keys for POST /_login
+#   DSH_ENTERPRISE_JWT_SECRET
+#                            optional: accept SaaS JWT tokens (shared secret with
+#                            the commercial account system)
+#   DSH_ROUTER_QUOTA_*       optional quota overrides (see packages/relay-router/README.md)
+#
+# For production, put a TLS reverse proxy (nginx/Caddy) in front and point the
+# bridge / phone app at the https/wss endpoint (see docs/self-hosting.md).
+services:
+  relay-router:
+    build: .
+    image: dsh-relay-router:latest
+    container_name: dsh-relay-router
+    restart: unless-stopped
+    ports:
+      - "13444:13444"            # router: HTTP + WS (/_bridge)
+    environment:
+      DSH_ROUTER_PORT: "13444"
+      DSH_ENTERPRISE_JWT_SECRET: ${DSH_ENTERPRISE_JWT_SECRET:-please-change-me}
+      DSH_LOCAL_JWT_SECRET: ${DSH_LOCAL_JWT_SECRET:-please-change-me}
+      DSH_LOCAL_ACCESS_KEYS: ${DSH_LOCAL_ACCESS_KEYS:-}
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:13444/_devices').then(r=>process.exit(r.status===401?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s

@@ -1,0 +1,1090 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#f6f8fa" />
+  <title>dsh-remote</title>
+  <style>
+    :root {
+      --bg: #f6f8fa; --card: #ffffff; --border: #d0d7de;
+      --text: #1f2328; --muted: #57606a; --accent: #0969da;
+      --ok: #1a7f37; --warn: #9a6700; --err: #cf222e;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: var(--bg); color: var(--text); min-height: 100vh;
+      display: flex; flex-direction: column;
+    }
+    header {
+      padding: 12px 20px; display: flex; align-items: center; gap: 12px;
+      border-bottom: 1px solid var(--border); background: rgba(255,255,255,.85);
+      backdrop-filter: blur(8px); z-index: 10;
+    }
+    header .logo {
+      width: 32px; height: 32px; border-radius: 8px; flex-shrink: 0;
+      background: linear-gradient(135deg, var(--accent), #6e40c9);
+      display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 14px;
+      color: #fff;
+    }
+    header h1 { font-size: 15px; font-weight: 600; }
+    header .sub { font-size: 11px; color: var(--muted); }
+    header .spacer { flex: 1; }
+    #btn-logout {
+      background: transparent; border: 1px solid var(--border); color: var(--text);
+      border-radius: 6px; padding: 6px 12px; font-size: 12px; cursor: pointer;
+    }
+    main { flex: 1; padding: 20px; max-width: 640px; width: 100%; margin: 0 auto; }
+    .card {
+      background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+      padding: 20px; margin-bottom: 16px;
+    }
+    .card h2 { font-size: 15px; font-weight: 600; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; }
+    .card h2 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+    .card h2 .dot.on { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+    label { display: block; font-size: 12px; color: var(--muted); margin: 12px 0 6px; }
+    input {
+      width: 100%; padding: 12px 14px; border-radius: 8px; font-size: 15px;
+      background: var(--bg); border: 1px solid var(--border); color: var(--text); outline: none;
+    }
+    input:focus { border-color: var(--accent); }
+    button {
+      width: 100%; padding: 13px; border-radius: 8px; font-size: 15px; font-weight: 600;
+      background: var(--accent); color: #fff; border: none; cursor: pointer; margin-top: 14px;
+    }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    button.secondary { background: transparent; border: 1px solid var(--border); color: var(--text); }
+    .msg { font-size: 13px; margin-top: 10px; min-height: 18px; }
+    .msg.err { color: var(--err); }
+    .msg.ok { color: var(--ok); }
+    .device {
+      display: flex; align-items: center; gap: 12px; padding: 14px;
+      border: 1px solid var(--border); border-radius: 10px; margin-bottom: 10px;
+      background: var(--bg); cursor: pointer;
+    }
+    .device:active { border-color: var(--accent); }
+    .device .icon { width: 40px; height: 40px; border-radius: 10px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 18px; background: rgba(47,129,247,.12); }
+    .device .name { font-size: 15px; font-weight: 600; }
+    .device .meta { font-size: 12px; color: var(--muted); margin-top: 2px; }
+    .device .status { margin-left: auto; font-size: 12px; padding: 3px 10px; border-radius: 20px; }
+    .device .status.on { color: var(--ok); background: rgba(63,185,80,.12); }
+    .empty { text-align: center; color: var(--muted); font-size: 13px; padding: 24px 0; }
+    /* ---------- 新用户安装引导(空设备状态) ---------- */
+    .guide {
+      text-align: left; background: var(--bg); border: 1px solid var(--border);
+      border-radius: 10px; padding: 14px 16px; margin: 4px 0 10px;
+      font-size: 13px; color: var(--text); line-height: 1.8;
+    }
+    .guide .guide-title { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
+    .guide .guide-sub { color: var(--muted); font-size: 12.5px; margin-bottom: 8px; }
+    .guide ol { padding-left: 20px; margin: 0; }
+    .guide li { margin-bottom: 10px; }
+    .guide code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "PingFang SC", monospace;
+      font-size: 12px; background: rgba(9,105,218,.08); color: var(--accent);
+      padding: 1px 5px; border-radius: 4px; word-break: break-all;
+    }
+    .guide-cmd {
+      display: flex; align-items: center; gap: 8px; margin-top: 6px;
+      background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
+    }
+    .guide-cmd code { flex: 1; min-width: 0; background: none; color: var(--text); padding: 0; }
+    .guide-copy {
+      flex-shrink: 0; width: auto; margin: 0; padding: 5px 10px; font-size: 12px;
+      background: transparent; border: 1px solid var(--border); color: var(--accent);
+      border-radius: 6px; cursor: pointer;
+    }
+    .guide-copy:active { background: rgba(9,105,218,.08); }
+    .hidden { display: none !important; }
+    .loading { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; vertical-align: middle; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .toast {
+      position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+      background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+      padding: 10px 18px; font-size: 13px; z-index: 100; display: none; max-width: 90vw;
+    }
+    .toast.show { display: block; }
+
+    /* ---------- 认证卡片(浅色高对比,遵循主流登录体验) ---------- */
+    #view-login { padding: 12px 0; }
+    .auth-card {
+      background: #ffffff; border: 1px solid #d0d7de; border-radius: 12px;
+      padding: 24px; max-width: 420px; margin: 0 auto; color: #1f2328;
+      box-shadow: 0 8px 24px rgba(0,0,0,.10);
+    }
+    .auth-card h2 { font-size: 17px; font-weight: 700; color: #1f2328; margin-bottom: 4px; }
+    .auth-tabs { display: flex; gap: 8px; margin: 16px 0; }
+    .auth-tab {
+      flex: 1; padding: 9px 0; text-align: center; border-radius: 8px; cursor: pointer;
+      font-size: 14px; font-weight: 600; color: #57606a; background: #f6f8fa; border: 1px solid #d0d7de;
+      user-select: none;
+    }
+    .auth-tab.active { color: #0969da; background: #ffffff; border-color: #0969da; }
+    .auth-field { margin-bottom: 13px; }
+    .auth-field > label { display: block; font-size: 13px; font-weight: 600; color: #1f2328; margin: 0 0 6px; }
+    .auth-input {
+      width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid #d0d7de;
+      background: #ffffff; color: #1f2328; font-size: 15px; outline: none; box-sizing: border-box;
+    }
+    .auth-input:focus { border-color: #0969da; box-shadow: 0 0 0 3px rgba(9,105,218,.15); }
+    .auth-btn {
+      width: 100%; padding: 11px; border-radius: 8px; border: none; background: #0969da;
+      color: #ffffff; font-size: 15px; font-weight: 600; cursor: pointer; margin-top: 4px;
+    }
+    .auth-btn:disabled { opacity: .6; cursor: not-allowed; }
+    .auth-btn.ghost { background: #f6f8fa; color: #1f2328; border: 1px solid #d0d7de; }
+    .auth-btn.danger { background: #ffffff; color: #cf222e; border: 1px solid #cf222e; }
+    .auth-captcha { display: flex; gap: 8px; align-items: stretch; }
+    .auth-captcha .auth-input { flex: 1; min-width: 0; }
+    .auth-captcha-img {
+      width: 118px; height: 44px; border-radius: 8px; border: 1px solid #d0d7de; cursor: pointer;
+      background: #f6f8fa; display: flex; align-items: center; justify-content: center; overflow: hidden; flex-shrink: 0;
+    }
+    .auth-captcha-img svg { display: block; width: 100%; height: 100%; }
+    .auth-sms { display: flex; gap: 8px; align-items: stretch; }
+    .auth-sms .auth-input { flex: 1; min-width: 0; }
+    .auth-send-btn {
+      flex: 0 0 auto; width: auto; margin-top: 0; padding: 0 16px;
+      border-radius: 8px; border: 1px solid #0969da;
+      background: #ffffff; color: #0969da; font-size: 13px; font-weight: 600; cursor: pointer; white-space: nowrap;
+    }
+    .auth-send-btn:disabled { color: #8c959f; border-color: #d0d7de; cursor: not-allowed; }
+    .auth-link { background: none; border: none; color: #0969da; font-size: 12.5px; cursor: pointer; padding: 0; }
+    .auth-link:hover { text-decoration: underline; }
+    .auth-hint { font-size: 12px; color: #57606a; margin-top: 6px; line-height: 1.6; }
+    .auth-msg { font-size: 13px; margin-top: 10px; min-height: 18px; }
+    .auth-msg.err { color: #cf222e; }
+    .auth-msg.ok { color: #1a7f37; }
+    .auth-user { display: flex; align-items: center; gap: 10px; margin: 12px 0 16px; }
+    .auth-user .avatar { width: 40px; height: 40px; border-radius: 50%; background: #0969da; color: #fff; display: flex; align-items: center; justify-content: center; font-size: 17px; font-weight: 700; flex-shrink: 0; }
+    .auth-user .mail { font-size: 14px; font-weight: 600; color: #1f2328; word-break: break-all; }
+    .auth-user .plan { font-size: 12px; color: #57606a; margin-top: 2px; }
+
+    /* ---------- 推广页:月付/年付 Tab + 版本对比表 + 购买 ---------- */
+    .promo-billing-tabs { display: flex; gap: 8px; margin: 14px 0 4px; }
+    .promo-billing-tabs .auth-tab { flex: 1; padding: 9px 0; text-align: center; border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: 600; color: #57606a; background: #f6f8fa; border: 1px solid #d0d7de; user-select: none; }
+    .promo-billing-tabs .auth-tab.active { color: #0969da; background: #ffffff; border-color: #0969da; }
+    .promo-tab-badge { display: inline-block; font-size: 11px; color: #9a6700; background: rgba(154,103,0,.12); border-radius: 10px; padding: 1px 7px; margin-left: 6px; font-weight: 600; }
+    .promo-table-wrap { overflow-x: auto; margin: 14px 0 4px; -webkit-overflow-scrolling: touch; }
+    .promo-compare { width: 100%; min-width: 300px; border-collapse: collapse; font-size: 12.5px; background: var(--card); }
+    .promo-compare th, .promo-compare td { border: 1px solid var(--border); padding: 9px 6px; text-align: center; vertical-align: middle; }
+    .promo-compare thead th { background: var(--bg); font-size: 13px; font-weight: 700; white-space: nowrap; }
+    .promo-compare tbody th { text-align: left; font-weight: 500; color: var(--muted); background: var(--bg); white-space: nowrap; }
+    .promo-compare .col-free { color: var(--muted); }
+    .promo-compare .col-pro { color: var(--accent); font-weight: 600; }
+    .promo-compare .col-pm { color: var(--warn); font-weight: 600; }
+    .promo-compare .cell-badge { display: block; font-size: 11px; font-weight: 600; margin-top: 2px; }
+    .promo-buy { display: flex; gap: 10px; margin: 16px 0 4px; }
+    .promo-buy .buy-btn { flex: 1; min-width: 0; margin: 0; padding: 11px 6px; display: flex; flex-direction: column; align-items: center; gap: 2px; line-height: 1.35; }
+    .promo-buy .buy-price { font-size: 12px; font-weight: 500; opacity: .92; }
+    .buy-btn-max { background: var(--warn) !important; }
+    /* ---------- 弹层(支付二维码 / 挽留) ---------- */
+    .modal-overlay { position: fixed; inset: 0; z-index: 900; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; padding: 20px; }
+    .modal-card { background: #ffffff; border: 1px solid var(--border); border-radius: 14px; padding: 22px; width: 100%; max-width: 340px; position: relative; box-shadow: 0 12px 40px rgba(0,0,0,.25); text-align: center; }
+    .modal-card h3 { font-size: 16px; font-weight: 700; color: var(--text); margin-bottom: 14px; }
+    .modal-close { position: absolute; top: 8px; right: 12px; width: 32px; height: 32px; margin: 0; padding: 0; background: transparent; border: none; color: var(--muted); font-size: 22px; line-height: 1; cursor: pointer; border-radius: 50%; }
+    .modal-close:active { background: var(--bg); }
+    .qr-img-wrap { margin: 4px auto 12px; }
+    .qr-sub { font-size: 12.5px; color: var(--muted); line-height: 1.7; }
+    .qr-empty { font-size: 13px; color: var(--muted); padding: 34px 8px; background: var(--bg); border: 1px dashed var(--border); border-radius: 10px; }
+    .retain-card { max-width: 320px; }
+    .retain-text { font-size: 13.5px; color: var(--text); line-height: 1.9; margin-bottom: 16px; text-align: left; }
+    .retain-btns { display: flex; gap: 10px; }
+    .retain-btns .auth-btn { flex: 1; margin: 0; }
+    #retain-modal { z-index: 950; }
+  </style>
+</head>
+<body>
+<header>
+  <div class="logo">DSH</div>
+  <div>
+    <h1>dsh-remote</h1>
+    <div class="sub" id="conn-status">未连接</div>
+  </div>
+  <div class="spacer"></div>
+  <button id="btn-logout" class="hidden">退出</button>
+</header>
+
+<main id="view-main">
+  <!-- 首屏读取态:会话判定完成前不渲染登录或设备界面,消除闪烁 -->
+  <div id="view-boot">
+    <div class="card" style="text-align:center;">
+      <div class="empty"><span class="loading"></span> 正在读取登录状态…</div>
+    </div>
+  </div>
+
+  <!-- 登录/注册视图 -->
+  <div id="view-login" class="hidden">
+    <div class="auth-card">
+      <!-- 已登录态 -->
+      <div id="auth-logged-in" class="hidden">
+        <h2>账号</h2>
+        <div class="auth-user">
+          <div class="avatar" id="auth-avatar">D</div>
+          <div>
+            <div class="mail" id="auth-email">-</div>
+            <div class="plan" id="auth-plan">-</div>
+          </div>
+        </div>
+        <button class="auth-btn danger" id="btn-logout-inline" style="margin-top:8px;">退出登录</button>
+      </div>
+
+      <!-- 未登录态:登录/注册 tabs -->
+      <div id="auth-logged-out">
+        <h2>远程控制</h2>
+        <div class="auth-hint">登录后可远程控制电脑上的 dsh web，体验与本地一致。</div>
+        <div class="auth-tabs">
+          <div class="auth-tab active" id="tab-login">登录</div>
+          <div class="auth-tab" id="tab-register">注册</div>
+        </div>
+
+        <!-- 登录表单 -->
+        <div id="auth-login-form">
+          <div class="auth-field"><label>手机号</label><input class="auth-input" id="login-phone" type="tel" placeholder="11 位手机号" autocomplete="tel" inputmode="tel" /></div>
+          <!-- 密码登录(默认) -->
+          <div id="login-mode-pass">
+            <div class="auth-field"><label>密码</label><input class="auth-input" id="login-pass" type="password" placeholder="密码" autocomplete="current-password" /></div>
+            <div class="auth-field"><label>验证码</label>
+              <div class="auth-captcha"><input class="auth-input" id="login-captcha" type="text" placeholder="图中数字" autocomplete="off" inputmode="numeric" maxlength="6" /><div class="auth-captcha-img" id="login-captcha-img" title="看不清?点击刷新"></div></div>
+            </div>
+          </div>
+          <!-- 短信验证码登录(次级,不显眼) -->
+          <div id="login-mode-sms" class="hidden">
+            <div class="auth-field"><label>短信验证码</label>
+              <div class="auth-sms"><input class="auth-input" id="login-sms-code" type="text" placeholder="6 位验证码" autocomplete="off" inputmode="numeric" maxlength="6" /><button class="auth-send-btn" id="btn-send-login-sms" type="button">获取验证码</button></div>
+            </div>
+            <div class="auth-field hidden" id="login-sms-captcha-row">
+              <div class="auth-captcha"><input class="auth-input" id="login-sms-captcha" type="text" placeholder="图中数字" autocomplete="off" inputmode="numeric" maxlength="6" /><div class="auth-captcha-img" id="login-sms-captcha-img" title="看不清?点击刷新"></div></div>
+            </div>
+          </div>
+          <!-- 开源自部署:访问密钥登录(本地认证,免账号体系) -->
+          <div id="login-mode-local" class="hidden">
+            <div class="auth-field"><label>访问密钥</label><input class="auth-input" id="login-local-key" type="password" placeholder="自建服务的访问密钥" autocomplete="off" /></div>
+            <button class="auth-btn" id="btn-local-login">密钥登录</button>
+            <div class="auth-hint">自建服务模式:在你自己的服务器部署后,在服务器配置中生成访问密钥填入即可。</div>
+          </div>
+          <button class="auth-btn" id="btn-login">登 录</button>
+          <div style="text-align:center;margin-top:8px;"><button class="auth-link" id="btn-toggle-login-sms" type="button">验证码登录</button> · <button class="auth-link" id="btn-toggle-login-local" type="button">自建服务密钥</button></div>
+          <div class="auth-msg" id="login-msg"></div>
+        </div>
+
+        <!-- 注册表单 -->
+        <div id="auth-register-form" class="hidden">
+          <div class="auth-field"><label>手机号</label><input class="auth-input" id="reg-phone" type="tel" placeholder="11 位手机号" autocomplete="tel" inputmode="tel" /></div>
+          <div class="auth-field"><label>短信验证码</label>
+            <div class="auth-sms"><input class="auth-input" id="reg-sms-code" type="text" placeholder="6 位验证码" autocomplete="off" inputmode="numeric" maxlength="6" /><button class="auth-send-btn" id="btn-send-reg-sms" type="button">获取验证码</button></div>
+          </div>
+          <div class="auth-field hidden" id="reg-sms-captcha-row">
+            <div class="auth-captcha"><input class="auth-input" id="reg-sms-captcha" type="text" placeholder="图中数字" autocomplete="off" inputmode="numeric" maxlength="6" /><div class="auth-captcha-img" id="reg-sms-captcha-img" title="看不清?点击刷新"></div></div>
+          </div>
+          <div class="auth-field"><label>密码</label><input class="auth-input" id="reg-pass" type="password" placeholder="至少 8 位" autocomplete="new-password" /></div>
+          <div class="auth-field"><label>确认密码</label><input class="auth-input" id="reg-pass2" type="password" placeholder="再次输入密码" autocomplete="new-password" /></div>
+          <button class="auth-btn" id="btn-register">注 册</button>
+          <div class="auth-msg" id="reg-msg"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 设备列表视图(实时在线设备选择 + 设备管理) -->
+  <div id="view-devices" class="hidden">
+    <div class="card">
+      <h2><span class="dot" id="dot-signal"></span><span id="signal-label">在线设备</span></h2>
+      <div id="device-list"></div>
+      <button id="btn-refresh" class="secondary">刷新设备列表</button>
+      <button id="btn-manage-devices" class="secondary" style="margin-top:8px;">管理设备(移除/换机)</button>
+      <div id="manage-device-list" class="hidden"></div>
+      <div id="free-hint" class="empty hidden"></div>
+    </div>
+    <div class="card" style="font-size:12px;color:var(--muted);line-height:1.8;">
+      <b>使用说明</b><br/>
+      1. 电脑上运行 <code>dsh-bridge</code> 并保持在线;<br/>
+      2. 列表实时来自路由器 WebSocket 连接,点选在线设备进入;<br/>
+      3. 进入后加载电脑端 <b>dsh web 原生界面</b>(与电脑本地一致,含设置/凭据)。<br/>
+      点选设备进入;单台在线也需点选确认,不会自动跳转。<br/>
+      <a href="/app/promo" style="color:var(--accent);">查看升级方案与邀请奖励 →</a>
+    </div>
+  </div>
+
+  <!-- 推广页(产品介绍/月付年付/价格对比/购买/安装引导/邀请) -->
+  <div id="view-promo" class="hidden">
+    <div class="card">
+      <h2>dsh-remote · 远程控制</h2>
+      <div style="font-size:14px;color:var(--muted);line-height:1.9;">
+        <p>📱 在手机浏览器上远程控制你的电脑,体验与电脑本地完全一致——实时会话、工作区、设置、插件,一个不少。</p>
+        <p>🚀 采用隧道直连技术:电脑安装守护进程后保持在线,手机随时随地接入。</p>
+        <p>🎁 <b>免费使用</b>:新注册即送 <span id="promo-trial-days">7</span> 天 PRO 体验,无需付费即可完整体验。</p>
+      </div>
+      <!-- 月付/年付 Tab -->
+      <div class="auth-tabs promo-billing-tabs" id="promo-billing-tabs">
+        <div class="auth-tab active" id="promo-tab-monthly">月付</div>
+        <div class="auth-tab" id="promo-tab-yearly">年付<span class="promo-tab-badge">9 折</span></div>
+      </div>
+      <div id="promo-plans"></div>
+      <div class="promo-table-wrap" id="promo-compare-wrap">
+        <table class="promo-compare" id="promo-compare"></table>
+      </div>
+      <div id="promo-buy"></div>
+      <div id="promo-install" style="font-size:13px;color:var(--muted);line-height:1.8;"></div>
+    </div>
+    <div class="card" id="promo-invite-card">
+      <h2>🎯 邀请好友,双方得奖励</h2>
+      <div id="promo-invite-body" style="font-size:13px;color:var(--muted);line-height:1.9;"></div>
+    </div>
+    <button id="btn-promo-back" class="secondary">← 返回</button>
+  </div>
+</main>
+
+<!-- 支付二维码弹层 -->
+<div class="modal-overlay hidden" id="qr-modal">
+  <div class="modal-card">
+    <button type="button" class="modal-close" id="qr-modal-close" aria-label="关闭">×</button>
+    <h3>扫码支付开通会员</h3>
+    <div class="qr-img-wrap" id="qr-img-wrap"></div>
+    <div class="qr-sub">微信扫码 → 选择套餐完成支付 → 会员自动/人工开通</div>
+  </div>
+</div>
+
+<!-- 挽留弹窗 -->
+<div class="modal-overlay hidden" id="retain-modal">
+  <div class="modal-card retain-card">
+    <h3>💛 先别走呀～</h3>
+    <div class="retain-text" id="retain-text"></div>
+    <div class="retain-btns">
+      <button type="button" class="auth-btn ghost" id="retain-stay">我再想想</button>
+      <button type="button" class="auth-btn danger" id="retain-leave">残忍离开</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+/* ============================================================
+ * native.html — dsh-remote 手机端 PWA(隧道模式)
+ *
+ * 架构:
+ *   本页(手机,公开地址 /app/)只做三件事:登录/注册、查实时在线设备、跳转。
+ *   进入设备后浏览器直接加载 https://<你的域名>/ 根路径,
+ *   nginx → relay-router → bridge WebSocket 隧道 → 电脑端 dsh web(127.0.0.1:3080),
+ *   页面体验与电脑本地一致(WebRTC/DataChannel 时代已废弃删除)。
+ *
+ * 流程:
+ *   登录/注册/会话恢复 → GET /_devices(router 实时 WS Map,校验 dsh_token cookie)
+ *     0/1/多台在线 → 一律进设备选择页(0 台展示安装引导),由用户点选设备
+ *       enterDevice(id) 写 dsh_device cookie 后跳 /
+ *   显式退出(/app/?logout=1)→ 先清 localStorage/Cookie 再渲染登录页
+ * ============================================================ */
+
+// ---------- 配置(默认按页面 origin 推断;public-config 再覆盖 api 地址) ----------
+const origin = window.location.origin;
+let API_BASE = (window.DSH_RELAY_API || origin + "/relay-api").replace(/\/+$/, "");
+/** 公共配置缓存(域名/价格/试用/邀请规则/安装教程)。 */
+let pubConfig = null;
+
+async function loadPublicConfig() {
+  try {
+    const r = await fetch(API_BASE + "/api/public-config");
+    const d = await r.json();
+    if (d.api_url) API_BASE = d.api_url.replace(/\/+$/, "");
+    pubConfig = d;
+  } catch { /* 离线/旧服务,用默认 */ }
+}
+
+const $ = (id) => document.getElementById(id);
+const state = {
+  token: localStorage.getItem("dsh_token") || "",
+  user: JSON.parse(localStorage.getItem("dsh_user") || "null")
+};
+
+// ---------- 工具 ----------
+function toast(msg, ms = 2500) {
+  const t = $("toast"); t.textContent = msg; t.classList.add("show");
+  setTimeout(() => t.classList.remove("show"), ms);
+}
+function esc(s) { return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+function setView(v) {
+  ["boot", "login", "devices", "promo"].forEach(n => $(`view-${n}`).classList.toggle("hidden", n !== v));
+}
+function setConn(text, ok) {
+  $("conn-status").textContent = text;
+  $("conn-status").style.color = ok ? "var(--ok)" : "var(--muted)";
+}
+
+// ---------- 账号 API ----------
+async function api(path, body, method = "POST") {
+  const r = await fetch(API_BASE + path, {
+    method,
+    headers: { "content-type": "application/json", ...(state.token ? { authorization: `Bearer ${state.token}` } : {}) },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  return { status: r.status, data: await r.json().catch(() => ({})) };
+}
+
+// ---------- 图形验证码(通用:加载到指定 img,id 存 dataset) ----------
+async function loadCaptchaInto(imgElId) {
+  const imgEl = $(imgElId);
+  imgEl.innerHTML = '<span class="auth-hint">加载中</span>';
+  delete imgEl.dataset.captchaId;
+  try {
+    const r = await fetch(API_BASE + "/api/captcha");
+    if (!r.ok) throw new Error("http " + r.status);
+    const d = await r.json();
+    imgEl.dataset.captchaId = d.captcha_id;
+    imgEl.innerHTML = d.svg || "";
+  } catch {
+    imgEl.innerHTML = '<span class="auth-hint">点击重试</span>';
+  }
+}
+const validPhone = (p) => /^1\d{10}$/.test((p || "").trim());
+
+// ---------- 登录/注册 tabs ----------
+function switchAuthTab(tab) {
+  const isLogin = tab === "login";
+  $("tab-login").classList.toggle("active", isLogin);
+  $("tab-register").classList.toggle("active", !isLogin);
+  $("auth-login-form").classList.toggle("hidden", !isLogin);
+  $("auth-register-form").classList.toggle("hidden", isLogin);
+}
+
+// ---------- 登录态渲染 ----------
+function renderAuthState() {
+  const loggedIn = !!state.token;
+  $("auth-logged-in").classList.toggle("hidden", !loggedIn);
+  $("auth-logged-out").classList.toggle("hidden", loggedIn);
+  $("btn-logout").classList.toggle("hidden", !loggedIn); // 登录后 header 显示退出按钮
+  if (loggedIn && state.user) {
+    const who = state.user.phone || state.user.email || "D";
+    $("auth-email").textContent = who;
+    $("auth-plan").textContent = state.user.plan ? `套餐: ${state.user.plan}` : "";
+    $("auth-avatar").textContent = who.charAt(0).toUpperCase();
+  }
+}
+
+/**
+ * 登录/注册/会话恢复统一入口:写 dsh_token cookie 后进入设备选择页,
+ * 由 Router 实时设备端点 GET /_devices 列出当前 WebSocket 在线的设备
+ * (不再依赖数据库 online 字段;也不再按台数自动跳转)。
+ *   0 台在线 → 选择页展示安装引导空状态(可刷新);
+ *   1/多台在线 → 展示实时列表,均由用户点选进入。
+ */
+async function enterMirror(token) {
+  const hours = 2;
+  document.cookie = `dsh_token=${encodeURIComponent(token)}; path=/; max-age=${hours * 3600}; SameSite=Lax; Secure`;
+  renderAuthState();
+  if (state.user) setConn(state.user.phone || state.user.email, true);
+  // 0/1/多台在线:一律进设备列表视图,由用户点选进入,不自动跳转
+  setView("devices");
+  refreshDevices();
+  void applyQuotaHint();
+}
+
+/** 选定设备:写 dsh_device cookie 后跳根路径(经 router 按 cookie 路由到设备镜像)。 */
+function enterDevice(deviceId) {
+  const hours = 2;
+  document.cookie = `dsh_device=${encodeURIComponent(deviceId)}; path=/; max-age=${hours * 3600}; SameSite=Lax; Secure`;
+  window.location.replace("/");
+}
+
+// ---------- v2 流量提示(免费用户:百分比 + 升级钩子;pro 不限流量不提示) ----------
+
+/** 拉取 router 实时用量;free 用户高用量时 Toast 引导升级。 */
+async function applyQuotaHint() {
+  const hintEl = $("free-hint");
+  if (!hintEl) return;
+  hintEl.classList.add("hidden");
+  try {
+    const r = await fetch("/_quota", { cache: "no-store" });
+    if (r.status !== 200) return;
+    const d = await r.json().catch(() => ({}));
+    const q = d.quota;
+    if (!q || q.limit_enabled === false) return; // pro/pro_max 不限流量
+    const pct = q.percent;
+    if (pct >= 100) {
+      hintEl.innerHTML = `本月免费流量已用完(<b>${pct}%</b>)。升级 PRO 后不限流量、不限速。<a href="/app/promo" style="color:var(--accent);">查看升级方案 →</a>`;
+      toast("本月免费流量已用完,升级 PRO 即可继续使用", 5000);
+    } else if (pct >= 90) {
+      hintEl.innerHTML = `本月免费流量已用 <b>${pct}%</b>。<a href="/app/promo" style="color:var(--accent);">升级 PRO 不限流量 →</a>`;
+    } else if (pct > 0) {
+      hintEl.innerHTML = `免费限速模式:本月流量已用 <b>${pct}%</b>。升级 PRO 解除限速。<a href="/app/promo" style="color:var(--accent);">查看方案 →</a>`;
+    } else {
+      hintEl.innerHTML = `免费限速模式:页面加载较慢属正常,升级 PRO 解除限速。<a href="/app/promo" style="color:var(--accent);">查看方案 →</a>`;
+    }
+    hintEl.classList.remove("hidden");
+  } catch { /* 离线忽略 */ }
+}
+
+// ---------- v2 设备管理(移除/换机;pro 每月 3 次,pro_max 不限) ----------
+
+let managingDevices = false;
+async function toggleManageDevices() {
+  managingDevices = !managingDevices;
+  const wrap = $("manage-device-list");
+  const btn = $("btn-manage-devices");
+  if (!managingDevices) {
+    wrap.classList.add("hidden");
+    btn.textContent = "管理设备(移除/换机)";
+    return;
+  }
+  btn.textContent = "收起管理";
+  wrap.classList.remove("hidden");
+  wrap.innerHTML = '<div class="empty">加载中...</div>';
+  try {
+    const r = await api("/api/devices", null, "GET");
+    const devices = (Array.isArray(r.data.devices) ? r.data.devices : []).filter(x => x && x.id);
+    if (devices.length === 0) {
+      wrap.innerHTML = '<div class="empty">尚未绑定任何设备。</div>';
+      return;
+    }
+    wrap.innerHTML = "";
+    devices.forEach(d => {
+      const el = document.createElement("div");
+      el.className = "device";
+      el.style.opacity = ".85";
+      el.innerHTML = `
+        <div class="icon">💻</div>
+        <div>
+          <div class="name">${esc(d.device_name || d.id)}</div>
+          <div class="meta">${esc(d.id)} · ${d.online ? "在线" : "离线"}</div>
+        </div>
+        <button class="secondary" style="margin:0;padding:8px 12px;width:auto;flex-shrink:0;" data-remove="${esc(d.id)}">移除</button>`;
+      wrap.appendChild(el);
+    });
+    wrap.querySelectorAll("[data-remove]").forEach(btn2 => {
+      btn2.onclick = async () => {
+        const id = btn2.dataset.remove;
+        btn2.disabled = true; btn2.textContent = "移除中...";
+        try {
+          const res = await api(`/api/devices/${encodeURIComponent(id)}`, null, "DELETE");
+          if (res.status === 200) {
+            toast("设备已移除");
+            await toggleManageDevices();
+            toggleManageDevices();
+          } else {
+            toast(res.data?.error?.message || `移除失败(${res.status})`, 4500);
+            btn2.disabled = false; btn2.textContent = "移除";
+          }
+        } catch (e) {
+          toast("移除失败: " + e.message, 4000);
+          btn2.disabled = false; btn2.textContent = "移除";
+        }
+      };
+    });
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty">获取设备列表失败:${esc(e.message)}</div>`;
+  }
+}
+
+// ---------- 短信验证码(发送 + 倒计时 + 防刷图形验证码) ----------
+function setMsgEl(id, cls, text) { const m = $(id); m.className = "auth-msg " + cls; m.textContent = text; }
+function startCountdown(btn) {
+  let s = 60; btn.disabled = true;
+  const tick = () => {
+    btn.textContent = `${s}s`;
+    if (--s < 0) { btn.disabled = false; btn.textContent = "获取验证码"; return; }
+    setTimeout(tick, 1000);
+  };
+  tick();
+}
+async function sendSms(kind) {
+  const phone = (kind === "login" ? $("login-phone") : $("reg-phone")).value.trim();
+  const msgId = kind === "login" ? "login-msg" : "reg-msg";
+  if (!validPhone(phone)) { setMsgEl(msgId, "err", "请输入正确的手机号"); return; }
+  const btn = kind === "login" ? $("btn-send-login-sms") : $("btn-send-reg-sms");
+  const capRow = kind === "login" ? $("login-sms-captcha-row") : $("reg-sms-captcha-row");
+  const capInput = kind === "login" ? $("login-sms-captcha") : $("reg-sms-captcha");
+  const capImg = kind === "login" ? $("login-sms-captcha-img") : $("reg-sms-captcha-img");
+
+  const payload = { phone };
+  // 防刷:验证码行可见时,需带图形验证码
+  if (!capRow.classList.contains("hidden")) {
+    if (!capImg.dataset.captchaId || !capInput.value.trim()) { setMsgEl(msgId, "err", "请输入图中验证码"); return; }
+    payload.captcha_id = capImg.dataset.captchaId;
+    payload.captcha_answer = capInput.value.trim();
+  }
+  setMsgEl(msgId, "", "发送中...");
+  try {
+    const r = await fetch(API_BASE + "/api/sms-code", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
+    const d = await r.json().catch(() => ({}));
+    if (r.status === 200) {
+      startCountdown(btn);
+      // 测试模式:服务端可能返回 test_code,展示出来方便自测
+      if (d.test_code) setMsgEl(msgId, "ok", `验证码已发送(测试码: ${d.test_code})`);
+      else setMsgEl(msgId, "ok", "验证码已发送");
+      capRow.classList.add("hidden"); capInput.value = "";
+    } else if (r.status === 400 && /验证码|captcha/i.test(d.error?.message || "")) {
+      capRow.classList.remove("hidden");
+      loadCaptchaInto(capImg.id);
+      setMsgEl(msgId, "err", "发送频繁,请先输入图形验证码");
+    } else {
+      setMsgEl(msgId, "err", d.error?.message || `发送失败(${r.status})`);
+    }
+  } catch (e) { setMsgEl(msgId, "err", "发送失败: " + e.message); }
+}
+
+// ---------- 登录(密码 / 短信 / 本地密钥 三选一,密码为默认) ----------
+let loginMode = "pass";
+function toggleLoginMode() {
+  loginMode = loginMode === "pass" ? "sms" : "pass";
+  $("login-mode-pass").classList.toggle("hidden", loginMode !== "pass");
+  $("login-mode-sms").classList.toggle("hidden", loginMode !== "sms");
+  $("login-mode-local").classList.add("hidden");
+  $("btn-toggle-login-sms").textContent = loginMode === "pass" ? "验证码登录" : "密码登录";
+}
+function toggleLocalLogin() {
+  const show = $("login-mode-local").classList.contains("hidden");
+  $("login-mode-local").classList.toggle("hidden", !show);
+  if (show) {
+    $("login-mode-pass").classList.add("hidden");
+    $("login-mode-sms").classList.add("hidden");
+  } else {
+    $("login-mode-pass").classList.remove("hidden");
+    loginMode = "pass";
+  }
+}
+/** 开源自部署:访问密钥登录(本地认证 POST /_login,免账号体系)。 */
+async function doLocalLogin() {
+  const key = $("login-local-key").value.trim();
+  const msg = $("login-msg");
+  if (!key) { msg.className = "auth-msg err"; msg.textContent = "请输入访问密钥"; return; }
+  msg.className = "auth-msg"; msg.innerHTML = '<span class="loading"></span> 登录中...';
+  try {
+    const r = await fetch("/_login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ key })
+    });
+    const d = await r.json().catch(() => ({}));
+    if (r.status === 200 && d.token) {
+      state.token = d.token;
+      state.user = { phone: "自建服务", plan: d.plan || "pro_max" };
+      localStorage.setItem("dsh_token", state.token);
+      localStorage.setItem("dsh_user", JSON.stringify(state.user));
+      msg.className = "auth-msg ok"; msg.textContent = "✅ 登录成功,正在进入...";
+      enterMirror(d.token);
+    } else {
+      msg.className = "auth-msg err";
+      msg.textContent = d.error?.message || `登录失败(${r.status})`;
+    }
+  } catch (e) {
+    msg.className = "auth-msg err";
+    msg.textContent = "无法连接本地认证服务: " + e.message + "(请确认访问的是自建服务地址)";
+  }
+}
+async function doLogin() {
+  const phone = $("login-phone").value.trim();
+  const msg = $("login-msg");
+  if (!validPhone(phone)) { msg.className = "auth-msg err"; msg.textContent = "请输入正确的手机号"; return; }
+  let res;
+  if (loginMode === "pass") {
+    const password = $("login-pass").value;
+    if (!password) { msg.className = "auth-msg err"; msg.textContent = "请输入密码"; return; }
+    const cid = $("login-captcha-img").dataset.captchaId, ctext = $("login-captcha").value.trim();
+    if (!cid || !ctext) { msg.className = "auth-msg err"; msg.textContent = "请输入图中验证码"; if (!cid) loadCaptchaInto("login-captcha-img"); return; }
+    msg.className = "auth-msg"; msg.innerHTML = '<span class="loading"></span> 登录中...';
+    res = await api("/api/login", { phone, password, captcha_id: cid, captcha_answer: ctext });
+  } else {
+    const sms = $("login-sms-code").value.trim();
+    if (!sms) { msg.className = "auth-msg err"; msg.textContent = "请输入短信验证码"; return; }
+    msg.className = "auth-msg"; msg.innerHTML = '<span class="loading"></span> 登录中...';
+    res = await api("/api/login-sms", { phone, sms_code: sms });
+  }
+  if (res.status === 200) {
+    state.token = res.data.token; state.user = res.data.user;
+    localStorage.setItem("dsh_token", state.token);
+    localStorage.setItem("dsh_user", JSON.stringify(state.user));
+    msg.className = "auth-msg ok"; msg.textContent = "✅ 登录成功,正在进入...";
+    enterMirror(res.data.token);
+  } else {
+    msg.className = "auth-msg err";
+    msg.textContent = res.data?.error?.message || `登录失败(${res.status})`;
+    if (loginMode === "pass") loadCaptchaInto("login-captcha-img");
+  }
+}
+
+async function doRegister() {
+  const phone = $("reg-phone").value.trim();
+  const sms = $("reg-sms-code").value.trim();
+  const password = $("reg-pass").value, password2 = $("reg-pass2").value;
+  const msg = $("reg-msg");
+  if (!validPhone(phone)) { msg.className = "auth-msg err"; msg.textContent = "请输入正确的手机号"; return; }
+  if (!sms) { msg.className = "auth-msg err"; msg.textContent = "请输入短信验证码"; return; }
+  if (password.length < 8) { msg.className = "auth-msg err"; msg.textContent = "密码至少 8 位"; return; }
+  if (password !== password2) { msg.className = "auth-msg err"; msg.textContent = "两次输入的密码不一致"; return; }
+  msg.className = "auth-msg"; msg.innerHTML = '<span class="loading"></span> 注册中...';
+  const payload = { phone, sms_code: sms, password };
+  // 邀请链接携带的邀请码(注册后首次绑设备计有效邀请)
+  if (window.__inviteCode) payload.invite_code = window.__inviteCode;
+  const res = await api("/api/register", payload);
+  if (res.status === 201) {
+    state.token = res.data.token; state.user = res.data.user;
+    localStorage.setItem("dsh_token", state.token);
+    localStorage.setItem("dsh_user", JSON.stringify(state.user));
+    msg.className = "auth-msg ok"; msg.textContent = "✅ 注册成功,已自动登录,正在进入...";
+    enterMirror(res.data.token);
+  } else {
+    msg.className = "auth-msg err";
+    msg.textContent = res.data?.error?.message || `注册失败(${res.status})`;
+  }
+}
+
+/** 统一退出:清 localStorage + dsh_token/dsh_device Cookie,并注销服务端 JWT。 */
+function logout(clearForm = false) {
+  const token = state.token;
+  state.token = ""; state.user = null;
+  localStorage.removeItem("dsh_token"); localStorage.removeItem("dsh_user");
+  document.cookie = "dsh_token=; path=/; max-age=0; SameSite=Lax; Secure";
+  document.cookie = "dsh_device=; path=/; max-age=0; SameSite=Lax; Secure";
+  if (token) fetch(API_BASE + "/api/logout", { method: "POST", headers: { authorization: `Bearer ${token}` } }).catch(() => {});
+  setConn("未连接");
+  if (clearForm) {
+    ["login-phone", "login-pass", "login-captcha", "login-sms-code", "login-sms-captcha", "reg-phone", "reg-sms-code", "reg-sms-captcha", "reg-pass", "reg-pass2"].forEach(id => { const el = $(id); if (el) el.value = ""; });
+    switchAuthTab("login");
+  }
+  renderAuthState();
+  setView("login");
+}
+
+// ---------- 新用户安装引导(空设备状态;后台 public-config 可覆盖) ----------
+
+/** 返回安装引导 HTML:后台配置 app_install_guide 非空时优先展示,否则用内置默认步骤。 */
+function installGuideHTML() {
+  const custom = pubConfig && pubConfig.app_install_guide;
+  if (custom) return custom;
+  const cmdInstall = "npx @mrrisega/dsh-relay";
+  return `
+    <div class="guide">
+      <div class="guide-title">💻 电脑端还没连接?</div>
+      <div class="guide-sub">在你要控制的电脑上安装 dsh-bridge,保持在线后本页即可看到并进入:</div>
+      <ol>
+        <li><b>安装 Node.js 22+</b> — 从 <code>nodejs.org</code> 下载安装,终端运行 <code>node -v</code> 确认版本 ≥ v22。</li>
+        <li><b>一键安装</b> — 终端执行(自动安装 bridge + dsh web 插件,并创建开机自启服务):
+          <div class="guide-cmd"><code>${esc(cmdInstall)}</code><button type="button" class="guide-copy" data-guide-copy="${esc(cmdInstall)}">复制</button></div>
+        </li>
+        <li><b>登录账号</b> — 运行 <code>npx @mrrisega/dsh-relay settings</code> 打开设置页,用本页注册的手机号与密码登录。</li>
+        <li><b>保持运行</b> — 服务常驻后台(launchd / systemd 自启),回到本页点「刷新设备列表」即可看到电脑上线。</li>
+      </ol>
+    </div>`;
+}
+
+/** 为引导卡片内的「复制」按钮绑定命令复制。 */
+function bindGuideCopy(root) {
+  root.querySelectorAll("[data-guide-copy]").forEach(btn => {
+    btn.onclick = async () => {
+      const text = btn.dataset.guideCopy || "";
+      try { await navigator.clipboard.writeText(text); toast("安装命令已复制"); }
+      catch { toast(text, 6000); }
+    };
+  });
+}
+
+// ---------- 设备列表(实时来自 Router /_devices) ----------
+async function refreshDevices() {
+  const list = $("device-list");
+  list.innerHTML = '<div class="empty">加载中...</div>';
+  $("signal-label").textContent = "查询在线设备...";
+  $("dot-signal").classList.remove("on");
+
+  let devices = [];
+  try {
+    const r = await fetch("/_devices", { cache: "no-store" });
+    if (r.status === 401) {
+      logout();
+      toast("登录已过期,请重新登录");
+      return;
+    }
+    const d = await r.json().catch(() => ({}));
+    devices = (Array.isArray(d.devices) ? d.devices : []).filter(x => x && x.id);
+  } catch (e) {
+    list.innerHTML = `<div class="empty">获取在线设备失败:${esc(e.message)}。<br>请检查网络后点"刷新"重试。</div>`;
+    return;
+  }
+
+  if (devices.length === 0) {
+    $("signal-label").textContent = "暂无在线设备";
+    list.innerHTML = `<div class="empty" style="padding:12px 0 8px;">暂无在线设备</div>${installGuideHTML()}`;
+    bindGuideCopy(list);
+    return;
+  }
+  list.innerHTML = "";
+  devices.forEach(d => {
+    const el = document.createElement("div");
+    el.className = "device";
+    el.innerHTML = `
+      <div class="icon">🟢</div>
+      <div>
+        <div class="name">${esc(d.name || d.id)}</div>
+        <div class="meta">${esc(d.id)}</div>
+      </div>
+      <div class="status on">在线</div>`;
+    el.onclick = () => enterDevice(d.id);
+    list.appendChild(el);
+  });
+  $("signal-label").textContent = `在线设备 ${devices.length} 台`;
+  $("dot-signal").classList.add("on");
+  void applyQuotaHint();
+}
+
+// ---------- v2 推广页(产品介绍/月付年付/价格对比/购买/安装引导/邀请) ----------
+
+let promoBilling = "monthly";   // "monthly" | "yearly"
+let qrRetentionShown = false;   // 挽留层只出现一次,之后关闭直接关
+let promoPlanName = "PRO";      // 当前点击购买对应的套餐名(挽留文案用)
+
+/** 套餐价格:月价取 prices.{key};年价优先 prices.{key}_yearly,缺失按 9 折兜底。 */
+function promoPriceOf(key) {
+  const prices = (pubConfig && pubConfig.prices) || {};
+  const monthly = Number(prices[key]) || (key === "pro" ? 19 : 49);
+  const yearly = Number(prices[key + "_yearly"]) || Math.round(monthly * 12 * 0.9);
+  return { monthly, yearly, save: monthly * 12 - yearly };
+}
+/** 纯文本价格(购买按钮用):¥X/月 或 ¥X/年。 */
+function promoPriceText(key) {
+  const p = promoPriceOf(key);
+  return promoBilling === "yearly" ? `¥${p.yearly}/年` : `¥${p.monthly}/月`;
+}
+/** 价格展示 HTML(对比表/价格卡片用):年付带「9 折(省 x 元)」徽标。 */
+function promoPriceHTML(key) {
+  const p = promoPriceOf(key);
+  if (promoBilling === "yearly") {
+    return `¥${esc(p.yearly)}/年<span class="cell-badge">年付 9 折(省 ¥${esc(p.save)})</span>`;
+  }
+  return `¥${esc(p.monthly)}/月`;
+}
+
+/** 渲染价格卡片 + 版本对比表 + 立即购买按钮(随月付/年付 Tab 刷新)。 */
+function renderPromoPlans() {
+  const gc = pubConfig || {};
+  const plans = gc.plans || {};
+  const pFree = plans.free || {}, pPro = plans.pro || {}, pPm = plans.pro_max || {};
+  const trial = gc.trial_days || 7;
+  // 价格卡片(简洁版,细节见下方对比表)
+  $("promo-plans").innerHTML = `
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px;">
+      <div style="flex:1;min-width:180px;background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:14px;">
+        <b>免费</b>
+        <div style="font-size:12px;color:var(--muted);margin-top:6px;">限速体验(约 ${esc(pFree.max_mbps || 1)}Mbps)· 月流量 ${esc(pFree.monthly_gb || 1)}GB · 新用户送 ${esc(trial)} 天 PRO</div>
+      </div>
+      <div style="flex:1;min-width:180px;background:var(--bg);border:1px solid var(--accent);border-radius:10px;padding:14px;">
+        <b>PRO</b> <span style="font-size:13px;color:var(--accent);font-weight:700;">${promoPriceHTML("pro")}</span>
+        <div style="font-size:12px;color:var(--muted);margin-top:6px;">不限流量 · 高带宽(约 ${esc(pPro.max_mbps || 8)}Mbps) · 1 台设备(每月可换 ${esc(pPro.monthly_resets || 3)} 次)</div>
+      </div>
+      <div style="flex:1;min-width:180px;background:var(--bg);border:1px solid var(--warn);border-radius:10px;padding:14px;">
+        <b>Pro Max</b> <span style="font-size:13px;color:var(--warn);font-weight:700;">${promoPriceHTML("pro_max")}</span>
+        <div style="font-size:12px;color:var(--muted);margin-top:6px;">不限流量 · 高带宽 · 多设备(${esc(pPm.devices || 3)} 台注册 / ${esc(pPm.online || 3)} 台同时在线) · 换机不限次</div>
+      </div>
+    </div>`;
+  // 版本纵向对比表(全部数据来自 public-config)
+  const rows = [
+    { label: "价格", free: "免费", pro: promoPriceHTML("pro"), pm: promoPriceHTML("pro_max") },
+    { label: "带宽", free: `约 ${esc(pFree.max_mbps || 1)} Mbps`, pro: `约 ${esc(pPro.max_mbps || 8)} Mbps`, pm: `约 ${esc(pPm.max_mbps || 8)} Mbps` },
+    { label: "月流量", free: `${esc(pFree.monthly_gb || 1)} GB/月`, pro: "不限", pm: "不限" },
+    { label: "是否限速", free: "限速", pro: "不限速", pm: "不限速" },
+    { label: "设备数", free: "—", pro: `${esc(pPro.devices || 1)} 台(每月可换 ${esc(pPro.monthly_resets || 3)} 次)`, pm: `${esc(pPm.devices || 3)} 台注册 / ${esc(pPm.online || 3)} 台同时在线` },
+    { label: "换机次数", free: "—", pro: `${esc(pPro.monthly_resets || 3)} 次/月`, pm: "不限" }
+  ];
+  $("promo-compare").innerHTML = `
+    <thead><tr><th></th><th class="col-free">免费</th><th class="col-pro">PRO</th><th class="col-pm">Pro Max</th></tr></thead>
+    <tbody>${rows.map(r => `<tr><th>${esc(r.label)}</th><td class="col-free">${r.free}</td><td class="col-pro">${r.pro}</td><td class="col-pm">${r.pm}</td></tr>`).join("")}</tbody>`;
+  // 立即购买按钮(两个套餐,价格随 Tab 变化)
+  $("promo-buy").innerHTML = `
+    <div class="promo-buy">
+      <button type="button" class="buy-btn" data-plan="PRO"><span>立即购买 PRO</span><span class="buy-price">${promoPriceText("pro")}</span></button>
+      <button type="button" class="buy-btn buy-btn-max" data-plan="Pro Max"><span>立即购买 Pro Max</span><span class="buy-price">${promoPriceText("pro_max")}</span></button>
+    </div>`;
+  $("promo-buy").querySelectorAll("[data-plan]").forEach(btn => {
+    btn.onclick = () => {
+      reportUpgradeIntent("buy_click"); // 第二层:点购买即上报
+      openQrModal(btn.dataset.plan);
+    };
+  });
+}
+
+/** 月付/年付 Tab 切换:更新 Tab 高亮并整体刷新价格展示。 */
+function switchPromoBilling(mode) {
+  promoBilling = mode;
+  $("promo-tab-monthly").classList.toggle("active", mode === "monthly");
+  $("promo-tab-yearly").classList.toggle("active", mode === "yearly");
+  renderPromoPlans();
+}
+
+/** 购买意愿上报(第一层:进页 promo_open;第二层:点购买 buy_click),fire-and-forget。 */
+function reportUpgradeIntent(source) {
+  api("/api/upgrade-intent", { source }).catch(() => {});
+}
+
+/** 打开支付二维码弹层;qrcode 为空或加载失败时展示提示文案。 */
+function openQrModal(plan) {
+  promoPlanName = plan;
+  const qr = (pubConfig && pubConfig.upgrade && pubConfig.upgrade.qrcode) || "";
+  const wrap = $("qr-img-wrap");
+  wrap.innerHTML = "";
+  if (!qr) {
+    wrap.innerHTML = `<div class="qr-empty">收款码配置中,请联系管理员/客服</div>`;
+  } else {
+    const src = /^https?:/i.test(qr) ? qr : API_BASE + qr;
+    const img = document.createElement("img");
+    img.src = src;
+    img.alt = "收款二维码";
+    img.style.cssText = "width:240px;max-width:62vw;background:#fff;padding:12px;border-radius:8px;display:block;margin:0 auto;";
+    img.onerror = () => { wrap.innerHTML = `<div class="qr-empty">二维码加载失败,请联系管理员/客服</div>`; };
+    wrap.appendChild(img);
+  }
+  $("qr-modal").classList.remove("hidden");
+}
+
+/** 关闭二维码层:首次先弹挽留层,挽留出现过后再关则直接关闭。 */
+function closeQrAttempt() {
+  if (!qrRetentionShown) {
+    qrRetentionShown = true;
+    $("retain-text").textContent = `先别走呀～开通 ${promoPlanName} 后不限流量不限速,电脑随时在线,一年下来每天不到几毛钱～再想想嘛?`;
+    $("retain-modal").classList.remove("hidden");
+  } else {
+    closeQrLayers();
+  }
+}
+/** 关闭全部弹层(二维码 + 挽留)。 */
+function closeQrLayers() {
+  $("retain-modal").classList.add("hidden");
+  $("qr-modal").classList.add("hidden");
+}
+
+async function renderPromo() {
+  const gc = pubConfig || {};
+  $("promo-trial-days").textContent = gc.trial_days || 7;
+  renderPromoPlans();
+  // 安装引导(后台可配;开源部署命令就绪前留空)
+  const guide = gc.app_install_guide || "";
+  $("promo-install").innerHTML = guide
+    ? `<b>安装引导</b><br/>${guide}`
+    : `安装引导即将上线,敬请期待。`;
+  // 邀请模块
+  const body = $("promo-invite-body");
+  const inviteRule = gc.invite_rule || { n: 3, days: 15 };
+  if (!state.token) {
+    body.innerHTML = `每邀请 <b>${inviteRule.n}</b> 位好友安装并注册,你获得 <b>${inviteRule.days}</b> 天 PRO。<br/>请先登录后获取你的专属邀请链接。`;
+    return;
+  }
+  const inviteCode = state.user?.invite_code || "";
+  const link = origin + "/app/?invite=" + encodeURIComponent(inviteCode);
+  body.innerHTML = `
+    每邀请 <b>${inviteRule.n}</b> 位好友安装并注册,你获得 <b>${inviteRule.days}</b> 天 PRO。<br/><br/>
+    我的邀请码:<b style="color:var(--accent);font-size:16px;">${esc(inviteCode) || "—"}</b><br/>
+    邀请链接:<span style="word-break:break-all;">${esc(link)}</span><br/>
+    <button id="btn-copy-invite" class="secondary" style="margin-top:10px;">复制邀请链接</button>
+    <div id="promo-invite-records" style="margin-top:12px;"></div>`;
+  const copyBtn = $("btn-copy-invite");
+  if (copyBtn) {
+    copyBtn.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(link);
+        toast("邀请链接已复制");
+      } catch {
+        toast(link, 6000);
+      }
+    };
+  }
+  // 邀请/奖励记录(登录态)
+  try {
+    const me = await api("/api/me", null, "GET");
+    const invited = me.data.user?.invited_by ? 1 : 0;
+    $("promo-invite-records").innerHTML = invited
+      ? `<div class="empty">你已通过好友邀请加入,自动获得试用福利。完成设备安装即可为好友计入有效邀请。</div>`
+      : `<div class="empty">暂无可展示的邀请记录。</div>`;
+  } catch { /* 忽略 */ }
+}
+
+function showPromo() {
+  renderAuthState();
+  setView("promo");
+  void renderPromo();
+  reportUpgradeIntent("promo_open"); // 第一层:进入推广页即上报购买意愿
+}
+
+// ---------- 事件绑定 ----------
+$("btn-login").onclick = () => doLogin();
+$("btn-register").onclick = () => doRegister();
+$("btn-logout").onclick = () => logout();
+$("btn-logout-inline").onclick = () => logout();
+$("tab-login").onclick = () => switchAuthTab("login");
+$("tab-register").onclick = () => switchAuthTab("register");
+$("login-captcha-img").onclick = () => loadCaptchaInto("login-captcha-img");
+$("login-sms-captcha-img").onclick = () => loadCaptchaInto("login-sms-captcha-img");
+$("reg-sms-captcha-img").onclick = () => loadCaptchaInto("reg-sms-captcha-img");
+$("btn-send-login-sms").onclick = () => sendSms("login");
+$("btn-send-reg-sms").onclick = () => sendSms("register");
+$("btn-toggle-login-sms").onclick = () => toggleLoginMode();
+$("btn-toggle-login-local").onclick = () => toggleLocalLogin();
+$("btn-local-login").onclick = () => doLocalLogin();
+$("btn-refresh").onclick = refreshDevices;
+$("btn-manage-devices").onclick = toggleManageDevices;
+// 推广页:月付/年付 Tab
+$("promo-tab-monthly").onclick = () => switchPromoBilling("monthly");
+$("promo-tab-yearly").onclick = () => switchPromoBilling("yearly");
+// 支付二维码弹层:关闭(× 或遮罩)先走挽留逻辑
+$("qr-modal-close").onclick = closeQrAttempt;
+$("qr-modal").addEventListener("click", (e) => { if (e.target === $("qr-modal")) closeQrAttempt(); });
+// 挽留弹层:「我再想想」回二维码层继续看;「残忍离开」关闭全部
+$("retain-stay").onclick = () => $("retain-modal").classList.add("hidden");
+$("retain-leave").onclick = closeQrLayers;
+$("btn-promo-back").onclick = () => {
+  history.replaceState(null, "", window.location.pathname);
+  if (state.token) { setView("devices"); refreshDevices(); }
+  else setView("login");
+};
+$("login-pass").addEventListener("keydown", (e) => { if (e.key === "Enter") $("btn-login").onclick(); });
+$("reg-pass2").addEventListener("keydown", (e) => { if (e.key === "Enter") $("btn-register").onclick(); });
+
+// ---------- 启动 ----------
+function tokenExpired(token) {
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) return true;
+    const payload = JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")));
+    return typeof payload.exp === "number" && payload.exp < Math.floor(Date.now() / 1000);
+  } catch { return true; }
+}
+(async function init() {
+  await loadPublicConfig();
+  // 推广页(/app/promo):产品介绍/价格/安装引导/邀请
+  if (window.location.pathname.endsWith("/promo")) {
+    showPromo();
+    return;
+  }
+  // 显式退出意图(/app/?logout=1,Router 错误页「返回登录」带此参数):
+  // 先同步清理本地令牌、用户数据与 dsh_token/dsh_device Cookie,再渲染登录页,
+  // 避免旧令牌残留导致自动重进;随后清理地址栏参数。
+  if (new URLSearchParams(window.location.search).get("logout") === "1") {
+    logout();
+    history.replaceState(null, "", window.location.pathname);
+    setView("login");
+    switchAuthTab("login");
+    loadCaptchaInto("login-captcha-img");
+    return;
+  }
+  // 邀请链接(/app/?invite=CODE):预填邀请码到注册流程,并给出可见提示
+  const inviteParam = new URLSearchParams(window.location.search).get("invite");
+  if (inviteParam) {
+    window.__inviteCode = inviteParam.trim().toUpperCase();
+    history.replaceState(null, "", window.location.pathname);
+    const hint = document.createElement("div");
+    hint.className = "auth-msg ok";
+    hint.style.marginBottom = "8px";
+    hint.textContent = `🎁 已通过好友邀请注册,邀请码 ${window.__inviteCode} 将自动生效`;
+    const form = $("auth-register-form");
+    if (form) form.insertBefore(hint, form.firstChild);
+  }
+  if (state.token && !tokenExpired(state.token)) {
+    enterMirror(state.token); // 会话恢复 → Router 实时设备列表
+  } else {
+    if (state.token) logout();
+    setView("login"); switchAuthTab("login");
+    loadCaptchaInto("login-captcha-img"); // 预载密码登录的图形验证码
+  }
+})();
+</script>
+</body>
+</html>
