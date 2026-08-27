@@ -1,0 +1,37 @@
+{
+  "name": "@mrrisega/dsh-relay",
+  "version": "0.2.0",
+  "description": "Remote control for DeepSeek Harness (dsh web) from any phone browser: tunnel-mode relay client with one-command install, self-hosting support, and a dsh web plugin panel",
+  "type": "module",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "private": false,
+  "bin": {
+    "dsh-relay": "dsh-setup.mjs"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dsh-setup.mjs",
+    "clients/dsh-remote",
+    "packages/dsh-remote-ui",
+    "docs/self-hosting.md"
+  ],
+  "workspaces": [
+    "packages/*",
+    "clients/*"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "npm run test:router && npm run test:plugin && npm run test:bridge",
+    "test:router": "node --test packages/relay-router/test/native-device-selection.test.mjs packages/relay-router/test/quotas.test.mjs",
+    "test:plugin": "node --test --test-concurrency=1 packages/dsh-remote-ui/test/*.test.mjs",
+    "test:bridge": "node --test clients/dsh-remote/test/*.test.mjs",
+    "check": "node --check clients/dsh-remote/dsh-bridge.mjs && node --check dsh-setup.mjs && node --check packages/dsh-remote-ui/lib/index.js && node --check packages/dsh-remote-ui/lib/client.js && bash -n deploy/install-open.sh"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

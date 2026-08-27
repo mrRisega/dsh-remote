@@ -1,0 +1,11 @@
+{
+  "name": "@dsh-relay/client",
+  "version": "0.2.0",
+  "description": "dsh-remote bridge: tunnel-mode WebSocket client to relay-router (WebRTC/P2P removed)",
+  "type": "module",
+  "main": "src/index.js",
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "license": "PolyForm-Noncommercial-1.0.0"
+}
