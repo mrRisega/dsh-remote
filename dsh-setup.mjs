@@ -243,6 +243,11 @@ function serveSettings() {
           cfg.api_url = body.api_url || cfg.api_url || DEFAULT_API;
           if (!cfg.tunnel_url) cfg.tunnel_url = deriveTunnelUrl(cfg.api_url);
         }
+        // 自动获取服务端下发的 bridge_secret（device-login 共享密钥，一键安装开箱即用）
+        if (!cfg.bridge_secret && !cfg.local_key) {
+          const pub = await fetchPublicConfig(cfg.api_url || DEFAULT_API);
+          if (pub.bridge_secret) cfg.bridge_secret = String(pub.bridge_secret);
+        }
         saveConfig(cfg);
         const r = restartBridgeService();
         return send(200, JSON.stringify({ ok: true, service: r.ok ? "running" : (r.status || "failed") }), "application/json");
@@ -420,6 +425,11 @@ async function setup(argv) {
     // 默认云端服务：无需任何参数；登录在设置页完成
     cfg.api_url = (api || cfg.api_url || DEFAULT_API).replace(/\/+$/, "");
     if (!cfg.tunnel_url) cfg.tunnel_url = deriveTunnelUrl(cfg.api_url);
+    // 自动获取服务端下发的 bridge_secret（device-login 共享密钥，一键安装开箱即用）
+    if (!cfg.bridge_secret) {
+      const pub = await fetchPublicConfig(cfg.api_url);
+      if (pub.bridge_secret) cfg.bridge_secret = String(pub.bridge_secret);
+    }
     saveConfig(cfg);
   }
 

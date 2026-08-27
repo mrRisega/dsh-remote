@@ -562,7 +562,13 @@ async function registerDeviceInAccount(token) {
       return;
     }
     if (r.status === 409) {
-      console.error(`[bridge] 设备 ${DEVICE_ID} 已绑定其他账号。若确需更换,请删除 .dsh-config.json 的 device_id 后重启。`);
+      const code = d.error?.code || "";
+      if (code === "device_limit_exceeded") {
+        console.error(`[bridge] 设备数已达上限: ${d.error?.message || "当前套餐最多绑定 1 台设备"}`);
+        console.error("   请在手机端设备管理或后台移除旧设备后重启。");
+      } else {
+        console.error(`[bridge] 设备 ${DEVICE_ID} 绑定失败(${code || 409}): ${d.error?.message || "未知错误"}`);
+      }
       process.exit(1);
     }
     console.warn(`[bridge] 设备登记失败(${r.status}): ${d.error?.message || "未知错误"}(手机端设备列表可能看不到本设备)`);
