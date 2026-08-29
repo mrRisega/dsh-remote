@@ -3,6 +3,20 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.1] - 2026-08-30
+
+### Changed
+
+- Feedback captcha is now optional: anonymous users (including self-hosted
+  deployments without a phone account) can submit feedback and satisfaction
+  ratings directly; the server still records the device IP and enforces
+  per-identity/IP/global rate limits. A captcha is validated when provided.
+- Payment modal shows a prominent announcement block from the server config
+  (`upgrade_announcement`, `{wechat}` substituted with the configured WeChat
+  id); admin console textarea enlarged for editing it.
+- README: added screenshot gallery (phone mirror view, device list,
+  self-hosted settings).
+
 ## [0.3.0] - 2026-08-28
 
 ### Changed

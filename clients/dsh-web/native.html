@@ -222,6 +222,7 @@
     .modal-close { position: absolute; top: 8px; right: 12px; width: 32px; height: 32px; margin: 0; padding: 0; background: transparent; border: none; color: var(--muted); font-size: 22px; line-height: 1; cursor: pointer; border-radius: 50%; }
     .modal-close:active { background: var(--bg); }
     .qr-img-wrap { margin: 4px auto 12px; }
+    .qr-announce { margin: 4px 2px 2px; padding: 12px 14px; background: var(--bg); border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 10px; font-size: 14px; font-weight: 600; color: var(--text); line-height: 1.9; text-align: left; white-space: pre-wrap; word-break: break-all; }
     .qr-sub { font-size: 12.5px; color: var(--muted); line-height: 1.7; }
     .qr-empty { font-size: 13px; color: var(--muted); padding: 34px 8px; background: var(--bg); border: 1px dashed var(--border); border-radius: 10px; }
     .retain-card { max-width: 320px; }
@@ -394,7 +395,7 @@
     <button type="button" class="modal-close" id="qr-modal-close" aria-label="关闭">×</button>
     <h3>扫码支付开通会员</h3>
     <div class="qr-img-wrap" id="qr-img-wrap"></div>
-    <div class="qr-sub">微信扫码 → 选择套餐完成支付 → 会员自动/人工开通</div>
+    <div class="qr-announce" id="qr-announce"></div>
   </div>
 </div>
 
@@ -1027,10 +1028,12 @@ function reportUpgradeIntent(source) {
   api("/api/upgrade-intent", { source }).catch(() => {});
 }
 
-/** 打开支付二维码弹层;qrcode 为空或加载失败时展示提示文案。 */
+/** 打开支付二维码弹层;qrcode 为空或加载失败时展示提示文案。公告取后台「弹窗公告」配置({wechat} 替换为微信号)。 */
 function openQrModal(plan) {
   promoPlanName = plan;
-  const qr = (pubConfig && pubConfig.upgrade && pubConfig.upgrade.qrcode) || "";
+  const up = (pubConfig && pubConfig.upgrade) || {};
+  const qr = up.qrcode || "";
+  const wechat = String(up.wechat || "").trim();
   const wrap = $("qr-img-wrap");
   wrap.innerHTML = "";
   if (!qr) {
@@ -1044,6 +1047,12 @@ function openQrModal(plan) {
     img.onerror = () => { wrap.innerHTML = `<div class="qr-empty">二维码加载失败,请联系管理员/客服</div>`; };
     wrap.appendChild(img);
   }
+  // 弹窗公告:后台配置优先,缺省用默认文案;{wechat} 替换为微信号配置
+  const ann = String(up.announcement || "").trim() ||
+    "微信扫码 → 选择套餐 → 输入手机号 → 完成支付 → 等待人工开通(5～60 分钟内)";
+  let announce = ann.replace(/\{wechat\}/g, wechat);
+  if (wechat && !announce.includes("客服微信")) announce += `\n如有问题请及时添加客服微信:「${wechat}」`;
+  $("qr-announce").textContent = announce;
   $("qr-modal").classList.remove("hidden");
 }
 
