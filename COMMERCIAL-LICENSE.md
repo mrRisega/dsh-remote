@@ -1,6 +1,6 @@
 # Commercial License
 
-dsh-relay is distributed under a dual-license model:
+dsh-remote is distributed under a dual-license model:
 
 | Scenario | License | Cost |
 |---|---|---|
@@ -12,11 +12,11 @@ dsh-relay is distributed under a dual-license model:
 
 The commercial capabilities — multi-user phone-number accounts, SMS verification,
 the SaaS admin console, quota management and SaaS operations — live in the
-closed-source `dsh-relay-enterprise` repository and are only available with a
+closed-source `dsh-remote-enterprise` repository and are only available with a
 commercial license.
 
 ## Getting a commercial license
 
 Contact the maintainer through the GitHub repository
-(https://github.com/mrRisega/dsh-relay) — issues or the security reporting flow
+(https://github.com/mrRisega/dsh-remote) — issues or the security reporting flow
 work for license inquiries as well.

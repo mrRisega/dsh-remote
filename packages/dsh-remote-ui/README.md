@@ -1,6 +1,6 @@
 # dsh-remote-ui — dsh web 远程控制插件
 
-Embeds the dsh-relay configuration UI into dsh web itself (the "everything is a
+Embeds the dsh-remote configuration UI into dsh web itself (the "everything is a
 plugin" model):
 
 - Entry point: the **Settings** page, via the official `settings.section`
@@ -35,15 +35,15 @@ The browser half needs no Vite/tsdown rebuild: `dsh-client-modules` reads
 
 ## Install / Uninstall
 
-`npx @mrrisega/dsh-relay`（一键安装）会自动把插件装进 dsh web 默认 profile。
+`npx @mrrisega/dsh-remote`（一键安装）会自动把插件装进 dsh web 默认 profile。
 也可以单独管理：
 
 ```bash
 # 单独安装/重装(把插件装进 dsh web 默认 profile)
-npx @mrrisega/dsh-relay plugin
+npx @mrrisega/dsh-remote plugin
 
 # 卸载
-npx @mrrisega/dsh-relay plugin --uninstall
+npx @mrrisega/dsh-remote plugin --uninstall
 ```
 
 What it does:

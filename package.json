@@ -1,12 +1,12 @@
 {
-  "name": "@mrrisega/dsh-relay",
-  "version": "0.2.1",
+  "name": "@mrrisega/dsh-remote",
+  "version": "0.3.0",
   "description": "Remote control for DeepSeek Harness (dsh web) from any phone browser: tunnel-mode relay client with one-command install, self-hosting support, and a dsh web plugin panel",
   "type": "module",
   "license": "PolyForm-Noncommercial-1.0.0",
   "private": false,
   "bin": {
-    "dsh-relay": "dsh-setup.mjs"
+    "dsh-remote": "dsh-setup.mjs"
   },
   "publishConfig": {
     "access": "public"

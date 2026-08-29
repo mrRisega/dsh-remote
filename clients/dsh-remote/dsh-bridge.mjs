@@ -72,7 +72,7 @@ const CONFIG_PATH = process.env.DSH_BRIDGE_CONFIG || DEFAULT_CONFIG;
 const TUNNEL_URL = (process.env.DSH_BRIDGE_TUNNEL_URL || "").replace(/\/+$/, "");
 const TUNNEL_HEARTBEAT_MS = Math.max(100, Number(process.env.DSH_BRIDGE_HEARTBEAT_MS) || 15_000);
 const UPSTREAM = process.env.DSH_BRIDGE_UPSTREAM || "http://127.0.0.1:3080";
-// 默认云端服务地址（dsh-relay setup 会显式传入；自建模式无需账号 API）
+// 默认云端服务地址（dsh-remote setup 会显式传入；自建模式无需账号 API）
 const API_BASE = (process.env.DSH_BRIDGE_API || "https://n.risegao.cn:13443/relay-api").replace(/\/+$/, "");
 const EMAIL = process.env.DSH_BRIDGE_EMAIL || "";
 // 手机号优先;兼容旧的 DSH_BRIDGE_EMAIL(过渡期)

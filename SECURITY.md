@@ -1,6 +1,6 @@
 # Security Policy
 
-dsh-relay operates public-facing relay infrastructure. Security issues are taken
+dsh-remote operates public-facing relay infrastructure. Security issues are taken
 seriously and handled with priority.
 
 ## Reporting a Vulnerability
@@ -9,7 +9,7 @@ seriously and handled with priority.
 
 Please report privately through GitHub's security reporting flow:
 
-- Open a **Security Advisory** (private): https://github.com/mrRisega/dsh-relay/security/advisories/new
+- Open a **Security Advisory** (private): https://github.com/mrRisega/dsh-remote/security/advisories/new
   or
 - Use GitHub's private vulnerability reporting on the repository page
   (*Security → Report a vulnerability*).

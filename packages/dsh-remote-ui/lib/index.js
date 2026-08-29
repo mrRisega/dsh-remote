@@ -1,7 +1,7 @@
 // dsh-remote-ui — node half (host plugin)
 //
 // 提供 /dsh-remote/* 同源 HTTP 路由，供浏览器半的配置面板调用：
-//   - 读写 dsh-relay-open/.dsh-config.json（0600）
+//   - 读写 dsh-remote-open/.dsh-config.json（0600）
 //   - 查询/启停 bridge（launchctl，plist 缺失时自动生成，逻辑与 dsh-setup.mjs 一致）
 //   - 代理 relay API（captcha / register / login / public-config），直连、不走系统代理
 //
@@ -386,6 +386,15 @@ async function readBodyBuffer(req, limit = 64 * 1024) {
  *   - 透传浏览器带的 Authorization（thread_token，存于浏览器 localStorage）
  *   - 不转发 cookie/浏览器标记；反馈服务不可达时降级 502 JSON
  */
+// 账号 JWT 缓存（反馈请求高频，避免每次 device-login 刷审计日志）；过期前复用
+let fbTokenCache = { token: "", exp: 0 };
+async function feedbackAuthToken(relayDir) {
+  if (fbTokenCache.token && Date.now() < fbTokenCache.exp) return fbTokenCache.token;
+  const t = await relayToken(relayDir).catch(() => "");
+  if (t) fbTokenCache = { token: t, exp: Date.now() + 100 * 60 * 1000 };
+  else fbTokenCache = { token: "", exp: 0 };
+  return t;
+}
 async function proxyFeedback(relayDir, req, res, pathname) {
   const cfg = loadConfig(relayDir);
   const api = feedbackApiOf(cfg);
@@ -399,7 +408,13 @@ async function proxyFeedback(relayDir, req, res, pathname) {
   };
   if (cfg.phone) headers["x-dsh-phone"] = String(cfg.phone);
   const auth = req.headers.authorization;
-  if (auth && /^Bearer\s+/i.test(auth)) headers.authorization = auth;
+  if (auth && /^Bearer\s+/i.test(auth)) {
+    headers.authorization = auth;
+  } else if (cfg.local_key || (cfg.phone && cfg.password)) {
+    // 登录态统一免验证码：节点半自动附加账号 JWT（服务端对有效 JWT 免验证码）
+    const t = await feedbackAuthToken(relayDir);
+    if (t) headers.authorization = `Bearer ${t}`;
+  }
   const method = req.method || "GET";
   const init = { method, headers };
   if (method !== "GET" && method !== "HEAD") {
@@ -417,6 +432,8 @@ async function proxyFeedback(relayDir, req, res, pathname) {
   }
   try {
     const r = await fetch(url, { ...init, signal: AbortSignal.timeout(8000) });
+    // 401（token 失效）→ 清缓存，下次请求自动刷新
+    if (r.status === 401) fbTokenCache = { token: "", exp: 0 };
     const text = await r.text();
     let body = null;
     try {
@@ -651,7 +668,15 @@ function registerRoutes(ctx, relayDir) {
         } catch {
           reachable = false;
         }
-        sendJson(res, 200, { ok: true, feedbackUrl: api, reachable, deviceId: cfg.device_id || "", phone: cfg.phone || "" });
+        sendJson(res, 200, {
+          ok: true,
+          feedbackUrl: api,
+          reachable,
+          deviceId: cfg.device_id || "",
+          phone: cfg.phone || "",
+          // 登录态（已配置账号或自建密钥）→ 节点半自动附加 JWT，免图形验证码
+          auth: cfg.local_key || (cfg.phone && cfg.password) ? "account" : "anonymous"
+        });
       },
     },
     {

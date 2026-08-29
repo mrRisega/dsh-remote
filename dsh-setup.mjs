@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 /**
- * dsh-relay — 一键安装 + 配置 + 自启动（电脑端）
+ * dsh-remote — 一键安装 + 配置 + 自启动（电脑端）
  *
  * 用法:
- *   dsh-relay [setup] [选项]                 一键安装（默认命令，无需任何参数）
- *   dsh-relay settings                        打开本地设置页（登录账号 / 自建配置）
- *   dsh-relay run                             前台运行 bridge（调试/守护）
- *   dsh-relay status                          查看配置与服务状态
- *   dsh-relay plugin [--uninstall]            手动安装/卸载 dsh web 远程控制插件
+ *   dsh-remote [setup] [选项]                 一键安装（默认命令，无需任何参数）
+ *   dsh-remote settings                        打开本地设置页（登录账号 / 自建配置）
+ *   dsh-remote run                             前台运行 bridge（调试/守护）
+ *   dsh-remote status                          查看配置与服务状态
+ *   dsh-remote plugin [--uninstall]            手动安装/卸载 dsh web 远程控制插件
  *
  * setup 选项（全部可选）:
  *   --server <wss://host:port> --key <访问密钥>   自建模式（不填则连默认云端服务）
@@ -19,7 +19,7 @@
  *   1. 写入配置 <CONFIG_DIR>/.dsh-config.json（0600；npm 安装时为 ~/.dsh-remote/）
  *   2. 生成自启动服务（macOS launchd / Linux systemd），随 dsh web(3080) 存活自动保活
  *   3. 自动把远程控制插件装进 dsh web 设置页（若检测到 profile）
- *   4. 登录在设置页完成: dsh-relay settings（手机号+密码，或自建密钥）
+ *   4. 登录在设置页完成: dsh-remote settings（手机号+密码，或自建密钥）
  */
 
 import http from "node:http";
@@ -39,7 +39,7 @@ const SETTINGS_PORT = 3499;
 // 默认云端服务地址（服务商 SaaS 入口；自建用户用 --server/--key 指向自己的 router）
 const DEFAULT_API = "https://n.risegao.cn:13443/relay-api";
 const DEFAULT_APP_URL = "https://n.risegao.cn:13443/app/";
-const REPO_URL = "https://github.com/mrRisega/dsh-relay";
+const REPO_URL = "https://github.com/mrRisega/dsh-remote";
 
 // ---------- 工具 ----------
 
@@ -146,20 +146,20 @@ function writeAutostartFile() {
   if (process.platform === "linux") {
     const dir = path.join(os.homedir(), ".config/systemd/user");
     fs.mkdirSync(dir, { recursive: true });
-    const unit = `[Unit]\nDescription=dsh-relay bridge (auto-starts with dsh web)\n\n[Service]\nExecStart=${runCmd}\nRestart=on-failure\nRestartSec=5\nEnvironment=PATH=/usr/local/bin:/usr/bin:/bin\n\n[Install]\nWantedBy=default.target\n`;
+    const unit = `[Unit]\nDescription=dsh-remote bridge (auto-starts with dsh web)\n\n[Service]\nExecStart=${runCmd}\nRestart=on-failure\nRestartSec=5\nEnvironment=PATH=/usr/local/bin:/usr/bin:/bin\n\n[Install]\nWantedBy=default.target\n`;
     const unitPath = autostartFilePath();
     fs.writeFileSync(unitPath, unit);
     console.log(`✅ 已创建自启动服务: ${unitPath}`);
     return unitPath;
   }
-  console.log("⚠️ 当前平台暂不支持自启动，请手动运行 `dsh-relay run`");
+  console.log("⚠️ 当前平台暂不支持自启动，请手动运行 `dsh-remote run`");
   return null;
 }
 
 function restartBridgeService() {
   const svcFile = autostartFilePath();
   if (svcFile && !fs.existsSync(svcFile)) {
-    console.log("[dsh-relay] 未检测到自启动服务，自动生成...");
+    console.log("[dsh-remote] 未检测到自启动服务，自动生成...");
     writeAutostartFile();
   }
   if (process.platform === "darwin") {
@@ -260,7 +260,7 @@ function serveSettings() {
 
     const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>dsh-relay 设置</title>
+<title>dsh-remote 设置</title>
 <style>
 body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:#0d1117;color:#e6edf3;max-width:520px;margin:0 auto;padding:24px}
 h1{font-size:18px}label{display:block;font-size:13px;color:#8b949e;margin:14px 0 6px}
@@ -270,7 +270,7 @@ button{width:100%;padding:13px;border-radius:8px;border:none;background:#2f81f7;
 .url{background:#010409;border:1px solid #30363d;border-radius:8px;padding:12px;font-family:monospace;font-size:14px;word-break:break-all}
 .msg{font-size:13px;margin-top:10px;min-height:18px}.ok{color:#3fb950}.err{color:#f85149}
 </style></head><body>
-<h1>dsh-relay 设置</h1>
+<h1>dsh-remote 设置</h1>
 <div class="card"><h3 style="margin:0 0 8px">📱 远程控制地址（当前模式：${mode}）</h3>
 <div class="url">${remoteUrl || "（未配置）"}</div>
 <div style="font-size:12px;color:#8b949e;margin-top:8px">手机浏览器打开此地址，即可远程控制本机 dsh web。</div></div>
@@ -293,7 +293,7 @@ async function save(){
         ? {server:document.getElementById("server").value.trim(),local_key:document.getElementById("lkey").value.trim()}
         : {phone:document.getElementById("phone").value.trim(),password:document.getElementById("pass").value})});
     const d=await r.json();
-    if(d.ok){m.className="msg ok";m.textContent = d.service==="running" ? "✅ 已保存并生效，无需手动重启" : "✅ 已保存（服务状态: "+(d.service||"未知")+"，可运行 dsh-relay setup 修复）";}
+    if(d.ok){m.className="msg ok";m.textContent = d.service==="running" ? "✅ 已保存并生效，无需手动重启" : "✅ 已保存（服务状态: "+(d.service||"未知")+"，可运行 dsh-remote setup 修复）";}
     else{m.className="msg err";m.textContent=d.message||"保存失败";}
   }catch(e){m.className="msg err";m.textContent="保存失败: "+e.message;}
 }
@@ -319,7 +319,7 @@ async function runBridge() {
       .catch(() => { clearTimeout(t); resolve(false); });
   });
 
-  console.log("[dsh-relay] 等待 dsh web（127.0.0.1:3080）启动...");
+  console.log("[dsh-remote] 等待 dsh web（127.0.0.1:3080）启动...");
   let bridgeProc = null;
   let starting = false;
 
@@ -332,13 +332,13 @@ async function runBridge() {
     if (!saas && !local) {
       if (!warnedNoLogin) {
         warnedNoLogin = true;
-        console.log("⚠️ 尚未登录：打开设置页 `dsh-relay settings` 登录账号（或配置自建密钥）后自动启动。");
+        console.log("⚠️ 尚未登录：打开设置页 `dsh-remote settings` 登录账号（或配置自建密钥）后自动启动。");
       }
       return;
     }
     warnedNoLogin = false;
     if (local && !cfg.tunnel_url) {
-      console.log("⚠️ 自建模式缺少服务器地址：请用 `dsh-relay setup --server wss://host:port --key <密钥>` 重新配置。");
+      console.log("⚠️ 自建模式缺少服务器地址：请用 `dsh-remote setup --server wss://host:port --key <密钥>` 重新配置。");
       return;
     }
     if (saas && !cfg.tunnel_url) {
@@ -350,7 +350,7 @@ async function runBridge() {
     const alive = await checkUpstream();
     if (alive && childStopped(bridgeProc)) {
       starting = true;
-      console.log("[dsh-relay] dsh web 在线，启动 bridge...");
+      console.log("[dsh-remote] dsh web 在线，启动 bridge...");
       // 清除代理环境变量（bridge 需直连 relay，不受本机代理影响）
       const childEnv = {
         ...process.env,
@@ -365,17 +365,17 @@ async function runBridge() {
       bridgeProc = spawn(NODE_BIN,
         [path.join(THIS_DIR, "clients/dsh-remote/dsh-bridge.mjs")],
         { env: childEnv, stdio: "inherit" });
-      bridgeProc.on("exit", () => { console.log("[dsh-relay] bridge 退出，等待重启..."); });
+      bridgeProc.on("exit", () => { console.log("[dsh-remote] bridge 退出，等待重启..."); });
       setTimeout(() => { starting = false; }, 5000);
     } else if (!alive && bridgeProc && bridgeProc.exitCode === null) {
-      console.log("[dsh-relay] dsh web 离线，停止 bridge...");
+      console.log("[dsh-remote] dsh web 离线，停止 bridge...");
       bridgeProc.kill();
     }
   };
 
   await ensureBridge();
   setInterval(ensureBridge, 10000); // 每 10s 检查
-  console.log("[dsh-relay] 守护运行中（Ctrl-C 退出）");
+  console.log("[dsh-remote] 守护运行中（Ctrl-C 退出）");
 }
 
 // ---------- setup：一键安装（默认云端服务；--server/--key 走自建） ----------
@@ -437,7 +437,7 @@ async function setup(argv) {
   if (!noAutostart) {
     svc = installAutostart();
   } else {
-    console.log("ℹ --no-autostart：跳过自启动服务安装（可用 `dsh-relay run` 手动运行 bridge）。");
+    console.log("ℹ --no-autostart：跳过自启动服务安装（可用 `dsh-remote run` 手动运行 bridge）。");
   }
   const st = svc.status;
 
@@ -458,7 +458,7 @@ async function setup(argv) {
     console.log(`   手机端: 打开 ${cfg.tunnel_url.replace(/^ws/, "https")}/app/ ，用访问密钥登录即可。`);
   } else {
     console.log(`   远程控制地址: ${pub.app_url || DEFAULT_APP_URL}`);
-    console.log(`   下一步: 运行 \`dsh-relay settings\` 打开设置页，用手机号+密码登录（或注册）。`);
+    console.log(`   下一步: 运行 \`dsh-remote settings\` 打开设置页，用手机号+密码登录（或注册）。`);
     console.log(`   登录后 bridge 会自动启动，手机端即可看到本机。`);
   }
   if (svc.path) console.log(`   自启动服务: ${svc.path}`);
@@ -467,7 +467,7 @@ async function setup(argv) {
 }
 
 // ---------- plugin：安装/卸载 dsh web 远程控制插件 ----------
-const PLUGIN_MARKER_START = "# >>> dsh-remote-ui (managed by dsh-relay plugin; do not edit)";
+const PLUGIN_MARKER_START = "# >>> dsh-remote-ui (managed by dsh-remote plugin; do not edit)";
 const PLUGIN_MARKER_END = "# <<< dsh-remote-ui";
 
 function pluginBlock(relayDir) {
@@ -597,19 +597,19 @@ else if (cmd === "status") {
   console.log("API:", cfg.api_url || (local ? "（自建模式无需账号 API）" : DEFAULT_API));
   console.log("远程地址: 运行 settings 查看最新");
 } else {
-  console.log(`dsh-relay — 手机远程控制 dsh web（隧道模式）
+  console.log(`dsh-remote — 手机远程控制 dsh web（隧道模式）
 
 用法:
-  dsh-relay              一键安装（默认命令，无需任何参数；含插件与自启动）
-  dsh-relay settings     打开本地设置页（登录账号 / 自建配置）
-  dsh-relay run          前台运行 bridge（调试）
-  dsh-relay status       查看配置与服务状态
-  dsh-relay plugin       手动安装 dsh web 远程控制插件（--uninstall 卸载）
+  dsh-remote              一键安装（默认命令，无需任何参数；含插件与自启动）
+  dsh-remote settings     打开本地设置页（登录账号 / 自建配置）
+  dsh-remote run          前台运行 bridge（调试）
+  dsh-remote status       查看配置与服务状态
+  dsh-remote plugin       手动安装 dsh web 远程控制插件（--uninstall 卸载）
 
 自建模式（可选）:
-  dsh-relay setup --server wss://你的域名:端口 --key 访问密钥
+  dsh-remote setup --server wss://你的域名:端口 --key 访问密钥
 
-登录: 安装后运行 \`dsh-relay settings\`，用手机号+密码登录（或配置自建密钥）。
+登录: 安装后运行 \`dsh-remote settings\`，用手机号+密码登录（或配置自建密钥）。
 文档: ${REPO_URL}
 `);
   process.exit(cmd === "help" ? 0 : 1);
