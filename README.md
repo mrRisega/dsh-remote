@@ -21,11 +21,11 @@ dsh-remote 是一个轻量的**隧道模式**远程控制方案：电脑端运�
 
 | 手机端进入 dsh web，100% 还原电脑端体验 | 手机端密钥登录后的在线设备列表 |
 |---|---|
-| ![手机端进入 dsh web](image/phone-mirror.png) | ![手机端在线设备列表](image/phone-devices.png) |
+| ![手机端进入 dsh web](https://cdn.jsdelivr.net/gh/mrRisega/dsh-remote@main/image/phone-mirror.png) | ![手机端在线设备列表](https://cdn.jsdelivr.net/gh/mrRisega/dsh-remote@main/image/phone-devices.png) |
 
 | 电脑端 dsh web 插件设置（自建服务模式） |
 |---|
-| ![客户端设置-自建服务](image/selfhost-settings.png) |
+| ![客户端设置-自建服务](https://cdn.jsdelivr.net/gh/mrRisega/dsh-remote@main/image/selfhost-settings.png) |
 
 ## 两个版本
 
