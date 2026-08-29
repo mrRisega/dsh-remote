@@ -34,7 +34,7 @@
     header .spacer { flex: 1; }
     #btn-logout {
       background: transparent; border: 1px solid var(--border); color: var(--text);
-      border-radius: 6px; padding: 6px 12px; font-size: 12px; cursor: pointer;
+      border-radius: 999px; padding: 3px 10px; font-size: 11px; cursor: pointer; flex: none; white-space: nowrap;
     }
     main { flex: 1; padding: 20px; max-width: 640px; width: 100%; margin: 0 auto; }
     .card {
@@ -179,6 +179,28 @@
     .promo-buy { display: flex; gap: 10px; margin: 16px 0 4px; }
     .promo-buy .buy-btn { flex: 1; min-width: 0; margin: 0; padding: 11px 6px; display: flex; flex-direction: column; align-items: center; gap: 2px; line-height: 1.35; }
     .promo-buy .buy-price { font-size: 12px; font-weight: 500; opacity: .92; }
+    /* ---- 推广页 Hero/卖点/安装/邀请 ---- */
+    .promo-hero { text-align: center; padding: 4px 2px 10px; }
+    .promo-hero-badge { display: inline-block; font-size: 12px; font-weight: 600; color: #9a6700; background: rgba(154,103,0,.12); border-radius: 999px; padding: 4px 12px; margin-bottom: 14px; }
+    .promo-hero-title { font-size: 32px; font-weight: 800; letter-spacing: -.5px; line-height: 1.2; }
+    .promo-hero-slogan { font-size: 17px; font-weight: 700; margin-top: 4px; color: var(--accent); }
+    .promo-hero-sub { font-size: 13.5px; color: var(--muted); line-height: 1.8; margin-top: 10px; max-width: 480px; margin-left: auto; margin-right: auto; }
+    .promo-features { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 18px; }
+    .promo-feature { background: var(--bg); border: 1px solid var(--border); border-radius: 12px; padding: 12px 10px; display: flex; flex-direction: column; gap: 2px; text-align: left; }
+    .promo-feature span { font-size: 20px; }
+    .promo-feature b { font-size: 14px; }
+    .promo-feature i { font-style: normal; font-size: 11.5px; color: var(--muted); }
+    .promo-install-title { font-size: 14.5px; font-weight: 700; margin: 6px 0 8px; }
+    .promo-install-cmd { display: flex; align-items: stretch; gap: 8px; }
+    .promo-install-cmd code { flex: 1; min-width: 0; background: #010409; border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; font-size: 13px; color: #a8c7ff; overflow-x: auto; white-space: nowrap; display: block; line-height: 1.5; }
+    .promo-install-cmd button { flex: none; border-radius: 8px; padding: 0 14px; font-size: 13px; font-weight: 600; }
+    .promo-install-hint { font-size: 12px; color: var(--muted); margin-top: 8px; line-height: 1.8; }
+    .promo-invite-rule { font-size: 15px; line-height: 1.9; color: var(--text); }
+    .promo-invite-rule b { color: var(--accent); }
+    .promo-invite-rule b.big, .promo-invite-code b.big { font-size: 28px; font-weight: 800; }
+    .promo-invite-sub { font-size: 12.5px; color: var(--muted); margin-top: 8px; }
+    .promo-invite-code { font-size: 14px; margin-top: 14px; }
+    .promo-invite-link { font-size: 12px; color: var(--muted); word-break: break-all; margin-top: 6px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
     .buy-btn-max { background: var(--warn) !important; }
     /* ---------- 弹层(支付二维码 / 挽留) ---------- */
     .modal-overlay { position: fixed; inset: 0; z-index: 900; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; padding: 20px; }
@@ -233,8 +255,8 @@
 
       <!-- 未登录态:登录/注册 tabs -->
       <div id="auth-logged-out">
-        <h2>远程控制</h2>
-        <div class="auth-hint">登录后可远程控制电脑上的 dsh web，体验与本地一致。</div>
+        <h2 id="auth-login-title">远程控制</h2>
+        <div class="auth-hint" id="auth-hint-login">登录后可远程控制电脑上的 dsh web，体验与本地一致。</div>
         <div class="auth-tabs">
           <div class="auth-tab active" id="tab-login">登录</div>
           <div class="auth-tab" id="tab-register">注册</div>
@@ -310,28 +332,33 @@
 
   <!-- 推广页(产品介绍/月付年付/价格对比/购买/安装引导/邀请) -->
   <div id="view-promo" class="hidden">
-    <div class="card">
-      <h2>dsh-remote · 远程控制</h2>
-      <div style="font-size:14px;color:var(--muted);line-height:1.9;">
-        <p>📱 在手机浏览器上远程控制你的电脑,体验与电脑本地完全一致——实时会话、工作区、设置、插件,一个不少。</p>
-        <p>🚀 采用隧道直连技术:电脑安装守护进程后保持在线,手机随时随地接入。</p>
-        <p>🎁 <b>免费使用</b>:新注册即送 <span id="promo-trial-days">7</span> 天 PRO 体验,无需付费即可完整体验。</p>
+    <div class="card" style="padding:24px 20px;">
+      <div class="promo-hero">
+        <div class="promo-hero-badge">🎁 新用户注册即送 <span id="promo-trial-days">7</span> 天 PRO 体验</div>
+        <div class="promo-hero-title">dsh-remote</div>
+        <div class="promo-hero-slogan">用手机远程控制你的电脑</div>
+        <div class="promo-hero-sub">随时随地接入电脑上的 DeepSeek Harness——实时会话、工作区、设置、插件,一个不少,体验与坐在电脑前一致。</div>
+        <div class="promo-features">
+          <div class="promo-feature"><span>⚡</span><b>毫秒级响应</b><i>高速隧道,操作跟手不卡顿</i></div>
+          <div class="promo-feature"><span>📱</span><b>手机即桌面</b><i>浏览器打开即用,无需装 App</i></div>
+          <div class="promo-feature"><span>🔒</span><b>连接安全</b><i>隧道传输,登录受保护</i></div>
+          <div class="promo-feature"><span>🖥️</span><b>多设备支持</b><i>多台电脑随时切换控制</i></div>
+        </div>
       </div>
       <!-- 月付/年付 Tab -->
       <div class="auth-tabs promo-billing-tabs" id="promo-billing-tabs">
         <div class="auth-tab active" id="promo-tab-monthly">月付</div>
         <div class="auth-tab" id="promo-tab-yearly">年付<span class="promo-tab-badge">9 折</span></div>
       </div>
-      <div id="promo-plans"></div>
       <div class="promo-table-wrap" id="promo-compare-wrap">
         <table class="promo-compare" id="promo-compare"></table>
       </div>
       <div id="promo-buy"></div>
-      <div id="promo-install" style="font-size:13px;color:var(--muted);line-height:1.8;"></div>
+      <div id="promo-install"></div>
     </div>
     <div class="card" id="promo-invite-card">
       <h2>🎯 邀请好友,双方得奖励</h2>
-      <div id="promo-invite-body" style="font-size:13px;color:var(--muted);line-height:1.9;"></div>
+      <div id="promo-invite-body"></div>
     </div>
     <button id="btn-promo-back" class="secondary">← 返回</button>
   </div>
@@ -384,14 +411,51 @@ const origin = window.location.origin;
 let API_BASE = (window.DSH_RELAY_API || origin + "/relay-api").replace(/\/+$/, "");
 /** 公共配置缓存(域名/价格/试用/邀请规则/安装教程)。 */
 let pubConfig = null;
+/** 部署模式:saas = 云端账号体系(手机号登录);self = 自建部署(访问密钥登录)。 */
+let deploymentMode = "saas";
 
 async function loadPublicConfig() {
   try {
-    const r = await fetch(API_BASE + "/api/public-config");
+    const r = await fetch(API_BASE + "/api/public-config", { signal: AbortSignal.timeout(6000) });
     const d = await r.json();
     if (d.api_url) API_BASE = d.api_url.replace(/\/+$/, "");
     pubConfig = d;
-  } catch { /* 离线/旧服务,用默认 */ }
+    deploymentMode = "saas";
+  } catch {
+    // 无 enterprise public-config → 自建部署:仅访问密钥登录,无账号体系
+    deploymentMode = "self";
+  }
+  applyDeploymentMode();
+}
+
+/** 按部署模式隔离登录 UI:SaaS 只保留手机号登录/注册;自建只保留访问密钥。 */
+function applyDeploymentMode() {
+  const self = deploymentMode === "self";
+  const title = $("auth-login-title");
+  const hint = $("auth-hint-login");
+  if (title) title.textContent = self ? "自建服务登录" : "远程控制";
+  if (hint) hint.textContent = self
+    ? "输入服务器访问密钥即可登录(密钥在你部署服务器的配置中生成,如 open.env)。"
+    : "登录后可远程控制电脑上的 dsh web，体验与本地一致。";
+  // 自建:只显示密钥表单;SaaS:隐藏密钥入口
+  $("login-mode-local").classList.toggle("hidden", !self);
+  $("btn-toggle-login-local").classList.toggle("hidden", !self);
+  $("btn-toggle-login-sms").classList.toggle("hidden", self);
+  const phoneField = $("login-phone")?.closest(".auth-field");
+  if (self) {
+    $("tab-register").classList.add("hidden");
+    $("auth-register-form").classList.add("hidden");
+    $("login-mode-pass").classList.add("hidden");
+    $("login-mode-sms").classList.add("hidden");
+    if (phoneField) phoneField.classList.add("hidden");
+    $("btn-login").classList.add("hidden");
+  } else {
+    $("tab-register").classList.remove("hidden");
+    $("auth-register-form").classList.remove("hidden");
+    $("login-mode-pass").classList.remove("hidden");
+    if (phoneField) phoneField.classList.remove("hidden");
+    $("btn-login").classList.remove("hidden");
+  }
 }
 
 const $ = (id) => document.getElementById(id);
@@ -860,31 +924,14 @@ function renderPromoPlans() {
   const gc = pubConfig || {};
   const plans = gc.plans || {};
   const pFree = plans.free || {}, pPro = plans.pro || {}, pPm = plans.pro_max || {};
-  const trial = gc.trial_days || 7;
-  // 价格卡片(简洁版,细节见下方对比表)
-  $("promo-plans").innerHTML = `
-    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px;">
-      <div style="flex:1;min-width:180px;background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:14px;">
-        <b>免费</b>
-        <div style="font-size:12px;color:var(--muted);margin-top:6px;">限速体验(约 ${esc(pFree.max_mbps || 1)}Mbps)· 月流量 ${esc(pFree.monthly_gb || 1)}GB · 新用户送 ${esc(trial)} 天 PRO</div>
-      </div>
-      <div style="flex:1;min-width:180px;background:var(--bg);border:1px solid var(--accent);border-radius:10px;padding:14px;">
-        <b>PRO</b> <span style="font-size:13px;color:var(--accent);font-weight:700;">${promoPriceHTML("pro")}</span>
-        <div style="font-size:12px;color:var(--muted);margin-top:6px;">不限流量 · 高带宽(约 ${esc(pPro.max_mbps || 8)}Mbps) · 1 台设备(每月可换 ${esc(pPro.monthly_resets || 3)} 次)</div>
-      </div>
-      <div style="flex:1;min-width:180px;background:var(--bg);border:1px solid var(--warn);border-radius:10px;padding:14px;">
-        <b>Pro Max</b> <span style="font-size:13px;color:var(--warn);font-weight:700;">${promoPriceHTML("pro_max")}</span>
-        <div style="font-size:12px;color:var(--muted);margin-top:6px;">不限流量 · 高带宽 · 多设备(${esc(pPm.devices || 3)} 台注册 / ${esc(pPm.online || 3)} 台同时在线) · 换机不限次</div>
-      </div>
-    </div>`;
   // 版本纵向对比表(全部数据来自 public-config)
   const rows = [
+    { label: "定位", free: "基础体验", pro: "个人主力", pm: "多设备重度使用" },
     { label: "价格", free: "免费", pro: promoPriceHTML("pro"), pm: promoPriceHTML("pro_max") },
-    { label: "带宽", free: `约 ${esc(pFree.max_mbps || 1)} Mbps`, pro: `约 ${esc(pPro.max_mbps || 8)} Mbps`, pm: `约 ${esc(pPm.max_mbps || 8)} Mbps` },
+    { label: "通道带宽", free: `约 ${esc(pFree.max_mbps || 1)} Mbps 基础带宽`, pro: "高速通道带宽", pm: "更高规格的高速通道" },
     { label: "月流量", free: `${esc(pFree.monthly_gb || 1)} GB/月`, pro: "不限", pm: "不限" },
-    { label: "是否限速", free: "限速", pro: "不限速", pm: "不限速" },
     { label: "设备数", free: "—", pro: `${esc(pPro.devices || 1)} 台(每月可换 ${esc(pPro.monthly_resets || 3)} 次)`, pm: `${esc(pPm.devices || 3)} 台注册 / ${esc(pPm.online || 3)} 台同时在线` },
-    { label: "换机次数", free: "—", pro: `${esc(pPro.monthly_resets || 3)} 次/月`, pm: "不限" }
+    { label: "换机次数", free: "—", pro: `${esc(pPro.monthly_resets || 3)} 次/月`, pm: "不限次" }
   ];
   $("promo-compare").innerHTML = `
     <thead><tr><th></th><th class="col-free">免费</th><th class="col-pro">PRO</th><th class="col-pm">Pro Max</th></tr></thead>
@@ -956,25 +1003,39 @@ async function renderPromo() {
   const gc = pubConfig || {};
   $("promo-trial-days").textContent = gc.trial_days || 7;
   renderPromoPlans();
-  // 安装引导(后台可配;开源部署命令就绪前留空)
+  // 安装引导(后台可配 app_install_guide 覆盖;默认展示一键安装命令)
   const guide = gc.app_install_guide || "";
   $("promo-install").innerHTML = guide
     ? `<b>安装引导</b><br/>${guide}`
-    : `安装引导即将上线,敬请期待。`;
+    : `<div class="promo-install-title">🚀 电脑端安装 · 一条命令</div>
+       <div class="promo-install-cmd"><code>npx @mrrisega/dsh-remote</code><button type="button" class="primary" id="btn-copy-install">复制</button></div>
+       <div class="promo-install-hint">自动安装 bridge 与 dsh web 插件并创建开机自启;安装后运行 <code>npx @mrrisega/dsh-remote settings</code> 打开设置页登录账号,手机端即可看到电脑上线。</div>`;
+  const copyInstallBtn = $("btn-copy-install");
+  if (copyInstallBtn) {
+    copyInstallBtn.onclick = async () => {
+      try { await navigator.clipboard.writeText("npx @mrrisega/dsh-remote"); toast("安装命令已复制"); }
+      catch { toast("npx @mrrisega/dsh-remote", 6000); }
+    };
+  }
   // 邀请模块
   const body = $("promo-invite-body");
   const inviteRule = gc.invite_rule || { n: 3, days: 15 };
   if (!state.token) {
-    body.innerHTML = `每邀请 <b>${inviteRule.n}</b> 位好友安装并注册,你获得 <b>${inviteRule.days}</b> 天 PRO。<br/>请先登录后获取你的专属邀请链接。`;
+    body.innerHTML = `
+      <div class="promo-invite-rule">每邀请 <b>${inviteRule.n}</b> 位好友注册并安装,<br/>你获得 <b class="big">${inviteRule.days}</b> 天 PRO</div>
+      <div class="promo-invite-sub">好友注册即送试用 PRO,双方受益。</div>
+      <button class="auth-btn" id="btn-invite-login" style="width:100%;margin-top:14px;">登录后获取专属邀请链接</button>`;
+    const loginBtn = $("btn-invite-login");
+    if (loginBtn) loginBtn.onclick = () => { setView("login"); switchAuthTab("login"); };
     return;
   }
   const inviteCode = state.user?.invite_code || "";
   const link = origin + "/app/?invite=" + encodeURIComponent(inviteCode);
   body.innerHTML = `
-    每邀请 <b>${inviteRule.n}</b> 位好友安装并注册,你获得 <b>${inviteRule.days}</b> 天 PRO。<br/><br/>
-    我的邀请码:<b style="color:var(--accent);font-size:16px;">${esc(inviteCode) || "—"}</b><br/>
-    邀请链接:<span style="word-break:break-all;">${esc(link)}</span><br/>
-    <button id="btn-copy-invite" class="secondary" style="margin-top:10px;">复制邀请链接</button>
+    <div class="promo-invite-rule">每邀请 <b>${inviteRule.n}</b> 位好友注册并安装,<br/>你获得 <b class="big">${inviteRule.days}</b> 天 PRO</div>
+    <div class="promo-invite-code">我的邀请码:<b class="big">${esc(inviteCode) || "—"}</b></div>
+    <div class="promo-invite-link">${esc(link)}</div>
+    <button class="auth-btn" id="btn-copy-invite" style="width:100%;margin-top:14px;">复制邀请链接</button>
     <div id="promo-invite-records" style="margin-top:12px;"></div>`;
   const copyBtn = $("btn-copy-invite");
   if (copyBtn) {
