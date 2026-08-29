@@ -34,7 +34,7 @@
     header .spacer { flex: 1; }
     #btn-logout {
       background: transparent; border: 1px solid var(--border); color: var(--text);
-      border-radius: 999px; padding: 3px 10px; font-size: 11px; cursor: pointer; flex: none; white-space: nowrap;
+      border-radius: 999px; padding: 3px 10px; font-size: 11px; cursor: pointer; flex: none; white-space: nowrap; width: auto;
     }
     main { flex: 1; padding: 20px; max-width: 640px; width: 100%; margin: 0 auto; }
     .card {
@@ -193,7 +193,7 @@
     .promo-install-title { font-size: 14.5px; font-weight: 700; margin: 6px 0 8px; }
     .promo-install-cmd { display: flex; align-items: stretch; gap: 8px; }
     .promo-install-cmd code { flex: 1; min-width: 0; background: #010409; border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; font-size: 13px; color: #a8c7ff; overflow-x: auto; white-space: nowrap; display: block; line-height: 1.5; }
-    .promo-install-cmd button { flex: none; border-radius: 8px; padding: 0 14px; font-size: 13px; font-weight: 600; }
+    .promo-install-cmd button { flex: none; width: auto; border-radius: 8px; padding: 0 14px; font-size: 13px; font-weight: 600; margin-top: 0; }
     .promo-install-hint { font-size: 12px; color: var(--muted); margin-top: 8px; line-height: 1.8; }
     .promo-invite-rule { font-size: 15px; line-height: 1.9; color: var(--text); }
     .promo-invite-rule b { color: var(--accent); }
@@ -428,7 +428,8 @@ async function loadPublicConfig() {
   applyDeploymentMode();
 }
 
-/** 按部署模式隔离登录 UI:SaaS 只保留手机号登录/注册;自建只保留访问密钥。 */
+/** 按部署模式隔离登录 UI:SaaS 只保留手机号登录/注册;自建只保留访问密钥。
+ *  登录/注册表单的显隐统一交给 switchAuthTab 管理,这里只切模式相关元素。 */
 function applyDeploymentMode() {
   const self = deploymentMode === "self";
   const title = $("auth-login-title");
@@ -442,20 +443,14 @@ function applyDeploymentMode() {
   $("btn-toggle-login-local").classList.toggle("hidden", !self);
   $("btn-toggle-login-sms").classList.toggle("hidden", self);
   const phoneField = $("login-phone")?.closest(".auth-field");
-  if (self) {
-    $("tab-register").classList.add("hidden");
-    $("auth-register-form").classList.add("hidden");
-    $("login-mode-pass").classList.add("hidden");
-    $("login-mode-sms").classList.add("hidden");
-    if (phoneField) phoneField.classList.add("hidden");
-    $("btn-login").classList.add("hidden");
-  } else {
-    $("tab-register").classList.remove("hidden");
-    $("auth-register-form").classList.remove("hidden");
-    $("login-mode-pass").classList.remove("hidden");
-    if (phoneField) phoneField.classList.remove("hidden");
-    $("btn-login").classList.remove("hidden");
-  }
+  if (phoneField) phoneField.classList.toggle("hidden", self);
+  $("login-mode-pass").classList.toggle("hidden", self);
+  $("login-mode-sms").classList.toggle("hidden", self);
+  $("btn-login").classList.toggle("hidden", self);
+  $("tab-register").classList.toggle("hidden", self);
+  // 恢复当前 tab 的登录/注册表单显隐(自建模式强制登录 tab)
+  const isLoginTab = $("tab-login").classList.contains("active");
+  switchAuthTab(self || isLoginTab ? "login" : "register");
 }
 
 const $ = (id) => document.getElementById(id);
