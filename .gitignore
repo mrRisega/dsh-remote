@@ -18,3 +18,13 @@ docs/PROJECT-ENV.md
 docs/PROJECT-LOG.md
 scripts/dsh-net-hosts.sh
 scripts/dsh-net-hosts-install.sh
+
+# 个人审计/自检/安全报告等敏感资料：一律禁止入库
+*自检*.md
+*审计*.md
+*安全报告*.md
+*安全自检*.md
+*SECURITY-AUDIT*
+*security-audit*
+*secreport*.md
+

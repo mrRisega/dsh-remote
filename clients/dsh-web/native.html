@@ -347,8 +347,8 @@
       2. 列表实时来自路由器 WebSocket 连接,点选在线设备进入;<br/>
       3. 进入后加载电脑端 <b>dsh web 原生界面</b>(与电脑本地一致,含设置/凭据)。<br/>
       点选设备进入;单台在线也需点选确认,不会自动跳转。
-      <div class="usage-actions">
-        <a class="usage-btn primary" href="/app/promo">🚀 升级方案</a>
+       <div class="usage-actions" id="devices-usage-actions">
+         <a class="usage-btn primary" href="/app/promo">🚀 升级方案</a>
         <a class="usage-btn ghost" href="/app/promo">🎯 邀请链接</a>
       </div>
     </div>
@@ -473,6 +473,8 @@ function applyDeploymentMode() {
   $("login-mode-sms").classList.toggle("hidden", self || loginMode !== "sms");
   $("btn-login").classList.toggle("hidden", self);
   $("tab-register").classList.toggle("hidden", self);
+  // 自建模式不展示升级/邀请相关按钮
+  updateCtaVisibility();
   // 恢复当前 tab 的登录/注册表单显隐(自建模式强制登录 tab)
   const isLoginTab = $("tab-login").classList.contains("active");
   switchAuthTab(self || isLoginTab ? "login" : "register");
@@ -549,14 +551,22 @@ function maskPhone(p) {
   return /^1\d{10}$/.test(s) ? s.slice(0, 3) + "****" + s.slice(7) : s;
 }
 
+/** 升级/邀请相关按钮显隐:登录态才显示;自建部署模式一律隐藏。 */
+function updateCtaVisibility() {
+  const loggedIn = !!state.token;
+  const showCta = loggedIn && deploymentMode !== "self";
+  $("nav-upgrade").classList.toggle("hidden", !showCta);
+  $("login-usage-actions").classList.toggle("hidden", !showCta);
+  const devCtas = $("devices-usage-actions");
+  if (devCtas) devCtas.classList.toggle("hidden", deploymentMode === "self");
+}
+
 function renderAuthState() {
   const loggedIn = !!state.token;
   $("auth-logged-in").classList.toggle("hidden", !loggedIn);
   $("auth-logged-out").classList.toggle("hidden", loggedIn);
   $("btn-logout").classList.toggle("hidden", !loggedIn); // 登录后 header 显示退出按钮
-  // 未登录:顶部只保留「官网」;登录页不展示升级/邀请按钮
-  $("nav-upgrade").classList.toggle("hidden", !loggedIn);
-  $("login-usage-actions").classList.toggle("hidden", !loggedIn);
+  updateCtaVisibility();
   if (loggedIn && state.user) {
     const who = state.user.phone ? maskPhone(state.user.phone) : (state.user.email || "D");
     $("auth-email").textContent = who;
@@ -576,7 +586,7 @@ async function enterMirror(token) {
   const hours = 2;
   document.cookie = `dsh_token=${encodeURIComponent(token)}; path=/; max-age=${hours * 3600}; SameSite=Lax; Secure`;
   renderAuthState();
-  if (state.user) setConn(state.user.phone || state.user.email, true);
+  if (state.user) setConn(maskPhone(state.user.phone) || state.user.email || "已连接", true);
   // 0/1/多台在线:一律进设备列表视图,由用户点选进入,不自动跳转
   setView("devices");
   refreshDevices();
