@@ -268,7 +268,9 @@
           <!-- 密码登录(默认) -->
           <div id="login-mode-pass">
             <div class="auth-field"><label>密码</label><input class="auth-input" id="login-pass" type="password" placeholder="密码" autocomplete="current-password" /></div>
-            <div class="auth-field"><label>验证码</label>
+            <!-- 渐进式图形验证码:默认隐藏,仅当服务端要求(连续失败/首次登录被拒)时展示 -->
+            <div class="auth-field hidden" id="login-captcha-row">
+              <label>验证码</label>
               <div class="auth-captcha"><input class="auth-input" id="login-captcha" type="text" placeholder="图中数字" autocomplete="off" inputmode="numeric" maxlength="6" /><div class="auth-captcha-img" id="login-captcha-img" title="看不清?点击刷新"></div></div>
             </div>
           </div>
@@ -467,6 +469,14 @@ function toast(msg, ms = 2500) {
 function esc(s) { return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
 function setView(v) {
   ["boot", "login", "devices", "promo"].forEach(n => $(`view-${n}`).classList.toggle("hidden", n !== v));
+  // 进入登录页时刷新所有当前可见的验证码,保证永远是新的、无需手动点击
+  if (v === "login") refreshVisibleCaptchas();
+}
+/** 刷新当前可见的图形验证码(密码/短信/注册各自的验证码区)。 */
+function refreshVisibleCaptchas() {
+  if (!$("login-captcha-row").classList.contains("hidden")) loadCaptchaInto("login-captcha-img");
+  if (!$("login-sms-captcha-row").classList.contains("hidden")) loadCaptchaInto("login-sms-captcha-img");
+  if (!$("reg-sms-captcha-row").classList.contains("hidden")) loadCaptchaInto("reg-sms-captcha-img");
 }
 function setConn(text, ok) {
   $("conn-status").textContent = text;
@@ -692,6 +702,7 @@ function toggleLoginMode() {
   $("login-mode-sms").classList.toggle("hidden", loginMode !== "sms");
   $("login-mode-local").classList.add("hidden");
   $("btn-toggle-login-sms").textContent = loginMode === "pass" ? "验证码登录" : "密码登录";
+  refreshVisibleCaptchas();
 }
 function toggleLocalLogin() {
   const show = $("login-mode-local").classList.contains("hidden");
@@ -741,10 +752,17 @@ async function doLogin() {
   if (loginMode === "pass") {
     const password = $("login-pass").value;
     if (!password) { msg.className = "auth-msg err"; msg.textContent = "请输入密码"; return; }
-    const cid = $("login-captcha-img").dataset.captchaId, ctext = $("login-captcha").value.trim();
-    if (!cid || !ctext) { msg.className = "auth-msg err"; msg.textContent = "请输入图中验证码"; if (!cid) loadCaptchaInto("login-captcha-img"); return; }
+    // 渐进式验证码:行可见时才要求输入并随请求提交
+    const capRow = $("login-captcha-row");
+    const payload = { phone, password };
+    if (!capRow.classList.contains("hidden")) {
+      const cid = $("login-captcha-img").dataset.captchaId, ctext = $("login-captcha").value.trim();
+      if (!cid || !ctext) { msg.className = "auth-msg err"; msg.textContent = "请输入图中验证码"; if (!cid) loadCaptchaInto("login-captcha-img"); return; }
+      payload.captcha_id = cid;
+      payload.captcha_answer = ctext;
+    }
     msg.className = "auth-msg"; msg.innerHTML = '<span class="loading"></span> 登录中...';
-    res = await api("/api/login", { phone, password, captcha_id: cid, captcha_answer: ctext });
+    res = await api("/api/login", payload);
   } else {
     const sms = $("login-sms-code").value.trim();
     if (!sms) { msg.className = "auth-msg err"; msg.textContent = "请输入短信验证码"; return; }
@@ -759,8 +777,17 @@ async function doLogin() {
     enterMirror(res.data.token);
   } else {
     msg.className = "auth-msg err";
-    msg.textContent = res.data?.error?.message || `登录失败(${res.status})`;
-    if (loginMode === "pass") loadCaptchaInto("login-captcha-img");
+    // 服务端要求图形验证码(首次提交缺验证码/失败过多):展示验证码行并加载新图
+    if (res.data?.error?.code === "captcha_invalid") {
+      const capRow = $("login-captcha-row");
+      capRow.classList.remove("hidden");
+      loadCaptchaInto("login-captcha-img");
+      msg.textContent = "请输入图形验证码后重试";
+    } else {
+      msg.textContent = res.data?.error?.message || `登录失败(${res.status})`;
+      // 验证码行可见时失败,刷新新图
+      if (loginMode === "pass" && !$("login-captcha-row").classList.contains("hidden")) loadCaptchaInto("login-captcha-img");
+    }
   }
 }
 
@@ -1118,7 +1145,6 @@ function tokenExpired(token) {
     history.replaceState(null, "", window.location.pathname);
     setView("login");
     switchAuthTab("login");
-    loadCaptchaInto("login-captcha-img");
     return;
   }
   // 邀请链接(/app/?invite=CODE):预填邀请码到注册流程,并给出可见提示
@@ -1138,7 +1164,6 @@ function tokenExpired(token) {
   } else {
     if (state.token) logout();
     setView("login"); switchAuthTab("login");
-    loadCaptchaInto("login-captcha-img"); // 预载密码登录的图形验证码
   }
 })();
 </script>
