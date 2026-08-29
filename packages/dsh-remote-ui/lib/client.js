@@ -344,15 +344,8 @@ window.__ModuleLoader__.load({
       var doSubmit = function () {
         if (!fbContent.trim()) { setMsg("err", "请填写反馈内容"); return; }
         if (fbContent.length > 2000) { setMsg("err", "内容不能超过 2000 字"); return; }
+        // 匿名也允许免验证码提交(服务端可选校验,自建/无账号用户可直达);已填验证码则一并带上
         var accountAuth = fbAuth === "account";
-        if (!accountAuth) {
-          if (capState !== "ready" || !cap || !cap.id) {
-            loadCaptcha();
-            setMsg("err", "请先输入验证码（图中 4 位数字，点图片可刷新）");
-            return;
-          }
-          if (!capTxt.trim()) { setMsg("err", "请输入验证码（图中 4 位数字）"); return; }
-        }
         setBusy("submit");
         var payload = {
           kind: "feedback",
@@ -361,7 +354,7 @@ window.__ModuleLoader__.load({
           content: fbContent.trim(),
           contact: contact.trim() || (cfg && cfg.phone ? cfg.phone : ""),
         };
-        if (!accountAuth) {
+        if (!accountAuth && capState === "ready" && cap && cap.id && capTxt.trim()) {
           payload.captcha_id = cap.id;
           payload.captcha_answer = capTxt.trim();
         }
@@ -587,10 +580,7 @@ window.__ModuleLoader__.load({
         if (rating === null) { setMessage({ kind: "err", text: "请先选择满意度" }); return; }
         if (step === "rate") { setStep("recommend"); return; }
         var accountAuth = fbAuth === "account";
-        if (!accountAuth) {
-          if (capState !== "ready" || !cap || !cap.id) { loadPopupCaptcha(); setMessage({ kind: "err", text: "请先输入验证码" }); return; }
-          if (!capTxt.trim()) { setMessage({ kind: "err", text: "请输入验证码（图中 4 位数字）" }); return; }
-        }
+        // 匿名也允许免验证码提交(服务端可选校验,自建/无账号用户可直达);已填验证码则一并带上
         setBusy("submit");
         var payload = {
           kind: "rating",
@@ -599,7 +589,7 @@ window.__ModuleLoader__.load({
           rating: rating,
           recommend: recommend === true ? 1 : 0,
         };
-        if (!accountAuth) {
+        if (!accountAuth && capState === "ready" && cap && cap.id && capTxt.trim()) {
           payload.captcha_id = cap.id;
           payload.captcha_answer = capTxt.trim();
         }
