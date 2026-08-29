@@ -1,5 +1,5 @@
 {
-  "name": "@dsh-relay/client",
+  "name": "@dsh-remote/client",
   "version": "0.2.0",
   "description": "dsh-remote bridge: tunnel-mode WebSocket client to relay-router (WebRTC/P2P removed)",
   "type": "module",

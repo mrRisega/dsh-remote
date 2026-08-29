@@ -1,7 +1,7 @@
 {
-  "name": "@dsh-relay/router",
+  "name": "@dsh-remote/router",
   "version": "0.1.0",
-  "description": "dsh-relay multi-device router: bridge registry + per-device HTTP/WS transparent proxy + bandwidth/traffic quota (NAS side)",
+  "description": "dsh-remote multi-device router: bridge registry + per-device HTTP/WS transparent proxy + bandwidth/traffic quota (NAS side)",
   "type": "module",
   "main": "src/index.mjs",
   "files": [

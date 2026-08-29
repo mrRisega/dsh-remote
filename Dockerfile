@@ -1,4 +1,4 @@
-# dsh-relay self-hosted router image (tunnel mode)
+# dsh-remote self-hosted router image (tunnel mode)
 #
 # Runs the relay-router: bridge registry + real-time device list + transparent
 # HTTP/WS proxy + per-plan quotas + optional local access-key auth (/ _login).

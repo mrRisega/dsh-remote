@@ -1,7 +1,25 @@
 # Changelog
 
-All notable changes to dsh-relay are documented here. This project follows
+All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
+
+## [0.3.0] - 2026-08-28
+
+### Changed
+
+- **Project renamed to `dsh-remote`** — package, binaries, docs and commands
+  now use `dsh-remote` (`npx @mrrisega/dsh-remote`). The old npm package
+  `@mrrisega/dsh-relay` is deprecated.
+
+### Fixed
+
+- Feedback: logged-in users (SaaS account or self-hosted key) no longer need a
+  captcha — the plugin's node half attaches the account JWT automatically, and
+  the panel/popup hide the captcha field accordingly. Anonymous submissions
+  keep the captcha requirement.
+- Satisfaction popup: submit no longer blocks on a hidden captcha when
+  anonymous users cannot load it; captcha is loaded on demand and errors are
+  actionable.
 
 ## [0.2.1] - 2026-08-28
 
@@ -20,10 +38,10 @@ First public release of the tunnel-mode architecture.
 
 ### Added
 
-- One-command client install via npm: `npx @mrrisega/dsh-relay`
+- One-command client install via npm: `npx @mrrisega/dsh-remote`
   (installs bridge + dsh web plugin + autostart in one shot; login happens in
   the local settings page afterwards).
-  Self-hosted mode: `npx @mrrisega/dsh-relay setup --server wss://… --key …`.
+  Self-hosted mode: `npx @mrrisega/dsh-remote setup --server wss://… --key …`.
 - Self-hosted mode: `relay-router` local authentication
   (`DSH_LOCAL_ACCESS_KEYS` → `POST /_login` → short-lived local JWT),
   with zero dependency on the closed-source account system.

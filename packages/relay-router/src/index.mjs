@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * dsh-relay router — 多设备 SaaS 路由(替换 SSH 反向隧道单机直连)
+ * dsh-remote router — 多设备 SaaS 路由(替换 SSH 反向隧道单机直连)
  *
  * 架构:
  *   手机 → nginx /remote/<deviceId>/<path> → relay-router(本进程,默认 13444)

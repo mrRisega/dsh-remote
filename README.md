@@ -1,8 +1,8 @@
-# dsh-relay
+# dsh-remote
 
 在手机浏览器上远程控制电脑端的 DeepSeek Harness（`dsh web`），操作体验与坐在电脑前一致。
 
-dsh-relay 是一个轻量的**隧道模式**远程控制方案：电脑端运行一个守护进程（bridge），
+dsh-remote 是一个轻量的**隧道模式**远程控制方案：电脑端运行一个守护进程（bridge），
 主动连接中继服务器（relay-router）注册为在线设备；手机浏览器打开 PWA 页面，
 登录后选择设备，即可经隧道进入电脑上的 `dsh web`（HTTP / WebSocket 全量透传）。
 
@@ -35,26 +35,26 @@ dsh-relay 是一个轻量的**隧道模式**远程控制方案：电脑端运行
 写入配置、创建开机自启服务：
 
 ```bash
-npx @mrrisega/dsh-relay
+npx @mrrisega/dsh-remote
 ```
 
 安装完成后运行下面命令打开设置页，用手机号+密码登录即可（注册在手机端完成，
 登录后 bridge 自动启动）：
 
 ```bash
-npx @mrrisega/dsh-relay settings
+npx @mrrisega/dsh-remote settings
 ```
 
 自建模式（自己部署了 relay-router，无需账号体系）：
 
 ```bash
-npx @mrrisega/dsh-relay setup --server wss://<你的域名>:端口 --key <访问密钥>
+npx @mrrisega/dsh-remote setup --server wss://<你的域名>:端口 --key <访问密钥>
 ```
 
 其他命令：`settings`（设置页）、`status`（查看状态）、`run`（前台调试）、
-`plugin`（重装/卸载 dsh web 插件）。运行 `npx @mrrisega/dsh-relay --help` 查看完整说明。
+`plugin`（重装/卸载 dsh web 插件）。运行 `npx @mrrisega/dsh-remote --help` 查看完整说明。
 
-源码安装（开发 / 自建服务器）：`git clone https://github.com/mrRisega/dsh-relay.git`
+源码安装（开发 / 自建服务器）：`git clone https://github.com/mrRisega/dsh-remote.git`
 并 `npm install`，见下文各组件说明。
 
 ## 自建部署（开源版）
@@ -62,7 +62,7 @@ npx @mrrisega/dsh-relay setup --server wss://<你的域名>:端口 --key <访问
 1. 在有公网 HTTPS 入口的服务器上部署 `relay-router`（见 [docs/self-hosting.md](docs/self-hosting.md)）：
 
    ```bash
-   git clone https://github.com/mrRisega/dsh-relay.git && cd dsh-relay
+   git clone https://github.com/mrRisega/dsh-remote.git && cd dsh-remote
    npm install
    bash deploy/install-open.sh        # 生成 open.env（0600）并启动 router
    ```

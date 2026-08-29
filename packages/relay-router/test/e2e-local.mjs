@@ -25,7 +25,7 @@ import { fileURLToPath } from "node:url";
 import WebSocket, { WebSocketServer } from "ws";
 
 const THIS_DIR = path.dirname(fileURLToPath(import.meta.url));
-const ROOT = path.join(THIS_DIR, "..", "..", ".."); // dsh-relay-open/
+const ROOT = path.join(THIS_DIR, "..", "..", ".."); // dsh-remote-open/
 const ROUTER_SRC = path.join(THIS_DIR, "..", "src", "index.mjs");
 const BRIDGE_SRC = path.join(ROOT, "clients/dsh-remote/dsh-bridge.mjs");
 

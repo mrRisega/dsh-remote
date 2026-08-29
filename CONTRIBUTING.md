@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for your interest in dsh-relay. Bug reports, documentation improvements and
+Thanks for your interest in dsh-remote. Bug reports, documentation improvements and
 feature work are all welcome.
 
 ## Code of Conduct
@@ -58,6 +58,6 @@ npm run check     # syntax checks (node --check, bash -n)
 ## Commercial Edition
 
 The multi-user account system, admin console and SaaS operations live in the
-closed-source `dsh-relay-enterprise` repository. It is not part of this project.
+closed-source `dsh-remote-enterprise` repository. It is not part of this project.
 The open source router interoperates with it via shared JWT secrets; self-hosted
 deployments do not need it at all.

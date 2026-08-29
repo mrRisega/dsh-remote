@@ -1,4 +1,4 @@
-# dsh-relay self-hosted router — one-command container deployment (tunnel mode)
+# dsh-remote self-hosted router — one-command container deployment (tunnel mode)
 #
 #   docker compose up -d
 #   curl http://127.0.0.1:13444/_devices     # expect 401 (auth required)
@@ -16,8 +16,8 @@
 services:
   relay-router:
     build: .
-    image: dsh-relay-router:latest
-    container_name: dsh-relay-router
+    image: dsh-remote-router:latest
+    container_name: dsh-remote-router
     restart: unless-stopped
     ports:
       - "13444:13444"            # router: HTTP + WS (/_bridge)

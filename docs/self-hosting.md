@@ -1,6 +1,6 @@
 # Self-Hosting Guide
 
-dsh-relay is designed so that anyone with a server can run the entire remote-control
+dsh-remote is designed so that anyone with a server can run the entire remote-control
 stack themselves. The self-hosted edition needs **no account system**: authentication
 is a simple access key, exchanged for short-lived local JWTs by the router.
 
@@ -33,7 +33,7 @@ The self-hosted stack:
 ## Option A — Docker (recommended)
 
 ```bash
-git clone https://github.com/mrRisega/dsh-relay.git && cd dsh-relay
+git clone https://github.com/mrRisega/dsh-remote.git && cd dsh-remote
 
 # 生成密钥与访问密钥(建议 >= 32 字节随机串)
 DSH_LOCAL_JWT_SECRET=$(openssl rand -hex 32) \
@@ -49,7 +49,7 @@ location blocks and `map $http_upgrade $connection_upgrade`).
 ## Option B — Bare Node
 
 ```bash
-git clone https://github.com/mrRisega/dsh-relay.git && cd dsh-relay
+git clone https://github.com/mrRisega/dsh-remote.git && cd dsh-remote
 npm install
 bash deploy/install-open.sh                # 生成 open.env(0600)并启动 router
 ```
@@ -64,7 +64,7 @@ holds `DSH_ENTERPRISE_JWT_SECRET`, `DSH_LOCAL_JWT_SECRET`,
 
 ```nginx
 location /app/ {
-    alias /srv/dsh-relay/app/;
+    alias /srv/dsh-remote/app/;
     index native.html;
     add_header Cache-Control "no-cache";
 }
@@ -76,7 +76,7 @@ lists online devices from `/_devices` and routes into `dsh web` through the tunn
 ## Connecting the desktop (controlled computer)
 
 ```bash
-npx @mrrisega/dsh-relay setup --server wss://你的域名:端口 --key 你的访问密钥
+npx @mrrisega/dsh-remote setup --server wss://你的域名:端口 --key 你的访问密钥
 ```
 
 This writes the local config, verifies the key against `/_login`, and installs a

@@ -1,6 +1,6 @@
-# @dsh-relay/router
+# @dsh-remote/router
 
-Server-side router for dsh-relay (tunnel mode): bridge registry, real-time device
+Server-side router for dsh-remote (tunnel mode): bridge registry, real-time device
 list, transparent HTTP/WS proxy and per-plan bandwidth/traffic quotas.
 
 ```

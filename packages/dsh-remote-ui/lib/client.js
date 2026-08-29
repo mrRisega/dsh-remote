@@ -289,6 +289,7 @@ window.__ModuleLoader__.load({
     /** 面板内的“用户反馈”卡片（提交 + 我的反馈 双 tab）。 */
     function FeedbackCard(props) {
       var cfgArr = useState(null); var cfg = cfgArr[0]; var setCfg = cfgArr[1];
+      var fbAuthArr = useState("anonymous"); var fbAuth = fbAuthArr[0]; var setFbAuth = fbAuthArr[1];
       var tabArr = useState("submit"); var tab = tabArr[0]; var setTab = tabArr[1];
       var catArr = useState("bug"); var cat = catArr[0]; var setCat = catArr[1];
       var titleArr = useState(""); var fbTitle = titleArr[0]; var setFbTitle = titleArr[1];
@@ -308,6 +309,9 @@ window.__ModuleLoader__.load({
       var loadCfg = useCallback(function () {
         api("/dsh-remote/feedback-config").then(function (b) {
           setCfg(b);
+          // 登录态（节点半自动附加 JWT）免验证码；匿名才需要图形验证码
+          setFbAuth(b.auth === "account" ? "account" : "anonymous");
+          if (b.auth !== "account") loadCaptcha();
           if (!b.reachable) setMsg("warn", "反馈服务未连接，请检查网络或 feedback_url 配置");
         }).catch(function (e) { setCfg({ reachable: false }); setMsg("warn", "反馈服务未连接：" + e.message); });
       }, []);
@@ -336,21 +340,19 @@ window.__ModuleLoader__.load({
       }
 
       useEffect(function () { loadCfg(); }, [loadCfg]);
-      useEffect(function () {
-        // 打开面板即预取验证码（匿名提交必填）
-        loadCaptcha();
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-      }, []);
 
       var doSubmit = function () {
         if (!fbContent.trim()) { setMsg("err", "请填写反馈内容"); return; }
         if (fbContent.length > 2000) { setMsg("err", "内容不能超过 2000 字"); return; }
-        if (capState !== "ready" || !cap || !cap.id) {
-          loadCaptcha();
-          setMsg("err", "请先输入验证码（图中 4 位数字，点图片可刷新）");
-          return;
+        var accountAuth = fbAuth === "account";
+        if (!accountAuth) {
+          if (capState !== "ready" || !cap || !cap.id) {
+            loadCaptcha();
+            setMsg("err", "请先输入验证码（图中 4 位数字，点图片可刷新）");
+            return;
+          }
+          if (!capTxt.trim()) { setMsg("err", "请输入验证码（图中 4 位数字）"); return; }
         }
-        if (!capTxt.trim()) { setMsg("err", "请输入验证码（图中 4 位数字）"); return; }
         setBusy("submit");
         var payload = {
           kind: "feedback",
@@ -359,8 +361,10 @@ window.__ModuleLoader__.load({
           content: fbContent.trim(),
           contact: contact.trim() || (cfg && cfg.phone ? cfg.phone : ""),
         };
-        payload.captcha_id = cap.id;
-        payload.captcha_answer = capTxt.trim();
+        if (!accountAuth) {
+          payload.captcha_id = cap.id;
+          payload.captcha_answer = capTxt.trim();
+        }
         fbApi("/feedback", { method: "POST", body: JSON.stringify(payload) })
           .then(function (b) {
             fbRememberThread(b.feedback.id, b.thread_token);
@@ -430,7 +434,9 @@ window.__ModuleLoader__.load({
                 h("label", null, "联系方式（可选）"),
                 h("input", { className: "dru-input", type: "text", value: contact, maxLength: 120, placeholder: cfg && cfg.phone ? "已登录手机号：" + cfg.phone : "邮箱/手机号，便于我们跟进", onChange: function (e) { setContact(e.target.value); } })
               ),
-              FbCaptcha({ state: capState, cap: cap, answer: capTxt, setAnswer: setCapTxt, onRefresh: loadCaptcha }),
+              fbAuth === "account"
+                ? h("div", { className: "dru-hint", style: { marginBottom: 10 } }, "已登录账号，提交反馈无需验证码。")
+                : FbCaptcha({ state: capState, cap: cap, answer: capTxt, setAnswer: setCapTxt, onRefresh: loadCaptcha }),
               h("button", { type: "button", className: "dru-btn dru-btn-primary", style: { width: "100%" }, disabled: busy !== "", onClick: doSubmit }, busy === "submit" ? "提交中…" : "提交反馈"),
               fbMsg && h("div", { className: "dru-msg dru-msg-" + fbMsg.kind }, fbMsg.text)
             )
@@ -530,6 +536,7 @@ window.__ModuleLoader__.load({
       var capTxtArr = useState(""); var capTxt = capTxtArr[0]; var setCapTxt = capTxtArr[1];
       var busyArr = useState(""); var busy = busyArr[0]; var setBusy = busyArr[1];
       var msgArr = useState(null); var message = msgArr[0]; var setMessage = msgArr[1];
+      var fbAuthArr = useState("anonymous"); var fbAuth = fbAuthArr[0]; var setFbAuth = fbAuthArr[1];
       // 邀请链接（已登录用户推荐成功后展示）
       var inviteArr = useState(null); var popupInvite = inviteArr[0]; var setPopupInvite = inviteArr[1];
       var inviteCopiedArr = useState(false); var inviteCopied = inviteCopiedArr[0]; var setInviteCopied = inviteCopiedArr[1];
@@ -560,17 +567,30 @@ window.__ModuleLoader__.load({
       }
 
       useEffect(function () {
-        if (open && step === "rate" && capState === "idle") loadPopupCaptcha();
+        if (!open) return;
+        // 登录态（节点半自动附加 JWT）免验证码；匿名才需要图形验证码
+        api("/dsh-remote/feedback-config").then(function (b) {
+          setFbAuth(b.auth === "account" ? "account" : "anonymous");
+          if (b.auth === "account") { setCap(null); setCapState("idle"); }
+        }).catch(function () { setFbAuth("anonymous"); });
         // eslint-disable-next-line react-hooks/exhaustive-deps
-      }, [open, step, capState]);
+      }, [open]);
+
+      useEffect(function () {
+        if (open && step === "rate" && capState === "idle" && fbAuth !== "account") loadPopupCaptcha();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [open, step, capState, fbAuth]);
 
       if (!open) return null;
 
       var doSubmit = function () {
         if (rating === null) { setMessage({ kind: "err", text: "请先选择满意度" }); return; }
         if (step === "rate") { setStep("recommend"); return; }
-        if (capState !== "ready" || !cap || !cap.id) { loadPopupCaptcha(); setMessage({ kind: "err", text: "请先输入验证码" }); return; }
-        if (!capTxt.trim()) { setMessage({ kind: "err", text: "请输入验证码（图中 4 位数字）" }); return; }
+        var accountAuth = fbAuth === "account";
+        if (!accountAuth) {
+          if (capState !== "ready" || !cap || !cap.id) { loadPopupCaptcha(); setMessage({ kind: "err", text: "请先输入验证码" }); return; }
+          if (!capTxt.trim()) { setMessage({ kind: "err", text: "请输入验证码（图中 4 位数字）" }); return; }
+        }
         setBusy("submit");
         var payload = {
           kind: "rating",
@@ -579,8 +599,10 @@ window.__ModuleLoader__.load({
           rating: rating,
           recommend: recommend === true ? 1 : 0,
         };
-        payload.captcha_id = cap.id;
-        payload.captcha_answer = capTxt.trim();
+        if (!accountAuth) {
+          payload.captcha_id = cap.id;
+          payload.captcha_answer = capTxt.trim();
+        }
         fbApi("/feedback", { method: "POST", body: JSON.stringify(payload) })
           .then(function (b) {
             fbRememberThread(b.feedback.id, b.thread_token);
@@ -610,7 +632,9 @@ window.__ModuleLoader__.load({
                     })
                   ),
                   h("textarea", { className: "dru-popup-textarea", value: note, maxLength: 2000, placeholder: "说说想法或遇到的问题（可选）…", onChange: function (e) { setNote(e.target.value); } }),
-                  FbCaptcha({ state: capState, cap: cap, answer: capTxt, setAnswer: setCapTxt, onRefresh: loadPopupCaptcha }),
+                  fbAuth === "account"
+                    ? h("div", { className: "dru-hint", style: { marginTop: 10 } }, "已登录账号，提交无需验证码。")
+                    : FbCaptcha({ state: capState, cap: cap, answer: capTxt, setAnswer: setCapTxt, onRefresh: loadPopupCaptcha }),
                   message && h("div", { className: "dru-msg dru-msg-" + message.kind }, message.text),
                   h("div", { className: "dru-popup-actions" },
                     h("button", { type: "button", className: "dru-btn dru-btn-primary", disabled: busy !== "", onClick: doSubmit }, "下一步")
@@ -1054,7 +1078,7 @@ window.__ModuleLoader__.load({
                   field("访问密钥", input({ type: "password", value: localKey, placeholder: "自建服务的访问密钥", autoComplete: "off", onChange: function (e) { setLocalKey(e.target.value); } })),
                   h("button", { type: "button", className: "dru-btn dru-btn-primary", style: { width: "100%" }, disabled: busy !== "", onClick: saveLocal }, busy === "local" ? "保存中…" : "切换到自建服务"),
                   h("div", { className: "dru-hint", style: { marginTop: 6 } },
-                    "服务器地址由你自行部署决定：填写你自建的 dsh-relay 服务地址与访问密钥即可（不是上面的云端地址）。部署方法见 README「自建部署」一节；切回云端随时可登录恢复。")
+                    "服务器地址由你自行部署决定：填写你自建的 dsh-remote 服务地址与访问密钥即可（不是上面的云端地址）。部署方法见 README「自建部署」一节；切回云端随时可登录恢复。")
                 )
           ),
           // Bridge 状态

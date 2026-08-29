@@ -754,7 +754,7 @@ function logout(clearForm = false) {
 function installGuideHTML() {
   const custom = pubConfig && pubConfig.app_install_guide;
   if (custom) return custom;
-  const cmdInstall = "npx @mrrisega/dsh-relay";
+  const cmdInstall = "npx @mrrisega/dsh-remote";
   return `
     <div class="guide">
       <div class="guide-title">💻 电脑端还没连接?</div>
@@ -764,7 +764,7 @@ function installGuideHTML() {
         <li><b>一键安装</b> — 终端执行(自动安装 bridge + dsh web 插件,并创建开机自启服务):
           <div class="guide-cmd"><code>${esc(cmdInstall)}</code><button type="button" class="guide-copy" data-guide-copy="${esc(cmdInstall)}">复制</button></div>
         </li>
-        <li><b>登录账号</b> — 运行 <code>npx @mrrisega/dsh-relay settings</code> 打开设置页,用本页注册的手机号与密码登录。</li>
+        <li><b>登录账号</b> — 运行 <code>npx @mrrisega/dsh-remote settings</code> 打开设置页,用本页注册的手机号与密码登录。</li>
         <li><b>保持运行</b> — 服务常驻后台(launchd / systemd 自启),回到本页点「刷新设备列表」即可看到电脑上线。</li>
       </ol>
     </div>`;

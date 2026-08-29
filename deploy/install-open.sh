@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-# install-open.sh — dsh-relay 开源自部署一键引导(router + 本地认证)
+# install-open.sh — dsh-remote 开源自部署一键引导(router + 本地认证)
 #
 # 适用:有服务器/域名,不想依赖 SaaS 账号体系的用户。
 # 产出:
@@ -28,7 +28,7 @@ if [ ! -f "$OPEN_ENV" ]; then
   LOCAL_SECRET=$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")
   ACCESS_KEY=$(node -e "console.log(require('crypto').randomBytes(9).toString('base64url'))")
   cat > "$OPEN_ENV" <<EOF
-# dsh-relay 开源自部署配置(0600,勿提交、勿外传)
+# dsh-remote 开源自部署配置(0600,勿提交、勿外传)
 DSH_ENTERPRISE_JWT_SECRET=${LOCAL_SECRET}
 DSH_LOCAL_JWT_SECRET=${LOCAL_SECRET}
 DSH_LOCAL_ACCESS_KEYS=${ACCESS_KEY}
