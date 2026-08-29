@@ -153,8 +153,8 @@
     .auth-send-btn:disabled { color: #8c959f; border-color: #d0d7de; cursor: not-allowed; }
     .auth-link { background: none; border: none; color: #0969da; font-size: 12.5px; cursor: pointer; padding: 0; }
     .auth-link:hover { text-decoration: underline; }
-    .auth-hint { font-size: 12px; color: #57606a; margin-top: 6px; line-height: 1.6; }
-    .auth-msg { font-size: 13px; margin-top: 10px; min-height: 18px; }
+    .auth-hint { font-size: 14px; color: #57606a; margin-top: 6px; line-height: 1.7; }
+    .auth-msg { font-size: 14px; margin-top: 10px; min-height: 18px; }
     .auth-msg.err { color: #cf222e; }
     .auth-msg.ok { color: #1a7f37; }
     .auth-user { display: flex; align-items: center; gap: 10px; margin: 12px 0 16px; }
@@ -202,6 +202,19 @@
     .promo-invite-code { font-size: 14px; margin-top: 14px; }
     .promo-invite-link { font-size: 12px; color: var(--muted); word-break: break-all; margin-top: 6px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
     .buy-btn-max { background: var(--warn) !important; }
+    /* ---- 顶部导航:官网链接 + 升级按钮 ---- */
+    header .nav-link { font-size: 12px; color: var(--muted); text-decoration: none; padding: 4px 6px; white-space: nowrap; }
+    header .nav-link:active { opacity: .7; }
+    header .nav-btn { font-size: 12px; font-weight: 700; color: #fff; background: linear-gradient(135deg, var(--accent), #6e40c9); border-radius: 999px; padding: 6px 12px; text-decoration: none; white-space: nowrap; }
+    header .nav-btn:active { opacity: .8; }
+    /* ---- 大号行动按钮(升级方案 / 邀请链接) ---- */
+    .usage-actions { display: flex; gap: 10px; margin-top: 16px; }
+    .usage-btn { flex: 1; text-align: center; padding: 13px 6px; border-radius: 10px; font-size: 15px; font-weight: 700; text-decoration: none; line-height: 1.3; }
+    .usage-btn.primary { background: linear-gradient(135deg, var(--accent), #6e40c9); color: #fff; }
+    .usage-btn.ghost { background: var(--bg); border: 1px solid var(--accent); color: var(--accent); }
+    .usage-btn:active { opacity: .85; }
+    .usage-card { font-size: 14px; color: var(--text); line-height: 1.9; }
+    .usage-card code { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; font-size: 13px; }
     /* ---------- 弹层(支付二维码 / 挽留) ---------- */
     .modal-overlay { position: fixed; inset: 0; z-index: 900; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; padding: 20px; }
     .modal-card { background: #ffffff; border: 1px solid var(--border); border-radius: 14px; padding: 22px; width: 100%; max-width: 340px; position: relative; box-shadow: 0 12px 40px rgba(0,0,0,.25); text-align: center; }
@@ -226,6 +239,8 @@
     <div class="sub" id="conn-status">未连接</div>
   </div>
   <div class="spacer"></div>
+  <a class="nav-link" href="https://n.risegao.cn:8085/" target="_blank" rel="noopener">官网</a>
+  <a class="nav-btn" href="/app/promo">🚀 升级方案</a>
   <button id="btn-logout" class="hidden">退出</button>
 </header>
 
@@ -292,6 +307,10 @@
           <button class="auth-btn" id="btn-login">登 录</button>
           <div style="text-align:center;margin-top:8px;"><button class="auth-link" id="btn-toggle-login-sms" type="button">验证码登录</button> · <button class="auth-link" id="btn-toggle-login-local" type="button">自建服务密钥</button></div>
           <div class="auth-msg" id="login-msg"></div>
+          <div class="usage-actions">
+            <a class="usage-btn primary" href="/app/promo">🚀 升级方案</a>
+            <a class="usage-btn ghost" href="/app/promo">🎯 邀请链接</a>
+          </div>
         </div>
 
         <!-- 注册表单 -->
@@ -322,13 +341,16 @@
       <div id="manage-device-list" class="hidden"></div>
       <div id="free-hint" class="empty hidden"></div>
     </div>
-    <div class="card" style="font-size:12px;color:var(--muted);line-height:1.8;">
+    <div class="card usage-card">
       <b>使用说明</b><br/>
       1. 电脑上运行 <code>dsh-bridge</code> 并保持在线;<br/>
       2. 列表实时来自路由器 WebSocket 连接,点选在线设备进入;<br/>
       3. 进入后加载电脑端 <b>dsh web 原生界面</b>(与电脑本地一致,含设置/凭据)。<br/>
-      点选设备进入;单台在线也需点选确认,不会自动跳转。<br/>
-      <a href="/app/promo" style="color:var(--accent);">查看升级方案与邀请奖励 →</a>
+      点选设备进入;单台在线也需点选确认,不会自动跳转。
+      <div class="usage-actions">
+        <a class="usage-btn primary" href="/app/promo">🚀 升级方案</a>
+        <a class="usage-btn ghost" href="/app/promo">🎯 邀请链接</a>
+      </div>
     </div>
   </div>
 
@@ -1155,7 +1177,9 @@ function tokenExpired(token) {
     history.replaceState(null, "", window.location.pathname);
     const hint = document.createElement("div");
     hint.className = "auth-msg ok";
-    hint.style.marginBottom = "8px";
+    hint.style.marginBottom = "10px";
+    hint.style.fontSize = "15px";
+    hint.style.fontWeight = "600";
     hint.textContent = `🎁 已通过好友邀请注册,邀请码 ${window.__inviteCode} 将自动生效`;
     const form = $("auth-register-form");
     if (form) form.insertBefore(hint, form.firstChild);
