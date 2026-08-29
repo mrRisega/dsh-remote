@@ -233,15 +233,15 @@
 </head>
 <body>
 <header>
-  <button id="btn-logout" class="hidden">退出</button>
   <div class="logo">DSH</div>
   <div>
     <h1>dsh-remote</h1>
     <div class="sub" id="conn-status">未连接</div>
   </div>
+  <button id="btn-logout" class="hidden">退出</button>
   <div class="spacer"></div>
   <a class="nav-link" href="https://n.risegao.cn:8085/" target="_blank" rel="noopener">官网</a>
-  <a class="nav-btn accent" href="/app/promo">🚀 升级方案</a>
+  <a class="nav-btn accent hidden" id="nav-upgrade" href="/app/promo">🚀 升级方案</a>
 </header>
 
 <main id="view-main">
@@ -307,7 +307,7 @@
           <button class="auth-btn" id="btn-login">登 录</button>
           <div style="text-align:center;margin-top:8px;"><button class="auth-link" id="btn-toggle-login-sms" type="button">验证码登录</button> · <button class="auth-link" id="btn-toggle-login-local" type="button">自建服务密钥</button></div>
           <div class="auth-msg" id="login-msg"></div>
-          <div class="usage-actions">
+          <div class="usage-actions hidden" id="login-usage-actions">
             <a class="usage-btn primary" href="/app/promo">🚀 升级方案</a>
             <a class="usage-btn ghost" href="/app/promo">🎯 邀请链接</a>
           </div>
@@ -543,13 +543,22 @@ function switchAuthTab(tab) {
 }
 
 // ---------- 登录态渲染 ----------
+/** 手机号中间 4 位打码:185****7193(非手机号原样返回)。 */
+function maskPhone(p) {
+  const s = String(p || "");
+  return /^1\d{10}$/.test(s) ? s.slice(0, 3) + "****" + s.slice(7) : s;
+}
+
 function renderAuthState() {
   const loggedIn = !!state.token;
   $("auth-logged-in").classList.toggle("hidden", !loggedIn);
   $("auth-logged-out").classList.toggle("hidden", loggedIn);
   $("btn-logout").classList.toggle("hidden", !loggedIn); // 登录后 header 显示退出按钮
+  // 未登录:顶部只保留「官网」;登录页不展示升级/邀请按钮
+  $("nav-upgrade").classList.toggle("hidden", !loggedIn);
+  $("login-usage-actions").classList.toggle("hidden", !loggedIn);
   if (loggedIn && state.user) {
-    const who = state.user.phone || state.user.email || "D";
+    const who = state.user.phone ? maskPhone(state.user.phone) : (state.user.email || "D");
     $("auth-email").textContent = who;
     $("auth-plan").textContent = state.user.plan ? `套餐: ${state.user.plan}` : "";
     $("auth-avatar").textContent = who.charAt(0).toUpperCase();
