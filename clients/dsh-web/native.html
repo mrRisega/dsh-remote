@@ -446,8 +446,9 @@ function applyDeploymentMode() {
   $("btn-toggle-login-sms").classList.toggle("hidden", self);
   const phoneField = $("login-phone")?.closest(".auth-field");
   if (phoneField) phoneField.classList.toggle("hidden", self);
-  $("login-mode-pass").classList.toggle("hidden", self);
-  $("login-mode-sms").classList.toggle("hidden", self);
+  // 密码/短信表单互斥:自建模式两者都隐藏;SaaS 模式按当前 loginMode 显示其一
+  $("login-mode-pass").classList.toggle("hidden", self || loginMode !== "pass");
+  $("login-mode-sms").classList.toggle("hidden", self || loginMode !== "sms");
   $("btn-login").classList.toggle("hidden", self);
   $("tab-register").classList.toggle("hidden", self);
   // 恢复当前 tab 的登录/注册表单显隐(自建模式强制登录 tab)
