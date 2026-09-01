@@ -1,0 +1,7 @@
+# dsh-remote-ui — dsh web 远程控制插件（dsh-remote 的插件半）
+# 提供设置页「远程控制」面板与同源 /dsh-remote/* 路由。
+# relayDir 默认取 ~/.dsh-remote（与 npx @mrrisega/dsh-remote 写入的
+# .dsh-config.json 相同），也可在面板或 entry config 中覆盖。
+- insert:
+    - id: dsh-remote-ui
+      name: 'dsh-remote-ui'
