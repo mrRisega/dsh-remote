@@ -1,9 +1,8 @@
 {
   "name": "dsh-remote-ui",
   "version": "0.1.0",
-  "description": "dsh web 远程控制插件：设置页「远程控制」栏目（settings.section 官方扩展点，位于 Agent 预设下方）+ 配置面板 + bridge 启停 + 反馈/邀请/满意度（双半插件：node 半提供 /dsh-remote 宿主 API，浏览器半提供 UI）",
+  "description": "Remote control for dsh web from a phone browser: an in-harness Settings panel (cloud/self-hosted mode tabs, account login, bridge start/stop, feedback) plus same-origin /dsh-remote relay routes; the desktop bridge and self-hosted relay-router shipped with this repo tunnel the local dsh web to a phone PWA with access-key auth, live device list and optional traffic quotas. · dsh web 远程控制插件：设置页「远程控制」栏目（settings.section 官方扩展点）+ 配置面板 + bridge 启停 + 反馈/邀请/满意度（双半插件：node 半提供 /dsh-remote 宿主 API，浏览器半提供 UI）。",
   "type": "module",
-  "private": true,
   "main": "lib/index.js",
   "exports": {
     ".": {
@@ -14,7 +13,15 @@
     },
     "./package.json": "./package.json"
   },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
   "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web",
       "inject": [
@@ -22,5 +29,14 @@
       ]
     }
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mrRisega/dsh-remote.git",
+    "directory": "packages/dsh-remote-ui"
+  },
+  "bugs": {
+    "url": "https://github.com/mrRisega/dsh-remote/issues"
+  },
+  "homepage": "https://github.com/mrRisega/dsh-remote/tree/main/packages/dsh-remote-ui#readme",
   "license": "PolyForm-Noncommercial-1.0.0"
 }

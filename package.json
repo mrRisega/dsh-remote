@@ -5,6 +5,14 @@
   "type": "module",
   "license": "PolyForm-Noncommercial-1.0.0",
   "private": false,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mrRisega/dsh-remote.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mrRisega/dsh-remote/issues"
+  },
+  "homepage": "https://github.com/mrRisega/dsh-remote#readme",
   "bin": {
     "dsh-remote": "dsh-setup.mjs"
   },
