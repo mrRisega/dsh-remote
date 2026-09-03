@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4d6bfe"/>
+      <stop offset="1" stop-color="#7c5cff"/>
+    </linearGradient>
+  </defs>
+  <!-- 圆角背景 -->
+  <rect x="8" y="8" width="496" height="496" rx="110" fill="url(#bg)"/>
+  <!-- 左侧：手机 -->
+  <g>
+    <rect x="84" y="150" width="120" height="212" rx="26" fill="#fff" opacity="0.96"/>
+    <rect x="100" y="176" width="88" height="150" rx="12" fill="none" stroke="#4d6bfe" stroke-width="9"/>
+    <circle cx="144" cy="344" r="7" fill="#4d6bfe"/>
+  </g>
+  <!-- 右侧：电脑/显示器 -->
+  <g>
+    <rect x="292" y="150" width="140" height="100" rx="14" fill="#fff" opacity="0.96"/>
+    <rect x="352" y="176" width="60" height="48" rx="8" fill="none" stroke="#4d6bfe" stroke-width="8"/>
+    <rect x="332" y="252" width="60" height="12" rx="6" fill="#fff" opacity="0.9"/>
+    <rect x="352" y="264" width="20" height="26" rx="4" fill="#fff" opacity="0.9"/>
+  </g>
+  <!-- 连接：动态箭头（远程控制） -->
+  <g stroke="#ffffff" stroke-width="12" fill="none" stroke-linecap="round">
+    <path d="M210 220 Q 250 200 286 220" fill="none" stroke-dasharray="2 26"/>
+    <path d="M210 280 Q 252 300 288 278" fill="none"/>
+    <path d="M274 196 L 286 214 L 262 218 Z" fill="#fff" stroke="none"/>
+    <path d="M274 296 L 286 284 L 262 276 Z" fill="#fff" stroke="none"/>
+  </g>
+  <text x="256" y="440" font-family="Arial, Helvetica, sans-serif" font-size="34" font-weight="700" fill="#ffffff" text-anchor="middle" opacity="0.96">远程控制</text>
+</svg>
