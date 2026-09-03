@@ -1,7 +1,22 @@
 {
   "name": "@mrrisega/dsh-remote",
   "version": "0.3.1",
-  "description": "Remote control for DeepSeek Harness (dsh web) from any phone browser: tunnel-mode relay client with one-command install, self-hosting support, and a dsh web plugin panel",
+  "description": "手机远程控制 DeepSeek Harness · Remote control DeepSeek Harness (dsh web) from any phone browser — 100% 全功能 App 级体验：发消息、看工具执行、审批权限、改设置、管凭据，含特权操作，免内网穿透。一条命令安装 npx @mrrisega/dsh-remote。Mobile remote control for DSH, self-host or SaaS, no server needed on LAN.",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "remote-control",
+    "mobile",
+    "手机远程控制",
+    "远程控制",
+    "反向代理",
+    "pwa",
+    "reverse-proxy",
+    "self-hosted",
+    "phone",
+    "web-remote"
+  ],
   "type": "module",
   "license": "PolyForm-Noncommercial-1.0.0",
   "private": false,

@@ -1,6 +1,17 @@
-# dsh-remote
+# dsh-remote — 手机远程控制 DeepSeek Harness（全功能 · App 级体验）
 
-在手机浏览器上远程控制电脑端的 DeepSeek Harness（`dsh web`），操作体验与坐在电脑前一致。
+<p align="left">
+  <a href="https://github.com/mrRisega/dsh-remote/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/mrRisega/dsh-remote?style=flat-square&label=Stars"></a>
+  <img alt="npm downloads" src="https://img.shields.io/npm/dt/@mrrisega/dsh-remote?style=flat-square&label=npm%20downloads">
+  <img alt="DeepSeek Harness" src="https://img.shields.io/badge/DeepSeek%20Harness-plugin-4f8cff?style=flat-square">
+  <img alt="dsh-plugin" src="https://img.shields.io/badge/topic-dsh--plugin-blueviolet?style=flat-square">
+  <img alt="Node" src="https://img.shields.io/badge/Node.js-%3E%3D20-339933?style=flat-square&logo=node.js&logoColor=white">
+  <img alt="License" src="https://img.shields.io/badge/License-PolyForm%20Noncommercial-2ea44f?style=flat-square">
+</p>
+
+> **离开电脑也能用手机 100% 全功能接管电脑上的 DeepSeek Harness（`dsh web`）**——发消息、看工具执行、审批权限、改设置、管凭据（含特权操作），操作体验与坐在电脑前完全一致。免内网穿透，局域网即连。
+>
+> **一条命令安装**：`npx @mrrisega/dsh-remote`
 
 dsh-remote 是一个轻量的**隧道模式**远程控制方案：电脑端运行一个守护进程（bridge），
 主动连接中继服务器（relay-router）注册为在线设备；手机浏览器打开 PWA 页面，
