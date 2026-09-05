@@ -469,6 +469,8 @@ async function setup(argv) {
 // ---------- plugin：安装/卸载 dsh web 远程控制插件 ----------
 const PLUGIN_MARKER_START = "# >>> dsh-remote-ui (managed by dsh-remote plugin; do not edit)";
 const PLUGIN_MARKER_END = "# <<< dsh-remote-ui";
+/** 插件在 profile 内的固定本地目录(安装时整目录拷贝,file: 引用;不依赖 pnpm 的 link:)。 */
+const PLUGIN_LOCAL_DIR = "dsh-remote-ui-plugin";
 
 function pluginBlock(relayDir) {
   return `${PLUGIN_MARKER_START}
@@ -527,11 +529,31 @@ function normalizePatchBase(patch) {
     .trimEnd();
 }
 
-/** 在 profile 目录执行依赖安装（pnpm 优先）。 */
+/** 在 profile 目录执行依赖安装（pnpm 优先，npm 兜底）。 */
 function installProfileDeps(profileDir) {
   const pm = sh("command -v pnpm >/dev/null 2>&1 && echo pnpm || echo npm").stdout.trim() || "npm";
   const cmd = pm === "pnpm" ? "pnpm install" : "npm install";
   return sh(cmd, 120000, profileDir);
+}
+
+/**
+ * 把插件整目录拷贝进 profile 的固定子目录并返回该目录。
+ * 之所以拷贝而不是 link: 引用 npx 缓存目录：
+ *   - link: 协议只有 pnpm 支持，npm 会报 EUNSUPPORTEDPROTOCOL（很多用户机器没装 pnpm）；
+ *   - npx 缓存目录是临时的，link 目标迟早失效。
+ * 拷贝后用 file: 相对依赖即可，npm/pnpm 都能解析。
+ */
+function copyPluginIntoProfile(profileDir, pluginDir) {
+  const dest = path.join(profileDir, PLUGIN_LOCAL_DIR);
+  fs.rmSync(dest, { recursive: true, force: true });
+  fs.cpSync(pluginDir, dest, {
+    recursive: true,
+    filter: (src) =>
+      !src.includes(`${path.sep}node_modules${path.sep}`) &&
+      !src.includes(`${path.sep}.git${path.sep}`) &&
+      !src.endsWith(".DS_Store")
+  });
+  return dest;
 }
 
 async function pluginCmd(argv) {
@@ -569,19 +591,22 @@ async function pluginCmd(argv) {
     if (pkg.dependencies && pkg.dependencies["dsh-remote-ui"]) {
       delete pkg.dependencies["dsh-remote-ui"];
       fs.writeFileSync(pkgFile, JSON.stringify(pkg, null, 2) + "\n");
-      console.log(`✅ 已从 ${pkgFile} 移除 dsh-remote-ui 依赖`);
+      fs.rmSync(path.join(profileDir, PLUGIN_LOCAL_DIR), { recursive: true, force: true });
+      console.log(`✅ 已从 ${pkgFile} 移除 dsh-remote-ui 依赖与本地插件目录`);
     }
     console.log("   执行依赖更新...");
     const r = installProfileDeps(profileDir);
-    if (!r.ok) console.warn(`⚠️ 依赖更新失败：${r.stderr.trim() || r.stdout.trim()}（请手动在 ${profileDir} 执行 pnpm install）`);
+    if (!r.ok) console.warn(`⚠️ 依赖更新失败：${r.stderr.trim() || r.stdout.trim()}（请手动在 ${profileDir} 执行 pnpm/npm install）`);
     console.log("✅ 卸载完成。重启 dsh web 生效。");
     return;
   }
 
-  // 安装：写依赖 + patch 块
+  // 安装：插件整目录拷贝进 profile，以 file: 相对依赖安装（npm/pnpm 均支持；不再用 link:）。
   pkg.dependencies = pkg.dependencies || {};
-  pkg.dependencies["dsh-remote-ui"] = `link:${pluginDir}`;
+  const pluginLocalDir = copyPluginIntoProfile(profileDir, pluginDir);
+  pkg.dependencies["dsh-remote-ui"] = `file:./${PLUGIN_LOCAL_DIR}`;
   fs.writeFileSync(pkgFile, JSON.stringify(pkg, null, 2) + "\n");
+  console.log(`✅ 插件已拷贝到 ${pluginLocalDir}（file: 依赖，npm/pnpm 均可安装）`);
 
   // 先清掉旧条目（含旧版无标记条目），再写入带标记的新块，保证不重复。
   // 关键：先清除默认的 [] 空文档占位行，否则拼接出的 YAML 非法，dsh web 启动即崩。
@@ -590,9 +615,9 @@ async function pluginCmd(argv) {
   const block = pluginBlock(CONFIG_DIR);
   fs.writeFileSync(patchFile, (base ? base + "\n" : "") + block + "\n");
   console.log(`✅ 已写入 ${patchFile}`);
-  console.log("   执行依赖更新（pnpm install）...");
+  console.log("   执行依赖更新（pnpm 优先，未装 pnpm 自动用 npm）...");
   const r = installProfileDeps(profileDir);
-  if (!r.ok) console.warn(`⚠️ 依赖更新失败：${r.stderr.trim() || r.stdout.trim()}（请手动在 ${profileDir} 执行 pnpm install）`);
+  if (!r.ok) console.warn(`⚠️ 依赖更新失败：${r.stderr.trim() || r.stdout.trim()}（请手动在 ${profileDir} 执行 pnpm install 或 npm install）`);
   console.log(`✅ 插件安装完成。配置目录: ${CONFIG_DIR}`);
   console.log("   重启 dsh web（或重开 profile）后，在「设置 → 远程控制」查看面板。");
 }
