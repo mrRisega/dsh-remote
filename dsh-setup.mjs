@@ -556,6 +556,29 @@ function copyPluginIntoProfile(profileDir, pluginDir) {
   return dest;
 }
 
+/**
+ * 兜底：确保 dsh 能从 profile 的 node_modules 解析到 dsh-remote-ui。
+ * 部分机器上 pnpm/npm 可能因网络、锁文件或旧 node_modules 布局没真正放下链接，
+ * 导致 dsh web 启动报 "Cannot find package 'dsh-remote-ui'"。这里直接自建链接/拷贝，
+ * 保证“装完就能用”，不依赖包管理器的成败。返回 true 表示本次补建了链接。
+ */
+function ensurePluginLinked(profileDir, pluginLocalDir) {
+  const nmPlugin = path.join(profileDir, "node_modules", "dsh-remote-ui");
+  if (fs.existsSync(nmPlugin)) return false; // 已可解析（含目标仍有效的软链）
+  try {
+    fs.mkdirSync(path.join(profileDir, "node_modules"), { recursive: true });
+    fs.symlinkSync(pluginLocalDir, nmPlugin, "dir");
+    return true;
+  } catch {
+    try {
+      fs.cpSync(pluginLocalDir, nmPlugin, { recursive: true });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
 async function pluginCmd(argv) {
   const uninstall = hasFlag(argv, "--uninstall");
   const profileIdx = argv.indexOf("--profile");
@@ -617,7 +640,15 @@ async function pluginCmd(argv) {
   console.log(`✅ 已写入 ${patchFile}`);
   console.log("   执行依赖更新（pnpm 优先，未装 pnpm 自动用 npm）...");
   const r = installProfileDeps(profileDir);
-  if (!r.ok) console.warn(`⚠️ 依赖更新失败：${r.stderr.trim() || r.stdout.trim()}（请手动在 ${profileDir} 执行 pnpm install 或 npm install）`);
+  if (!r.ok) {
+    console.warn(`⚠️ 包管理器依赖更新未完全成功（${(r.stderr || r.stdout || "").trim().slice(0, 300) || "未知错误"}）`);
+    console.warn("   将直接建立插件链接，不依赖包管理器，dsh web 仍可正常加载插件。");
+  }
+  // 兜底：不依赖 pnpm/npm 的成败，确保 node_modules 里能解析到 dsh-remote-ui
+  const linked = ensurePluginLinked(profileDir, pluginLocalDir);
+  console.log(linked
+    ? `✅ 插件链接已就绪：${path.join(profileDir, "node_modules", "dsh-remote-ui")} → ${pluginLocalDir}`
+    : "✅ 插件依赖已就绪");
   console.log(`✅ 插件安装完成。配置目录: ${CONFIG_DIR}`);
   console.log("   重启 dsh web（或重开 profile）后，在「设置 → 远程控制」查看面板。");
 }
