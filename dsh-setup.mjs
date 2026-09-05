@@ -547,10 +547,14 @@ function copyPluginIntoProfile(profileDir, pluginDir) {
   fs.rmSync(dest, { recursive: true, force: true });
   fs.cpSync(pluginDir, dest, {
     recursive: true,
-    filter: (src) =>
-      !src.includes(`${path.sep}node_modules${path.sep}`) &&
-      !src.includes(`${path.sep}.git${path.sep}`) &&
-      !src.endsWith(".DS_Store")
+    // 注意：插件源(npx 缓存 / npm 全局)本身就位于某个 node_modules 之下，
+    // 过滤必须基于“相对插件目录”的路径片段，绝不能整条 src 路径包含判断，
+    // 否则会把插件文件全过滤掉、拷出空目录(此前反复“插件入口缺失”的总根因)。
+    filter: (src) => {
+      if (src === pluginDir) return true;
+      const rel = path.relative(pluginDir, src);
+      return !String(rel).split(path.sep).some((seg) => seg === "node_modules" || seg === ".git" || seg === ".DS_Store");
+    }
   });
   return dest;
 }
