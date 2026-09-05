@@ -512,6 +512,21 @@ function stripPluginEntries(patch) {
   return out.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd() + "\n";
 }
 
+/**
+ * 归一化 patch 基座：去掉 dsh 新 profile 默认的空文档占位行 `[]`。
+ * 默认 cordis.patch.yml 是「顶部注释 + []」，若保留 [] 再往下拼 `- insert:`，
+ * YAML 会报 “end of the stream or a document separator is expected”（dsh web 启动即崩）。
+ * 返回内容不含结尾换行；[] 行只在独立成行时视为占位，不影响真正的条目。
+ */
+function normalizePatchBase(patch) {
+  return String(patch ?? "")
+    .split("\n")
+    .filter((l) => !/^\[\s*\]\s*$/.test(l))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trimEnd();
+}
+
 /** 在 profile 目录执行依赖安装（pnpm 优先）。 */
 function installProfileDeps(profileDir) {
   const pm = sh("command -v pnpm >/dev/null 2>&1 && echo pnpm || echo npm").stdout.trim() || "npm";
@@ -568,10 +583,12 @@ async function pluginCmd(argv) {
   pkg.dependencies["dsh-remote-ui"] = `link:${pluginDir}`;
   fs.writeFileSync(pkgFile, JSON.stringify(pkg, null, 2) + "\n");
 
-  // 先清掉旧条目（含旧版无标记条目），再写入带标记的新块，保证不重复
+  // 先清掉旧条目（含旧版无标记条目），再写入带标记的新块，保证不重复。
+  // 关键：先清除默认的 [] 空文档占位行，否则拼接出的 YAML 非法，dsh web 启动即崩。
   const stripped = stripPluginEntries(patch);
+  const base = normalizePatchBase(stripped);
   const block = pluginBlock(CONFIG_DIR);
-  fs.writeFileSync(patchFile, stripped + block + "\n");
+  fs.writeFileSync(patchFile, (base ? base + "\n" : "") + block + "\n");
   console.log(`✅ 已写入 ${patchFile}`);
   console.log("   执行依赖更新（pnpm install）...");
   const r = installProfileDeps(profileDir);
