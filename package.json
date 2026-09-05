@@ -1,6 +1,6 @@
 {
   "name": "@mrrisega/dsh-remote",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "手机远程控制 DeepSeek Harness · Remote control DeepSeek Harness (dsh web) from any phone browser — 100% 全功能 App 级体验：发消息、看工具执行、审批权限、改设置、管凭据，含特权操作，免内网穿透。一条命令安装 npx @mrrisega/dsh-remote。Mobile remote control for DSH, self-host or SaaS, no server needed on LAN.",
   "keywords": [
     "deepseek-harness",
