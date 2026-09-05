@@ -557,26 +557,29 @@ function copyPluginIntoProfile(profileDir, pluginDir) {
 }
 
 /**
- * 兜底：确保 dsh 能从 profile 的 node_modules 解析到 dsh-remote-ui。
- * 部分机器上 pnpm/npm 可能因网络、锁文件或旧 node_modules 布局没真正放下链接，
- * 导致 dsh web 启动报 "Cannot find package 'dsh-remote-ui'"。这里直接自建链接/拷贝，
- * 保证“装完就能用”，不依赖包管理器的成败。返回 true 表示本次补建了链接。
+ * 兜底：确保 dsh 能从 profile 的 node_modules 解析到 dsh-remote-ui，且指向本次拷贝的插件目录。
+ * 常见坑：
+ *   - 残留的旧软链指向旧 npx 缓存（可能悬空/已清理），existsSync 判“存在”会误跳过 → 必须校验真实目标；
+ *   - pnpm 布局的 profile 里跑 npm install 会崩（npm 读 .pnpm 报错），不能依赖包管理器。
+ * 因此这里：解析现有链接的真实目标，只要不等于本次拷贝目录就强制重建为绝对路径链接/拷贝。
+ * 返回 true 表示本次重建了链接。
  */
 function ensurePluginLinked(profileDir, pluginLocalDir) {
-  const nmPlugin = path.join(profileDir, "node_modules", "dsh-remote-ui");
-  if (fs.existsSync(nmPlugin)) return false; // 已可解析（含目标仍有效的软链）
+  const nmDir = path.join(profileDir, "node_modules");
+  const nmPlugin = path.join(nmDir, "dsh-remote-ui");
+  fs.mkdirSync(nmDir, { recursive: true });
+  // 已正确指向本次拷贝目录 → 无需处理
   try {
-    fs.mkdirSync(path.join(profileDir, "node_modules"), { recursive: true });
+    if (fs.realpathSync(nmPlugin) === pluginLocalDir) return false;
+  } catch { /* 悬空或不存在 → 需要重建 */ }
+  try { fs.rmSync(nmPlugin, { recursive: true, force: true }); } catch { /* ignore */ }
+  try {
     fs.symlinkSync(pluginLocalDir, nmPlugin, "dir");
-    return true;
   } catch {
-    try {
-      fs.cpSync(pluginLocalDir, nmPlugin, { recursive: true });
-      return true;
-    } catch {
-      return false;
-    }
+    fs.cpSync(pluginLocalDir, nmPlugin, { recursive: true });
   }
+  // 复核
+  try { return fs.realpathSync(nmPlugin) === pluginLocalDir; } catch { return false; }
 }
 
 async function pluginCmd(argv) {
