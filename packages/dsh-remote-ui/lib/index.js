@@ -362,7 +362,9 @@ function appendLogLine(relayDir, name, line) {
 
 /** 插件市场只装了 UI 插件;若桌面缺 dsh-remote 运行环境(dsh-setup.mjs=bridge/自启动),
  * 由插件在后台自动执行一次 `npx @mrrisega/dsh-remote` 补齐,用户无需手动跑命令。
- * 已有环境(包括手动 npx 装过)直接跳过。返回 true=已就绪。 */
+ * 已有环境(包括手动 npx 装过)直接跳过。返回 true=已就绪。
+ * 注意：默认优先官方源——镜像(npmmirror)可能滞后于刚发布的版本，装到旧版会把
+ * 已被 0.4.5 移除的“用户 include”重新写回 profile（历史上造成 dsh web 重复 ID 崩溃）。 */
 function ensureRuntime(relayDir) {
   if (existsSync(join(relayDir, "dsh-setup.mjs"))) return true;
   const marker = join(relayDir, PROVISION_MARKER);
@@ -372,7 +374,7 @@ function ensureRuntime(relayDir) {
     const log = join(relayDir, AUTO_INSTALL_LOG);
     const child = spawn(npxCommand(), ["--yes", "@mrrisega/dsh-remote"], {
       detached: true,
-      env: spawnEnv(),
+      env: spawnEnv({ npm_config_registry: "https://registry.npmjs.org" }),
       stdio: ["ignore", openSync(log, "a"), openSync(log, "a")]
     });
     writeMarker(marker, child.pid); // 记 pid：宿主重启后可立即清理死进程残留
@@ -711,7 +713,7 @@ async function proxyFeedback(relayDir, req, res, pathname) {
 // ---------- 自管理：版本 / 在线更新 / 彻底卸载（面板内“版本与更新”卡片） ----------
 
 /** 插件自身发布版本（与 dsh-remote 根包同步递增）。 */
-const PLUGIN_VERSION = "0.4.5";
+const PLUGIN_VERSION = "0.4.6";
 const UPDATE_LOG = ".dsh-update.log";
 const UPDATE_MARKER = ".dsh-update-running";
 
@@ -740,10 +742,12 @@ function spawnUpdater(relayDir, extraEnv) {
 }
 
 /**
- * 后台执行在线一键更新：npx @mrrisega/dsh-remote@latest（幂等自愈：补运行环境/更新 bridge/重写 include）。
+ * 后台执行在线一键更新：npx @mrrisega/dsh-remote@latest（幂等自愈：补运行环境/更新 bridge/收敛 include）。
  * 稳健性：
  *   - npx 用绝对路径 + PATH 补全解析（App 拉起的 dsh web PATH 最小化时不再 ENOENT 静默失败）；
- *   - 默认 npx 源（国内常为 npmmirror）未同步到最新版导致失败时，自动用官方 npm 源重试一次；
+ *   - 【官方源优先】镜像(npmmirror)滞后时会把旧版(如 0.4.4)当成最新安装，旧 pluginCmd 会把
+ *     已被移除的“用户 include”重新写回 profile → dsh web 重启重复 ID 崩溃。故先试官方源，
+ *     失败(国内网络)才回退用户默认镜像源；
  *   - marker 记录 pid，子进程退出/出错即清理；宿主重启后由 sweepStaleMarkers 立即清掉死进程残留。
  */
 function runOnlineUpdate(relayDir) {
@@ -756,16 +760,17 @@ function runOnlineUpdate(relayDir) {
     let retried = false;
     const clear = () => { try { rmSync(marker, { force: true }); } catch { /* ignore */ } };
     const run = () => {
-      const child = spawnUpdater(relayDir, retried ? { npm_config_registry: "https://registry.npmjs.org" } : {});
+      // 第一次：官方 npm 源；失败(exit≠0/网络)才回退用户默认源（通常为国内镜像）
+      const child = spawnUpdater(relayDir, retried ? {} : { npm_config_registry: "https://registry.npmjs.org" });
       writeMarker(marker, child.pid);
       child.on("exit", (code) => {
         if (!retried && code !== 0) {
           retried = true;
-          appendLogLine(relayDir, UPDATE_LOG, `[update] 默认源安装失败(exit=${code})，改用官方 npm 源重试…`);
+          appendLogLine(relayDir, UPDATE_LOG, `[update] 官方源安装失败(exit=${code})，回退默认源(npmmirror 等)重试…`);
           run();
           return;
         }
-        appendLogLine(relayDir, UPDATE_LOG, `[update] npx 退出 code=${code ?? "?"}（默认源${retried ? "/官方源" : ""}）`);
+        appendLogLine(relayDir, UPDATE_LOG, `[update] npx 退出 code=${code ?? "?"}（${retried ? "默认源" : "官方源"}）`);
         clear();
       });
       child.on("error", (e) => {
