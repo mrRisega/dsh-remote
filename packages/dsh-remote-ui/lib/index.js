@@ -64,6 +64,89 @@ function preferredNode() {
 
 const NODE_BIN = preferredNode();
 
+/**
+ * 解析 npx 绝对路径。DeepSeek App 拉起 dsh web 时 PATH 只有 /usr/bin:/bin:/usr/sbin:/sbin
+ * （没有 /opt/homebrew/bin 等），裸 `npx` 会 spawn ENOENT 而静默失败——必须按绝对路径找，
+ * 且子进程 env 的 PATH 要把当前 node 所在目录补在最前（npx 的 #!/usr/bin/env node 依赖它）。
+ */
+function npxCommand() {
+  const name = process.platform === "win32" ? "npx.cmd" : "npx";
+  const dirs = [
+    dirname(process.execPath),           // 与当前 node 同目录（homebrew/usr/local 均可覆盖）
+    process.env.DSH_SETUP_NPX_DIR || "",
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/opt/homebrew/opt/node@20/bin",
+    "/usr/local/opt/node@20/bin",
+    "/usr/bin",
+  ].filter(Boolean);
+  for (const d of dirs) {
+    const real = resolveExecutable(join(d, name));
+    if (real) return real;
+  }
+  return name; // 全找不到 → 退回裸名（普通 shell 场景仍可用）
+}
+
+/** 子进程环境：把 node 目录补进 PATH（npx 及其 shebang 需要），可附加额外变量。 */
+function spawnEnv(extra) {
+  const nodeDir = dirname(process.execPath);
+  const base = process.env.PATH || "";
+  const PATH = [nodeDir, base, "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"].filter(Boolean).join(":");
+  return { ...process.env, PATH, ...(extra || {}) };
+}
+
+// ---------- 后台子进程标记（防重入 + 宿主重启自愈） ----------
+// marker 内容 = JSON {pid, at}：pid 供“宿主重启后立即清理死进程残留”判断；
+// 兼容旧格式（纯时间戳数字 → 只按超时清理）。
+
+function readMarkerInfo(filePath) {
+  try {
+    const raw = readFileSync(filePath, "utf8").trim();
+    const j = JSON.parse(raw);
+    if (Number.isInteger(j?.pid) || Number.isInteger(j?.at)) return j;
+  } catch { /* 非 JSON → 数字时间戳或空 */ }
+  const t = Number(raw || "0");
+  return Number.isFinite(t) && t > 0 ? { pid: null, at: t } : null;
+}
+
+function writeMarker(filePath, pid) {
+  mkdirSync(dirname(filePath), { recursive: true });
+  writeFileSync(filePath, JSON.stringify({ pid: pid ?? null, at: Date.now() }), { mode: 0o600 });
+}
+
+/** pid 是否存活（ESRCH=已死）。 */
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return null; // 未知 → 由超时规则兜底
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === "EPERM" ? true : false; // EPERM=存在但无权限
+  }
+}
+
+/**
+ * 清理残留标记：宿主 dsh web 在后台安装/更新期间被重启/强杀时，子进程清理回调随之丢失，
+ * 若只按“30 分钟超时”清理，用户会在这半小时内反复遇到“已有更新进行中/正在安装”。
+ * 现在：记录 pid → 重启后立刻清掉已死进程的标记；pid 不可读的旧标记仍按超时兜底。
+ */
+function sweepStaleMarkers(relayDir) {
+  const now = Date.now();
+  for (const name of [PROVISION_MARKER, UPDATE_MARKER]) {
+    const p = join(relayDir, name);
+    let info;
+    try { info = readMarkerInfo(p); } catch { continue; }
+    if (!info) continue;
+    const dead = pidAlive(info.pid);
+    const expired = now - info.at > STALE_MARKER_MS;
+    if (dead === false || (dead === null && expired)) {
+      try { rmSync(p, { force: true }); } catch { /* ignore */ }
+      appendLogLine(relayDir, AUTO_INSTALL_LOG,
+        `[dsh-remote-ui] 清理残留标记 ${name}（pid=${info.pid ?? "?"}, at=${new Date(info.at).toISOString()}${dead === false ? ", 进程已死" : ", 已超时"}）`);
+    }
+  }
+}
+
 /** 读取 JSON body。 */
 async function readJsonBody(req) {
   let raw = "";
@@ -274,23 +357,8 @@ function appendLogLine(relayDir, name, line) {
 }
 
 /**
- * 清理“进程残留”标记：dsh web 在后台安装/更新期间被重启/强杀时，
- * 子进程的清理回调会随宿主进程一起丢失，marker 会永久卡住后续安装/更新。
- * 插件每次启动时把超时的 marker 清掉（内容=创建时间戳）。
+ * 清理“进程残留”标记的实现见上方小工具区 sweepStaleMarkers（pid 存活 + 超时双保险）。
  */
-function sweepStaleMarkers(relayDir) {
-  const now = Date.now();
-  for (const name of [PROVISION_MARKER, UPDATE_MARKER]) {
-    const p = join(relayDir, name);
-    try {
-      const t = Number((readFileSync(p, "utf8") || "0").trim());
-      if (Number.isFinite(t) && t > 0 && now - t > STALE_MARKER_MS) {
-        rmSync(p, { force: true });
-        appendLogLine(relayDir, AUTO_INSTALL_LOG, `[dsh-remote-ui] 清理残留标记 ${name}（${new Date(t).toISOString()} 创建，已超时）`);
-      }
-    } catch { /* 无文件等 → 忽略 */ }
-  }
-}
 
 /** 插件市场只装了 UI 插件;若桌面缺 dsh-remote 运行环境(dsh-setup.mjs=bridge/自启动),
  * 由插件在后台自动执行一次 `npx @mrrisega/dsh-remote` 补齐,用户无需手动跑命令。
@@ -301,17 +369,22 @@ function ensureRuntime(relayDir) {
   if (existsSync(marker)) return false; // 正在安装中
   try {
     mkdirSync(relayDir, { recursive: true });
-    writeFileSync(marker, String(Date.now()), { mode: 0o600 });
     const log = join(relayDir, AUTO_INSTALL_LOG);
-    const npx = process.platform === "win32" ? "npx.cmd" : "npx";
-    const child = spawn(npx, ["--yes", "@mrrisega/dsh-remote"], {
+    const child = spawn(npxCommand(), ["--yes", "@mrrisega/dsh-remote"], {
       detached: true,
+      env: spawnEnv(),
       stdio: ["ignore", openSync(log, "a"), openSync(log, "a")]
     });
+    writeMarker(marker, child.pid); // 记 pid：宿主重启后可立即清理死进程残留
+    const clear = () => { try { rmSync(marker, { force: true }); } catch { /* ignore */ } };
     child.on("exit", (code) => {
-      // 安装结束即移除 marker（无论成败，失败由下一轮 scheduleRuntime 重试）
-      try { rmSync(marker, { force: true }); } catch { /* ignore */ }
+      clear();
       appendLogLine(relayDir, AUTO_INSTALL_LOG, `[auto-install] npx 退出 code=${code ?? "?"}`);
+    });
+    child.on("error", (e) => {
+      clear();
+      appendLogLine(relayDir, AUTO_INSTALL_LOG, `[auto-install] 启动失败: ${e.message}`);
+      console.warn(`[dsh-remote-ui] 自动安装子进程启动失败: ${e.message}`);
     });
     child.unref();
     console.log(`[dsh-remote-ui] 检测到缺少桌面运行环境,已在后台自动安装(日志: ${log}),完成后将自动启动 bridge`);
@@ -373,14 +446,15 @@ function scheduleRuntime(relayDir) {
       const cfg = loadConfig(relayDir);
       const hasAcct = Boolean((cfg.phone || cfg.email) && cfg.password) || Boolean(cfg.local_key);
       if (!hasAcct) return;
-      const setupUrl = join(relayDir, "dsh-setup.mjs");
-      if (!existsSync(setupUrl)) {
-        ensureRuntime(relayDir);
-        return;
-      }
+      // 先看服务是否已在运行（runtime 可能位于 npx 缓存/固化目录，不必重复安装）
       const st = launchdStatus();
       if (st.running) { done = true; clearInterval(iv); return; }
-      startBridge(relayDir);
+      const setupUrl = join(relayDir, "dsh-setup.mjs");
+      if (!existsSync(setupUrl)) {
+        ensureRuntime(relayDir); // 什么环境都没有 → 后台 npx 安装一次
+        return;
+      }
+      startBridge(relayDir); // 环境在但服务没起 → 拉起
     } catch { /* 下一轮再试 */ }
   }, 12_000);
   iv.unref?.();
@@ -637,7 +711,7 @@ async function proxyFeedback(relayDir, req, res, pathname) {
 // ---------- 自管理：版本 / 在线更新 / 彻底卸载（面板内“版本与更新”卡片） ----------
 
 /** 插件自身发布版本（与 dsh-remote 根包同步递增）。 */
-const PLUGIN_VERSION = "0.4.3";
+const PLUGIN_VERSION = "0.4.4";
 const UPDATE_LOG = ".dsh-update.log";
 const UPDATE_MARKER = ".dsh-update-running";
 
@@ -657,11 +731,10 @@ async function npmLatestVersion() {
 /** 以 detached 子进程执行 `npx --yes @mrrisega/dsh-remote@latest`（env 可覆盖 npm 源）。 */
 function spawnUpdater(relayDir, extraEnv) {
   const log = join(relayDir, UPDATE_LOG);
-  const npx = process.platform === "win32" ? "npx.cmd" : "npx";
-  return spawn(npx, ["--yes", "@mrrisega/dsh-remote@latest"], {
+  return spawn(npxCommand(), ["--yes", "@mrrisega/dsh-remote@latest"], {
     detached: true,
     cwd: homedir(),
-    env: { ...process.env, ...(extraEnv || {}) },
+    env: spawnEnv(extraEnv), // PATH 补 node 目录：App 最小 PATH 下也能跑 npx
     stdio: ["ignore", openSync(log, "a"), openSync(log, "a")]
   });
 }
@@ -669,20 +742,22 @@ function spawnUpdater(relayDir, extraEnv) {
 /**
  * 后台执行在线一键更新：npx @mrrisega/dsh-remote@latest（幂等自愈：补运行环境/更新 bridge/重写 include）。
  * 稳健性：
+ *   - npx 用绝对路径 + PATH 补全解析（App 拉起的 dsh web PATH 最小化时不再 ENOENT 静默失败）；
  *   - 默认 npx 源（国内常为 npmmirror）未同步到最新版导致失败时，自动用官方 npm 源重试一次；
- *   - marker 由子进程退出回调清理；若宿主 dsh web 在更新期间被重启，残留 marker 由启动时的 sweepStaleMarkers 兜底。
+ *   - marker 记录 pid，子进程退出/出错即清理；宿主重启后由 sweepStaleMarkers 立即清掉死进程残留。
  */
 function runOnlineUpdate(relayDir) {
   try {
     mkdirSync(relayDir, { recursive: true });
     const marker = join(relayDir, UPDATE_MARKER);
     if (existsSync(marker)) return { ok: false, detail: "已有更新在进行中，请稍候" };
-    writeFileSync(marker, String(Date.now()), { mode: 0o600 });
     appendLogLine(relayDir, UPDATE_LOG, `[update] 开始在线更新 @mrrisega/dsh-remote@latest (${new Date().toISOString()})`);
 
     let retried = false;
+    const clear = () => { try { rmSync(marker, { force: true }); } catch { /* ignore */ } };
     const run = () => {
       const child = spawnUpdater(relayDir, retried ? { npm_config_registry: "https://registry.npmjs.org" } : {});
+      writeMarker(marker, child.pid);
       child.on("exit", (code) => {
         if (!retried && code !== 0) {
           retried = true;
@@ -691,7 +766,11 @@ function runOnlineUpdate(relayDir) {
           return;
         }
         appendLogLine(relayDir, UPDATE_LOG, `[update] npx 退出 code=${code ?? "?"}（默认源${retried ? "/官方源" : ""}）`);
-        try { rmSync(marker, { force: true }); } catch { /* ignore */ }
+        clear();
+      });
+      child.on("error", (e) => {
+        appendLogLine(relayDir, UPDATE_LOG, `[update] 子进程启动失败: ${e.message}`);
+        clear();
       });
       child.unref();
       return child;
