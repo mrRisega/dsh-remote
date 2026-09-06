@@ -106,6 +106,19 @@ function saveConfig(relayDir, cfg) {
   }
 }
 
+/**
+ * SaaS 模式权威归一化（与 dsh-setup.mjs 同规则）：
+ * 清除自建残留(local_key/假 tunnel_url)，api_url 与 tunnel_url 一律按云端权威地址重算。
+ * 解决“切过自建(填了假地址)后，再登/重装云端账号仍连错服务器、手机看不到设备”的残留配置问题。
+ */
+function applySaaSMode(cfg) {
+  delete cfg.local_key;
+  delete cfg.server;
+  cfg.api_url = String(cfg.api_url || DEFAULT_API).replace(/\/+$/, "");
+  cfg.tunnel_url = cfg.api_url.replace(/\/relay-api\/?$/, "").replace(/^https/, "wss");
+  return cfg;
+}
+
 // ---------- bridge 服务状态 / 启停（launchctl，macOS） ----------
 
 function launchAgentPath() {
@@ -524,14 +537,8 @@ function registerRoutes(ctx, relayDir) {
             delete cfg.device_private_key;
             delete cfg.device_public_key;
           }
-          // 切回 SaaS:仅当此前是自建模式(local_key)才清理本地隧道/API 地址;
-          // 正常 SaaS 用户的 tunnel_url 是核心配置(wss://公网域名),绝不能删
-          const wasLocal = Boolean(cfg.local_key);
-          delete cfg.local_key;
-          if (wasLocal) {
-            if (cfg.tunnel_url) delete cfg.tunnel_url;
-            if (cfg.api_url) delete cfg.api_url;
-          }
+          // SaaS 权威归一化：清除自建残留(local_key/假 tunnel_url)，api/tunnel 一律按云端重算
+          applySaaSMode(cfg);
         }
         saveConfig(relayDir, cfg);
         const bridgeRestart = startBridge(relayDir);

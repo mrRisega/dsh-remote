@@ -99,6 +99,19 @@ function deriveTunnelUrl(apiUrl) {
   return apiUrl.replace(/\/relay-api\/?$/, "").replace(/^https/, "wss");
 }
 
+/**
+ * 模式归一化（SaaS 权威）：清掉自建残留(local_key/假 tunnel_url)，api_url 与
+ * tunnel_url 一律按云端权威地址重算。防止"切过自建后又登云端"时残留配置把
+ * bridge 带到错误服务器（此前手机永远看不到设备的根因之一）。
+ */
+function applySaaSMode(cfg) {
+  delete cfg.local_key;
+  delete cfg.server; // 旧字段兜底
+  cfg.api_url = String(cfg.api_url || DEFAULT_API).replace(/\/+$/, "");
+  cfg.tunnel_url = deriveTunnelUrl(cfg.api_url);
+  return cfg;
+}
+
 /** 归一化自建服务器地址：缺省补 wss://，去掉末尾 / */
 function normalizeTunnelUrl(raw) {
   let u = String(raw || "").trim().replace(/\/+$/, "");
@@ -239,9 +252,7 @@ function serveSettings() {
             return send(400, JSON.stringify({ ok: false, message: "SaaS 模式需要手机号与密码" }), "application/json");
           }
           cfg.phone = body.phone; cfg.password = body.password;
-          delete cfg.local_key;
-          cfg.api_url = body.api_url || cfg.api_url || DEFAULT_API;
-          if (!cfg.tunnel_url) cfg.tunnel_url = deriveTunnelUrl(cfg.api_url);
+          applySaaSMode(cfg); // 清自建残留,api/tunnel 权威重算
         }
         // 自动获取服务端下发的 bridge_secret（device-login 共享密钥，一键安装开箱即用）
         if (!cfg.bridge_secret && !cfg.local_key) {
@@ -328,7 +339,7 @@ async function runBridge() {
     // 每次循环重读配置：设置页登录/切换模式后无需重启守护即可生效
     cfg = loadConfig();
     const saas = Boolean((cfg.phone || cfg.email) && cfg.password);
-    const local = Boolean(cfg.local_key);
+    let local = Boolean(cfg.local_key);
     if (!saas && !local) {
       if (!warnedNoLogin) {
         warnedNoLogin = true;
@@ -341,9 +352,13 @@ async function runBridge() {
       console.log("⚠️ 自建模式缺少服务器地址：请用 `dsh-remote setup --server wss://host:port --key <密钥>` 重新配置。");
       return;
     }
-    if (saas && !cfg.tunnel_url) {
-      cfg.tunnel_url = deriveTunnelUrl(cfg.api_url || DEFAULT_API);
+    if (saas) {
+      // SaaS 权威归一化：清掉任何自建残留，tunnel/api 始终指向云端地址
+      applySaaSMode(cfg);
+      local = false;
       saveConfig(cfg);
+    } else if (local && !cfg.tunnel_url) {
+      cfg.tunnel_url = deriveTunnelUrl(cfg.api_url || DEFAULT_API);
     }
     const apiUrl = saas ? (cfg.api_url || DEFAULT_API) : "";
 
@@ -458,7 +473,8 @@ async function setup(argv) {
     console.log(`   手机端: 打开 ${cfg.tunnel_url.replace(/^ws/, "https")}/app/ ，用访问密钥登录即可。`);
   } else {
     console.log(`   远程控制地址: ${pub.app_url || DEFAULT_APP_URL}`);
-    console.log(`   下一步: 运行 \`dsh-remote settings\` 打开设置页，用手机号+密码登录（或注册）。`);
+    console.log(`   下一步（小白/无需任何命令）: 打开 dsh web → 设置 → 「远程控制」→ 注册/登录手机号即可。`);
+    console.log(`   若你是从 DeepSeek App/插件市场 安装：请【完全退出并重开 App】（或刷新 profile），插件即生效。`);
     console.log(`   登录后 bridge 会自动启动，手机端即可看到本机。`);
   }
   if (svc.path) console.log(`   自启动服务: ${svc.path}`);
@@ -652,7 +668,8 @@ async function pluginCmd(argv) {
     : "✅ node_modules/dsh-remote-ui 已就绪");
 
   console.log(`✅ 插件安装完成。配置目录: ${CONFIG_DIR}`);
-  console.log("   重启 dsh web（或重开 profile）后，在「设置 → 远程控制」查看面板。");
+  console.log("   打开 dsh web → 设置 → 「远程控制」，注册/登录手机号即可（无需任何命令）。");
+  console.log("   若从 DeepSeek App/插件市场 安装：请完全退出并重开 App 让插件生效。");
 }
 
 // ---------- main ----------
