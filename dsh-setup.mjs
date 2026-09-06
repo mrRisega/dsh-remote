@@ -658,6 +658,91 @@ function declarePluginDep(pkgFile) {
   fs.writeFileSync(pkgFile, JSON.stringify(pkg, null, 2) + "\n");
 }
 
+/** 把 dsh-remote-ui 加入 dsh.profile.bundles（幂等）。返回是否发生变更。 */
+function ensureBundleEntry(pkgFile) {
+  const pkg = JSON.parse(fs.readFileSync(pkgFile, "utf8"));
+  const bundles = pkg.dsh && pkg.dsh.profile && Array.isArray(pkg.dsh.profile.bundles)
+    ? pkg.dsh.profile.bundles
+    : null;
+  if (bundles && bundles.includes("dsh-remote-ui")) return false;
+  pkg.dsh = pkg.dsh || {};
+  pkg.dsh.profile = pkg.dsh.profile || {};
+  pkg.dsh.profile.bundles = bundles || [];
+  pkg.dsh.profile.bundles.push("dsh-remote-ui");
+  fs.writeFileSync(pkgFile, JSON.stringify(pkg, null, 2) + "\n");
+  return true;
+}
+
+/** 从 dsh.profile.bundles 移除 dsh-remote-ui（幂等）。返回是否发生变更。 */
+function removeBundleEntry(pkgFile) {
+  const pkg = JSON.parse(fs.readFileSync(pkgFile, "utf8"));
+  const bundles = pkg.dsh && pkg.dsh.profile && Array.isArray(pkg.dsh.profile.bundles)
+    ? pkg.dsh.profile.bundles
+    : null;
+  if (!bundles || !bundles.includes("dsh-remote-ui")) return false;
+  pkg.dsh.profile.bundles = bundles.filter((b) => b !== "dsh-remote-ui");
+  fs.writeFileSync(pkgFile, JSON.stringify(pkg, null, 2) + "\n");
+  return true;
+}
+
+/**
+ * 插件安装(pluginCmd 非卸载分支)收敛策略 —— 2026-09-06「重复 ID 崩溃」根治：
+ * dsh-remote-ui 是带 dsh.bundle.patch 的 bundle：package.json 的 dsh.profile.bundles
+ * 声明它后，加载器会自动应用插件自带的 cordis.patch.yml（节点半+浏览器半的唯一激活点）。
+ * 若用户级 cordis.patch.yml 再手工 insert 同一个 id，dsh web 启动即报“重复 ID”崩溃。
+ * 因此本命令【绝不写用户 include】，只负责：让插件以 bundle 形态可解析，
+ * 并清理历史遗留的 include 块。市场形态(github:/npm 依赖)则完全交由市场管理，只清理 include。
+ */
+function convergePluginActivation(profileDir, pkgFile, patchFile, pluginDir, patch) {
+  const pkg = JSON.parse(fs.readFileSync(pkgFile, "utf8"));
+  const dep = pkg.dependencies && pkg.dependencies["dsh-remote-ui"];
+  const inBundles = !!(pkg.dsh && pkg.dsh.profile && Array.isArray(pkg.dsh.profile.bundles)
+    && pkg.dsh.profile.bundles.includes("dsh-remote-ui"));
+  const marketManaged = dep && !String(dep).startsWith("file:"); // github:/npm: 等由市场/包管理器管源码
+  const managedByUs = !dep || String(dep).startsWith("file:");   // 无依赖或 file: 拷贝 → 我们管
+
+  const stripInclude = (reason) => {
+    const newPatch = stripPluginEntries(patch);
+    if (newPatch !== patch) {
+      fs.writeFileSync(patchFile, newPatch);
+      console.log(`✅ 已移除 ${patchFile} 中的冗余 include（${reason}；激活统一走插件自带 bundle patch，避免重复 ID 崩溃）`);
+    }
+  };
+
+  if (marketManaged && inBundles) {
+    // 插件市场安装形态：依赖与源码归市场管，我们只清历史 include（若旧版曾写过）
+    stripInclude("插件市场安装形态无需用户 include");
+    console.log("ℹ 插件市场安装形态（bundles+dependency）：已保持市场管理的源码不变。");
+    return;
+  }
+
+  if (managedByUs) {
+    const pluginLocalDir = copyPluginIntoProfile(profileDir, pluginDir);
+    const entryFile = path.join(pluginLocalDir, "lib", "index.js");
+    if (!fs.existsSync(entryFile)) {
+      console.error(`❌ 插件入口缺失：${entryFile}（本包不完整？请用官方源重装：npx --registry=https://registry.npmjs.org @mrrisega/dsh-remote@latest）`);
+      process.exit(1);
+    }
+    console.log(`✅ 插件已拷贝到 ${pluginLocalDir}`);
+    declarePluginDep(pkgFile);                      // file: 依赖(包管理器 install 不误删)
+    const addedBundle = ensureBundleEntry(pkgFile); // bundles 声明 → 插件自带 patch 自动激活
+    const linked = ensurePluginLinked(profileDir, pluginLocalDir); // 自建 node_modules 链接
+    stripInclude("bundle patch 已是唯一激活点");     // 清历史 include
+    console.log(addedBundle
+      ? "✅ 已加入 dsh.profile.bundles（dsh-remote-ui 自带 patch 自动生效）"
+      : "ℹ dsh.profile.bundles 已含 dsh-remote-ui");
+    console.log(linked
+      ? `✅ 已建立 node_modules/dsh-remote-ui → ${pluginLocalDir}（免包管理器即可解析）`
+      : "✅ node_modules/dsh-remote-ui 已就绪");
+    console.log(`✅ 插件安装完成（bundle 形态，无用户 include）。配置目录: ${CONFIG_DIR}`);
+    return;
+  }
+
+  // 异常形态：有非 file: 依赖但不在 bundles（无法靠 bundle patch 激活）
+  console.log(`ℹ 检测到依赖 dsh-remote-ui(${dep}) 但未声明在 dsh.profile.bundles——插件不会激活。`);
+  console.log("   请在 dsh 插件市场重新添加该插件，或先执行 `dsh-remote plugin --uninstall` 再一键安装。");
+}
+
 async function pluginCmd(argv) {
   const uninstall = hasFlag(argv, "--uninstall");
   const profileIdx = argv.indexOf("--profile");
@@ -696,35 +781,17 @@ async function pluginCmd(argv) {
       if (pkg.dependencies) delete pkg.dependencies["dsh-remote-ui"];
       fs.writeFileSync(pkgFile, JSON.stringify(pkg, null, 2) + "\n");
     } catch { /* ignore */ }
+    // 同步移除 bundles 声明，避免“bundles 引用已删除包 → dsh web 启动报错”
+    try {
+      if (removeBundleEntry(pkgFile)) console.log("✅ 已从 dsh.profile.bundles 移除 dsh-remote-ui");
+    } catch { /* ignore */ }
     console.log("✅ 卸载完成。重启 dsh web 生效。");
     return;
   }
 
-  // 安装 = 拷贝完整插件目录 + 写裸名 include + 自建 node_modules 链接 + 声明 file: 依赖。
-  // 全程不跑 pnpm/npm；但链接与依赖双保险，任何包管理器之后 install 也不会破坏它。
-  const pluginLocalDir = copyPluginIntoProfile(profileDir, pluginDir);
-  const entryFile = path.join(pluginLocalDir, "lib", "index.js");
-  if (!fs.existsSync(entryFile)) {
-    console.error(`❌ 插件入口缺失：${entryFile}（本包不完整？请用官方源重装：npx --registry=https://registry.npmjs.org @mrrisega/dsh-remote@latest）`);
-    process.exit(1);
-  }
-  console.log(`✅ 插件已拷贝到 ${pluginLocalDir}`);
+  // 安装：收敛到“恰好一处激活”（bundle patch 唯一激活点），绝不与市场/历史 include 并存
+  convergePluginActivation(profileDir, pkgFile, patchFile, pluginDir, patch);
 
-  // 先清掉旧条目（含旧版无标记条目），再写入带标记的新块，保证不重复。
-  // 关键：先清除默认的 [] 空文档占位行，否则拼接出的 YAML 非法，dsh web 启动即崩。
-  const stripped = stripPluginEntries(patch);
-  const base = normalizePatchBase(stripped);
-  const block = pluginBlock(CONFIG_DIR);
-  fs.writeFileSync(patchFile, (base ? base + "\n" : "") + block + "\n");
-  console.log(`✅ 已写入 ${patchFile}（裸名 include：dsh-remote-ui → 节点半 + 浏览器半均生效）`);
-
-  declarePluginDep(pkgFile); // package.json 声明 file: 依赖(后端各类 install 不误删)
-  const linked = ensurePluginLinked(profileDir, pluginLocalDir); // 自建 node_modules 链接
-  console.log(linked
-    ? `✅ 已建立 node_modules/dsh-remote-ui → ${pluginLocalDir}（免包管理器即可解析）`
-    : "✅ node_modules/dsh-remote-ui 已就绪");
-
-  console.log(`✅ 插件安装完成。配置目录: ${CONFIG_DIR}`);
   console.log("   打开 dsh web → 设置 → 「远程控制」，注册/登录手机号即可（无需任何命令）。");
   console.log("   若从 DeepSeek App/插件市场 安装：请完全退出并重开 App 让插件生效。");
 }

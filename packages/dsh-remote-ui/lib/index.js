@@ -711,7 +711,7 @@ async function proxyFeedback(relayDir, req, res, pathname) {
 // ---------- 自管理：版本 / 在线更新 / 彻底卸载（面板内“版本与更新”卡片） ----------
 
 /** 插件自身发布版本（与 dsh-remote 根包同步递增）。 */
-const PLUGIN_VERSION = "0.4.4";
+const PLUGIN_VERSION = "0.4.5";
 const UPDATE_LOG = ".dsh-update.log";
 const UPDATE_MARKER = ".dsh-update-running";
 
