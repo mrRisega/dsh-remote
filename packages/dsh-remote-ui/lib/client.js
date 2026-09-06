@@ -713,7 +713,10 @@ window.__ModuleLoader__.load({
         post("/dsh-remote/self/uninstall", {}).then(function (b) {
           if (b && b.ok) {
             setArmed(false);
-            setSelfMsg({ kind: "ok", text: "已移除插件引用与本地文件。请重启 dsh web：插件将完全卸载（本栏目也会消失）。之后如需重新安装，直接在插件市场再次安装即可。" });
+            // 优先展示服务端 detail（含 bridge 自启动/配置目录的逐项清理结果与重启提示）；
+            // 兜底文案同样说明 bridge 自启动服务与本地配置目录会一并移除/清空
+            var detail = b && b.detail ? String(b.detail) : "";
+            setSelfMsg({ kind: "ok", text: detail || "已彻底卸载：插件引用、bridge 自启动服务与本地配置目录（账号/密钥/运行时等）已一并移除并清空。请重启 dsh web 后完全生效（本栏目将消失）；如需再次使用，在插件市场重新安装即可。" });
           } else {
             setArmed(false);
             setSelfMsg({ kind: "err", text: "卸载失败：" + ((b && (b.error || b.detail)) || "未知错误") });
@@ -762,7 +765,7 @@ window.__ModuleLoader__.load({
         log ? h("div", { className: "dru-up-log", title: "更新日志（尾部）" }, log) : null,
         selfMsg ? h("div", { className: "dru-msg dru-msg-" + selfMsg.kind }, selfMsg.text) : null,
         h("div", { className: "dru-hint", style: { marginTop: 8 } },
-          armed ? "卸载会移除插件引用与本地文件；远程控制用的桌面 bridge 与数据目录保留，可随时重新安装。" :
+          armed ? "⚠ 再次点击后即开始彻底卸载：① 移除 dsh web 配置中的插件引用与本地文件；② 停止并移除 bridge 自启动服务（macOS com.dshremote.bridge / Linux dsh-bridge）并结束残留进程；③ 清空本地配置目录（~/.dsh-remote：账号、设备密钥、固化运行时等）。此操作不可撤销，如需再次使用请在插件市场重新安装。" :
             "插件市场没有更新/卸载按钮（dsh 官方市场暂不提供），本卡片即官方管理入口：检测新版、一键在线更新、彻底卸载都在这里完成。")
       );
     }

@@ -75,6 +75,15 @@
     .device .meta { font-size: 12px; color: var(--muted); margin-top: 2px; }
     .device .status { margin-left: auto; font-size: 12px; padding: 3px 10px; border-radius: 20px; }
     .device .status.on { color: var(--ok); background: rgba(63,185,80,.12); }
+    /* 离线设备:整行置灰、不可进入,标注离线原因 */
+    .device.off { cursor: default; }
+    .device.off:active { border-color: var(--border); }
+    .device.off .icon { background: rgba(87,96,106,.16); }
+    .device.off .name { color: var(--muted); }
+    .list-hint {
+      margin: 2px 0 14px; padding: 10px 12px; font-size: 12.5px; color: var(--muted);
+      background: var(--bg); border: 1px dashed var(--border); border-radius: 10px; line-height: 1.75;
+    }
     .empty { text-align: center; color: var(--muted); font-size: 13px; padding: 24px 0; }
     /* ---------- 新用户安装引导(空设备状态) ---------- */
     .guide {
@@ -347,7 +356,7 @@ var _hmt = _hmt || [];
   <!-- 设备列表视图(实时在线设备选择 + 设备管理) -->
   <div id="view-devices" class="hidden">
     <div class="card">
-      <h2><span class="dot" id="dot-signal"></span><span id="signal-label">在线设备</span></h2>
+      <h2><span class="dot" id="dot-signal"></span><span id="signal-label">我的设备</span></h2>
       <div id="device-list"></div>
       <button id="btn-refresh" class="secondary">刷新设备列表</button>
       <button id="btn-manage-devices" class="secondary" style="margin-top:8px;">管理设备(移除/换机)</button>
@@ -357,7 +366,7 @@ var _hmt = _hmt || [];
     <div class="card usage-card">
       <b>使用说明</b><br/>
       1. 电脑上运行 <code>dsh-bridge</code> 并保持在线;<br/>
-      2. 列表实时来自路由器 WebSocket 连接,点选在线设备进入;<br/>
+      2. 列表展示你的全部已绑定设备及实时状态,🟢 在线设备可直接点选进入,灰色为离线;<br/>
       3. 进入后加载电脑端 <b>dsh web 原生界面</b>(与电脑本地一致,含设置/凭据)。<br/>
       点选设备进入;单台在线也需点选确认,不会自动跳转。
        <div class="usage-actions" id="devices-usage-actions">
@@ -922,14 +931,62 @@ function bindGuideCopy(root) {
   });
 }
 
-// ---------- 设备列表(实时来自 Router /_devices) ----------
+// ---------- 设备列表(合并:Router 实时在线 /_devices + 账号已绑定设备 /relay-api/api/devices) ----------
+
+/** 拉取账号已绑定设备(GET API_BASE + "/api/devices" = /relay-api/api/devices,Bearer token)。
+ *  失败抛错,由 refreshDevices 统一优雅降级。
+ *  容错:后端字段版本差异 → 名称可能叫 name 或 device_name;在线标记缺失/不一致时,最终以 Router 实时列表交集判定。 */
+async function fetchAccountDevices() {
+  const r = await fetch(API_BASE + "/api/devices", {
+    method: "GET",
+    headers: state.token ? { authorization: `Bearer ${state.token}` } : {},
+    signal: AbortSignal.timeout(6000)
+  });
+  const d = await r.json().catch(() => ({}));
+  if (r.status !== 200) throw new Error("http " + r.status);
+  return (Array.isArray(d.devices) ? d.devices : [])
+    .filter(x => x && x.id)
+    .map(x => ({
+      id: String(x.id),
+      name: String(x.device_name || x.name || x.id),
+      online: x.online === true || x.online === 1
+    }));
+}
+
+/** 单台设备行 HTML:在线 → 绿色徽标,可点进入;离线 → 置灰并标注「离线 · 电脑端未连接」。 */
+function deviceRowHTML(d) {
+  if (d.online) {
+    return `
+      <div class="device" data-device="${esc(d.id)}">
+        <div class="icon">🟢</div>
+        <div>
+          <div class="name">${esc(d.name || d.id)}</div>
+          <div class="meta">${esc(d.id)}</div>
+        </div>
+        <div class="status on">在线</div>
+      </div>`;
+  }
+  return `
+    <div class="device off" data-device="${esc(d.id)}">
+      <div class="icon">💻</div>
+      <div>
+        <div class="name">${esc(d.name || d.id)}</div>
+        <div class="meta">${esc(d.id)} · 离线 · 电脑端未连接</div>
+      </div>
+    </div>`;
+}
+
+/** 列表底部轻提示(离线引导 / 降级说明),样式见 .list-hint。 */
+function listHintHTML(html) { return `<div class="list-hint">${html}</div>`; }
+
 async function refreshDevices() {
   const list = $("device-list");
   list.innerHTML = '<div class="empty">加载中...</div>';
-  $("signal-label").textContent = "查询在线设备...";
+  $("signal-label").textContent = "正在查询设备...";
   $("dot-signal").classList.remove("on");
 
-  let devices = [];
+  // 1) Router 实时在线设备(权威:决定当前能否点选进入,带 dsh_token cookie)
+  let routerOk = false, routerErr = "", routerDevices = [];
   try {
     const r = await fetch("/_devices", { cache: "no-store" });
     if (r.status === 401) {
@@ -938,35 +995,76 @@ async function refreshDevices() {
       return;
     }
     const d = await r.json().catch(() => ({}));
-    devices = (Array.isArray(d.devices) ? d.devices : []).filter(x => x && x.id);
-  } catch (e) {
-    list.innerHTML = `<div class="empty">获取在线设备失败:${esc(e.message)}。<br>请检查网络后点"刷新"重试。</div>`;
+    routerDevices = (Array.isArray(d.devices) ? d.devices : [])
+      .filter(x => x && x.id)
+      .map(x => ({ id: String(x.id), name: String(x.name || x.id) }));
+    routerOk = true;
+  } catch (e) { routerErr = e.message; }
+
+  // 2) 账号已绑定设备(/relay-api,Bearer)。失败/未登录/非账号体系部署(自建)→ 优雅降级,仅用 Router 在线列表
+  let boundOk = false, boundDevices = [];
+  if (deploymentMode !== "self" && state.token) {
+    try {
+      boundDevices = await fetchAccountDevices();
+      boundOk = true;
+    } catch { /* 降级:只用 Router 在线列表,不报错不打断 */ }
+  }
+
+  // 3) 合并渲染:已绑定设备铺底 + Router 实时在线设备并入(并集,不漏可进入设备);
+  //    能否进入以 Router 实时连接为准 → 在线标记 = 是否出现在 Router /_devices 列表。
+  const byId = new Map();
+  for (const b of boundDevices) byId.set(b.id, { id: b.id, name: b.name || b.id, online: false });
+  for (const rd of routerDevices) {
+    const ex = byId.get(rd.id);
+    if (ex) { ex.online = true; if (ex.name === ex.id) ex.name = rd.name; }
+    else byId.set(rd.id, { id: rd.id, name: rd.name || rd.id, online: true });
+  }
+  const all = [...byId.values()];
+  const online = all.filter(d => d.online);
+  const offline = all.filter(d => !d.online);
+
+  // Router 查询失败:已绑定设备仍照常列出(均视为离线不可点),否则维持原错误提示
+  if (!routerOk) {
+    if (all.length > 0) {
+      $("signal-label").textContent = `已绑定 ${all.length} 台设备`;
+      list.innerHTML = all.map(deviceRowHTML).join("") +
+        listHintHTML(`⚠️ 暂时无法确认实时在线状态${routerErr ? `(${esc(routerErr)})` : ""}。以下为账号已绑定设备,请检查网络后点「刷新设备列表」重试。`);
+      return;
+    }
+    list.innerHTML = `<div class="empty">获取在线设备失败:${esc(routerErr)}。<br>请检查网络后点"刷新"重试。</div>`;
     return;
   }
 
-  if (devices.length === 0) {
+  // 一个已绑定/在线设备都没有 → 展示安装引导(不再是空白/无解释)
+  if (all.length === 0) {
     $("signal-label").textContent = "暂无在线设备";
-    list.innerHTML = `<div class="empty" style="padding:12px 0 8px;">暂无在线设备</div>${installGuideHTML()}`;
+    const emptyText = boundOk ? "还没有绑定任何设备" : "暂无在线设备";
+    list.innerHTML = `<div class="empty" style="padding:12px 0 8px;">${emptyText}</div>${installGuideHTML()}`;
     bindGuideCopy(list);
     return;
   }
-  list.innerHTML = "";
-  devices.forEach(d => {
-    const el = document.createElement("div");
-    el.className = "device";
-    el.innerHTML = `
-      <div class="icon">🟢</div>
-      <div>
-        <div class="name">${esc(d.name || d.id)}</div>
-        <div class="meta">${esc(d.id)}</div>
-      </div>
-      <div class="status on">在线</div>`;
-    el.onclick = () => enterDevice(d.id);
-    list.appendChild(el);
+
+  // 有设备:在线可点进入,离线置灰 + 底部一行引导
+  list.innerHTML = [...online, ...offline].map(deviceRowHTML).join("");
+  if (offline.length > 0) {
+    list.insertAdjacentHTML("beforeend", listHintHTML(
+      `💡 有 ${offline.length} 台设备离线(电脑端未连接)。请在电脑上打开 dsh web → 设置 → 远程控制,确保 bridge 运行中,然后点「刷新设备列表」。`
+    ));
+  }
+
+  $("signal-label").textContent = boundOk
+    ? `设备 ${all.length} 台${online.length ? ` · ${online.length} 台在线` : " · 当前均离线"}`
+    : (online.length ? `在线设备 ${online.length} 台` : "暂无在线设备");
+  $("dot-signal").classList.toggle("on", online.length > 0);
+  if (online.length) void applyQuotaHint();
+
+  // 行点击:在线 → 进入设备(原流程不变);离线 → 轻提示引导
+  list.querySelectorAll(".device").forEach(el => {
+    el.onclick = () => {
+      if (el.classList.contains("off")) toast("该设备当前无法进入:请在电脑上确认 bridge 运行中后,点「刷新设备列表」重试", 3500);
+      else enterDevice(el.dataset.device);
+    };
   });
-  $("signal-label").textContent = `在线设备 ${devices.length} 台`;
-  $("dot-signal").classList.add("on");
-  void applyQuotaHint();
 }
 
 // ---------- v2 推广页(产品介绍/月付年付/价格对比/购买/安装引导/邀请) ----------

@@ -34,8 +34,8 @@ test("0/1/多设备统一进设备选择页:不按台数自动跳转,由用户�
   assert.match(APP, /devices\.length === 0/);
   // 单台不再写 dsh_device 自动进入:enterMirror 内不允许出现 devices[0] 直跳
   assert.doesNotMatch(APP, /enterDevice\(devices\[0\]\.id\)/);
-  // 点选设备才是唯一进入途径
-  assert.match(APP, /el\.onclick = \(\) => enterDevice/);
+  // 点选设备(行级 onclick,读取 data-device)才是唯一进入途径;离线行不会触发 enter
+  assert.match(APP, /enterDevice\(el\.dataset\.device\)/);
 });
 
 test("仅用户点选设备才写 dsh_device 并跳根路径(enterDevice)", () => {

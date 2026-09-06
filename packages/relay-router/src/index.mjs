@@ -21,6 +21,8 @@
  *   DSH_ROUTER_PORT          监听端口(默认 13444,替换原 SSH 隧道占用)
  *   DSH_ROUTER_HOST          监听地址(默认 0.0.0.0)
  *   DSH_ENTERPRISE_JWT_SECRET JWT 密钥(必填;从 NAS .env 读,勿写死)
+ *   DSH_INTERNAL_TOKEN        enterprise 内部里程碑上报密钥(可选;开启「成功使用/连接成功」统计)
+ *   DSH_ENTERPRISE_INTERNAL_URL enterprise 内部端点基址(默认 http://127.0.0.1:13446)
  *   DSH_ROUTER_QUOTA_FREE_MAX_BPS / *_MONTHLY_GB …(可选,覆盖默认配额)
  * 命令行:
  *   node src/index.mjs [--env-file /path/.env]   # --env-file 简易 KEY=VALUE 加载
@@ -82,6 +84,34 @@ if (LOCAL_JWT_SECRET && !LOCAL_ACCESS_KEYS.length) {
   console.warn("[router] 已设 DSH_LOCAL_JWT_SECRET 但无 DSH_LOCAL_ACCESS_KEYS,本地认证未启用");
 }
 if (LOCAL_AUTH_ENABLED) console.log("[router] 本地认证已启用(开源自部署模式,POST /_login)");
+
+/**
+ * 服务端里程碑上报(供「成功使用 / 连接成功」统计;服务端到服务端,无任何客户端上报)。
+ * router 观察到用户真实跑通的关键节点后,向 enterprise 内部端点 POST 一次(每用户每 kind 仅首条):
+ *   - devices:手机端拉取到非空设备列表(说明登录+设备可见)
+ *   - remote:首次远程控制成功(某次上游 http/ws 请求真正打通,说明用户点进去用上了)
+ * 环境变量:DSH_INTERNAL_TOKEN(与 enterprise 一致)/ DSH_ENTERPRISE_INTERNAL_URL(默认本机 13446)。
+ * 失败静默,绝不影响业务路径。
+ */
+const INTERNAL_TOKEN = process.env.DSH_INTERNAL_TOKEN || "";
+const ENTERPRISE_INTERNAL_URL = (process.env.DSH_ENTERPRISE_INTERNAL_URL || "http://127.0.0.1:13446").replace(/\/+$/, "");
+const reportedMilestones = new Set(); // `${kind}:${userId}` 去重
+function reportMilestone(userId, kind) {
+  try {
+    const uid = Number(userId);
+    if (!Number.isInteger(uid) || uid <= 0 || !INTERNAL_TOKEN) return;
+    const key = `${kind}:${uid}`;
+    if (reportedMilestones.has(key)) return;
+    reportedMilestones.add(key);
+    const url = `${ENTERPRISE_INTERNAL_URL}/api/internal/milestone`;
+    fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${INTERNAL_TOKEN}` },
+      body: JSON.stringify({ user_id: uid, kind }),
+      signal: AbortSignal.timeout(3000)
+    }).catch(() => { /* 静默:enterprise 不可达不影响隧道 */ });
+  } catch { /* ignore */ }
+}
 
 /** 依次用 enterprise/本地密钥校验 JWT;返回 claims 或 null。 */
 function verifyAnyJwt(token) {
@@ -480,6 +510,7 @@ const server = http.createServer(async (req, res) => {
     const list = [...devices.values()]
       .filter((d) => d.ws.readyState === WebSocket.OPEN && String(d.userId) === String(claims.sub))
       .map((d) => ({ id: d.deviceId, name: d.name || d.deviceId }));
+    if (list.length > 0) reportMilestone(claims.sub, "devices"); // 手机端成功拉到设备列表(首条上报)
     const r = jsonBody(200, { devices: list });
     res.writeHead(r.status, r.headers);
     res.end(r.body);
@@ -740,6 +771,7 @@ function onBridgeFrame(dev, frame) {
       : Buffer.from(String(frame.body || ""), "utf8");
     quotas.recordTraffic(p.deviceId, buf.length, p.userId); // 下行计入月流量
     const status = Number(frame.status) || 502;
+    if (status >= 200 && status < 400) reportMilestone(p.userId, "remote"); // 首次远程 http 真正打通
     const headers = sanitizeResHeaders(frame.headers || {});
     headers["content-length"] = String(buf.length);
     const hasBody = p.method !== "HEAD" && status >= 200 && status !== 204 && status !== 304;
@@ -769,6 +801,7 @@ function onBridgeFrame(dev, frame) {
       return;
     }
     if (pu.socket.destroyed) return; // 手机已断开
+    reportMilestone(pu.userId, "remote"); // 首次远程 ws 隧道建立(点进设备成功用上)
     tunnelWss.handleUpgrade(pu.req, pu.socket, pu.head, (ws) => {
       const sess = {
         ws,
