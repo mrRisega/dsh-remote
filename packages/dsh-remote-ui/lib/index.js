@@ -119,6 +119,82 @@ function applySaaSMode(cfg) {
   return cfg;
 }
 
+// ---------- Harness 浏览器会话代持(0.1.2-rc.1+ 的 ?token 鉴权) ----------
+
+/**
+ * 新版 dsh web(0.1.2-rc.1+)启动会打印带 ?token= 的 URL,并只给"换到了会话 Cookie"的浏览器放行,
+ * 其余请求一律 401(手机经隧道因此白页)。本插件与 Harness 同进程:
+ *  - 通过 ctx.connection 服务拿到本进程 launch token(authenticatedUrl 自带 token);
+ *  - 在本地向 /?token=… 发起 token 交换,捕获下发的 dsh-auth-* 会话 Cookie;
+ *  - 写入 <relayDir>/.harness-cookie.json,bridge 上游转发时自动携带,让手机表现为已授权浏览器。
+ * 老版本(无该鉴权)下 connection 服务没有 authenticatedUrl → 静默跳过,行为不变。
+ */
+const HARNESS_COOKIE_FILE = ".harness-cookie.json";
+const HARNESS_AUTH_RETRY_MS = 3000;
+const HARNESS_AUTH_RETRY_MAX = 20; // 最多约 60s 等 connection 服务就绪
+const HARNESS_AUTH_REFRESH_MS = 6 * 3600 * 1000;
+
+/** 读取响应里的 set-cookie(兼容 getSetCookie / get 两种实现)。 */
+function setCookieOf(res) {
+  try {
+    if (typeof res.headers.getSetCookie === "function") return res.headers.getSetCookie().join("; ");
+  } catch { /* ignore */ }
+  return res.headers.get("set-cookie") || "";
+}
+
+async function mintHarnessCookie(ctx, relayDir) {
+  try {
+    const port = ctx.webServer?.port;
+    if (!port) return false;
+    // 不能把 "connection" 写进 inject(0.1.1 无该服务会拖死激活),只能运行时 try 获取
+    let holder;
+    try { holder = ctx.get("connection"); } catch { holder = void 0; }
+    if (!holder && ctx.connection !== void 0) { try { holder = ctx.connection; } catch { /* ignore */ } }
+    const svc = holder && typeof holder.authenticatedUrl === "function"
+      ? holder
+      : holder && holder.connection && typeof holder.connection.authenticatedUrl === "function"
+        ? holder.connection
+        : null;
+    if (!svc) return false; // 老版本无浏览器鉴权 → 无需 cookie
+    const tokenUrl = svc.authenticatedUrl(`http://127.0.0.1:${port}`);
+    const res = await fetch(tokenUrl, { redirect: "manual", signal: AbortSignal.timeout(6000) });
+    const cookie = setCookieOf(res).split(";")[0].trim();
+    if (!cookie || !cookie.startsWith("dsh-auth-")) return false;
+    const out = { authority: `127.0.0.1:${port}`, cookie, mintedAt: Date.now() };
+    mkdirSync(dirname(configPathOf(relayDir)), { recursive: true });
+    writeFileSync(join(relayDir, HARNESS_COOKIE_FILE), JSON.stringify(out, null, 2), { mode: 0o600 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 后台调度:启动重试直到换取成功,成功后每 6h 刷新(与插件生命周期同进退)。 */
+function scheduleHarnessMint(ctx, relayDir) {
+  let succeeded = false;
+  let retries = 0;
+  const attempt = async () => {
+    if (succeeded) return;
+    if (await mintHarnessCookie(ctx, relayDir)) succeeded = true;
+  };
+  const bootIv = setInterval(() => {
+    if (succeeded || ++retries > HARNESS_AUTH_RETRY_MAX) {
+      clearInterval(bootIv);
+      return;
+    }
+    void attempt();
+  }, HARNESS_AUTH_RETRY_MS);
+  bootIv.unref?.();
+  const refreshIv = setInterval(() => {
+    void mintHarnessCookie(ctx, relayDir).catch(() => {});
+  }, HARNESS_AUTH_REFRESH_MS);
+  refreshIv.unref?.();
+  return () => {
+    clearInterval(bootIv);
+    clearInterval(refreshIv);
+  };
+}
+
 // ---------- bridge 服务状态 / 启停（launchctl，macOS） ----------
 
 function launchAgentPath() {
@@ -736,5 +812,7 @@ function registerRoutes(ctx, relayDir) {
 export function apply(ctx, config = {}) {
   const relayDir = config.relayDir || process.env.DSH_RELAY_DIR || DEFAULT_RELAY_DIR;
   ctx.effect(() => registerRoutes(ctx, relayDir), "dsh-remote-ui: /dsh-remote routes");
+  // 0.1.2-rc.1+ 浏览器会话代持：换取 Harness 会话 Cookie 供 bridge 上游携带（手机点设备不再 401 白页）
+  ctx.effect(() => scheduleHarnessMint(ctx, relayDir), "dsh-remote-ui: harness browser-session mint");
   ctx.logger?.info?.(`dsh-remote-ui: /dsh-remote routes ready (relayDir=${relayDir})`);
 }

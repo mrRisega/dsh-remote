@@ -96,6 +96,22 @@ function saveLocalConfig(cfg) {
 }
 
 /**
+ * Harness 浏览器会话 Cookie(由 dsh-remote-ui 插件在进程内换取后写入
+ * <relayDir>/.harness-cookie.json)。新版 dsh web(0.1.2+)对每个请求校验该 Cookie,
+ * 不带则 401 → 手机端白页;bridge 对所有上游 HTTP/WS 请求自动携带,让手机表现为已授权浏览器。
+ */
+const HARNESS_COOKIE_FILE = ".harness-cookie.json";
+function harnessCookieOf() {
+  try {
+    const p = path.join(path.dirname(CONFIG_PATH), HARNESS_COOKIE_FILE);
+    const j = JSON.parse(fs.readFileSync(p, "utf8"));
+    return j && typeof j.cookie === "string" && j.cookie ? j.cookie : "";
+  } catch {
+    return "";
+  }
+}
+
+/**
  * 解析稳定 deviceId:优先级 env DSH_BRIDGE_DEVICE_ID > argv[2] > 配置 device_id > 生成。
  * 生成格式 dev-<12hex> 并持久化到 .dsh-config.json,保证每台 Mac 重启后 id 不变。
  */
@@ -257,6 +273,8 @@ export function buildWsHeaders(headers) {
   const up = new URL(UPSTREAM);
   const out = sanitizeRequestHeaders(headers);
   out.Host = up.host; // e.g. "127.0.0.1:3080"
+  const ck = harnessCookieOf(); // 新版 dsh web 的浏览器会话 Cookie
+  if (ck) out.Cookie = ck;
   return out;
 }
 
@@ -335,7 +353,10 @@ async function doHttp(method, path, reqHeaders, body, isB64) {
   const safe = safePath(path);
   if (safe === null) throw new Error("非法路径");
   const url = `${UPSTREAM}${safe}`;
-  const init = { method, headers: sanitizeRequestHeaders(reqHeaders) };
+  const reqHdrs = sanitizeRequestHeaders(reqHeaders);
+  const ck = harnessCookieOf(); // 新版 dsh web 的浏览器会话 Cookie(否则 401 白页)
+  if (ck) reqHdrs.Cookie = ck;
+  const init = { method, headers: reqHdrs };
   if (body !== undefined && body !== null && body !== "") {
     // 新协议 http 帧的 body 一律 base64;旧协议 body 是原始文本
     init.body = isB64 ? Buffer.from(String(body), "base64") : String(body);
