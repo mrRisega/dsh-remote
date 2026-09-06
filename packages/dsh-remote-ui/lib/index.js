@@ -4,12 +4,17 @@
 //   - 读写 dsh-remote-open/.dsh-config.json（0600）
 //   - 查询/启停 bridge（launchctl，plist 缺失时自动生成，逻辑与 dsh-setup.mjs 一致）
 //   - 代理 relay API（captcha / register / login / public-config），直连、不走系统代理
+//   - 自管理 self*（版本可见 / 新版检测 / 一键在线更新 / 彻底卸载）：插件市场没有更新卸载按钮，
+//     面板内即官方管理入口；更新=后台 npx @mrrisega/dsh-remote@latest（幂等补齐运行环境并重启 bridge）
+//   - 运行时自愈：缺运行环境自动后台安装、登录后自动拉起 bridge（0.4.2 起）
+//   - 0.1.2+ ?token 浏览器鉴权会话代持（0.4.1 起）
 //
 // 不依赖任何第三方包：只使用 node 内置模块与 cordis 注入的 webServer 服务。
-import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync, accessSync, chmodSync, openSync, rmSync, constants as fsConstants } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync, accessSync, chmodSync, openSync, closeSync, rmSync, constants as fsConstants } from "node:fs";
 import { join, dirname } from "node:path";
 import { execSync, spawn } from "node:child_process";
 import { homedir, hostname, platform } from "node:os";
+import { fileURLToPath } from "node:url";
 
 /** 本插件在 host 侧的服务依赖。 */
 export const inject = ["webServer"];
@@ -254,6 +259,38 @@ function manualStatus() {
 
 const PROVISION_MARKER = ".dsh-setup-installing";
 const AUTO_INSTALL_LOG = ".dsh-setup-install.log";
+const STALE_MARKER_MS = 30 * 60 * 1000; // 超过该时长视为上次进程残留，插件启动时清理
+
+/** 向日志追加一行（多个子进程写同一日志用 append 模式，互不覆盖）。 */
+function appendLogLine(relayDir, name, line) {
+  try {
+    const fd = openSync(join(relayDir, name), "a");
+    try {
+      writeFileSync(fd, `\n${line}\n`);
+    } finally {
+      closeSync(fd);
+    }
+  } catch { /* 非关键 */ }
+}
+
+/**
+ * 清理“进程残留”标记：dsh web 在后台安装/更新期间被重启/强杀时，
+ * 子进程的清理回调会随宿主进程一起丢失，marker 会永久卡住后续安装/更新。
+ * 插件每次启动时把超时的 marker 清掉（内容=创建时间戳）。
+ */
+function sweepStaleMarkers(relayDir) {
+  const now = Date.now();
+  for (const name of [PROVISION_MARKER, UPDATE_MARKER]) {
+    const p = join(relayDir, name);
+    try {
+      const t = Number((readFileSync(p, "utf8") || "0").trim());
+      if (Number.isFinite(t) && t > 0 && now - t > STALE_MARKER_MS) {
+        rmSync(p, { force: true });
+        appendLogLine(relayDir, AUTO_INSTALL_LOG, `[dsh-remote-ui] 清理残留标记 ${name}（${new Date(t).toISOString()} 创建，已超时）`);
+      }
+    } catch { /* 无文件等 → 忽略 */ }
+  }
+}
 
 /** 插件市场只装了 UI 插件;若桌面缺 dsh-remote 运行环境(dsh-setup.mjs=bridge/自启动),
  * 由插件在后台自动执行一次 `npx @mrrisega/dsh-remote` 补齐,用户无需手动跑命令。
@@ -270,6 +307,11 @@ function ensureRuntime(relayDir) {
     const child = spawn(npx, ["--yes", "@mrrisega/dsh-remote"], {
       detached: true,
       stdio: ["ignore", openSync(log, "a"), openSync(log, "a")]
+    });
+    child.on("exit", (code) => {
+      // 安装结束即移除 marker（无论成败，失败由下一轮 scheduleRuntime 重试）
+      try { rmSync(marker, { force: true }); } catch { /* ignore */ }
+      appendLogLine(relayDir, AUTO_INSTALL_LOG, `[auto-install] npx 退出 code=${code ?? "?"}`);
     });
     child.unref();
     console.log(`[dsh-remote-ui] 检测到缺少桌面运行环境,已在后台自动安装(日志: ${log}),完成后将自动启动 bridge`);
@@ -592,11 +634,167 @@ async function proxyFeedback(relayDir, req, res, pathname) {
   }
 }
 
+// ---------- 自管理：版本 / 在线更新 / 彻底卸载（面板内“版本与更新”卡片） ----------
+
+/** 插件自身发布版本（与 dsh-remote 根包同步递增）。 */
+const PLUGIN_VERSION = "0.4.3";
+const UPDATE_LOG = ".dsh-update.log";
+const UPDATE_MARKER = ".dsh-update-running";
+
+/** 查询 npm 最新版（官方源优先，失败回退 npmmirror；纯服务端无 CORS 限制）。 */
+async function npmLatestVersion() {
+  for (const reg of ["https://registry.npmjs.org/@mrrisega/dsh-remote", "https://registry.npmmirror.com/@mrrisega/dsh-remote"]) {
+    try {
+      const res = await fetch(reg, { signal: AbortSignal.timeout(8000) });
+      if (!res.ok) continue;
+      const j = await res.json();
+      if (j && j["dist-tags"] && typeof j["dist-tags"].latest === "string") return j["dist-tags"].latest;
+    } catch { /* 试下一个源 */ }
+  }
+  return "";
+}
+
+/** 以 detached 子进程执行 `npx --yes @mrrisega/dsh-remote@latest`（env 可覆盖 npm 源）。 */
+function spawnUpdater(relayDir, extraEnv) {
+  const log = join(relayDir, UPDATE_LOG);
+  const npx = process.platform === "win32" ? "npx.cmd" : "npx";
+  return spawn(npx, ["--yes", "@mrrisega/dsh-remote@latest"], {
+    detached: true,
+    cwd: homedir(),
+    env: { ...process.env, ...(extraEnv || {}) },
+    stdio: ["ignore", openSync(log, "a"), openSync(log, "a")]
+  });
+}
+
+/**
+ * 后台执行在线一键更新：npx @mrrisega/dsh-remote@latest（幂等自愈：补运行环境/更新 bridge/重写 include）。
+ * 稳健性：
+ *   - 默认 npx 源（国内常为 npmmirror）未同步到最新版导致失败时，自动用官方 npm 源重试一次；
+ *   - marker 由子进程退出回调清理；若宿主 dsh web 在更新期间被重启，残留 marker 由启动时的 sweepStaleMarkers 兜底。
+ */
+function runOnlineUpdate(relayDir) {
+  try {
+    mkdirSync(relayDir, { recursive: true });
+    const marker = join(relayDir, UPDATE_MARKER);
+    if (existsSync(marker)) return { ok: false, detail: "已有更新在进行中，请稍候" };
+    writeFileSync(marker, String(Date.now()), { mode: 0o600 });
+    appendLogLine(relayDir, UPDATE_LOG, `[update] 开始在线更新 @mrrisega/dsh-remote@latest (${new Date().toISOString()})`);
+
+    let retried = false;
+    const run = () => {
+      const child = spawnUpdater(relayDir, retried ? { npm_config_registry: "https://registry.npmjs.org" } : {});
+      child.on("exit", (code) => {
+        if (!retried && code !== 0) {
+          retried = true;
+          appendLogLine(relayDir, UPDATE_LOG, `[update] 默认源安装失败(exit=${code})，改用官方 npm 源重试…`);
+          run();
+          return;
+        }
+        appendLogLine(relayDir, UPDATE_LOG, `[update] npx 退出 code=${code ?? "?"}（默认源${retried ? "/官方源" : ""}）`);
+        try { rmSync(marker, { force: true }); } catch { /* ignore */ }
+      });
+      child.unref();
+      return child;
+    };
+    const child = run();
+    return { ok: true, pid: child.pid, log: join(relayDir, UPDATE_LOG) };
+  } catch (e) {
+    try { rmSync(join(relayDir, UPDATE_MARKER), { force: true }); } catch { /* ignore */ }
+    return { ok: false, detail: String(e.message || e) };
+  }
+}
+
+/** 读日志尾部(更新进度展示)。 */
+function tailOf(filePath, lines = 24) {
+  try {
+    const all = readFileSync(filePath, "utf8").split("\n");
+    return all.slice(-lines).join("\n");
+  } catch { return ""; }
+}
+
+/** 彻底卸载（兼容市场“拒绝改写用户补丁”的场景）：移除 include、依赖、bundle、本地目录与链接。 */
+function uninstallSelf(relayDir, profileDir, patchFile, pkgFile) {
+  const out = { removedPatch: false, removedDep: false, removedDir: false, removedBundle: false };
+  try {
+    const patch = readFileSync(patchFile, "utf8");
+    const cleaned = patch
+      .replace(/\n?# >>> dsh-remote-ui .*?# <<< dsh-remote-ui\s*/s, "\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trimEnd() + "\n";
+    if (cleaned !== patch) { writeFileSync(patchFile, cleaned); out.removedPatch = true; }
+  } catch { /* 无 patch 忽略 */ }
+  try {
+    const pkg = JSON.parse(readFileSync(pkgFile, "utf8"));
+    if (pkg.dependencies && pkg.dependencies["dsh-remote-ui"]) { delete pkg.dependencies["dsh-remote-ui"]; out.removedDep = true; }
+    const bundles = pkg.dsh && pkg.dsh.profile && Array.isArray(pkg.dsh.profile.bundles) ? pkg.dsh.profile.bundles : null;
+    if (bundles) {
+      const i = bundles.indexOf("dsh-remote-ui");
+      if (i >= 0) { bundles.splice(i, 1); out.removedBundle = true; }
+    }
+    if (out.removedDep || out.removedBundle) writeFileSync(pkgFile, JSON.stringify(pkg, null, 2) + "\n");
+  } catch { /* 无 package.json 忽略 */ }
+  try {
+    rmSync(join(profileDir, "dsh-remote-ui-plugin"), { recursive: true, force: true });
+    rmSync(join(profileDir, "node_modules", "dsh-remote-ui"), { recursive: true, force: true });
+    out.removedDir = true;
+  } catch { /* ignore */ }
+  return out;
+}
+
 // ---------- 路由 ----------
 
 /** 路由表：{method, path, handler}。 */
 function registerRoutes(ctx, relayDir) {
+  // 本插件所在 profile(由插件自身文件位置推导,覆盖市场 git 安装与本地 include 两种形态)
+  let profileDir = join(homedir(), ".dsh", "profiles", "web");
+  try {
+    const here = fileURLToPath(import.meta.url);
+    // 依次尝试两种安装布局；split()[0] 未命中时返回原串，需显式判断后再试下一种
+    let m = here.split("/dsh-remote-ui-plugin/")[0];
+    if (m === here) m = here.split("/node_modules/dsh-remote-ui/")[0];
+    if (m !== here) profileDir = m;
+  } catch { /* 保持默认 */ }
   const routes = [
+    // 自管理：版本信息 / 检查更新 / 一键更新 / 更新日志 / 彻底卸载
+    {
+      method: "GET",
+      path: "/dsh-remote/self",
+      handler: async (_req, res) => {
+        const runtimeReady = existsSync(join(relayDir, "dsh-setup.mjs"));
+        sendJson(res, 200, { ok: true, version: PLUGIN_VERSION, runtimeReady, relayDir });
+      },
+    },
+    {
+      method: "GET",
+      path: "/dsh-remote/self/update-check",
+      handler: async (_req, res) => {
+        const latest = await npmLatestVersion();
+        const current = PLUGIN_VERSION;
+        sendJson(res, 200, { ok: true, current, latest, outdated: !!latest && latest !== current });
+      },
+    },
+    {
+      method: "POST",
+      path: "/dsh-remote/self/update",
+      handler: async (_req, res) => {
+        sendJson(res, 200, { ok: true, ...runOnlineUpdate(relayDir) });
+      },
+    },
+    {
+      method: "GET",
+      path: "/dsh-remote/self/update-log",
+      handler: async (_req, res) => {
+        sendJson(res, 200, { ok: true, running: existsSync(join(relayDir, UPDATE_MARKER)), log: tailOf(join(relayDir, UPDATE_LOG)) });
+      },
+    },
+    {
+      method: "POST",
+      path: "/dsh-remote/self/uninstall",
+      handler: async (_req, res) => {
+        const r = uninstallSelf(relayDir, profileDir, join(profileDir, "cordis.patch.yml"), join(profileDir, "package.json"));
+        sendJson(res, 200, { ok: true, ...r, detail: "已移除插件引用与本地文件，重启 dsh web 后完全卸载生效" });
+      },
+    },
     {
       method: "GET",
       path: "/dsh-remote/status",
@@ -865,6 +1063,8 @@ function registerRoutes(ctx, relayDir) {
  */
 export function apply(ctx, config = {}) {
   const relayDir = config.relayDir || process.env.DSH_RELAY_DIR || DEFAULT_RELAY_DIR;
+  // 清理上次进程残留的安装/更新 marker（宿主被重启/强杀时子进程清理回调会丢失）
+  sweepStaleMarkers(relayDir);
   ctx.effect(() => registerRoutes(ctx, relayDir), "dsh-remote-ui: /dsh-remote routes");
   // 0.1.2-rc.1+ 浏览器会话代持：换取 Harness 会话 Cookie 供 bridge 上游携带（手机点设备不再 401 白页）
   ctx.effect(() => scheduleHarnessMint(ctx, relayDir), "dsh-remote-ui: harness browser-session mint");
