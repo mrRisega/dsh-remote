@@ -175,6 +175,9 @@ test("uninstall 路由：移除 include 块 + package.json 依赖/bundle + 本�
   await writeFile(path.join(relayDir, ".dsh-config.json"), "{}");
 
   try {
+    // 测试隔离开关：卸载路由跳过 launchctl / systemctl / 杀进程等系统级操作（本机真实 bridge 正由 launchd 运行，
+    // 不能被测试误停），只验证「插件 profile 清理 + 配置目录清空」逻辑。
+    process.env.DSH_RELAY_SKIP_SERVICE = "1";
     // 关键：以 tempHome 为 HOME 启动，profileDir 默认推导才会落在 temp profile 而非真实 ~/.dsh
     const routes = boot(tempHome, relayDir);
     const { host, base } = await serve(routes);
@@ -185,6 +188,15 @@ test("uninstall 路由：移除 include 块 + package.json 依赖/bundle + 本�
       assert.equal(r.removedDep, true, "应移除 package.json 依赖");
       assert.equal(r.removedBundle, true, "应移除 dsh.profile.bundles 条目");
       assert.equal(r.removedDir, true, "应删除本地插件目录与 node_modules 链接");
+
+      // 运行时/bridge 清理（隔离模式下只清空配置目录，绝不触碰真实 launchd 服务）
+      assert.equal(r.relayDirRemoved, true, "配置目录 relayDir 应被整目录清空");
+      assert.equal(r.stoppedService, false, "DSH_RELAY_SKIP_SERVICE=1 → 不做真实服务操作");
+      assert.equal(r.removedPlist, false, "DSH_RELAY_SKIP_SERVICE=1 → 不删自启动 plist");
+      assert.deepEqual(r.killedPids, [], "DSH_RELAY_SKIP_SERVICE=1 → 不杀进程");
+      assert.equal(existsSync(relayDir), false, "relayDir 物理上应已不存在");
+      assert.match(String(r.detail), /配置目录已清空/, "detail 应说明配置目录已清空");
+      assert.match(String(r.detail), /请重启 dsh web/, "detail 应提示重启生效");
 
       const patch = await readFile(patchFile, "utf8");
       assert.ok(!patch.includes("dsh-remote-ui"), "patch 不应再引用 dsh-remote-ui");
@@ -198,6 +210,7 @@ test("uninstall 路由：移除 include 块 + package.json 依赖/bundle + 本�
       host.close();
     }
   } finally {
+    delete process.env.DSH_RELAY_SKIP_SERVICE;
     await rm(tempHome, { recursive: true, force: true });
   }
 });

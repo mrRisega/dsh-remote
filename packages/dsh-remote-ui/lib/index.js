@@ -5,13 +5,15 @@
 //   - 查询/启停 bridge（launchctl，plist 缺失时自动生成，逻辑与 dsh-setup.mjs 一致）
 //   - 代理 relay API（captcha / register / login / public-config），直连、不走系统代理
 //   - 自管理 self*（版本可见 / 新版检测 / 一键在线更新 / 彻底卸载）：插件市场没有更新卸载按钮，
-//     面板内即官方管理入口；更新=后台 npx @mrrisega/dsh-remote@latest（幂等补齐运行环境并重启 bridge）
+//     面板内即官方管理入口；更新=后台 npx @mrrisega/dsh-remote@latest（幂等补齐运行环境并重启 bridge）；
+//     彻底卸载=profile 插件清理（uninstallSelf）+ 运行时清理（uninstallRuntime：停 bridge 自启动 /
+//     删 plist|unit / 杀残留进程 / 清空配置目录 ~/.dsh-remote），0.4.7 起回归真正「未安装」状态
 //   - 运行时自愈：缺运行环境自动后台安装、登录后自动拉起 bridge（0.4.2 起）
 //   - 0.1.2+ ?token 浏览器鉴权会话代持（0.4.1 起）
 //
 // 不依赖任何第三方包：只使用 node 内置模块与 cordis 注入的 webServer 服务。
 import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync, accessSync, chmodSync, openSync, closeSync, rmSync, constants as fsConstants } from "node:fs";
-import { join, dirname } from "node:path";
+import { join, dirname, sep } from "node:path";
 import { execSync, spawn } from "node:child_process";
 import { homedir, hostname, platform } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -231,6 +233,7 @@ function setCookieOf(res) {
 }
 
 async function mintHarnessCookie(ctx, relayDir) {
+  if (UNINSTALLED_DIRS.has(relayDir)) return false; // 已彻底卸载：不再代持会话、不再重建配置目录
   try {
     const port = ctx.webServer?.port;
     if (!port) return false;
@@ -248,6 +251,8 @@ async function mintHarnessCookie(ctx, relayDir) {
     const res = await fetch(tokenUrl, { redirect: "manual", signal: AbortSignal.timeout(6000) });
     const cookie = setCookieOf(res).split(";")[0].trim();
     if (!cookie || !cookie.startsWith("dsh-auth-")) return false;
+    // 竞态兜底：fetch 期间用户点击了「彻底卸载」→ 不得重建已被清空的配置目录
+    if (UNINSTALLED_DIRS.has(relayDir)) return false;
     const out = { authority: `127.0.0.1:${port}`, cookie, mintedAt: Date.now() };
     mkdirSync(dirname(configPathOf(relayDir)), { recursive: true });
     writeFileSync(join(relayDir, HARNESS_COOKIE_FILE), JSON.stringify(out, null, 2), { mode: 0o600 });
@@ -366,6 +371,7 @@ function appendLogLine(relayDir, name, line) {
  * 注意：默认优先官方源——镜像(npmmirror)可能滞后于刚发布的版本，装到旧版会把
  * 已被 0.4.5 移除的“用户 include”重新写回 profile（历史上造成 dsh web 重复 ID 崩溃）。 */
 function ensureRuntime(relayDir) {
+  if (UNINSTALLED_DIRS.has(relayDir)) return false; // 已彻底卸载：不再自动安装运行环境
   if (existsSync(join(relayDir, "dsh-setup.mjs"))) return true;
   const marker = join(relayDir, PROVISION_MARKER);
   if (existsSync(marker)) return false; // 正在安装中
@@ -422,6 +428,10 @@ function writeAutostartFile(relayDir) {
 
 /** 启动 bridge：确保 plist 存在 → launchctl bootstrap（回退 load -w）。 */
 function startBridge(relayDir) {
+  if (UNINSTALLED_DIRS.has(relayDir)) {
+    // 已彻底卸载：面板/自愈在重启前可能仍在内存中，禁止再把自启动与 plist 拉回来
+    return { ok: false, status: "uninstalled", detail: "插件已彻底卸载，重启 dsh web 后生效" };
+  }
   const plistPath = launchAgentPath();
   if (!plistPath) return { ok: false, status: "unsupported", detail: "仅支持 macOS" };
   if (!existsSync(plistPath)) writeAutostartFile(relayDir);
@@ -444,6 +454,7 @@ function scheduleRuntime(relayDir) {
   let done = false;
   const iv = setInterval(() => {
     if (done) { clearInterval(iv); return; }
+    if (UNINSTALLED_DIRS.has(relayDir)) { done = true; clearInterval(iv); return; } // 已彻底卸载：自愈 watcher 停摆
     try {
       const cfg = loadConfig(relayDir);
       const hasAcct = Boolean((cfg.phone || cfg.email) && cfg.password) || Boolean(cfg.local_key);
@@ -469,6 +480,112 @@ function stopBridge() {
   const r = sh(`launchctl bootout ${target}`);
   const st = launchdStatus();
   return { ok: !st.running, status: st.running ? "failed" : "stopped", pid: null, detail: st.running ? (r.stderr || "停止失败").trim() : void 0 };
+}
+
+// ---------- 彻底卸载：bridge 自启动 / 残留进程 / 配置目录 ----------
+
+/**
+ * 已执行「彻底卸载」的 relayDir 集合。卸载动作本身不改代码，但 dsh web 重启前本插件仍在内存中：
+ * 自愈调度（scheduleRuntime/ensureRuntime/startBridge）与浏览器会话代持（mintHarnessCookie）
+ * 若继续执行，会把刚清空的配置目录 / 自启动服务重新拉起来——故卸载后本进程内一律停摆，
+ * 直到 dsh web 重启（profile 引用已移除，插件整体不再加载）或重新激活（apply 时清除）。
+ */
+const UNINSTALLED_DIRS = new Set();
+
+/** 标记某 relayDir 已完成彻底卸载（其后续自愈/代持调度全部停摆）。 */
+function markUninstalled(relayDir) {
+  if (relayDir) UNINSTALLED_DIRS.add(relayDir);
+}
+
+/**
+ * 彻底卸载 —— 「运行时/bridge」部分：把本机 dsh-remote 运行时回归到未安装状态。
+ * 执行顺序（每步独立 try/catch，单项失败不致命，不影响后续步骤；结果以标志位返回）：
+ *   1) 停掉自启动服务并移除自启动文件：macOS launchctl bootout com.dshremote.bridge +
+ *      删 ~/Library/LaunchAgents/com.dshremote.bridge.plist；Linux systemctl --user
+ *      stop/disable dsh-bridge（+ 删 ~/.config/systemd/user/dsh-bridge.service）。
+ *      ⚠ 必须先停服务再删配置目录：否则 launchd KeepAlive / systemd Restart 会立刻
+ *      重启一个「指向已被删除文件」的进程；
+ *   2) 杀掉仍存活的手动 watcher/bridge 进程（launchd/systemd 托管的进程已随 bootout 结束，
+ *      manualStatus() 本身也排除了本进程与 launchd 托管链）；
+ *   3) rm -rf 配置目录 relayDir（账号/设备密钥/.dsh-config.json/.harness-cookie.json/
+ *      固化运行时 dsh-setup.mjs + clients 等全部残留）。
+ * 安全护栏：
+ *   - DSH_RELAY_SKIP_SERVICE=1（测试隔离开关，生产勿设）：跳过 1/2 的一切系统级操作，
+ *     只清理配置目录——避免测试真的去 launchctl / systemctl / kill 真实服务；
+ *   - 自启动文件只处理「属于当前 HOME 的 plist/unit」，误配/测试环境不碰同名真实服务；
+ *   - 配置目录删除前校验：不是 "/"、不是家目录、不是 dsh web profile 目录或其父级（防误删用户数据）。
+ */
+function uninstallRuntime(relayDir, protectedPath) {
+  const out = {
+    stoppedService: false, // 自启动服务原本在运行且已停止
+    removedPlist: false,   // 自启动文件（plist / systemd unit）已删除
+    killedPids: [],        // 额外结束的残留进程 pid 列表
+    removedDir: false,     // 配置目录 relayDir 已整目录清空
+    servicePlatform: platform() === "darwin" ? "launchd" : platform() === "linux" ? "systemd" : "none",
+  };
+  const skipService = process.env.DSH_RELAY_SKIP_SERVICE === "1";
+  if (!skipService) {
+    // a) 停服务 + 移除自启动文件
+    try {
+      if (platform() === "darwin") {
+        // 只处理「plist 位于当前 HOME」的服务：本插件/dsh-setup.mjs 安装的服务一定在此
+        const plistPath = launchAgentPath();
+        if (plistPath && existsSync(plistPath)) {
+          if (launchdStatus().running) {
+            const r = stopBridge(); // launchctl bootout → KeepAlive 一并失效
+            out.stoppedService = r.ok;
+          }
+          rmSync(plistPath, { force: true });
+          out.removedPlist = !existsSync(plistPath);
+        }
+      } else if (platform() === "linux") {
+        // systemd --user 用户态服务，与 dsh-setup.mjs 安装的 dsh-bridge 同名
+        const isActive = sh("systemctl --user is-active dsh-bridge");
+        if (isActive.ok && String(isActive.stdout).trim() === "active") {
+          sh("systemctl --user stop dsh-bridge");
+          const after = sh("systemctl --user is-active dsh-bridge");
+          out.stoppedService = !(after.ok && String(after.stdout).trim() === "active");
+        }
+        sh("systemctl --user disable dsh-bridge"); // 幂等；失败不致命
+        const unitPath = join(homedir(), ".config", "systemd", "user", "dsh-bridge.service");
+        if (existsSync(unitPath)) {
+          try { rmSync(unitPath, { force: true }); } catch { /* 非关键 */ }
+          sh("systemctl --user daemon-reload");
+          out.removedPlist = !existsSync(unitPath);
+        }
+      }
+    } catch { /* 服务清理失败不致命：目录照常清理，剩余残留可由用户手动处理 */ }
+    // b) 杀残留手动进程（launchd 托管的已随 bootout 结束；manualStatus 排除本进程）
+    try {
+      const manual = manualStatus();
+      const targets = [...manual.watcher, ...manual.bridge];
+      for (const pid of targets) {
+        try { process.kill(pid, "SIGTERM"); out.killedPids.push(pid); } catch { /* EPERM/ESRCH 忽略 */ }
+      }
+      if (targets.length) {
+        try { execSync("sleep 1", { timeout: 3000 }); } catch { /* 等待进程退出 */ }
+        for (const pid of targets) {
+          if (pidAlive(pid)) {
+            try { process.kill(pid, "SIGKILL"); } catch { /* 已退出 */ }
+          }
+        }
+      }
+    } catch { /* ignore */ }
+  }
+  // c) 清空配置目录（账号/密钥/会话 cookie/固化运行时等全部残留）
+  try {
+    const isRoot = dirname(relayDir) === relayDir;                     // "/" 或盘符根
+    const isHome = relayDir === homedir();
+    const hitsProfile = Boolean(protectedPath) && (
+      relayDir === protectedPath || relayDir.startsWith(protectedPath + sep)
+      || protectedPath.startsWith(relayDir + sep)
+    ); // 配置目录误指向 dsh web profile → 绝不整目录删除
+    if (relayDir && !isRoot && !isHome && !hitsProfile && existsSync(relayDir)) {
+      rmSync(relayDir, { recursive: true, force: true });
+      out.removedDir = !existsSync(relayDir);
+    }
+  } catch { /* 目录正被占用等：删除失败不致命（残留可由用户手动删除） */ }
+  return out;
 }
 
 // ---------- relay API 代理（直连，不走系统代理；undici 默认忽略代理环境变量） ----------
@@ -713,7 +830,7 @@ async function proxyFeedback(relayDir, req, res, pathname) {
 // ---------- 自管理：版本 / 在线更新 / 彻底卸载（面板内“版本与更新”卡片） ----------
 
 /** 插件自身发布版本（与 dsh-remote 根包同步递增）。 */
-const PLUGIN_VERSION = "0.4.6";
+const PLUGIN_VERSION = "0.4.7";
 const UPDATE_LOG = ".dsh-update.log";
 const UPDATE_MARKER = ".dsh-update-running";
 
@@ -796,7 +913,7 @@ function tailOf(filePath, lines = 24) {
   } catch { return ""; }
 }
 
-/** 彻底卸载（兼容市场“拒绝改写用户补丁”的场景）：移除 include、依赖、bundle、本地目录与链接。 */
+/** 彻底卸载第 2 步 —— profile 插件清理（兼容市场“拒绝改写用户补丁”）：移除 include、依赖、bundle、本地目录与链接。 */
 function uninstallSelf(relayDir, profileDir, patchFile, pkgFile) {
   const out = { removedPatch: false, removedDep: false, removedDir: false, removedBundle: false };
   try {
@@ -875,8 +992,30 @@ function registerRoutes(ctx, relayDir) {
       method: "POST",
       path: "/dsh-remote/self/uninstall",
       handler: async (_req, res) => {
-        const r = uninstallSelf(relayDir, profileDir, join(profileDir, "cordis.patch.yml"), join(profileDir, "package.json"));
-        sendJson(res, 200, { ok: true, ...r, detail: "已移除插件引用与本地文件，重启 dsh web 后完全卸载生效" });
+        // 彻底卸载 = ① 运行时/bridge 清理（停自启动 → 杀残留 → 清空配置目录，顺序防 KeepAlive 复活）
+        //           + ② 插件 profile 清理（include 块/依赖/bundle/本地目录与链接，解锁市场卸载）
+        const rt = uninstallRuntime(relayDir, profileDir);
+        const prof = uninstallSelf(relayDir, profileDir, join(profileDir, "cordis.patch.yml"), join(profileDir, "package.json"));
+        // 卸载后本进程内（直到重启）自愈/代持调度一律停摆，不再重建配置目录或拉起 bridge
+        markUninstalled(relayDir);
+        const bits = [];
+        if (prof.removedPatch || prof.removedDep || prof.removedBundle || prof.removedDir) bits.push("插件引用与本地文件已移除");
+        if (rt.stoppedService) bits.push("bridge 自启动服务已停止");
+        if (rt.removedPlist) bits.push("自启动项已删除");
+        if (rt.killedPids.length) bits.push(`已结束 ${rt.killedPids.length} 个残留进程`);
+        if (rt.removedDir) bits.push("配置目录已清空（账号/密钥/固化运行时等）");
+        bits.push("请重启 dsh web 后完全卸载生效（本插件与远程控制将消失）；如需再次使用，在插件市场重新安装即可。");
+        sendJson(res, 200, {
+          ok: true,
+          ...prof, // removedPatch / removedDep / removedBundle / removedDir(profile 插件目录)
+          servicePlatform: rt.servicePlatform,
+          stoppedService: rt.stoppedService,
+          removedPlist: rt.removedPlist,
+          killedPids: rt.killedPids,
+          relayDirRemoved: rt.removedDir, // 配置目录 relayDir 已整目录清空
+          relayDir,
+          detail: bits.join("；"),
+        });
       },
     },
     {
@@ -1147,6 +1286,8 @@ function registerRoutes(ctx, relayDir) {
  */
 export function apply(ctx, config = {}) {
   const relayDir = config.relayDir || process.env.DSH_RELAY_DIR || DEFAULT_RELAY_DIR;
+  // 全新激活（dsh web 重启后插件重新加载，或卸载后再次安装）→ 解除上次的「已卸载」停摆标记
+  UNINSTALLED_DIRS.delete(relayDir);
   // 清理上次进程残留的安装/更新 marker（宿主被重启/强杀时子进程清理回调会丢失）
   sweepStaleMarkers(relayDir);
   ctx.effect(() => registerRoutes(ctx, relayDir), "dsh-remote-ui: /dsh-remote routes");
