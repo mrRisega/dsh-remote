@@ -41,6 +41,63 @@ const DEFAULT_API = "https://n.risegao.cn:13443/relay-api";
 const DEFAULT_APP_URL = "https://n.risegao.cn:13443/app/";
 const REPO_URL = "https://github.com/mrRisega/dsh-remote";
 
+// ---------- 运行时自物化（npm/npx 安装 → 固化到配置目录，脱离 npx 缓存） ----------
+// npx 每次安装的缓存目录（~/.npm/_npx/<hash>）不固定：缓存一旦清理，指向它的自启动服务
+// 就会像“找不到模块”一样崩溃。因此 npm 形态安装时把 dsh-setup.mjs + clients + 依赖(ws)
+// 固化到 CONFIG_DIR（~/.dsh-remote），自启动服务只指向这个稳定路径。
+// 插件（dsh-remote-ui）的“运行环境已就绪”判断同样以 CONFIG_DIR/dsh-setup.mjs 为准。
+
+function pkgVersion() {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(THIS_DIR, "package.json"), "utf8")).version || "";
+  } catch { return ""; }
+}
+
+/** 向上查找依赖树里的 ws（npx 布局通常提升到缓存根 node_modules，npm 布局则内嵌）。 */
+function findDepWs(startDir) {
+  let d = startDir;
+  while (true) {
+    const cand = path.join(d, "node_modules", "ws");
+    if (fs.existsSync(cand)) return cand;
+    const parent = path.dirname(d);
+    if (parent === d) break;
+    d = parent;
+  }
+  return null;
+}
+
+function ensureRuntimeCopy() {
+  if (!IS_NPM_INSTALL) return; // 仓库开发形态：原地使用
+  fs.mkdirSync(CONFIG_DIR, { recursive: true });
+  const ver = pkgVersion();
+  const setupTarget = path.join(CONFIG_DIR, "dsh-setup.mjs");
+  if (setupTarget === path.join(THIS_DIR, "dsh-setup.mjs")) return; // 已在配置目录内执行
+  const verFile = path.join(CONFIG_DIR, ".dsh-setup-version");
+  let cur = "";
+  try { cur = fs.readFileSync(verFile, "utf8").trim(); } catch { /* 首次 */ }
+  if (fs.existsSync(setupTarget) && cur === ver) return; // 同版本幂等跳过
+  fs.cpSync(path.join(THIS_DIR, "dsh-setup.mjs"), setupTarget);
+  fs.cpSync(path.join(THIS_DIR, "clients"), path.join(CONFIG_DIR, "clients"), { recursive: true, force: true });
+  const wsSrc = findDepWs(THIS_DIR);
+  if (wsSrc) {
+    fs.mkdirSync(path.join(CONFIG_DIR, "node_modules"), { recursive: true });
+    fs.cpSync(wsSrc, path.join(CONFIG_DIR, "node_modules", "ws"), { recursive: true, force: true });
+  }
+  fs.writeFileSync(verFile, ver);
+  console.log(`✅ 运行时已固化到 ${CONFIG_DIR}（自启动指向稳定路径，不再依赖 npx 缓存）`);
+}
+try { ensureRuntimeCopy(); } catch (e) { console.warn(`⚠️ 运行时固化跳过: ${e.message}`); }
+
+/** 自启动服务应指向的 dsh-setup.mjs：优先配置目录内的固化副本，否则当前执行文件。 */
+function runtimeSetupPath() {
+  const local = path.join(CONFIG_DIR, "dsh-setup.mjs");
+  try {
+    fs.accessSync(local, fs.constants.R_OK);
+    return local;
+  } catch { /* 未固化（如仓库开发）→ 用当前文件 */ }
+  return fileURLToPath(import.meta.url);
+}
+
 // ---------- 工具 ----------
 
 function sh(cmd, timeoutMs = 15000, cwd = undefined) {
@@ -137,7 +194,7 @@ function autostartFilePath() {
 }
 
 function writeAutostartFile() {
-  const runCmd = `"${NODE_BIN}" "${fileURLToPath(import.meta.url)}" run`;
+  const runCmd = `"${NODE_BIN}" "${runtimeSetupPath()}" run`;
   if (process.platform === "darwin") {
     const plistPath = autostartFilePath();
     const plist = `<?xml version="1.0" encoding="UTF-8"?>
@@ -145,7 +202,7 @@ function writeAutostartFile() {
 <plist version="1.0"><dict>
   <key>Label</key><string>com.dshremote.bridge</string>
   <key>ProgramArguments</key>
-  <array><string>${NODE_BIN}</string><string>${fileURLToPath(import.meta.url)}</string><string>run</string></array>
+  <array><string>${NODE_BIN}</string><string>${runtimeSetupPath()}</string><string>run</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>${path.join(CONFIG_DIR, ".dsh-bridge.log")}</string>

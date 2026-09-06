@@ -5,8 +5,8 @@
 //   3) 版本可见 + 新版本检测 + 稳健更新（含残留 marker 清理兜底逻辑在 apply 时执行）。
 import assert from "node:assert/strict";
 import http from "node:http";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtemp, mkdir, rm, writeFile, readFile } from "node:fs/promises";
-import { readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -66,24 +66,24 @@ test("self 路由：版本可见 + 运行环境状态（无 npx 环境时不谎�
   }
 });
 
-test("update-check 路由：从 npm 检测新版本（dist-tags.latest 0.4.4 > 当前）", async () => {
+test("update-check 路由：从 npm 检测新版本（dist-tags.latest 9.9.9 > 当前）", async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "dsh-ui-upchk-"));
   const origFetch = globalThis.fetch;
   try {
     const routes = boot(null, tempDir);
     const { host, base } = await serve(routes);
-    // 假 npm 源：registry 请求回 0.4.4，其余请求（本测试自身的 HTTP 调用）走真实 fetch
+    // 假 npm 源：registry 请求回 9.9.9，其余请求（本测试自身的 HTTP 调用）走真实 fetch
     globalThis.fetch = async (url, init) => {
       if (String(url).startsWith("https://registry.")) {
-        return { ok: true, status: 200, json: async () => ({ "dist-tags": { latest: "0.4.4" } }) };
+        return { ok: true, status: 200, json: async () => ({ "dist-tags": { latest: "9.9.9" } }) };
       }
       return origFetch(url, init);
     };
     try {
       const r = await (await fetch(`${base}/dsh-remote/self/update-check`)).json();
       assert.equal(r.ok, true);
-      assert.equal(r.latest, "0.4.4");
-      assert.equal(r.outdated, true, "0.4.4 > 当前版本 → outdated 应为 true");
+      assert.equal(r.latest, "9.9.9");
+      assert.equal(r.outdated, true, "9.9.9 > 当前版本 → outdated 应为 true");
       assert.notEqual(r.current, r.latest);
     } finally {
       host.close();
@@ -136,6 +136,22 @@ test("update 路由：已有更新进行中时拒绝重复触发（防重入）"
     }
   } finally {
     await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("残留 marker 自愈：记录进程已死的 marker 在插件启动时立即清理（不等 30 分钟超时）", () => {
+  const tempDir = mkdtempSync(path.join(os.tmpdir(), "dsh-ui-sweep-"));
+  try {
+    // 模拟“宿主在更新途中被重启”：更新子进程已死，但清理回调随旧宿主丢失
+    const deadPid = 2147483647; // 不可能存在的 pid
+    writeFileSync(path.join(tempDir, ".dsh-setup-installing"), JSON.stringify({ pid: deadPid, at: Date.now() }));
+    writeFileSync(path.join(tempDir, ".dsh-update-running"), JSON.stringify({ pid: deadPid, at: Date.now() }));
+    writeFileSync(path.join(tempDir, ".dsh-config.json"), "{}");
+    boot(null, tempDir); // apply() → sweepStaleMarkers
+    assert.equal(existsSync(path.join(tempDir, ".dsh-setup-installing")), false, "死进程的安装 marker 应被立即清理");
+    assert.equal(existsSync(path.join(tempDir, ".dsh-update-running")), false, "死进程的更新 marker 应被立即清理");
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
   }
 });
 
