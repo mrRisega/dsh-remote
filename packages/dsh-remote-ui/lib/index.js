@@ -6,9 +6,9 @@
 //   - 代理 relay API（captcha / register / login / public-config），直连、不走系统代理
 //
 // 不依赖任何第三方包：只使用 node 内置模块与 cordis 注入的 webServer 服务。
-import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync, accessSync, chmodSync, constants as fsConstants } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync, accessSync, chmodSync, openSync, rmSync, constants as fsConstants } from "node:fs";
 import { join, dirname } from "node:path";
-import { execSync } from "node:child_process";
+import { execSync, spawn } from "node:child_process";
 import { homedir, hostname, platform } from "node:os";
 
 /** 本插件在 host 侧的服务依赖。 */
@@ -250,6 +250,37 @@ function manualStatus() {
   return { watcher, bridge };
 }
 
+// ---------- 插件市场一键全功能：缺桌面运行环境时自动后台安装 dsh-remote ----------
+
+const PROVISION_MARKER = ".dsh-setup-installing";
+const AUTO_INSTALL_LOG = ".dsh-setup-install.log";
+
+/** 插件市场只装了 UI 插件;若桌面缺 dsh-remote 运行环境(dsh-setup.mjs=bridge/自启动),
+ * 由插件在后台自动执行一次 `npx @mrrisega/dsh-remote` 补齐,用户无需手动跑命令。
+ * 已有环境(包括手动 npx 装过)直接跳过。返回 true=已就绪。 */
+function ensureRuntime(relayDir) {
+  if (existsSync(join(relayDir, "dsh-setup.mjs"))) return true;
+  const marker = join(relayDir, PROVISION_MARKER);
+  if (existsSync(marker)) return false; // 正在安装中
+  try {
+    mkdirSync(relayDir, { recursive: true });
+    writeFileSync(marker, String(Date.now()), { mode: 0o600 });
+    const log = join(relayDir, AUTO_INSTALL_LOG);
+    const npx = process.platform === "win32" ? "npx.cmd" : "npx";
+    const child = spawn(npx, ["--yes", "@mrrisega/dsh-remote"], {
+      detached: true,
+      stdio: ["ignore", openSync(log, "a"), openSync(log, "a")]
+    });
+    child.unref();
+    console.log(`[dsh-remote-ui] 检测到缺少桌面运行环境,已在后台自动安装(日志: ${log}),完成后将自动启动 bridge`);
+    return false;
+  } catch (e) {
+    console.warn(`[dsh-remote-ui] 自动安装启动失败: ${e.message}`);
+    try { rmSync(marker, { force: true }); } catch { /* ignore */ }
+    return false;
+  }
+}
+
 /** 生成 plist（与 dsh-setup.mjs writeAutostartFile 同构），返回路径。 */
 function writeAutostartFile(relayDir) {
   const plistPath = launchAgentPath();
@@ -289,6 +320,29 @@ function startBridge(relayDir) {
   if (!boot.ok) return { ok: false, status: "failed", detail: (boot.stderr || boot.stdout).trim() || "launchctl 启动失败" };
   const st = launchdStatus();
   return { ok: st.running, status: st.running ? "running" : "failed", pid: st.pid, detail: st.running ? void 0 : "服务未进入运行态" };
+}
+
+/** 运行时自愈 watcher:账号就绪后若环境缺失则自动安装;装好/重启后自动拉起 bridge。 */
+function scheduleRuntime(relayDir) {
+  let done = false;
+  const iv = setInterval(() => {
+    if (done) { clearInterval(iv); return; }
+    try {
+      const cfg = loadConfig(relayDir);
+      const hasAcct = Boolean((cfg.phone || cfg.email) && cfg.password) || Boolean(cfg.local_key);
+      if (!hasAcct) return;
+      const setupUrl = join(relayDir, "dsh-setup.mjs");
+      if (!existsSync(setupUrl)) {
+        ensureRuntime(relayDir);
+        return;
+      }
+      const st = launchdStatus();
+      if (st.running) { done = true; clearInterval(iv); return; }
+      startBridge(relayDir);
+    } catch { /* 下一轮再试 */ }
+  }, 12_000);
+  iv.unref?.();
+  return () => clearInterval(iv);
 }
 
 /** 停止 bridge：launchctl bootout。 */
@@ -814,5 +868,7 @@ export function apply(ctx, config = {}) {
   ctx.effect(() => registerRoutes(ctx, relayDir), "dsh-remote-ui: /dsh-remote routes");
   // 0.1.2-rc.1+ 浏览器会话代持：换取 Harness 会话 Cookie 供 bridge 上游携带（手机点设备不再 401 白页）
   ctx.effect(() => scheduleHarnessMint(ctx, relayDir), "dsh-remote-ui: harness browser-session mint");
+  // 插件市场一键全功能:缺桌面运行环境则自动安装,登录后自动拉起 bridge(不依赖用户跑 npx)
+  ctx.effect(() => scheduleRuntime(relayDir), "dsh-remote-ui: runtime self-provision");
   ctx.logger?.info?.(`dsh-remote-ui: /dsh-remote routes ready (relayDir=${relayDir})`);
 }
