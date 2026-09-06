@@ -1,4 +1,13 @@
-# dsh-remote-ui — dsh web 远程控制插件
+# dsh-remote-ui — 公网远程控制 dsh web 的插件
+
+> **给 DeepSeek Harness（dsh web）一个「随时随地」的公网入口。**
+> 安装后在 dsh web 的设置页登录账号，即得到一个专属的**加密远程地址**：人在办公室外、
+> 用手机流量或任意网络打开它，都能像坐在电脑前一样操作 dsh——继续对话、看工具执行、
+> 审批授权、改设置。**不要求手机和电脑在同一 WiFi/局域网**，也不需要公网 IP、
+> 路由器映射或自己搭服务器，开箱即用、全程加密。
+> 懂技术的用户也可以把服务部署到自己的服务器上，数据与流量完全自控（普通用户无需关心）。
+
+以下为面向开发者/维护者的实现说明：
 
 Embeds the dsh-remote configuration UI into dsh web itself (the "everything is a
 plugin" model):
