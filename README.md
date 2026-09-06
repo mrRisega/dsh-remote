@@ -79,6 +79,12 @@ npx @mrrisega/dsh-remote setup --server wss://<你的域名>:端口 --key <访�
 其他命令：`settings`（设置页）、`status`（查看状态）、`run`（前台调试）、
 `plugin`（重装/卸载 dsh web 插件）。运行 `npx @mrrisega/dsh-remote --help` 查看完整说明。
 
+> **版本与更新 / 卸载**：dsh 官方插件市场目前不提供更新按钮，也不会改写用户补丁（因此市场
+> 卸载会提示「仍通过 insert 引用 dsh-remote-ui」而拒绝）。插件设置面板里已内置管理入口
+> （dsh web → 设置 → 「远程控制」→「🔄 版本与更新」卡片）：显示当前版本、自动检测 npm 新版、
+> **一键在线更新**（后台补运行环境并重启 bridge，完成后重启 dsh web 生效）、以及**彻底卸载**
+> （移除补丁 include / 依赖 / bundle 与本地文件，之后市场卸载或直接重启均可完成卸载）。
+
 源码安装（开发 / 自建服务器）：`git clone https://github.com/mrRisega/dsh-remote.git`
 并 `npm install`，见下文各组件说明。
 
