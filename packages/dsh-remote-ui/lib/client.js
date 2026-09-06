@@ -1177,7 +1177,16 @@ window.__ModuleLoader__.load({
                 : h("button", { type: "button", className: "dru-btn dru-btn-danger", disabled: busy !== "", onClick: function () { toggleBridge(false); } }, busy === "stop" ? "停止中…" : "停止 bridge")
             ),
             h("div", { className: "dru-meta" }, st && st.config && st.config.deviceId ? "设备 ID：" + st.config.deviceId : "设备 ID：生成中"),
-            h("div", { className: "dru-meta" }, st ? (st.service && st.service.plistExists ? "自启动服务已安装" : "自启动服务未安装（启动时自动创建）") : "")
+            h("div", { className: "dru-meta" }, st ? (st.service && st.service.plistExists ? "自启动服务已安装" : "自启动服务未安装（启动时自动创建）") : ""),
+            st && st.service && st.service.bindError
+              ? h("div", { className: "dru-msg dru-msg-err", style: { marginTop: 8 } },
+                  "⚠️ 设备注册失败：" + (st.service.bindError.message || "未说明原因"),
+                  h("div", { className: "dru-hint", style: { marginTop: 4 } },
+                    st.service.bindError.code === "device_limit_exceeded"
+                      ? "已达本套餐设备数上限。若是同一台电脑重装，稍等片刻会自动顶替旧设备；仍未恢复请在手机端「设备管理」解绑旧设备（免费用户每月可解绑 3 次）后，回到这里点「启动 bridge」。"
+                      : "请确认网络与账号状态后重试；仍未解决可点下方「彻底卸载」后重新安装。")
+                )
+              : null
           ),
           // 关于 dsh-remote（开源项目说明卡片）
           card("📖 关于 dsh-remote", [
