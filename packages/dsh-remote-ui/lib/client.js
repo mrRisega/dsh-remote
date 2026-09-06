@@ -124,6 +124,11 @@ window.__ModuleLoader__.load({
       ".dru-popup-foot button{border:none;background:none;color:#57606a;cursor:pointer;font-size:12px;font-family:inherit;padding:4px 6px}",
       ".dru-popup-foot button:hover{color:#0969da}",
       ".dru-popup .dru-msg{text-align:left}",
+      // ── 自管理：版本与更新（插件面板内提供在线更新/彻底卸载，市场无更新按钮） ──
+      ".dru-ver-badge{display:inline-block;font-size:11px;border-radius:999px;padding:1px 8px;margin-left:6px;vertical-align:1px}",
+      ".dru-ver-badge-new{color:#9a6700;background:#fff8c5;border:1px solid #eed888}",
+      ".dru-ver-badge-ok{color:#1a7f37;background:#dafbe1;border:1px solid #aceebb}",
+      ".dru-up-log{margin-top:8px;background:#0d1117;color:#e6edf3;border-radius:8px;padding:8px 10px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;line-height:1.5;white-space:pre-wrap;word-break:break-word;max-height:150px;overflow:auto}",
     ].join("\n");
     document.head.appendChild(styleEl);
 
@@ -607,6 +612,161 @@ window.__ModuleLoader__.load({
     // 通用「远程控制」图标（🖥 风格 emoji，与面板内既有 emoji 图标体系一致）：
     // 栏目导航 label 与栏目头部均使用它。原侧边栏入口（电源图标按钮）已随入口迁移移除。
 
+    // ── 版本与更新卡片（自管理：市场没有更新按钮，这里提供在线一键更新/彻底卸载） ──
+    // 数据来自 node 半新增的 /dsh-remote/self* 路由；逻辑均在插件 node 半实现，
+    // 因此无论插件从「插件市场」还是 npx 安装，界面与行为完全一致。
+    function SelfManageCard() {
+      var verArr = useState(null); var ver = verArr[0]; var setVer = verArr[1];       // {version, runtimeReady}
+      var chkArr = useState(null); var chk = chkArr[0]; var setChk = chkArr[1];       // {current, latest, outdated}
+      var chkBusyArr = useState(false); var chkBusy = chkBusyArr[0]; var setChkBusy = chkBusyArr[1];
+      var upBusyArr = useState(false); var upBusy = upBusyArr[0]; var setUpBusy = upBusyArr[1];
+      var unBusyArr = useState(false); var unBusy = unBusyArr[0]; var setUnBusy = unBusyArr[1];
+      var logArr = useState(""); var log = logArr[0]; var setLog = logArr[1];         // 更新日志尾部
+      var updArr = useState(false); var updating = updArr[0]; var setUpdating = updArr[1]; // 更新任务是否仍在跑
+      var doneArr = useState(false); var updated = doneArr[0]; var setUpdated = doneArr[1]; // 本轮已更新完成（提示重启）
+      var armArr = useState(false); var armed = armArr[0]; var setArmed = armArr[1];   // 彻底卸载二次确认
+      var msgArr = useState(null); var selfMsg = msgArr[0]; var setSelfMsg = msgArr[1]; // {kind, text}
+
+      var loadVer = useCallback(function () {
+        api("/dsh-remote/self").then(function (b) {
+          if (b && b.ok) setVer(b);
+        }).catch(function () {});
+      }, []);
+
+      var doCheck = useCallback(function () {
+        setChkBusy(true);
+        api("/dsh-remote/self/update-check").then(function (b) {
+          if (b && b.ok) setChk(b);
+          else setSelfMsg({ kind: "err", text: "检查更新失败：" + ((b && (b.error || b.detail)) || "未知错误") });
+        }).catch(function (e) {
+          setSelfMsg({ kind: "err", text: "无法连接更新服务：" + e.message });
+        }).finally(function () { setChkBusy(false); });
+      }, []);
+
+      // 轮询更新日志：点击一键更新后，每 2s 拉一次日志；直到 running=false 视为完成
+      var logTimer = useCallback(function (force) {
+        if (!force && updating) return;
+        api("/dsh-remote/self/update-log").then(function (b) {
+          if (b && b.ok) {
+            setLog(b.log || "");
+            if (!b.running) {
+              setUpdating(false);
+              setUpdated(true);
+              loadVer();
+              return;
+            }
+          }
+          setUpdating(true);
+        }).catch(function () { setUpdating(false); });
+      }, [updating, loadVer]);
+
+      useEffect(function () { loadVer(); doCheck(); }, [loadVer, doCheck]);
+      useEffect(function () {
+        if (!updating) return;
+        var iv = setInterval(function () {
+          api("/dsh-remote/self/update-log").then(function (b) {
+            if (!b || !b.ok) return;
+            setLog(b.log || "");
+            if (!b.running) {
+              clearInterval(iv);
+              setUpdating(false);
+              setUpdated(true);
+              loadVer();
+              doCheck();
+            }
+          }).catch(function () {});
+        }, 2000);
+        return function () { clearInterval(iv); };
+      }, [updating, loadVer, doCheck]);
+
+      var doUpdate = function () {
+        setUpBusy(true);
+        setUpdated(false);
+        setSelfMsg(null);
+        post("/dsh-remote/self/update", {}).then(function (b) {
+          if (b && b.ok) {
+            setSelfMsg({ kind: "ok", text: "更新已在后台开始，正在下载安装…（本页会实时显示进度日志）" });
+            setUpdating(true);
+            logTimer(true);
+          } else {
+            var detail = String((b && (b.detail || b.error)) || "更新启动失败");
+            // 另一种常见情况：node 半返回 ok:false + “已有更新在进行中” → 转为跟踪进度而非报错
+            api("/dsh-remote/self/update-log").then(function (lb) {
+              if (lb && lb.ok && lb.running) {
+                setSelfMsg({ kind: "ok", text: "检测到已有一次更新正在进行，正在跟踪进度…" });
+                setUpdating(true);
+                logTimer(true);
+              } else {
+                setSelfMsg({ kind: "err", text: detail });
+              }
+            }).catch(function () { setSelfMsg({ kind: "err", text: detail }); });
+          }
+        }).catch(function (e) {
+          setSelfMsg({ kind: "err", text: "更新失败：" + e.message });
+        }).finally(function () { setUpBusy(false); });
+      };
+
+      var doUninstall = function () {
+        if (!armed) { setArmed(true); return; }
+        setUnBusy(true);
+        setSelfMsg(null);
+        post("/dsh-remote/self/uninstall", {}).then(function (b) {
+          if (b && b.ok) {
+            setArmed(false);
+            setSelfMsg({ kind: "ok", text: "已移除插件引用与本地文件。请重启 dsh web：插件将完全卸载（本栏目也会消失）。之后如需重新安装，直接在插件市场再次安装即可。" });
+          } else {
+            setArmed(false);
+            setSelfMsg({ kind: "err", text: "卸载失败：" + ((b && (b.error || b.detail)) || "未知错误") });
+          }
+        }).catch(function (e) {
+          setArmed(false);
+          setSelfMsg({ kind: "err", text: "卸载失败：" + e.message });
+        }).finally(function () { setUnBusy(false); });
+      };
+
+      var outdated = !!(chk && chk.outdated && chk.latest && chk.latest !== chk.current);
+      var currentV = (ver && ver.version) || (chk && chk.current) || "…";
+      var runtimeReady = ver ? !!ver.runtimeReady : null;
+
+      return h("div", { className: "dru-card", style: { marginTop: 2 } },
+        h("h3", null, "🔄 版本与更新"),
+        h("div", { className: "dru-status-line" },
+          h("span", null, "插件版本 v" + currentV),
+          chk === null && chkBusy ? h("span", { className: "dru-meta", style: { margin: 0 } }, "（检查新版本中…）") : null,
+          chk && outdated
+            ? h("span", { className: "dru-ver-badge dru-ver-badge-new" }, "发现新版本 v" + chk.latest)
+            : chk && !outdated ? h("span", { className: "dru-ver-badge dru-ver-badge-ok" }, "已是最新版本") : null
+        ),
+        h("div", { className: "dru-meta" },
+          runtimeReady === false ? "⚠ 桌面运行环境缺失（点击下方「一键更新」会自动补全并启动）" : runtimeReady === true ? "桌面运行环境正常" : "读取运行环境中…"
+        ),
+        h("div", { className: "dru-actions", style: { marginTop: 10 } },
+          outdated
+            ? h("button", { type: "button", className: "dru-btn dru-btn-primary", disabled: upBusy || unBusy || chkBusy || updating, onClick: doUpdate },
+                upBusy ? "更新启动中…" : updating ? "正在更新…" : "一键更新到 v" + chk.latest)
+            : h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: upBusy || unBusy || chkBusy || updating, onClick: doUpdate },
+                updating ? "正在更新…" : (ver && !ver.runtimeReady) ? "安装并启动（一键修复）" : "重新检查 / 修复"),
+          h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: chkBusy || updating || upBusy, onClick: doCheck }, chkBusy ? "检查中…" : "检查更新"),
+          h("button", {
+            type: "button",
+            className: "dru-btn dru-btn-danger",
+            style: { marginLeft: "auto" },
+            disabled: unBusy || updating || upBusy,
+            onClick: doUninstall
+          }, unBusy ? "卸载中…" : armed ? "⚠ 再点一次确认彻底卸载" : "彻底卸载")
+        ),
+        updated
+          ? h("div", { className: "dru-msg dru-msg-ok" },
+              "✅ 更新已完成，最新代码已就位。请", h("strong", null, "重启 dsh web"), "后生效；桌面 bridge 会随系统自启自动运行新版本。")
+          : null,
+        log ? h("div", { className: "dru-up-log", title: "更新日志（尾部）" }, log) : null,
+        selfMsg ? h("div", { className: "dru-msg dru-msg-" + selfMsg.kind }, selfMsg.text) : null,
+        h("div", { className: "dru-hint", style: { marginTop: 8 } },
+          armed ? "卸载会移除插件引用与本地文件；远程控制用的桌面 bridge 与数据目录保留，可随时重新安装。" :
+            "插件市场没有更新/卸载按钮（dsh 官方市场暂不提供），本卡片即官方管理入口：检测新版、一键在线更新、彻底卸载都在这里完成。")
+      );
+    }
+
     // ── 面板主体（渲染于设置页 settings.section 栏目内） ─────────────────────
     function RemoteControlSection(props) {
 
@@ -1023,6 +1183,8 @@ window.__ModuleLoader__.load({
             h("div", { className: "dru-hint", style: { marginBottom: 6 } }, "③ 也可以自建：项目完全开源，有服务器可自行部署，流量走自己的服务器，闭环自控。"),
             h("div", { className: "dru-hint" }, "④ 一句话总结：简单省心用 SaaS，技术玩家可自建。")
           ]),
+          // 版本与更新（自管理：检测新版 / 一键在线更新 / 彻底卸载）
+          h(SelfManageCard, null),
           message && h("div", { className: "dru-msg dru-msg-" + message.kind }, message.text)
         );
       }
