@@ -704,6 +704,12 @@ async function composeStatus(relayDir) {
   const cfg = loadConfig(relayDir);
   const launchd = launchdStatus();
   const manual = manualStatus();
+  // 注册/绑定失败提示(bridge 写 .bind-error.json;面板据此展示“已达上限/需解绑”引导)
+  let bindError = null;
+  try {
+    const f = join(relayDir, ".bind-error.json");
+    if (existsSync(f)) bindError = JSON.parse(readFileSync(f, "utf8"));
+  } catch { /* 无/损坏忽略 */ }
   // 远程地址（public-config 的 app_url，取不到用默认）
   const pub = await relayFetch(relayDir, "/api/public-config");
   const pubBody = pub.ok && pub.body && typeof pub.body === "object" ? pub.body : {};
@@ -727,6 +733,7 @@ async function composeStatus(relayDir) {
       launchd,
       manual,
       running: launchd.running || manual.bridge.length > 0,
+      bindError,
     },
     host: hostname(),
   };
@@ -830,7 +837,7 @@ async function proxyFeedback(relayDir, req, res, pathname) {
 // ---------- 自管理：版本 / 在线更新 / 彻底卸载（面板内“版本与更新”卡片） ----------
 
 /** 插件自身发布版本（与 dsh-remote 根包同步递增）。 */
-const PLUGIN_VERSION = "0.4.7";
+const PLUGIN_VERSION = "0.4.8";
 const UPDATE_LOG = ".dsh-update.log";
 const UPDATE_MARKER = ".dsh-update-running";
 

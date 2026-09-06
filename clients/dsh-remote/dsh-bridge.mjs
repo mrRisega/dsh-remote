@@ -47,7 +47,8 @@ import WebSocket from "ws";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { randomBytes, generateKeyPairSync } from "node:crypto";
+import { execSync } from "node:child_process";
+import { randomBytes, generateKeyPairSync, createHash } from "node:crypto";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { gzip as gzipCb } from "node:zlib";
@@ -79,6 +80,46 @@ const EMAIL = process.env.DSH_BRIDGE_EMAIL || "";
 const PHONE = process.env.DSH_BRIDGE_PHONE || EMAIL;
 const PASSWORD = process.env.DSH_BRIDGE_PASSWORD || "";
 const TOKEN = process.env.DSH_BRIDGE_TOKEN || "";
+
+// ---------- 本机稳定指纹(同机重装识别;供服务端自动顶替旧设备) ----------
+
+/** 读取与安装无关的机器级唯一值:macOS IOPlatformUUID / Linux machine-id。 */
+function machineUniqueId() {
+  if (process.env.DSH_BRIDGE_MACHINE_FP) return String(process.env.DSH_BRIDGE_MACHINE_FP).slice(0, 64);
+  if (process.platform === "darwin") {
+    try {
+      const out = execSync("ioreg -rd1 -c IOPlatformExpertDevice", { encoding: "utf8", timeout: 5000 });
+      const m = /"IOPlatformUUID"\s*=\s*"([^"]+)"/.exec(out);
+      if (m && m[1]) return m[1];
+    } catch { /* 兜底 */ }
+  } else if (process.platform === "linux") {
+    for (const f of ["/etc/machine-id", "/var/lib/dbus/machine-id"]) {
+      try {
+        const s = fs.readFileSync(f, "utf8").trim();
+        if (s) return s;
+      } catch { /* 继续 */ }
+    }
+  }
+  return ""; // 读不到(如容器) → 回退宿主名指纹
+}
+/** 稳定指纹:机器唯一值哈希;同机卸载重装后不变。 */
+function machineFingerprint() {
+  const base = machineUniqueId() || `${os.hostname()}|${os.platform()}`;
+  return createHash("sha256").update(`dsh-remote/machine/v1:${base}`).digest("hex").slice(0, 32);
+}
+const MACHINE_FP = machineFingerprint();
+
+/** 绑定/登录失败提示文件:供 dsh web 插件面板读取并展示(如“注册失败,已达到上限”)。 */
+const BIND_ERROR_FILE = path.join(path.dirname(CONFIG_PATH), ".bind-error.json");
+function persistBindError(payload) {
+  try {
+    fs.mkdirSync(path.dirname(BIND_ERROR_FILE), { recursive: true });
+    fs.writeFileSync(BIND_ERROR_FILE, JSON.stringify({ ...payload, at: Date.now() }, null, 2), { mode: 0o600 });
+  } catch { /* 非关键 */ }
+}
+function clearBindError() {
+  try { fs.rmSync(BIND_ERROR_FILE, { force: true }); } catch { /* 非关键 */ }
+}
 
 // ---------- 稳定设备身份(.dsh-config.json) ----------
 
@@ -575,25 +616,36 @@ async function registerDeviceInAccount(token) {
     const r = await fetch(API_BASE + "/api/devices", {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
-      body: JSON.stringify({ device_id: DEVICE_ID, device_name: os.hostname() || "dsh-bridge", pub_key: pubKey })
+      body: JSON.stringify({
+        device_id: DEVICE_ID,
+        device_name: os.hostname() || "dsh-bridge",
+        pub_key: pubKey,
+        machine_fp: MACHINE_FP // v6 同机识别:服务端据此自动顶替旧设备(重装不再被设备数卡死)
+      })
     });
     const d = await r.json().catch(() => ({}));
     if (r.status === 201 || r.status === 200) {
+      clearBindError();
       console.log(`[bridge] ✅ 设备已登记到账号: ${DEVICE_ID}`);
       return;
     }
     if (r.status === 409) {
       const code = d.error?.code || "";
       if (code === "device_limit_exceeded") {
-        console.error(`[bridge] 设备数已达上限: ${d.error?.message || "当前套餐最多绑定 1 台设备"}`);
-        console.error("   请在手机端设备管理或后台移除旧设备后重启。");
+        const msg = d.error?.message || "当前套餐最多绑定 1 台设备";
+        persistBindError({ code, message: msg });
+        console.error(`[bridge] 设备数已达上限: ${msg}`);
+        console.error("   同机重装会自动顶替旧设备;仍失败请到手机端设备管理解绑旧设备后重启(免费每月可解绑 3 次)。");
       } else {
+        persistBindError({ code, status: 409, message: d.error?.message || "绑定冲突" });
         console.error(`[bridge] 设备 ${DEVICE_ID} 绑定失败(${code || 409}): ${d.error?.message || "未知错误"}`);
       }
       process.exit(1);
     }
+    persistBindError({ code: d.error?.code || `http_${r.status}`, status: r.status, message: d.error?.message || "设备登记失败" });
     console.warn(`[bridge] 设备登记失败(${r.status}): ${d.error?.message || "未知错误"}(手机端设备列表可能看不到本设备)`);
   } catch (e) {
+    persistBindError({ code: "api_unreachable", message: `无法连接账号 API: ${e.message}` });
     console.warn(`[bridge] 无法连接账号 API ${API_BASE}: ${e.message}(手机端设备列表可能看不到本设备)`);
   }
 }
