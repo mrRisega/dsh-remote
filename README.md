@@ -63,12 +63,9 @@ dsh-remote 是一个轻量的**隧道模式**远程控制方案：电脑端运�
 npx @mrrisega/dsh-remote
 ```
 
-安装完成后运行下面命令打开设置页，用手机号+密码登录即可（注册在手机端完成，
-登录后 bridge 自动启动）：
-
-```bash
-npx @mrrisega/dsh-remote settings
-```
+安装完成后**无需任何命令**：打开 dsh web → 设置 → 「远程控制」，注册/登录手机号即可
+（注册在手机端完成，登录后 bridge 自动启动；自建用户在同一面板切「自建服务」标签）。
+原来的独立设置页（`dsh-remote settings`）已移除，避免与插件面板重复造成困惑。
 
 自建模式（自己部署了 relay-router，无需账号体系）：
 
@@ -76,7 +73,7 @@ npx @mrrisega/dsh-remote settings
 npx @mrrisega/dsh-remote setup --server wss://<你的域名>:端口 --key <访问密钥>
 ```
 
-其他命令：`settings`（设置页）、`status`（查看状态）、`run`（前台调试）、
+其他命令：`status`（查看状态）、`run`（前台调试）、`settings`（仅显示登录指引）、
 `plugin`（重装/卸载 dsh web 插件）。运行 `npx @mrrisega/dsh-remote --help` 查看完整说明。
 
 > **版本与更新 / 卸载**：dsh 官方插件市场目前不提供更新按钮，也不会改写用户补丁（因此市场

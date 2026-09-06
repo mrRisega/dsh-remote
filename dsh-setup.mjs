@@ -4,7 +4,7 @@
  *
  * 用法:
  *   dsh-remote [setup] [选项]                 一键安装（默认命令，无需任何参数）
- *   dsh-remote settings                        打开本地设置页（登录账号 / 自建配置）
+ *   dsh-remote settings                        提示如何登录（独立设置页已移除，见 dsh web 面板）
  *   dsh-remote run                             前台运行 bridge（调试/守护）
  *   dsh-remote status                          查看配置与服务状态
  *   dsh-remote plugin [--uninstall]            手动安装/卸载 dsh web 远程控制插件
@@ -19,10 +19,10 @@
  *   1. 写入配置 <CONFIG_DIR>/.dsh-config.json（0600；npm 安装时为 ~/.dsh-remote/）
  *   2. 生成自启动服务（macOS launchd / Linux systemd），随 dsh web(3080) 存活自动保活
  *   3. 自动把远程控制插件装进 dsh web 设置页（若检测到 profile）
- *   4. 登录在设置页完成: dsh-remote settings（手机号+密码，或自建密钥）
+ *   4. 登录/连接配置在 dsh web → 设置 → 「远程控制」面板完成（SaaS 注册登录 / 自建切换）
+ *      自建 CLI 用户也可用 `dsh-remote setup --server … --key …`（无需再打开设置页）
  */
 
-import http from "node:http";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -35,7 +35,6 @@ const IS_NPM_INSTALL = THIS_DIR.includes(`${path.sep}node_modules${path.sep}`);
 // 配置目录：npm 安装时放在用户目录（node_modules 内不可写）；仓库开发时放在仓库根。
 const CONFIG_DIR = process.env.DSH_RELAY_DIR || (IS_NPM_INSTALL ? path.join(os.homedir(), ".dsh-remote") : THIS_DIR);
 const CONFIG_PATH = path.join(CONFIG_DIR, ".dsh-config.json");
-const SETTINGS_PORT = 3499;
 // 默认云端服务地址（服务商 SaaS 入口；自建用户用 --server/--key 指向自己的 router）
 const DEFAULT_API = "https://n.risegao.cn:13443/relay-api";
 const DEFAULT_APP_URL = "https://n.risegao.cn:13443/app/";
@@ -281,97 +280,20 @@ function installAutostart() {
   return { path: svcPath, status: r };
 }
 
-// ---------- 设置页（本地 HTTP：远程地址 + 账号/自建配置） ----------
-function serveSettings() {
-  const cfg = loadConfig();
-  const server = http.createServer(async (req, res) => {
-    const url = new URL(req.url, `http://127.0.0.1:${SETTINGS_PORT}`);
-    const send = (code, body, type = "text/html") => {
-      res.writeHead(code, { "Content-Type": type + "; charset=utf-8" });
-      res.end(body);
-    };
+// ---------- settings：旧独立设置页已移除（引导到 dsh web 插件面板） ----------
+// 云服务用户在 dsh web → 设置 → 「远程控制」面板即可注册/登录（自建切换也在此面板）；
+// 独立设置页(127.0.0.1:3499)与面板功能完全重复、且暴露自建表单给普通用户造成困惑,已移除。
+// 保留 `dsh-remote settings` 命令为“引导提示”,避免旧脚本/旧文档直接调它时报错。
+function settingsHint() {
+  console.log(`
+dsh-remote：独立的本地设置页已移除。
 
-    if (req.method === "POST" && url.pathname === "/api/config") {
-      let raw = "";
-      for await (const c of req) raw += c;
-      try {
-        const body = JSON.parse(raw);
-        const local = Boolean(body.local_key || body.server);
-        if (local) {
-          if (!body.server || !body.local_key) {
-            return send(400, JSON.stringify({ ok: false, message: "自建模式需要服务器地址与访问密钥" }), "application/json");
-          }
-          cfg.tunnel_url = normalizeTunnelUrl(body.server);
-          cfg.local_key = String(body.local_key).trim();
-          delete cfg.phone; delete cfg.password;
-        } else {
-          if (!body.phone || !body.password) {
-            return send(400, JSON.stringify({ ok: false, message: "SaaS 模式需要手机号与密码" }), "application/json");
-          }
-          cfg.phone = body.phone; cfg.password = body.password;
-          applySaaSMode(cfg); // 清自建残留,api/tunnel 权威重算
-        }
-        // 自动获取服务端下发的 bridge_secret（device-login 共享密钥，一键安装开箱即用）
-        if (!cfg.bridge_secret && !cfg.local_key) {
-          const pub = await fetchPublicConfig(cfg.api_url || DEFAULT_API);
-          if (pub.bridge_secret) cfg.bridge_secret = String(pub.bridge_secret);
-        }
-        saveConfig(cfg);
-        const r = restartBridgeService();
-        return send(200, JSON.stringify({ ok: true, service: r.ok ? "running" : (r.status || "failed") }), "application/json");
-      } catch { return send(400, JSON.stringify({ ok: false, message: "JSON 解析失败" }), "application/json"); }
-    }
+请直接在 dsh web 里完成登录/连接配置（无需任何命令）：
+  打开 dsh web → 设置 → 「远程控制」→ 注册或登录手机号即可（自建模式切换也在该面板）。
 
-    const mode = cfg.local_key ? "自建服务" : "SaaS 云端服务";
-    const pub = await fetchPublicConfig(cfg.api_url || DEFAULT_API);
-    const remoteUrl = pub.app_url || (cfg.local_key ? (cfg.tunnel_url || "") : DEFAULT_APP_URL);
-
-    const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>dsh-remote 设置</title>
-<style>
-body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:#0d1117;color:#e6edf3;max-width:520px;margin:0 auto;padding:24px}
-h1{font-size:18px}label{display:block;font-size:13px;color:#8b949e;margin:14px 0 6px}
-input{width:100%;padding:11px 13px;border-radius:8px;border:1px solid #30363d;background:#161b22;color:#e6edf3;font-size:15px;box-sizing:border-box}
-button{width:100%;padding:13px;border-radius:8px;border:none;background:#2f81f7;color:#fff;font-size:15px;font-weight:600;cursor:pointer;margin-top:16px}
-.card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:18px;margin-bottom:16px}
-.url{background:#010409;border:1px solid #30363d;border-radius:8px;padding:12px;font-family:monospace;font-size:14px;word-break:break-all}
-.msg{font-size:13px;margin-top:10px;min-height:18px}.ok{color:#3fb950}.err{color:#f85149}
-</style></head><body>
-<h1>dsh-remote 设置</h1>
-<div class="card"><h3 style="margin:0 0 8px">📱 远程控制地址（当前模式：${mode}）</h3>
-<div class="url">${remoteUrl || "（未配置）"}</div>
-<div style="font-size:12px;color:#8b949e;margin-top:8px">手机浏览器打开此地址，即可远程控制本机 dsh web。</div></div>
-<div class="card"><h3 style="margin:0 0 4px">🔑 连接配置</h3>
-<div style="font-size:12px;color:#8b949e;margin-bottom:8px">二选一：填手机号密码（SaaS），或填服务器地址+访问密钥（自建）。</div>
-<label>SaaS 手机号</label><input id="phone" value="${cfg.phone || ""}" autocomplete="tel"/>
-<label>SaaS 密码</label><input id="pass" type="password" placeholder="••••••••" autocomplete="current-password"/>
-<div style="height:1px;background:#30363d;margin:16px 0"></div>
-<label>自建服务器地址（wss://host:port）</label><input id="server" value="${cfg.tunnel_url || ""}" placeholder="wss://relay.example.com"/>
-<label>自建访问密钥</label><input id="lkey" type="password" value="${cfg.local_key || ""}" placeholder="访问密钥"/>
-<button onclick="save()">保存并生效</button>
-<div class="msg" id="msg"></div></div>
-<script>
-async function save(){
-  const m=document.getElementById("msg");m.className="msg";m.textContent="保存中...";
-  const local = document.getElementById("lkey").value.trim() !== "" || document.getElementById("server").value.trim() !== "";
-  try{
-    const r=await fetch("/api/config",{method:"POST",headers:{"content-type":"application/json"},
-      body:JSON.stringify(local
-        ? {server:document.getElementById("server").value.trim(),local_key:document.getElementById("lkey").value.trim()}
-        : {phone:document.getElementById("phone").value.trim(),password:document.getElementById("pass").value})});
-    const d=await r.json();
-    if(d.ok){m.className="msg ok";m.textContent = d.service==="running" ? "✅ 已保存并生效，无需手动重启" : "✅ 已保存（服务状态: "+(d.service||"未知")+"，可运行 dsh-remote setup 修复）";}
-    else{m.className="msg err";m.textContent=d.message||"保存失败";}
-  }catch(e){m.className="msg err";m.textContent="保存失败: "+e.message;}
-}
-</script></body></html>`;
-    return send(200, html);
-  });
-  server.listen(SETTINGS_PORT, "127.0.0.1", () => {
-    console.log(`\n✅ 设置页已打开: http://127.0.0.1:${SETTINGS_PORT}`);
-    console.log("   在浏览器中配置账号或自建连接，查看远程控制地址。Ctrl-C 关闭。\n");
-  });
+自建用户若偏好命令行，可用：
+  dsh-remote setup --server wss://你的域名:端口 --key 访问密钥
+`);
 }
 
 // ---------- run：前台跑 bridge（带配置 + 自启动 watcher） ----------
@@ -400,7 +322,7 @@ async function runBridge() {
     if (!saas && !local) {
       if (!warnedNoLogin) {
         warnedNoLogin = true;
-        console.log("⚠️ 尚未登录：打开设置页 `dsh-remote settings` 登录账号（或配置自建密钥）后自动启动。");
+        console.log("⚠️ 尚未登录：请打开 dsh web → 设置 → 「远程控制」，注册/登录手机号（或切到自建模式）后自动启动。");
       }
       return;
     }
@@ -802,7 +724,7 @@ const raw = process.argv[2];
 const cmd = raw && !raw.startsWith("-") ? raw : "setup";
 const args = raw && !raw.startsWith("-") ? process.argv.slice(3) : process.argv.slice(2);
 if (cmd === "setup" || cmd === "install") await setup(args);
-else if (cmd === "settings") serveSettings();
+else if (cmd === "settings") settingsHint();
 else if (cmd === "run") await runBridge();
 else if (cmd === "plugin") await pluginCmd(process.argv.slice(3));
 else if (cmd === "status") {
@@ -811,13 +733,13 @@ else if (cmd === "status") {
   console.log("配置文件:", CONFIG_PATH);
   console.log("连接模式:", local ? `自建服务（${cfg.tunnel_url || "未设置服务器地址"}）` : `SaaS 云端服务（${cfg.phone || "未配置账号"}）`);
   console.log("API:", cfg.api_url || (local ? "（自建模式无需账号 API）" : DEFAULT_API));
-  console.log("远程地址: 运行 settings 查看最新");
+  console.log("远程地址/登录: 打开 dsh web → 设置 → 「远程控制」查看与操作");
 } else {
   console.log(`dsh-remote — 手机远程控制 dsh web（隧道模式）
 
 用法:
   dsh-remote              一键安装（默认命令，无需任何参数；含插件与自启动）
-  dsh-remote settings     打开本地设置页（登录账号 / 自建配置）
+  dsh-remote settings     显示登录/连接配置指引（独立设置页已移除）
   dsh-remote run          前台运行 bridge（调试）
   dsh-remote status       查看配置与服务状态
   dsh-remote plugin       手动安装 dsh web 远程控制插件（--uninstall 卸载）
@@ -825,7 +747,8 @@ else if (cmd === "status") {
 自建模式（可选）:
   dsh-remote setup --server wss://你的域名:端口 --key 访问密钥
 
-登录: 安装后运行 \`dsh-remote settings\`，用手机号+密码登录（或配置自建密钥）。
+登录/连接配置: 打开 dsh web → 设置 → 「远程控制」→ 注册或登录手机号即可
+（自建用户切「自建服务」标签或直接用上方 setup 命令，无需另开页面）。
 文档: ${REPO_URL}
 `);
   process.exit(cmd === "help" ? 0 : 1);
