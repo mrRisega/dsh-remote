@@ -5,11 +5,12 @@
 // factory 内只能 require shell 种子模块（react / react/jsx-runtime 等）。
 //
 // 功能：
-//   - settings.section：设置页「远程控制」栏目（位于「Agent 预设」下方，官方扩展点）
+//   - settings.section：设置页「远程访问」栏目（位于「Agent 预设」下方，官方扩展点）
 //   - 栏目内联渲染配置面板（浅色高对比 UI，遵循主流登录体验）
 //     · 登录态：已登录显示账号 + 退出登录；未登录显示 登录/注册 tabs
 //     · 登录要求图形验证码；注册要求两次密码 + 图形验证码
-//     · 远程地址展示 + bridge 状态与启停开关 + 关于 dsh-remote 说明卡片
+//     · 📱 远程访问卡：一次性访问密钥（扫码/直接打开/复制 + 到期倒计时自动刷新）与已授权设备管理
+//     · bridge 状态与启停开关 + 关于 dsh-remote 说明卡片
 //   - 首次安装引导：设置页栏目旁小红点（localStorage dsh-remote-seen-dot 控制）
 //   - shell.overlay：满意度弹窗（安装体验至少 1 小时后弹出，只弹一次）
 // 所有数据经同源 /dsh-remote/* 宿主路由读写（node 半提供）。
@@ -40,7 +41,7 @@ window.__ModuleLoader__.load({
       ".dru-settings-title{margin:0;font-size:17px;font-weight:600;color:var(--dsw-alias-label-primary,#e6edf3)}",
       ".dru-settings-sub{font-size:12px;color:var(--dsw-alias-label-tertiary,#8c959f);margin-top:2px}",
       ".dru-settings-body{display:flex;flex-direction:column;gap:14px}",
-      // 首次安装引导小红点（挂在设置页「远程控制」导航栏目右上角）
+      // 首次安装引导小红点（挂在设置页「远程访问」导航栏目右上角）
       ".dru-reddot{position:absolute;top:9px;right:12px;width:7px;height:7px;border-radius:50%;background:#e5484d;box-shadow:0 0 0 2px var(--dsw-alias-bg-layer-2,#fff);pointer-events:none;z-index:1}",
       ".dru-card{background:#f6f8fa;border:1px solid #eaeef2;border-radius:10px;padding:14px 16px}",
       ".dru-card h3{margin:0 0 8px;font-size:13px;font-weight:700;color:#1f2328}",
@@ -129,10 +130,26 @@ window.__ModuleLoader__.load({
       ".dru-ver-badge-new{color:#9a6700;background:#fff8c5;border:1px solid #eed888}",
       ".dru-ver-badge-ok{color:#1a7f37;background:#dafbe1;border:1px solid #aceebb}",
       ".dru-up-log{margin-top:8px;background:#0d1117;color:#e6edf3;border-radius:8px;padding:8px 10px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;line-height:1.5;white-space:pre-wrap;word-break:break-word;max-height:150px;overflow:auto}",
+      // ── 📱 远程访问（一次性访问密钥 + 已授权设备管理） ──
+      ".dru-access-flex{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-start;margin-top:10px}",
+      ".dru-access-col{flex:1;min-width:230px;display:flex;flex-direction:column;gap:8px}",
+      ".dru-qr-img{width:180px;height:180px;flex:none;border-radius:8px;border:1px solid #d0d7de;background:#ffffff;object-fit:contain}",
+      ".dru-qr-ph{width:180px;height:180px;flex:none;border-radius:8px;border:1px dashed #d0d7de;background:#f6f8fa;color:#8c959f;font-size:12px;display:flex;align-items:center;justify-content:center;text-align:center;padding:10px;box-sizing:border-box}",
+      ".dru-url.big{font-size:13.5px;font-weight:600}",
+      ".dru-cd{font-size:12px;color:#9a6700;margin-top:2px}",
+      ".dru-cd-ok{color:#1a7f37}",
+      ".dru-key-note{font-size:12px;color:#57606a;line-height:1.6}",
+      ".dru-dev{border:1px solid #eaeef2;border-radius:8px;background:#ffffff;padding:9px 11px;margin-bottom:8px}",
+      ".dru-dev-top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}",
+      ".dru-dev-name{font-size:13px;font-weight:600;color:#1f2328;flex:1;min-width:130px}",
+      ".dru-dev-meta{font-size:11.5px;color:#57606a}",
+      ".dru-dev-sub{font-size:11px;color:#8c959f;margin-top:3px}",
+      ".dru-dev-tag{font-size:10.5px;color:#8c959f;border:1px solid #d0d7de;border-radius:999px;padding:0 7px;flex:none;white-space:nowrap}",
+      ".dru-dev-tag-off{color:#cf222e;border-color:#ffb3b6;background:#fff0f1}",
     ].join("\n");
     document.head.appendChild(styleEl);
 
-    // ── 首次安装引导小红点（设置页「远程控制」栏目，localStorage 控制） ────
+    // ── 首次安装引导小红点（设置页「远程访问」栏目，localStorage 控制） ────
     // 无 dsh-remote-seen-dot key 视为首次：在设置页导航栏目右上角显示 CSS 圆点；
     // 点击栏目/红点后写入 key（之后不再显示），重启 DSH Web 不复发。
     // 设置页由官方 shell 渲染（class 含 navCell 的导航按钮 + 栏目 label），
@@ -168,17 +185,17 @@ window.__ModuleLoader__.load({
         });
       } catch (e) {}
     }
-    /** 扫描设置页导航，找到「远程控制」栏目按钮后注入红点。 */
+    /** 扫描设置页导航，找到「远程访问」栏目按钮后注入红点。 */
     function dotScan() {
       if (dotSeen()) return;
       var cells = document.querySelectorAll("button");
       for (var i = 0; i < cells.length; i++) {
         var c = cells[i];
-        // 语义化匹配：设置页导航按钮（navCell）+ 栏目名「远程控制」。
+        // 语义化匹配：设置页导航按钮（navCell）+ 栏目名「远程访问」。
         // class 为 shell 的 hashed 类名，取子串匹配避免依赖具体 hash；
         // 若未来 hash 变化导致匹配失败，仅红点不显示，栏目本身不受影响。
         if (String(c.className || "").indexOf("navCell") === -1) continue;
-        if ((c.textContent || "").indexOf("远程控制") === -1) continue;
+        if ((c.textContent || "").indexOf("远程访问") === -1) continue;
         dotInject(c);
       }
     }
@@ -524,7 +541,7 @@ window.__ModuleLoader__.load({
         var payload = {
           kind: "rating",
           category: "satisfaction",
-          content: note.trim() || (rating >= 4 ? "对远程控制功能满意" : "对远程控制功能不太满意"),
+          content: note.trim() || (rating >= 4 ? "对远程访问功能满意" : "对远程访问功能不太满意"),
           rating: rating,
           recommend: recommend === true ? 1 : 0,
         };
@@ -547,7 +564,7 @@ window.__ModuleLoader__.load({
             step === "rate"
               ? h("div", null,
                   h("div", { className: "dru-popup-icon" }, "😊"),
-                  h("div", { className: "dru-popup-title" }, "您对远程控制功能满意吗？"),
+                  h("div", { className: "dru-popup-title" }, "您对远程访问功能满意吗？"),
                   h("div", { className: "dru-popup-sub" }, "使用体验已满 1 小时，说说真实感受吧（1 分钟搞定）"),
                   h("div", { className: "dru-popup-rate" },
                     [ [5, "😄", "很满意"], [3, "😐", "一般"], [1, "😞", "不满意"] ].map(function (r) {
@@ -609,8 +626,8 @@ window.__ModuleLoader__.load({
     }
 
     // ── 图标 ────────────────────────────────────────────────────────────────
-    // 通用「远程控制」图标（🖥 风格 emoji，与面板内既有 emoji 图标体系一致）：
-    // 栏目导航 label 与栏目头部均使用它。原侧边栏入口（电源图标按钮）已随入口迁移移除。
+    // 「远程访问」栏目图标沿用面板 emoji 图标体系：📱 更贴合“手机/另一台电脑远程访问”语义
+    // （原 🖥 已随入口迁移调整）；栏目导航 label 与栏目头部均使用它。
 
     // ── 版本与更新卡片（自管理：市场没有更新按钮，这里提供在线一键更新/彻底卸载） ──
     // 数据来自 node 半新增的 /dsh-remote/self* 路由；逻辑均在插件 node 半实现，
@@ -807,6 +824,18 @@ window.__ModuleLoader__.load({
       var shArr = useState(""); var selfHost = shArr[0]; var setSelfHost = shArr[1];
       var lkArr = useState(""); var localKey = lkArr[0]; var setLocalKey = lkArr[1];
 
+      // ── 📱 远程访问卡（一次性访问密钥 + 已授权设备管理）——放在全部既有字段之后，保持既有 hook 序号 ──
+      var akeyArr = useState(null); var akey = akeyArr[0]; var setAkey = akeyArr[1];             // {url,key,expires_at,ttl_ms,qr_data_url}
+      var akeyBusyArr = useState(false); var akeyBusy = akeyBusyArr[0]; var setAkeyBusy = akeyBusyArr[1];
+      var akeyMsgArr = useState(null); var akeyMsg = akeyMsgArr[0]; var setAkeyMsg = akeyMsgArr[1]; // {kind,text}
+      var nowTickArr = useState(function () { return Date.now(); }); var nowTick = nowTickArr[0]; var setNowTick = nowTickArr[1];
+      var copiedKeyArr = useState(false); var copiedKey = copiedKeyArr[0]; var setCopiedKey = copiedKeyArr[1];
+      var devSessArr = useState(null); var devSessions = devSessArr[0]; var setDevSessions = devSessArr[1]; // null=未加载
+      var devOpenArr = useState(false); var devOpen = devOpenArr[0]; var setDevOpen = devOpenArr[1];
+      var devBusyArr = useState(""); var devBusy = devBusyArr[0]; var setDevBusy = devBusyArr[1];
+      var devMsgArr = useState(null); var devMsg = devMsgArr[0]; var setDevMsg = devMsgArr[1];
+      var armedDevArr = useState(null); var armedDev = armedDevArr[0]; var setArmedDev = armedDevArr[1]; // 待二次确认的 session id
+
       var refresh = useCallback(function () {
         setBusy("status");
         api("/dsh-remote/status").then(function (body) {
@@ -847,6 +876,162 @@ window.__ModuleLoader__.load({
       useEffect(function () {
         if (st !== null && !loggedIn && mode === "saas" && authTab === "login" && !lcap) loadCaptcha("login");
       }, [st, loggedIn, mode, authTab, lcap]);
+
+      // ── 📱 远程访问卡：常量 / 轮询 / 一次性访问密钥 / 已授权设备 ─────────────────
+      var KEY_AUTO_REFRESH_MS = 25000;  // 停留栏目时约每 25s 自动轮换一把新的一次性密钥（防已用/过期）
+      var STATUS_POLL_MS = 5000;        // 连接状态行轮询间隔
+
+      /** 轻量状态轮询：只更新 st，不改 mode（mode 由用户 Tab 选择决定，避免轮询把自建/云端来回切）。 */
+      function pollStatus() {
+        api("/dsh-remote/status").then(function (body) {
+          if (!body || !body.ok) return;
+          setSt(body);
+        }).catch(function () {});
+      }
+
+      // 时间工具（兼容 epoch 毫秒 / ISO 字符串 / 数字字符串）
+      function toMs(ts) {
+        if (ts === null || ts === undefined || ts === "") return 0;
+        var n = Number(ts);
+        if (String(ts).trim() !== "" && isFinite(n)) return n;
+        var d = new Date(ts);
+        return isNaN(d.getTime()) ? 0 : d.getTime();
+      }
+      function pad2(n) { return String(n).padStart(2, "0"); }
+      function fmtClock(ts) {
+        var ms = toMs(ts);
+        if (!ms) return "--:--:--";
+        var d = new Date(ms);
+        if (isNaN(d.getTime())) return "--:--:--";
+        return pad2(d.getHours()) + ":" + pad2(d.getMinutes()) + ":" + pad2(d.getSeconds());
+      }
+      function fmtRemain(ms) {
+        var s = Math.max(0, Math.floor((ms || 0) / 1000));
+        var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+        return (h > 0 ? pad2(h) + ":" : "") + pad2(m) + ":" + pad2(sec);
+      }
+      function fmtDT(ts) {
+        var ms = toMs(ts);
+        if (!ms) return "—";
+        var d = new Date(ms);
+        if (isNaN(d.getTime())) return "—";
+        return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()) + " " + pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+      }
+
+      /** 创建（或刷新）一次性访问密钥：GET /dsh-remote/access-key（node 半转发企业端 /api/auth-key）。 */
+      function loadAccessKey() {
+        if (akeyBusy) return;
+        setAkeyBusy(true);
+        api("/dsh-remote/access-key").then(function (b) {
+          if (!b || !b.ok) {
+            var why = (b && (b.error || (b.body && b.body.error))) || "未知错误";
+            setAkeyMsg({ kind: "err", text: "获取一次性访问地址失败：" + why });
+            return;
+          }
+          // 契约容错：url 必须有；qr_data_url 取不到时仍展示链接/复制/直接打开
+          if (!b.url) {
+            setAkeyMsg({ kind: "err", text: "获取一次性访问地址失败：企业端未返回可用链接" });
+            return;
+          }
+          setAkey({
+            url: b.url || "",
+            key: b.key != null ? b.key : null,
+            expires_at: b.expires_at != null ? b.expires_at : null,
+            ttl_ms: b.ttl_ms != null ? b.ttl_ms : null,
+            qr_data_url: b.qr_data_url != null ? b.qr_data_url : null
+          });
+          setAkeyMsg(null);
+        }).catch(function (e) {
+          setAkeyMsg({ kind: "err", text: "获取一次性访问地址失败：" + e.message });
+        }).finally(function () { setAkeyBusy(false); });
+      }
+
+      var copyKeyUrl = function () {
+        if (!(akey && akey.url)) return;
+        try {
+          navigator.clipboard.writeText(akey.url).then(function () {
+            setCopiedKey(true);
+            setTimeout(function () { setCopiedKey(false); }, 1500);
+          });
+        } catch (e) {}
+      };
+      /** 「直接打开」：浏览器新标签打开一次性访问地址（打开即扫码/点击进入）。 */
+      var openKeyUrl = function () {
+        if (!(akey && akey.url)) return;
+        try { window.open(akey.url, "_blank", "noopener"); } catch (e) {}
+      };
+
+      /** 加载已授权设备列表：GET /dsh-remote/mobile-sessions。 */
+      function loadDevices() {
+        if (devBusy !== "") return;
+        setDevBusy("list");
+        api("/dsh-remote/mobile-sessions").then(function (b) {
+          if (!b || !b.ok) throw new Error((b && b.error) || "加载已授权设备失败");
+          setDevSessions(Array.isArray(b.sessions) ? b.sessions : []);
+          setDevMsg(null);
+        }).catch(function (e) {
+          setDevMsg({ kind: "err", text: "加载已授权设备失败：" + e.message });
+        }).finally(function () { setDevBusy(""); });
+      }
+
+      var toggleDevices = function () {
+        var next = !devOpen;
+        setDevOpen(next);
+        if (next && devSessions === null && devBusy === "") loadDevices();
+        if (!next) setArmedDev(null);
+      };
+
+      /** 取消配对：先点一次进入确认态，再点一次才 POST revoke（同 SelfManageCard 二次确认风格）。 */
+      var doRevokeDevice = function (id) {
+        if (!id) return;
+        if (armedDev !== id) { setArmedDev(id); return; }
+        setDevBusy("revoke:" + id);
+        post("/dsh-remote/mobile-sessions/revoke", { id: id }).then(function (b) {
+          if (!b || !b.ok) throw new Error((b && (b.error || (b.body && b.body.error))) || "取消失败");
+          setArmedDev(null);
+          setDevMsg({ kind: "ok", text: "已取消，对方需重新扫码/登录" });
+          // 刷新列表（成功即重拉，行内状态随后由列表覆盖）
+          api("/dsh-remote/mobile-sessions").then(function (lb) {
+            if (lb && lb.ok) setDevSessions(Array.isArray(lb.sessions) ? lb.sessions : []);
+          }).catch(function () {});
+        }).catch(function (e) {
+          setArmedDev(null);
+          setDevMsg({ kind: "err", text: "取消配对失败：" + e.message });
+        }).finally(function () { setDevBusy(""); });
+      };
+
+      /** 升级/续费带登录态打开：先取一次性访问 url，再 window.open（node 半用账号 JWT 换 key）。 */
+      var openUpgradeAuth = function () {
+        setBusy("upgrade");
+        api("/dsh-remote/access-key").then(function (b) {
+          if (!b || !b.ok || !b.url) throw new Error((b && b.error) || "生成访问链接失败");
+          try { window.open(b.url, "_blank", "noopener"); } catch (e2) {}
+          setMsg("ok", "✅ 升级/续费页已在新标签页打开（带登录态）");
+        }).catch(function (e) {
+          setMsg("err", "打开升级/续费页失败：" + e.message);
+        }).finally(function () { setBusy(""); });
+      };
+
+      // 停留主视图（home）时：每 5s 轻量轮询连接状态 + 每秒刷新倒计时
+      useEffect(function () {
+        if (view !== "home") return;
+        var pollIv = setInterval(function () { pollStatus(); }, STATUS_POLL_MS);
+        var tickIv = setInterval(function () { setNowTick(Date.now()); }, 1000);
+        return function () {
+          clearInterval(pollIv);
+          clearInterval(tickIv);
+        };
+      }, [view]);
+
+      // 已登录云端主视图停留期间：打开即取一把新 key + 已授权设备；之后每 ~25s 自动轮换
+      // （未登录不轮询，避免 401 空转；离开栏目/切视图/退出登录即清理定时器）
+      useEffect(function () {
+        if (view !== "home" || mode !== "saas" || !loggedIn) return undefined;
+        loadAccessKey();
+        loadDevices();
+        var rotateIv = setInterval(function () { loadAccessKey(); }, KEY_AUTO_REFRESH_MS);
+        return function () { clearInterval(rotateIv); };
+      }, [view, mode, loggedIn]);
 
       function setMsg(kind, text) { setMessage({ kind: kind, text: text }); }
 
@@ -948,11 +1133,6 @@ window.__ModuleLoader__.load({
           .finally(function () { setBusy(""); });
       };
 
-      var copyUrl = function () {
-        if (!st) return;
-        try { navigator.clipboard.writeText(st.remoteUrl).then(function () { setCopied(true); setTimeout(function () { setCopied(false); }, 1500); }); } catch (e) {}
-      };
-
       var saveLocal = function () {
         if (!selfHost.trim() || !localKey.trim()) { setMsg("err", "请填写服务器地址与访问密钥"); return; }
         setBusy("local");
@@ -991,12 +1171,6 @@ window.__ModuleLoader__.load({
         if (!ts) return "—";
         try { var d = new Date(Number(ts)); return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0"); } catch (e) { return "—"; }
       }
-      /** 推广/升级页地址（/app/promo），取不到时返回空（按钮隐藏）。 */
-      function promoUrl() {
-        var base = (pub && pub.app_url) || (st && st.remoteUrl) || "";
-        if (!base) return "";
-        return base.replace(/\/+$/, "") + "/promo";
-      }
       function renderAccount() {
         var a = account;
         var plan = a ? a.plan : "free";
@@ -1004,7 +1178,6 @@ window.__ModuleLoader__.load({
         var isMember = plan === "pro" || plan === "pro_max";
         var endsAt = a && (a.plan_ends_at || a.trial_expires_at) ? Number(a.plan_ends_at || a.trial_expires_at) : 0;
         var quotaPct = quota && quota.limit_enabled ? quota.percent : null;
-        var promo = promoUrl();
         var planText;
         if (!isMember) planText = "免费额度: 带宽 ≈1Mbps" + (quotaPct !== null ? " · 本月流量已用 " + quotaPct + "%" : " · 本月流量限额 1GB");
         else if (source === "trial") planText = "试用 PRO 会员 · 到期 " + fmtDate(a.trial_expires_at);
@@ -1024,15 +1197,15 @@ window.__ModuleLoader__.load({
             h("span", null, planText)
           ),
           h("div", { className: "dru-actions", style: { marginTop: 10 } },
-            promo && h("a", { className: "dru-btn dru-btn-primary", style: { textDecoration: "none", display: "inline-flex", alignItems: "center" }, href: promo, target: "_blank", rel: "noopener" },
-              !isMember ? "🚀 升级 PRO" : source === "trial" ? "🚀 转正式 PRO" : "🔄 续费会员"),
+            h("button", { type: "button", className: "dru-btn dru-btn-primary", style: { display: "inline-flex", alignItems: "center" }, disabled: busy !== "", title: "升级/续费（带登录态打开）", onClick: openUpgradeAuth },
+              busy === "upgrade" ? "生成链接中…" : (!isMember ? "🚀 升级 PRO" : source === "trial" ? "🚀 转正式 PRO" : "🔄 续费会员")),
             h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "", onClick: function () { setView("invite"); loadInvite(); } }, "🎯 邀请好友赚会员"),
             h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "", onClick: function () { setView("feedback"); } }, "💬 用户反馈"),
             h("button", { type: "button", className: "dru-btn dru-btn-danger", disabled: busy !== "", onClick: function () { doLogout(false); } }, "退出登录")
           ),
-          endsAt && isMember ? h("div", { className: "dru-hint", style: { marginTop: 8 } },
-            "到期后如需继续使用会员权益，请在到期前续费。" + (promo ? "升级/续费入口在推广页。" : "")
-          ) : null
+          h("div", { className: "dru-hint", style: { marginTop: 8 } },
+            "升级/续费以带登录态方式打开：点击后生成一次性访问链接并直接跳转，无需重新登录。" +
+            (endsAt && isMember ? "到期后如需继续使用会员权益，请在到期前续费。" : ""))
         );
       }
 
@@ -1087,6 +1260,128 @@ window.__ModuleLoader__.load({
         );
       }
 
+      // ---------- 📱 远程访问卡：一次性访问地址 / 二维码 / 状态行 ----------
+      function renderAccessCard() {
+        var hasKey = !!(akey && akey.url);
+        var expMs = akey ? toMs(akey.expires_at) : 0;
+        var remainMs = expMs ? expMs - nowTick : 0;
+        var loggedInSaaS = !!(st && st.config && st.config.phone);
+        var statusTxt = st === null ? "查询中…" : serviceRunning ? "已连接（可远程访问）" : "等待设备连接";
+        var dotCls = "dru-dot " + (serviceRunning ? "dru-dot-on" : "dru-dot-off");
+        return card("📱 远程访问", [
+          h("div", { className: "dru-status-line" },
+            h("span", { className: dotCls }),
+            h("span", null, statusTxt)
+          ),
+          akeyMsg ? h("div", { className: "dru-msg dru-msg-" + akeyMsg.kind, style: { marginTop: 8 } }, akeyMsg.text) : null,
+          hasKey ? h("div", null, [
+            h("div", { className: "dru-url big", style: { marginTop: 8 } },
+              h("span", null, akey.url),
+              h("button", { type: "button", onClick: copyKeyUrl }, copiedKey ? "已复制" : "复制")
+            ),
+            h("div", { className: "dru-access-flex" },
+              h("div", { className: "dru-access-col", style: { alignItems: "center" } },
+                akey.qr_data_url
+                  ? h("img", { className: "dru-qr-img", src: akey.qr_data_url, alt: "远程访问二维码" })
+                  : h("div", { className: "dru-qr-ph" }, "二维码生成中 / 暂不可用\n链接仍可复制或直接打开"),
+                h("div", { className: "dru-cd" + (remainMs > 0 ? " dru-cd-ok" : "") },
+                  "有效至 " + fmtClock(akey.expires_at) + " · 剩余 " + fmtRemain(remainMs))
+              ),
+              h("div", { className: "dru-access-col" },
+                h("div", { className: "dru-key-note" },
+                  "扫码即进入远程访问；每次生成的链接 30 分钟有效、访问一次后失效，停留栏目期间会自动更新。"),
+                h("div", { className: "dru-actions", style: { marginTop: 2 } },
+                  h("button", { type: "button", className: "dru-btn dru-btn-primary", disabled: akeyBusy, onClick: openKeyUrl }, "直接打开"),
+                  h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: akeyBusy, onClick: loadAccessKey }, akeyBusy ? "生成中…" : "刷新二维码/访问链接")
+                ),
+                h("div", { className: "dru-hint", style: { marginTop: 4 } },
+                  !serviceRunning
+                    ? "本机 bridge 未运行：请先在下方「🖥 Bridge 服务」卡片启动，手机/另一台电脑才能连入本机。"
+                    : "手机上打开链接点「进入」即可像在本机一样使用 dsh web。")
+              )
+            )
+          ]) : h("div", null, [
+            h("div", { className: "dru-hint", style: { marginTop: 6 } },
+              loggedInSaaS
+                ? "正在生成一次性访问链接…（手机或另一台电脑扫码/打开即可进入）"
+                : "登录下方「🔑 账号」卡片中的手机号账号后，即可生成一次性访问链接，让手机或另一台电脑远程使用同一份 dsh web。"),
+            h("div", { className: "dru-actions", style: { marginTop: 8 } },
+              h("button", { type: "button", className: "dru-btn dru-btn-primary", disabled: akeyBusy, onClick: loadAccessKey },
+                akeyBusy ? "生成中…" : "生成访问链接")
+            )
+          ])
+        ]);
+      }
+
+      // ---------- 📲 已授权设备卡（展开列表 + 二次确认取消配对） ----------
+      function deviceLabel(s) {
+        if (s && s.label) return String(s.label);
+        var parts = [];
+        if (s && s.os) parts.push(String(s.os));
+        if (s && s.browser) parts.push(String(s.browser));
+        return parts.length ? parts.join(" ") : "未知设备";
+      }
+      function deviceMeta(s) {
+        var parts = [];
+        if (s && s.os) parts.push(String(s.os));
+        if (s && s.browser) parts.push(String(s.browser));
+        return parts.join(" · ");
+      }
+      function renderDeviceList() {
+        if (devSessions === null) {
+          return h("div", { className: "dru-hint" }, devBusy === "list" ? "正在加载已授权设备…" : "加载已授权设备中，请稍候或点上方按钮重试");
+        }
+        if (devSessions.length === 0) {
+          return h("div", { className: "dru-fb-empty" }, "暂无已授权设备（手机扫码后出现）");
+        }
+        return h("div", null, [
+          devSessions.map(function (s) {
+            var revoked = !!(s && s.revoked_at);
+            return h("div", { key: s && s.id, className: "dru-dev" },
+              h("div", { className: "dru-dev-top" },
+                h("span", { className: "dru-dev-name" }, deviceLabel(s)),
+                deviceMeta(s) ? h("span", { className: "dru-dev-meta" }, deviceMeta(s)) : null,
+                revoked ? h("span", { className: "dru-dev-tag dru-dev-tag-off" }, "已取消配对") : null
+              ),
+              h("div", { className: "dru-dev-sub" },
+                "首次配对 " + fmtDT(s && s.created_at) +
+                (s && s.last_seen_at ? " · 最近活跃 " + fmtDT(s.last_seen_at) : "") +
+                (revoked ? " · 取消于 " + fmtDT(s.revoked_at) : "")
+              ),
+              revoked ? null : h("div", { className: "dru-actions", style: { marginTop: 8 } },
+                h("button", {
+                  type: "button",
+                  className: "dru-btn dru-btn-danger",
+                  disabled: devBusy !== "",
+                  onClick: function () { doRevokeDevice(s && s.id); }
+                }, devBusy === "revoke:" + (s && s.id) ? "取消中…" : armedDev === (s && s.id) ? "⚠ 再点一次确认取消配对" : "取消配对")
+              )
+            );
+          }),
+          h("div", { className: "dru-hint", style: { marginTop: 4 } },
+            "取消配对后，对方需重新扫码/登录才能再次远程访问本机。")
+        ]);
+      }
+      function renderDevicesCard() {
+        var count = devSessions === null ? null : devSessions.length;
+        var btnLabel = devOpen
+          ? "收起已授权设备列表"
+          : "已授权设备 " + (count === null ? "…" : count) + "（点击展开管理）";
+        return card("📲 已授权设备", [
+          h("div", { className: "dru-actions", style: { marginTop: 2 } },
+            h("button", {
+              type: "button",
+              className: "dru-btn dru-btn-ghost",
+              style: { width: "100%" },
+              disabled: devBusy !== "",
+              onClick: toggleDevices
+            }, devBusy === "list" ? "加载中…" : btnLabel)
+          ),
+          devOpen ? renderDeviceList() : null,
+          devMsg ? h("div", { className: "dru-msg dru-msg-" + devMsg.kind, style: { marginTop: 6 } }, devMsg.text) : null
+        ]);
+      }
+
       // ---------- 主视图 ----------
       function renderHome() {
         var isLocal = mode === "local";
@@ -1096,16 +1391,10 @@ window.__ModuleLoader__.load({
             h("div", { className: "dru-tab" + (!isLocal ? " active" : ""), onClick: function () { setMode("saas"); setMessage(null); } }, "☁️ 云端服务"),
             h("div", { className: "dru-tab" + (isLocal ? " active" : ""), onClick: function () { setMode("local"); setMessage(null); } }, "🖥 自建服务")
           ),
-          // 云端 tab：远程控制地址 + 账号（手机号登录，官方托管）
+          // 云端 tab：📱 远程访问（一次性扫码访问 + 已授权设备）+ 账号（手机号登录，官方托管）
           !isLocal ? h("div", null,
-            card("📱 远程控制地址",
-              h("div", { className: "dru-url" },
-                h("span", null, st ? st.remoteUrl : "加载中…"),
-                h("button", { type: "button", onClick: copyUrl }, copied ? "已复制" : "复制")
-              ),
-              h("div", { className: "dru-hint", style: { marginTop: 6 } },
-                st && st.relayReachable === false ? "⚠ 云端服务不可达（地址可能不是最新）" : "手机浏览器打开此地址登录后即可远程控制本机。")
-            ),
+            renderAccessCard(),
+            renderDevicesCard(),
             card("🔑 账号",
               st === null
                 ? h("div", { className: "dru-hint" }, "正在读取远控状态…")
@@ -1188,12 +1477,12 @@ window.__ModuleLoader__.load({
                 )
               : null
           ),
-          // 关于 dsh-remote（开源项目说明卡片）
+          // 关于 dsh-remote（v0.5+ 远程访问价值说明卡片）
           card("📖 关于 dsh-remote", [
-            h("div", { className: "dru-hint", style: { marginBottom: 6 } }, "① 为什么推荐用 SaaS：不用自己买服务器、不用折腾部署，装好客户端就能用，最省心。"),
-            h("div", { className: "dru-hint", style: { marginBottom: 6 } }, "② 会员费去向：付的是网络带宽/服务器成本，也是给开发者的合理支持，让项目持续维护。"),
-            h("div", { className: "dru-hint", style: { marginBottom: 6 } }, "③ 也可以自建：项目完全开源，有服务器可自行部署，流量走自己的服务器，闭环自控。"),
-            h("div", { className: "dru-hint" }, "④ 一句话总结：简单省心用 SaaS，技术玩家可自建。")
+            h("div", { className: "dru-hint", style: { marginBottom: 6 } }, "📱 远程访问：用手机或另一台电脑的浏览器，随时随地使用同一份 dsh web——人在哪都能用（免公网 IP、免内网穿透）；官方托管中继，4G/5G 即用，也可自建服务。"),
+            h("div", { className: "dru-hint", style: { marginBottom: 6 } }, "🛠 电脑端一键安装：bridge 与「远程访问」面板一次到位——云端/自建切换、账号登录、bridge 启停、一次性扫码访问、已授权设备管理、意见反馈都在这里。"),
+            h("div", { className: "dru-hint", style: { marginBottom: 6 } }, "🔒 安全与通道：HTTP / WebSocket 全量透传，一次性访问密钥认证，面板实时显示设备与已授权设备列表；服务端可配置流量配额。"),
+            h("div", { className: "dru-hint" }, "🛡 端到端流量保护：可选对通道做端到端加密保护，传输全程不暴露本机公网 IP（详见项目 README「安全」说明）。")
           ]),
           // 版本与更新（自管理：检测新版 / 一键在线更新 / 彻底卸载）
           h(SelfManageCard, null),
@@ -1201,12 +1490,12 @@ window.__ModuleLoader__.load({
         );
       }
 
-      return h("div", { className: "dru-settings-section", role: "region", "aria-label": "远程控制" },
+      return h("div", { className: "dru-settings-section", role: "region", "aria-label": "远程访问" },
         h("div", { className: "dru-settings-head" },
-          h("span", { className: "dru-settings-icon" }, "🖥"),
+          h("span", { className: "dru-settings-icon" }, "📱"),
           h("div", null,
-            h("h2", { className: "dru-settings-title" }, "远程控制"),
-            h("div", { className: "dru-settings-sub" }, "通过手机远程控制本机 dsh web")
+            h("h2", { className: "dru-settings-title" }, "远程访问"),
+            h("div", { className: "dru-settings-sub" }, "通过手机或另一台电脑远程使用同一份 dsh web，人在哪都能用（免公网 IP）")
           )
         ),
         h("div", { className: "dru-settings-body" },
@@ -1220,13 +1509,13 @@ window.__ModuleLoader__.load({
     function apply(ctx) {
       // 面板入口迁移：从侧边栏（sidebar.footer.action）移入「设置」页官方扩展点
       // settings.section（列表槽，由 ui-settings-general 在 sidebar.settings 下声明）。
-      // order 30 > Agent 预设(20)，栏目落在「Agent 预设」下方；label 即栏目名（🖥 通用远程控制图标）。
+      // order 30 > Agent 预设(20)，栏目落在「Agent 预设」下方；label 即栏目名（📱 远程访问）。
       ctx.slots.inject("settings.section", function () {
         return ctx.slots.register({
           name: "settings.section",
           id: "dsh-remote",
           order: 30,
-          label: function () { return "🖥 远程控制"; }
+          label: function () { return "📱 远程访问"; }
         }, RemoteControlSection);
       });
       ctx.slots.inject("shell.overlay", function () {

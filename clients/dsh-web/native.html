@@ -270,7 +270,7 @@ var _hmt = _hmt || [];
   <!-- 首屏读取态:会话判定完成前不渲染登录或设备界面,消除闪烁 -->
   <div id="view-boot">
     <div class="card" style="text-align:center;">
-      <div class="empty"><span class="loading"></span> 正在读取登录状态…</div>
+      <div class="empty" id="boot-status-text"><span class="loading"></span> 正在读取登录状态…</div>
     </div>
   </div>
 
@@ -898,6 +898,108 @@ function logout(clearForm = false) {
   setView("login");
 }
 
+// ---------- 一次性扫码登录(/app/?auth=KEY:电脑端生成的访问链接,30 分钟/一次性) ----------
+
+/** UA 关键词简判,随一次性登录请求上报 os/browser(服务端仅作统计,无需精确识别)。
+ *  os 按 iPhone/iPad/Mac/Android/Windows/Linux 关键词粗判;browser 按
+ *  WeChat/MiuiBrowser/Quark/Edge/Chrome/Firefox/Safari 判;取不到统一兜底「手机浏览器」。 */
+function detectClientUA() {
+  const ua = navigator.userAgent || "";
+  let os = "";
+  if (/iPhone|iPad/.test(ua)) os = "iOS";
+  else if (/Android/.test(ua)) os = "Android";
+  else if (/Mac/.test(ua)) os = "macOS";
+  else if (/Windows/.test(ua)) os = "Windows";
+  else if (/Linux/.test(ua)) os = "Linux";
+  else os = "其他";
+  let browser = "";
+  if (/MicroMessenger/i.test(ua)) browser = "WeChat";
+  else if (/MiuiBrowser/i.test(ua)) browser = "MiuiBrowser";
+  else if (/Quark/i.test(ua)) browser = "Quark";
+  else if (/Edg\//i.test(ua)) browser = "Edge";
+  else if (/Chrome\//i.test(ua)) browser = "Chrome";
+  else if (/Firefox\//i.test(ua)) browser = "Firefox";
+  else if (/Safari\//i.test(ua)) browser = "Safari";
+  else browser = "手机浏览器";
+  return { os, browser };
+}
+
+/** 链接失效/失败落地:清登录态 → 登录页常驻展示可读错误(不让页面停在无解释状态)。 */
+function authFailToLogin(message) {
+  logout();
+  switchAuthTab("login");
+  const m = $("login-msg");
+  if (m) { m.className = "auth-msg err"; m.textContent = message; }
+}
+
+/**
+ * 一次性访问链接登录(boot 阶段 location.search 含 auth=KEY 时统一调用):
+ *   无论当前是否已登录,有 auth 就走 exchange(幂等;已用/过期/无效的 key 会被服务端拒绝)。
+ *   成功 → token/user 走与正常登录完全相同的落库路径(localStorage dsh_token/dsh_user
+ *            + dsh_token cookie 由 enterMirror 统一写入)→ 进入设备列表视图;
+ *   失败 → 业务性拒绝(4xx 且带 error)视为链接失效:登出并提示重新扫码/生成;
+ *           网络/超时/5xx 视为暂时不可用:保留原有有效会话(若有),否则留在登录页展示可读错误。
+ *   无论成败:处理完立即用 history.replaceState 隐去地址栏 auth 明文(保留 promo/utm 等其它参数)。
+ */
+async function doAuthExchangeLogin(key) {
+  // 1) 先隐去地址栏明文 key:key 只在内存中使用,后续任何分支/刷新都不会再残留
+  try {
+    history.replaceState(null, "", location.pathname + location.search.replace(/([?&])auth=[^&#]*/, "$1").replace(/[?&]$/, ""));
+  } catch { /* 个别 WebView 限制 replaceState:忽略,不阻断登录流程 */ }
+  const boot = $("boot-status-text");
+  if (boot) boot.innerHTML = '<span class="loading"></span> 正在验证一次性登录链接…';
+
+  // 2) 调用企业端 exchange(公开端点无需登录;与 /relay-api 其余请求一致的 6s 超时)
+  let status = 0, data = {}, errMsg = "";
+  try {
+    const ua = detectClientUA();
+    const r = await fetch(API_BASE + "/api/auth-key/exchange", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ key, os: ua.os, browser: ua.browser }),
+      signal: AbortSignal.timeout(6000)
+    });
+    status = r.status;
+    data = await r.json().catch(() => ({}));
+  } catch (e) { errMsg = e.name === "TimeoutError" ? "请求超时" : e.message; }
+
+  // 3) 成功:复用登录成功后的统一入口 enterMirror(同一套存储/校验/进入路径)
+  if (status === 200 && data && data.token) {
+    state.token = data.token;
+    // 字段容错:user 缺失/非对象时保留原 user,再不行置空,不阻断登录
+    if (data.user && typeof data.user === "object") state.user = data.user;
+    else if (!state.user) state.user = null;
+    localStorage.setItem("dsh_token", state.token);
+    localStorage.setItem("dsh_user", JSON.stringify(state.user));
+    enterMirror(state.token); // 写 dsh_token cookie → 设备列表(0/多台均由用户点选进入)
+    if (!state.user) setConn("已连接", true);
+    toast("✅ 扫码登录成功,可点选在线设备进入", 3500);
+    return;
+  }
+
+  // 4) 失败分类:业务性拒绝(服务端明确返回 error 的 4xx,含 invalid_auth_key/已用/过期/无效)
+  const err = data && data.error || null;
+  const serverMsg = err && typeof err.message === "string" ? err.message : "";
+  const code = err && err.code ? String(err.code) : "";
+  if (status >= 400 && status < 500 && err) {
+    const invalidKey = code === "invalid_auth_key" || !serverMsg || /失效|无效|已用|过期|invalid|expired|used/i.test(serverMsg);
+    authFailToLogin(invalidKey
+      ? "链接已失效,请返回电脑端重新扫码/生成。"
+      : "链接验证失败: " + serverMsg);
+    return;
+  }
+  // 网络/超时/服务端异常:错误可读,不静默。仍持有有效会话 → 保留登录并提示;否则登录页常驻错误
+  const why = errMsg
+    ? "无法连接服务器: " + errMsg + ",请检查网络后重试。"
+    : (serverMsg || (status ? "服务异常(HTTP " + status + "),请稍后重试。" : "无法连接服务器,请检查网络后重试。"));
+  if (state.token && !tokenExpired(state.token)) {
+    toast("扫码登录未完成(" + why.replace(/[。.]+$/, "") + ")已沿用当前登录", 5000);
+    enterMirror(state.token);
+  } else {
+    authFailToLogin("扫码登录失败: " + why);
+  }
+}
+
 // ---------- 新用户安装引导(空设备状态;后台 public-config 可覆盖) ----------
 
 /** 返回安装引导 HTML:后台配置 app_install_guide 非空时优先展示,否则用内置默认步骤。 */
@@ -1306,6 +1408,13 @@ function tokenExpired(token) {
     history.replaceState(null, "", window.location.pathname);
     setView("login");
     switchAuthTab("login");
+    return;
+  }
+  // 一次性扫码登录(/app/?auth=KEY,电脑端生成,30 分钟/一次性):
+  // 有 auth 一律走 exchange(无论当前是否已登录),成败去向由 doAuthExchangeLogin 决定
+  const authKey = (new URLSearchParams(window.location.search).get("auth") || "").trim();
+  if (authKey) {
+    await doAuthExchangeLogin(authKey);
     return;
   }
   // 邀请链接(/app/?invite=CODE):预填邀请码到注册流程,并给出可见提示

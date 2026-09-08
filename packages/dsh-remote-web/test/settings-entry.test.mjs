@@ -23,6 +23,11 @@ function find(tree, predicate) {
   return match;
 }
 
+/** 任意文本子节点包含子串（用于动态拼接文案，如「已授权设备 N」）。 */
+function textHas(tree, substr) {
+  return !!find(tree, (node) => (node.children || []).some((c) => typeof c === "string" && c.includes(substr)));
+}
+
 /** 极简 DOM 元素假件（够 client.js 的红点注入用）。 */
 function makeEl(tag) {
   return {
@@ -158,7 +163,7 @@ test("入口迁移：注册 settings.section 栏目（id/order/label），移除
   // 不再注入侧边栏入口槽
   assert.equal(plugin.injects.has("sidebar.footer.action"), false, "侧边栏入口槽不应再注入");
 
-  // settings.section 官方扩展点：id=dsh-remote、order=30（> Agent 预设 20，位于其下方）、label=🖥 远程控制
+  // settings.section 官方扩展点：id=dsh-remote、order=30（> Agent 预设 20，位于其下方）、label=📱 远程访问
   assert.ok(plugin.injects.has("settings.section"), "应注入 settings.section 扩展点");
   const disposeSection = plugin.injects.get("settings.section")();
   assert.equal(typeof disposeSection, "function", "register 应返回 disposer");
@@ -168,8 +173,9 @@ test("入口迁移：注册 settings.section 栏目（id/order/label），移除
   assert.equal(meta.order, 30);
   assert.equal(typeof meta.label, "function");
   const label = meta.label();
-  assert.ok(String(label).includes("远程控制"), `栏目名应含「远程控制」，实际: ${label}`);
-  assert.ok(String(label).includes("🖥"), "栏目名应带 🖥 通用远程控制图标");
+  assert.ok(String(label).includes("远程访问"), `栏目名应含「远程访问」，实际: ${label}`);
+  assert.ok(String(label).includes("📱"), "栏目名应带 📱 远程访问图标（手机访问语义）");
+  assert.ok(!String(label).includes("远程控制"), "栏目名不应再残留旧称「远程控制」");
 
   // shell.overlay 仅保留满意度弹窗，浮动面板已移除
   assert.ok(plugin.injects.has("shell.overlay"));
@@ -178,22 +184,26 @@ test("入口迁移：注册 settings.section 栏目（id/order/label），移除
   assert.equal(plugin.registered.has("dsh-remote-panel"), false, "浮动配置面板不应再注册");
 });
 
-test("登录态账号区：无「切换账号」，有「退出登录」，关于卡片文案完整", () => {
+test("登录态账号区：无「切换账号」，有「退出登录」，头部/关于卡文案为「远程访问」", () => {
   const plugin = loadPlugin();
   plugin.states[0] = { config: { phone: "13800000000", deviceId: "dev-test" }, service: { running: false } };
   let tree = plugin.renderSection();
+
+  // 栏目头部：标题「远程访问」+ 副文案（人在哪都能用，免公网 IP）
+  assert.ok(find(tree, (n) => n.children?.includes("远程访问")), "头部标题应为「远程访问」");
+  assert.ok(find(tree, (n) => n.children?.includes("通过手机或另一台电脑远程使用同一份 dsh web，人在哪都能用（免公网 IP）")), "应渲染新副文案（人在哪都能用，免公网 IP）");
 
   // 账号区按钮
   assert.ok(find(tree, (n) => n.children?.includes("退出登录")), "应保留「退出登录」");
   assert.ok(!find(tree, (n) => n.children?.includes("切换账号")), "「切换账号」按钮应移除");
 
-  // 关于 dsh-remote 说明卡片（面板底部，4 条要点）
+  // 关于 dsh-remote 说明卡片（面板底部，v0.5+ 价值要点）
   assert.ok(find(tree, (n) => n.children?.includes("📖 关于 dsh-remote")), "应渲染「关于 dsh-remote」卡片标题");
   const points = [
-    "① 为什么推荐用 SaaS：不用自己买服务器、不用折腾部署，装好客户端就能用，最省心。",
-    "② 会员费去向：付的是网络带宽/服务器成本，也是给开发者的合理支持，让项目持续维护。",
-    "③ 也可以自建：项目完全开源，有服务器可自行部署，流量走自己的服务器，闭环自控。",
-    "④ 一句话总结：简单省心用 SaaS，技术玩家可自建。",
+    "📱 远程访问：用手机或另一台电脑的浏览器，随时随地使用同一份 dsh web——人在哪都能用（免公网 IP、免内网穿透）；官方托管中继，4G/5G 即用，也可自建服务。",
+    "🛠 电脑端一键安装：bridge 与「远程访问」面板一次到位——云端/自建切换、账号登录、bridge 启停、一次性扫码访问、已授权设备管理、意见反馈都在这里。",
+    "🔒 安全与通道：HTTP / WebSocket 全量透传，一次性访问密钥认证，面板实时显示设备与已授权设备列表；服务端可配置流量配额。",
+    "🛡 端到端流量保护：可选对通道做端到端加密保护，传输全程不暴露本机公网 IP（详见项目 README「安全」说明）。",
   ];
   for (const p of points) {
     assert.ok(find(tree, (n) => n.children?.includes(p)), `说明卡片应含要点: ${p.slice(0, 12)}…`);
@@ -202,6 +212,10 @@ test("登录态账号区：无「切换账号」，有「退出登录」，关�
   // 面板主体仍在（连接模式 tab 不受影响）
   assert.ok(find(tree, (n) => n.children?.includes("☁️ 云端服务")), "云端服务 tab 应保留");
   assert.ok(find(tree, (n) => n.children?.includes("🖥 自建服务")), "自建服务 tab 应保留");
+
+  // 📱 远程访问卡 / 📲 已授权设备卡在云端视图中渲染（bridge 未运行 → “等待设备连接”）
+  assert.ok(find(tree, (n) => n.children?.includes("等待设备连接")), "无 bridge 时应显示「等待设备连接」状态行");
+  assert.ok(textHas(tree, "已授权设备"), "应渲染「已授权设备」管理按钮");
 });
 
 test("退出登录清除用户反馈线程凭据（localStorage dsh-feedback-threads）", async () => {
@@ -223,7 +237,7 @@ test("首次安装红点：设置页导航栏目出现后注入，点击后写 k
   const navCells = [];
   const navCell = makeEl("button");
   navCell.className = "VOzbGW_navCell"; // shell hashed 类名（含 navCell 子串）
-  navCell.textContent = "🖥 远程控制";
+  navCell.textContent = "📱 远程访问";
   const plugin = loadPlugin({ navCells });
 
   // apply 时设置页未打开：观察器就位、无红点
@@ -255,7 +269,7 @@ test("红点已看过（localStorage 有 key）时不注入，重启 DSH Web 不
   const navCells = [];
   const navCell = makeEl("button");
   navCell.className = "VOzbGW_navCell";
-  navCell.textContent = "🖥 远程控制";
+  navCell.textContent = "📱 远程访问";
   navCells.push(navCell);
   // 预置 seen key（模拟“首次点击后重启”）
   const plugin = loadPlugin({ navCells, localStorageSeed: { "dsh-remote-seen-dot": "1" } });
@@ -263,17 +277,22 @@ test("红点已看过（localStorage 有 key）时不注入，重启 DSH Web 不
   assert.equal(navCell.children.length, 0, "已看过时不应再注入红点");
 });
 
-test("源码约束：无侧边栏入口/浮动面板/切换账号；登录与自建切换也清理线程凭据", () => {
+test("源码约束：无侧边栏入口/浮动面板/切换账号；命名统一为「远程访问」；新增访问密钥/设备路由", () => {
   // 只断言“代码形态”不存在（注释里允许出现说明文字）
   assert.doesNotMatch(SOURCE, /slots\.inject\("sidebar\.footer\.action"/);
   assert.doesNotMatch(SOURCE, /dru-backdrop\{/);
   assert.doesNotMatch(SOURCE, /切换账号/);
   assert.doesNotMatch(SOURCE, /dsh-remote-panel/);
+  assert.doesNotMatch(SOURCE, /远程控制/);   // 旧称呼「远程控制」不再出现（含 label/头部/说明）
   assert.match(SOURCE, /settings\.section/);
   assert.match(SOURCE, /dsh-remote-seen-dot/);
   assert.match(SOURCE, /fbClearThreads/);
   assert.match(SOURCE, /关于 dsh-remote/);
-  assert.match(SOURCE, /简单省心用 SaaS/);
+  assert.match(SOURCE, /免公网 IP/);           // 关于卡 v0.5+ 价值要点
+  assert.match(SOURCE, /端到端/);
+  assert.match(SOURCE, /已授权设备/);
+  assert.match(SOURCE, /dsh-remote\/access-key/);
+  assert.match(SOURCE, /dsh-remote\/mobile-sessions/);
   assert.match(SOURCE, /order: 30/);
   // 清理时机：退出登录成功回调内、登录账号变化时、切换自建服务时
   assert.match(SOURCE, /post\("\/dsh-remote\/logout"\)\.then\(function \(body\) \{[\s\S]*?fbClearThreads\(\);/);
