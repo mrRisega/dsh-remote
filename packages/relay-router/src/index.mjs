@@ -451,12 +451,14 @@ function resolveRoute(req, url) {
   const m = url.pathname.match(/^\/remote\/([^/]+)(\/.*)?$/);
   if (m) {
     const head = m[1];
-    // channel 模式(客户端改写的 /remote/api|sidebar|git|pet/*)
+    // channel 模式(客户端改写的 /remote/api|sidebar|git|pet/*):首段既是指示符也是路径首段,
+    // 上游路径 = /<首段> + 余下路径(如 /remote/api/session/search → /api/session/search)
     if (CHANNEL_MARKERS.has(head)) {
       const deviceId = channelDeviceOf(req, url);
       if (!deviceId) return null; // 无设备凭据:交由上层按未登录/404 处理,勿报“设备 api 离线”
-      const path = m[2] || "/";
-      if (path.includes("..") || path.includes("\\")) return null;
+      const rest = m[2] || "/";
+      if (rest.includes("..") || rest.includes("\\")) return null;
+      const path = "/" + head + rest;
       const u2 = new URL(url.href);
       u2.searchParams.delete("device"); // 设备参数只用于选设备,不透传给上游
       return { deviceId, path: path + (u2.search || ""), channel: true };
