@@ -58,7 +58,7 @@ test("反馈代理：附加设备身份/手机号，透传 thread_token", async 
     assert.equal(echo.url, "/api/feedback");
     assert.equal(echo.headers["x-dsh-device"], "dev-testproxy123");
     assert.equal(echo.headers["x-dsh-phone"], "13800000000");
-    assert.equal(echo.headers["x-dsh-client"], "dsh-remote-web/0.5.0");
+    assert.match(echo.headers["x-dsh-client"], /^dsh-remote-web\/\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/, `x-dsh-client 应带插件名与版本，实际 ${echo.headers["x-dsh-client"]}`);
     assert.equal(echo.headers.authorization, "Bearer thread-token-abc");
     assert.equal(echo.body.category, "bug");
 
