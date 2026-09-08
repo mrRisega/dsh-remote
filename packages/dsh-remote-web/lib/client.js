@@ -320,6 +320,18 @@ window.__ModuleLoader__.load({
       return api(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(data || {}) });
     };
 
+    /** 一次性访问 url → 升级/续费页 url（带同一 auth，进入后即登录态到 /app/promo）。 */
+    function promoUrlOf(u) {
+      var s = String(u || "");
+      if (/\/app\/\?auth=/i.test(s)) return s.replace(/\/app\/\?auth=/i, "/app/promo?auth=");
+      try {
+        var m = /auth=([^&#]+)/.exec(s);
+        var origin = s.split("/app")[0];
+        if (m && origin) return origin + "/app/promo?auth=" + m[1];
+      } catch (e) { /* fallthrough */ }
+      return s;
+    }
+
     // ── 用户反馈模块：本地状态（thread 令牌 / 弹窗节流） ───────────────────
     var FB_THREADS_KEY = "dsh-feedback-threads";
     var FB_POPUP_KEY = "dsh-feedback-popup";
@@ -1093,12 +1105,13 @@ window.__ModuleLoader__.load({
         }).finally(function () { setDevBusy(""); });
       };
 
-      /** 升级/续费带登录态打开：先取一次性访问 url，再 window.open（node 半用账号 JWT 换 key）。 */
+      /** 升级/续费带登录态打开：取一次性访问 url，改写为 /app/promo?auth=… 后在手机端进入续费页。 */
       var openUpgradeAuth = function () {
         setBusy("upgrade");
         api("/dsh-remote/access-key").then(function (b) {
           if (!b || !b.ok || !b.url) throw new Error((b && b.error) || "生成访问链接失败");
-          try { window.open(b.url, "_blank", "noopener"); } catch (e2) {}
+          var promo = promoUrlOf(b.url);
+          try { window.open(promo, "_blank", "noopener"); } catch (e2) {}
           setMsg("ok", "✅ 升级/续费页已在新标签页打开（带登录态）");
         }).catch(function (e) {
           setMsg("err", "打开升级/续费页失败：" + e.message);
@@ -1206,6 +1219,8 @@ window.__ModuleLoader__.load({
         setBusy("logout");
         post("/dsh-remote/logout").then(function (body) {
           setSt(body); setAccount(null); setQuota(null);
+          // 清空一次性访问密钥/二维码/授权设备等本地状态（退出后不得残留可见）
+          setAkey(null); setAkeyMsg(null);
           // 退出登录：清除本机保存的用户反馈线程凭据（thread_token 见 FB_THREADS_KEY），
           // 反馈历史保留在服务端（按账号校验），账号身份变化后本机不再可见旧线程。
           fbClearThreads();

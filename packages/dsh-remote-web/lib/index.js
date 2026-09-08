@@ -762,13 +762,13 @@ async function proxyCreateAccessKey(relayDir, res) {
 }
 
 /**
- * GET /dsh-remote/mobile-sessions → 已授权设备列表（企业端 POST /api/mobile-sessions，Bearer）。
+ * GET /dsh-remote/mobile-sessions → 已授权设备列表（企业端 GET /api/mobile-sessions，Bearer）。
  */
 async function proxyMobileSessions(relayDir, res) {
   const token = await relayToken(relayDir).catch(() => "");
   if (!token) return sendJson(res, 401, notLoggedInJson());
   const r = await relayFetch(relayDir, "/api/mobile-sessions", {
-    method: "POST",
+    method: "GET",
     headers: { authorization: `Bearer ${token}` },
   });
   const d = flattenRelayBody(r);
@@ -946,7 +946,7 @@ const PLUGIN_ID = "dsh-remote-web";
 const PLUGIN_LEGACY_IDS = ["dsh-remote-ui"];
 const PLUGIN_ALL_IDS = [PLUGIN_ID, ...PLUGIN_LEGACY_IDS];
 /** 插件自身发布版本（与 dsh-remote 根包同步递增）。 */
-const PLUGIN_VERSION = "0.6.0-beta.2";
+const PLUGIN_VERSION = "0.6.0-beta.3";
 const UPDATE_LOG = ".dsh-update.log";
 const UPDATE_MARKER = ".dsh-update-running";
 

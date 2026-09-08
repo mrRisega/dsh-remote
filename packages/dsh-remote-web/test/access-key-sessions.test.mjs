@@ -30,7 +30,7 @@ function startFakeRelay(opts = {}) {
       if (!opts.noQr) body.qr_data_url = QR;
       return send(200, body);
     }
-    if (req.method === "POST" && url.pathname === "/api/mobile-sessions") {
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/mobile-sessions") {
       return send(200, {
         ok: true,
         sessions: [
@@ -117,7 +117,7 @@ test("mobile-sessions 路由：列表透传，Bearer 已带上", async () => {
     assert.equal(r.sessions[0].label, "iPhone 15");
     assert.equal(r.sessions[0].os, "iOS");
     const up = relay.seen.find((s) => s.path === "/api/mobile-sessions");
-    assert.equal(up.method, "POST");
+    assert.equal(up.method, "GET"); // 列表为 GET；POST 仅用于 auth-key/revoke
     assert.equal(up.authorization, "Bearer jwt-abc");
   } finally {
     host.close();
