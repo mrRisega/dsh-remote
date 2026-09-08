@@ -5,7 +5,7 @@
 //   - 查询/启停 bridge（launchctl，plist 缺失时自动生成，逻辑与 dsh-setup.mjs 一致）
 //   - 代理 relay API（captcha / register / login / public-config），直连、不走系统代理
 //   - 自管理 self*（版本可见 / 新版检测 / 一键在线更新 / 彻底卸载）：插件市场没有更新卸载按钮，
-//     面板内即官方管理入口；更新=后台 npx @mrrisega/dsh-remote@latest（幂等补齐运行环境并重启 bridge）；
+//     面板内即官方管理入口；更新=后台 npx 按 dist-tag(默认 latest,DSH_UPDATE_TAG 可切 beta/alpha)（幂等补齐运行环境并重启 bridge）；
 //     彻底卸载=profile 插件清理（uninstallSelf）+ 运行时清理（uninstallRuntime：停 bridge 自启动 /
 //     删 plist|unit / 杀残留进程 / 清空配置目录 ~/.dsh-remote），0.4.7 起回归真正「未安装」状态
 //   - 运行时自愈：缺运行环境自动后台安装、登录后自动拉起 bridge（0.4.2 起）
@@ -378,7 +378,7 @@ function ensureRuntime(relayDir) {
   try {
     mkdirSync(relayDir, { recursive: true });
     const log = join(relayDir, AUTO_INSTALL_LOG);
-    const child = spawn(npxCommand(), ["--yes", "@mrrisega/dsh-remote"], {
+    const child = spawn(npxCommand(), ["--yes", UPDATE_SPEC], {
       detached: true,
       env: spawnEnv({ npm_config_registry: "https://registry.npmjs.org" }),
       stdio: ["ignore", openSync(log, "a"), openSync(log, "a")]
@@ -846,23 +846,31 @@ const PLUGIN_VERSION = "0.5.0";
 const UPDATE_LOG = ".dsh-update.log";
 const UPDATE_MARKER = ".dsh-update-running";
 
-/** 查询 npm 最新版（官方源优先，失败回退 npmmirror；纯服务端无 CORS 限制）。 */
+/**
+ * 更新通道（发布策略）：普通用户只拉稳定 dist-tag `latest`；预发(alpha/beta)由作者/内测
+ * 通过 `DSH_UPDATE_TAG=beta`（或显式版本号）拉取。迭代一律先发 beta/alpha，稳定后才升 latest。
+ */
+const UPDATE_TAG = (process.env.DSH_UPDATE_TAG || "latest").replace(/^@/, "");
+const UPDATE_SPEC = `@mrrisega/dsh-remote@${UPDATE_TAG}`;
+
+/** 查询所选通道(npm dist-tag)最新版（官方源优先，失败回退 npmmirror；纯服务端无 CORS 限制）。 */
 async function npmLatestVersion() {
   for (const reg of ["https://registry.npmjs.org/@mrrisega/dsh-remote", "https://registry.npmmirror.com/@mrrisega/dsh-remote"]) {
     try {
       const res = await fetch(reg, { signal: AbortSignal.timeout(8000) });
       if (!res.ok) continue;
       const j = await res.json();
-      if (j && j["dist-tags"] && typeof j["dist-tags"].latest === "string") return j["dist-tags"].latest;
+      const tags = j && j["dist-tags"] ? j["dist-tags"] : {};
+      if (typeof tags[UPDATE_TAG] === "string") return tags[UPDATE_TAG];
     } catch { /* 试下一个源 */ }
   }
   return "";
 }
 
-/** 以 detached 子进程执行 `npx --yes @mrrisega/dsh-remote@latest`（env 可覆盖 npm 源）。 */
+/** 以 detached 子进程执行 `npx --yes <UPDATE_SPEC>`（env 可覆盖 npm 源/更新通道）。 */
 function spawnUpdater(relayDir, extraEnv) {
   const log = join(relayDir, UPDATE_LOG);
-  return spawn(npxCommand(), ["--yes", "@mrrisega/dsh-remote@latest"], {
+  return spawn(npxCommand(), ["--yes", UPDATE_SPEC], {
     detached: true,
     cwd: homedir(),
     env: spawnEnv(extraEnv), // PATH 补 node 目录：App 最小 PATH 下也能跑 npx
@@ -871,7 +879,7 @@ function spawnUpdater(relayDir, extraEnv) {
 }
 
 /**
- * 后台执行在线一键更新：npx @mrrisega/dsh-remote@latest（幂等自愈：补运行环境/更新 bridge/收敛 include）。
+ * 后台执行在线一键更新：npx 按 dist-tag(默认 latest)（幂等自愈：补运行环境/更新 bridge/收敛 include）。
  * 稳健性：
  *   - npx 用绝对路径 + PATH 补全解析（App 拉起的 dsh web PATH 最小化时不再 ENOENT 静默失败）；
  *   - 【官方源优先】镜像(npmmirror)滞后时会把旧版(如 0.4.4)当成最新安装，旧 pluginCmd 会把
@@ -884,7 +892,7 @@ function runOnlineUpdate(relayDir) {
     mkdirSync(relayDir, { recursive: true });
     const marker = join(relayDir, UPDATE_MARKER);
     if (existsSync(marker)) return { ok: false, detail: "已有更新在进行中，请稍候" };
-    appendLogLine(relayDir, UPDATE_LOG, `[update] 开始在线更新 @mrrisega/dsh-remote@latest (${new Date().toISOString()})`);
+    appendLogLine(relayDir, UPDATE_LOG, `[update] 开始在线更新 ${UPDATE_SPEC} (${new Date().toISOString()})`);
 
     let retried = false;
     const clear = () => { try { rmSync(marker, { force: true }); } catch { /* ignore */ } };
