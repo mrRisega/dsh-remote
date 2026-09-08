@@ -153,12 +153,13 @@ window.__ModuleLoader__.load({
     ].join("\n");
     document.head.appendChild(styleEl);
 
-    // ── 左下角「远程访问」快捷小手机图标 ──
-    // 常驻于左下角：点击打开 设置页 → 「远程访问」栏目；首次点击前显示小红点（localStorage 一次）。
-    var FAB_SEEN_KEY = "dsh-remote-fab-seen";
+    // ── 侧边栏「远程访问」快捷入口（挂到官方设置按钮上方一行，用 dsh 自身的挂载位） ──
+    // 不用 fixed 悬浮层（会遮挡官方按钮）；改为在左侧主菜单的「设置」按钮上方克隆一行同款导航项：
+    // 点击 = 打开 设置页 → 「远程访问」栏目；首次点击前该入口右上角带小红点（localStorage 一次）。
+    var NAV_SEEN_KEY = "dsh-remote-nav-seen";
     function clickTextNav(text) {
       try {
-        var nodes = document.querySelectorAll('button, [role="tab"], [class*="navCell"], [class*="nav"], [class*="sidebar"] a, a');
+        var nodes = document.querySelectorAll('button, [role="tab"], [role="menuitem"], [class*="navCell"], [class*="nav"], [class*="sidebar"] a, a');
         for (var i = 0; i < nodes.length; i++) {
           var el = nodes[i];
           var t = (el.textContent || "").trim();
@@ -179,36 +180,61 @@ window.__ModuleLoader__.load({
       }, 150);
       if (typeof iv.unref === "function") iv.unref();
     }
-    function ensureRemoteFab() {
+    function injectSidebarRemoteEntry() {
       try {
-        if (document.getElementById("dru-remote-fab")) return;
-        if (!document.body) { setTimeout(ensureRemoteFab, 300); return; }
-        var fab = document.createElement("button");
-        fab.id = "dru-remote-fab";
-        fab.className = "dru-fab";
-        fab.type = "button";
-        fab.setAttribute("aria-label", "远程访问");
-        fab.textContent = "📱";
-        var seen = false;
-        try { seen = !!localStorage.getItem(FAB_SEEN_KEY); } catch (e) {}
-        if (!seen) {
-          var dot = document.createElement("span");
-          dot.className = "dru-fab-dot";
-          fab.appendChild(dot);
-        }
-        fab.addEventListener("click", function () {
-          try { localStorage.setItem(FAB_SEEN_KEY, "1"); } catch (e) {}
-          var d = fab.querySelector(".dru-fab-dot");
-          if (d) d.remove();
-          openRemoteSettings();
-        });
-        document.body.appendChild(fab);
+        if (document.getElementById("dru-nav-remote")) return;
+        if (!document.body) { setTimeout(injectSidebarRemoteEntry, 300); return; }
+        var tries = 0;
+        var iv = setInterval(function () {
+          try {
+            if (document.getElementById("dru-nav-remote")) { clearInterval(iv); return; }
+            // 只在「设置页已打开/未打开都能出现」的左侧主导航找「设置」按钮；
+            // 取文本以“设置”开头且最可能是菜单项(避免命中标题/弹层里的“设置”文字)
+            var nodes = document.querySelectorAll('button, [role="menuitem"], a, [class*="navCell"]');
+            var settingsBtn = null;
+            for (var i = 0; i < nodes.length; i++) {
+              var el = nodes[i];
+              var t = (el.textContent || "").trim();
+              if (t.indexOf("设置") === 0 || t.indexOf("设置 ") === 0 || t === "设置") { settingsBtn = el; break; }
+            }
+            if (!settingsBtn || !settingsBtn.parentNode) {
+              if (++tries > 80) clearInterval(iv);
+              return;
+            }
+            var entry = settingsBtn.cloneNode(false);
+            entry.id = "dru-nav-remote";
+            entry.removeAttribute("data-view");
+            entry.removeAttribute("href");
+            entry.textContent = "";
+            entry.setAttribute("role", "button");
+            entry.setAttribute("tabindex", "0");
+            entry.setAttribute("aria-label", "远程访问");
+            entry.textContent = "📱 远程访问";
+            var seen = false;
+            try { seen = !!localStorage.getItem(NAV_SEEN_KEY); } catch (e) {}
+            if (!seen) {
+              var dot = document.createElement("span");
+              dot.style.cssText = "position:absolute;top:4px;right:10px;width:8px;height:8px;border-radius:50%;background:#e5484d;pointer-events:none";
+              entry.style.position = "relative";
+              entry.appendChild(dot);
+            }
+            entry.addEventListener("click", function () {
+              try { localStorage.setItem(NAV_SEEN_KEY, "1"); } catch (e) {}
+              var d = entry.querySelector("span[style]");
+              if (d && /background:#e5484d/.test(d.getAttribute("style") || "")) d.remove();
+              openRemoteSettings();
+            });
+            settingsBtn.parentNode.insertBefore(entry, settingsBtn); // 设置在入口下方
+            clearInterval(iv);
+          } catch (e) { /* 忽略单次失败,继续重试 */ }
+        }, 300);
+        if (typeof iv.unref === "function") iv.unref();
       } catch (e) { /* 非关键 */ }
     }
     if (document.readyState === "loading") {
-      document.addEventListener("DOMContentLoaded", ensureRemoteFab);
+      document.addEventListener("DOMContentLoaded", injectSidebarRemoteEntry);
     } else {
-      setTimeout(ensureRemoteFab, 600);
+      setTimeout(injectSidebarRemoteEntry, 600);
     }
 
     // ── 首次安装引导小红点（设置页「远程访问」栏目，localStorage 控制） ────
