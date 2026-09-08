@@ -1,4 +1,4 @@
-// dsh-remote-ui — browser half（手写 bundle，无需构建）
+// dsh-remote-web — browser half（手写 bundle，无需构建）
 //
 // 格式遵循 dsh 浏览器插件约定（双半插件，bundle 手写无构建）：
 //   window.__ModuleLoader__.load({ id: <包名>, factory: (require) => {...} })
@@ -14,7 +14,7 @@
 //   - shell.overlay：满意度弹窗（安装体验至少 1 小时后弹出，只弹一次）
 // 所有数据经同源 /dsh-remote/* 宿主路由读写（node 半提供）。
 window.__ModuleLoader__.load({
-  id: "dsh-remote-ui",
+  id: "dsh-remote-web",
   factory: (require) => {
     var module = { exports: {} };
     var exports = module.exports;
@@ -31,7 +31,7 @@ window.__ModuleLoader__.load({
     // 面板主体内嵌于 DSH Web「设置」页的 settings.section 栏目（官方扩展点），
     // 不再使用侧边栏入口与全窗浮动层，故不再需要 .dru-entry/.dru-backdrop/.dru-panel。
     var styleEl = document.createElement("style");
-    styleEl.setAttribute("data-plugin", "dsh-remote-ui");
+    styleEl.setAttribute("data-plugin", "dsh-remote-web");
     styleEl.textContent = [
       // 设置页栏目容器（nav 选中后渲染在 settings.section 内容区）
       ".dru-settings-section{max-width:720px;display:flex;flex-direction:column;gap:14px;padding-top:2px}",

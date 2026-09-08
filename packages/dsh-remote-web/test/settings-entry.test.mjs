@@ -1,4 +1,4 @@
-// dsh-remote-ui 浏览器半回归：面板入口迁移进「设置」页 settings.section 官方扩展点。
+// dsh-remote-web 浏览器半回归（2026-09 前名 dsh-remote-ui）：面板入口迁移进「设置」页 settings.section 官方扩展点。
 // 覆盖：栏目注册（id/order/label）、侧边栏入口与浮动面板移除、账号区无「切换账号」、
 // 「关于 dsh-remote」说明卡片、退出登录/切换连接账号清理反馈线程凭据、首次安装红点引导。
 import assert from "node:assert/strict";

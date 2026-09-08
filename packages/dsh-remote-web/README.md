@@ -1,4 +1,8 @@
-# dsh-remote-ui — 公网远程控制 dsh web 的插件
+# dsh-remote-web — 公网远程控制 dsh web 的插件
+
+> 曾用名 **dsh-remote-ui**（≤0.4.9）；2026-09 更名 **dsh-remote-web** —— 本插件是
+> dsh-remote 全家桶的 **dsh web 插件半**（远程控制宿主插件，不是纯 UI/皮肤插件），
+> 名称与功能定位一致。旧名安装可由新版 `dsh-setup.mjs` 自动迁移/清理。
 
 > **给 DeepSeek Harness（dsh web）一个「随时随地」的公网入口。**
 > 安装后在 dsh web 的设置页登录账号，即得到一个专属的**加密远程地址**：人在办公室外、
@@ -57,8 +61,8 @@ npx @mrrisega/dsh-remote plugin --uninstall
 
 What it does:
 
-- `package.json` dependency: `"dsh-remote-ui": "link:<包目录>/packages/dsh-remote-ui"`
-- `cordis.patch.yml` insert: `{ id: dsh-remote-ui, name: 'dsh-remote-ui', config: { relayDir: '~/.dsh-remote' } }`
+- `package.json` dependency: `"dsh-remote-web": "link:<包目录>/packages/dsh-remote-web"`
+- `cordis.patch.yml` insert: `{ id: dsh-remote-web, name: 'dsh-remote-web', config: { relayDir: '~/.dsh-remote' } }`
 - runs `pnpm install` (fallback `npm install`) in the profile
 
 Restart `dsh web` afterwards. Manual alternative: edit the two files above and
@@ -75,7 +79,7 @@ restart.
 dsh --profile web --port 3090 --no-open   # verify on a separate port, 3080 untouched
 ```
 
-Verify: `/` `__DSH_BOOT__` contains `dsh-remote-ui`; `/plugins/dsh-remote-ui/client.js`
+Verify: `/` `__DSH_BOOT__` contains `dsh-remote-web`; `/plugins/dsh-remote-web/client.js`
 200; `/dsh-remote/status` returns JSON; panel renders in headless Chrome.
 
 ## Known limitations

@@ -21,7 +21,7 @@ be tolerated.
 1. Fork this repository and create a branch from `main`.
 2. Match the existing code style: ESM, `node:`-prefixed imports, JSDoc comments,
    Chinese inline comments are fine but not required.
-3. **Tests**: changes to `relay-router`, `dsh-remote-ui` or the bridge must come
+3. **Tests**: changes to `relay-router`, `dsh-remote-web` or the bridge must come
    with tests (`npm test`).
 4. Follow conventional commits (`feat:` / `fix:` / `docs:` / `test:` / `chore:`).
 5. Describe the motivation and how you verified the change in the PR description.
@@ -52,7 +52,7 @@ npm run check     # syntax checks (node --check, bash -n)
   local access-key auth (`/_login`) for self-hosting.
 - `clients/dsh-remote/` — the desktop bridge daemon (tunnel mode only).
 - `clients/dsh-web/` — the phone PWA (login / device selection).
-- `packages/dsh-remote-ui/` — the dsh web plugin (settings-page panel + bridge
+- `packages/dsh-remote-web/` — the dsh web plugin (settings-page panel + bridge
   lifecycle + feedback card).
 
 ## Commercial Edition

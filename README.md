@@ -77,7 +77,7 @@ npx @mrrisega/dsh-remote setup --server wss://<你的域名>:端口 --key <访�
 `plugin`（重装/卸载 dsh web 插件）。运行 `npx @mrrisega/dsh-remote --help` 查看完整说明。
 
 > **版本与更新 / 卸载**：dsh 官方插件市场目前不提供更新按钮，也不会改写用户补丁（因此市场
-> 卸载会提示「仍通过 insert 引用 dsh-remote-ui」而拒绝）。插件设置面板里已内置管理入口
+> 卸载会提示「仍通过 insert 引用 dsh-remote-web」而拒绝）。插件设置面板里已内置管理入口
 > （dsh web → 设置 → 「远程控制」→「🔄 版本与更新」卡片）：显示当前版本、自动检测 npm 新版、
 > **一键在线更新**（后台补运行环境并重启 bridge，完成后重启 dsh web 生效）、以及**彻底卸载**
 > （移除补丁 include / 依赖 / bundle 与本地文件，之后市场卸载或直接重启均可完成卸载）。
@@ -109,7 +109,7 @@ npx @mrrisega/dsh-remote setup --server wss://<你的域名>:端口 --key <访�
 | relay-router | `packages/relay-router/` | 中继服务器：bridge 注册表、实时设备列表、HTTP/WS 透明代理、配额 |
 | bridge | `clients/dsh-remote/` | 电脑端守护进程：连 router 注册，把转发帧代理到本地 `dsh web`；心跳自愈 |
 | PWA | `clients/dsh-web/native.html` | 手机端：登录 / 注册 / 设备选择（单文件，零构建） |
-| dsh web 插件 | `packages/dsh-remote-ui/` | 设置页「远程控制」面板：连接模式 / 账号 / bridge 启停 / 反馈 |
+| dsh web 插件 | `packages/dsh-remote-web/` | 设置页「远程控制」面板：连接模式 / 账号 / bridge 启停 / 反馈 |
 | 部署脚本 | `deploy/` | `install-open.sh` 自建引导、nginx 参考配置、Dockerfile / compose |
 
 测试：`npm test`（router 契约 + 插件 + bridge 全部单测与回归）。

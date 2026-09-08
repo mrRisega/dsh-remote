@@ -137,7 +137,7 @@ function saveLocalConfig(cfg) {
 }
 
 /**
- * Harness 浏览器会话 Cookie(由 dsh-remote-ui 插件在进程内换取后写入
+ * Harness 浏览器会话 Cookie(由 dsh-remote-web 插件在进程内换取后写入
  * <relayDir>/.harness-cookie.json)。新版 dsh web(0.1.2+)对每个请求校验该 Cookie,
  * 不带则 401 → 手机端白页;bridge 对所有上游 HTTP/WS 请求自动携带,让手机表现为已授权浏览器。
  */
