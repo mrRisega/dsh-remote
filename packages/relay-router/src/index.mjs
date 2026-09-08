@@ -176,7 +176,8 @@ const WS_MAX_PAYLOAD = 256 * 1024 * 1024;
 // 转发给 bridge 前剥离的 hop-by-hop / 本地头(业务头由 bridge 的 sanitizeRequestHeaders 再清洗)
 const STRIP_FWD_HEADERS = new Set([
   "host", "connection", "upgrade", "keep-alive", "transfer-encoding",
-  "content-length", "te", "trailer", "proxy-connection", "cookie"
+  "content-length", "te", "trailer", "proxy-connection", "cookie",
+  "x-dsh-remote-device" // channel 模式专用设备选择头,不透传给上游
 ]);
 // 回给手机前剥离的实体/传输头(content-length 由 router 重算;content-encoding 需透传:
 // bridge 对响应做 gzip 压缩时,手机浏览器必须看到该头才能正确解压)
@@ -416,18 +417,53 @@ function parseRemote(urlPath) {
   return { deviceId, path };
 }
 
+/**
+ * remote-channel 标记（dsh web 0.1.2-rc.1+ 在非回环域名下的传输改写）：
+ * 客户端把 /api/* 、/sidebar*、/git*、/pet* 与 WS 统一改写为 /remote/<channel>/... 形态，
+ * 并以 x-dsh-remote-device 头（HTTP）/ ?device= 参数（WS）/ dsh_device cookie 指明目标设备——
+ * 相当于把设备选择从 URL 首段挪到 header/参数。中继需把这些“channel 请求”还原为普通
+ * /remote/<device>/<原路径> 转发，否则首段会被当成设备号（如 “api”）→ 502 设备离线。
+ */
+const CHANNEL_MARKERS = new Set(["api", "sidebar", "git", "pet"]);
+
 /** 取「/remote/<deviceId>/<path>[?query]」,path 含查询串,保持原样转发。 */
 function remotePathWithQuery(url) {
   return url.pathname + (url.search || "");
 }
 
-/** 解析路由:优先 /remote/<deviceId>/<path>;否则按 dsh_device cookie 路由(根路径,兼容 dsh web 绝对路径)。 */
+/** channel 形态下的设备选择:header(x-dsh-remote-device) → ?device= → dsh_device cookie。 */
+function channelDeviceOf(req, url) {
+  const h = req.headers["x-dsh-remote-device"];
+  if (typeof h === "string" && h && DEVICE_ID_RE.test(h)) return h;
+  const q = url.searchParams.get("device");
+  if (q && DEVICE_ID_RE.test(q)) return q;
+  const c = getCookie(req, "dsh_device");
+  if (c && DEVICE_ID_RE.test(c)) return c;
+  return null;
+}
+
+/** 解析路由：
+ * 1) /remote/<channel>/<path> 且首段是 channel 标记 → channel 模式:设备从 header/参数/cookie 取,
+ *    转发路径去掉 /remote 前缀并剥掉 device 参数;
+ * 2) /remote/<deviceId>/<path> → 原行为;
+ * 3) 根路径按 dsh_device cookie 兜底(兼容 dsh web 绝对路径)。 */
 function resolveRoute(req, url) {
   const m = url.pathname.match(/^\/remote\/([^/]+)(\/.*)?$/);
   if (m) {
+    const head = m[1];
+    // channel 模式(客户端改写的 /remote/api|sidebar|git|pet/*)
+    if (CHANNEL_MARKERS.has(head)) {
+      const deviceId = channelDeviceOf(req, url);
+      if (!deviceId) return null; // 无设备凭据:交由上层按未登录/404 处理,勿报“设备 api 离线”
+      const path = m[2] || "/";
+      if (path.includes("..") || path.includes("\\")) return null;
+      const u2 = new URL(url.href);
+      u2.searchParams.delete("device"); // 设备参数只用于选设备,不透传给上游
+      return { deviceId, path: path + (u2.search || ""), channel: true };
+    }
     let deviceId;
     try {
-      deviceId = decodeURIComponent(m[1]);
+      deviceId = decodeURIComponent(head);
     } catch {
       return null;
     }
