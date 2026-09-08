@@ -1,9 +1,10 @@
-// dsh-remote-web — node half (host plugin)（2026-09 由 dsh-remote-web 更名；卸载/清理兼容旧名）
+// dsh-remote-web — node half (host plugin)（2026-09 由 dsh-remote-ui 更名 dsh-remote-web；卸载/清理兼容旧名）
 //
-// 提供 /dsh-remote/* 同源 HTTP 路由，供浏览器半的配置面板调用：
-//   - 读写 dsh-remote-open/.dsh-config.json（0600）
+// 提供 /dsh-remote/* 同源 HTTP 路由，供浏览器半的「远程访问」设置面板调用：
+//   - 读写配置目录下 .dsh-config.json（0600）
 //   - 查询/启停 bridge（launchctl，plist 缺失时自动生成，逻辑与 dsh-setup.mjs 一致）
-//   - 代理 relay API（captcha / register / login / public-config），直连、不走系统代理
+//   - 代理 relay API（captcha / register / login / public-config），直连、不走系统代理；
+//     另代理企业端一次性访问密钥 / 授权设备（/api/auth-key、/api/mobile-sessions、…/revoke，Bearer）供面板「📱 远程访问」卡使用
 //   - 自管理 self*（版本可见 / 新版检测 / 一键在线更新 / 彻底卸载）：插件市场没有更新卸载按钮，
 //     面板内即官方管理入口；更新=后台 npx 按 dist-tag(默认 latest,DSH_UPDATE_TAG 可切 beta/alpha)（幂等补齐运行环境并重启 bridge）；
 //     彻底卸载=profile 插件清理（uninstallSelf）+ 运行时清理（uninstallRuntime：停 bridge 自启动 /
@@ -698,6 +699,109 @@ async function relayInviteRecords(relayDir) {
   return { records: r.body.records || [], rewards: r.body.rewards || [] };
 }
 
+// ---------- 一次性访问密钥 / 已授权设备代理（E1 企业端新增 auth-key / mobile-sessions） ----------
+
+/** 从 relay 响应里尽量提取人类可读错误信息（兼容 {error:{message}} / {error:".."} / {message} / 纯文本）。 */
+function relayErrorMessage(r) {
+  const b = r && typeof r === "object" ? r.body : null;
+  if (b && typeof b === "object") {
+    if (typeof b.error === "string" && b.error) return b.error;
+    if (b.error && typeof b.error === "object") {
+      if (typeof b.error.message === "string" && b.error.message) return b.error.message;
+    }
+    if (typeof b.message === "string" && b.message) return b.message;
+  }
+  if (typeof b === "string" && b.trim()) return b.trim();
+  const st = r && r.status;
+  return st ? `企业端请求失败（HTTP ${st}）` : "企业端不可达，请稍后重试";
+}
+
+/** 未登录（无账号/自建密钥）时的统一返回文案。 */
+function notLoggedInJson() {
+  return { ok: false, error: "尚未登录：请先在「账号」卡片登录手机号账号（或切换到自建服务）后重试", hint: "login_required" };
+}
+
+/**
+ * 透传企业端响应体：契约字段可能在顶层或 data 子对象里（容错）。
+ * 返回扁平对象；数组字段只取首层数组。
+ */
+function flattenRelayBody(r) {
+  const b = r && typeof r === "object" && r.body && typeof r.body === "object" ? r.body : {};
+  const d = b.data && typeof b.data === "object" ? { ...b.data, ...b } : b;
+  return d;
+}
+
+/**
+ * GET /dsh-remote/access-key → 创建一次性访问密钥（企业端 POST /api/auth-key，Bearer device-login token）。
+ * 契约容错：url 必须可用；qr_data_url 取不到时返回 null（UI 只展示链接并说明“二维码暂不可用”，不报错）。
+ */
+async function proxyCreateAccessKey(relayDir, res) {
+  const token = await relayToken(relayDir).catch(() => "");
+  if (!token) return sendJson(res, 401, notLoggedInJson());
+  const r = await relayFetch(relayDir, "/api/auth-key", {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  const d = flattenRelayBody(r);
+  const url = typeof d.url === "string" ? d.url.trim() : "";
+  if (!r.ok || !url) {
+    // url 不可用是硬失败（企业端契约缺陷）；错误码/状态透传给 UI 展示
+    const err = r.ok && !url ? "企业端未返回可用的访问地址（缺 url）" : relayErrorMessage(r);
+    return sendJson(res, (r && r.status) || 502, { ok: false, error: err, relayStatus: (r && r.status) || 0 });
+  }
+  return sendJson(res, 200, {
+    ok: true,
+    url,
+    key: d.key ?? null,
+    expires_at: d.expires_at ?? null,
+    ttl_ms: d.ttl_ms ?? null,
+    qr_data_url: d.qr_data_url ?? null,
+    relayStatus: (r && r.status) || 200,
+  });
+}
+
+/**
+ * GET /dsh-remote/mobile-sessions → 已授权设备列表（企业端 POST /api/mobile-sessions，Bearer）。
+ */
+async function proxyMobileSessions(relayDir, res) {
+  const token = await relayToken(relayDir).catch(() => "");
+  if (!token) return sendJson(res, 401, notLoggedInJson());
+  const r = await relayFetch(relayDir, "/api/mobile-sessions", {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}` },
+  });
+  const d = flattenRelayBody(r);
+  const sessions = Array.isArray(d.sessions) ? d.sessions : [];
+  if (!r.ok) {
+    return sendJson(res, (r && r.status) || 502, { ok: false, error: relayErrorMessage(r), relayStatus: (r && r.status) || 0, sessions });
+  }
+  return sendJson(res, 200, { ok: true, sessions, relayStatus: (r && r.status) || 200 });
+}
+
+/**
+ * POST /dsh-remote/mobile-sessions/revoke（body {id}）→ 取消配对（企业端 POST /api/mobile-sessions/:id/revoke，Bearer）。
+ */
+async function proxyRevokeMobileSession(relayDir, req, res) {
+  const body = await readJsonBody(req);
+  if (body.__parseError) return sendJson(res, 400, { ok: false, error: "JSON 解析失败" });
+  const id = String(body.id ?? "").trim();
+  if (!id) return sendJson(res, 400, { ok: false, error: "缺少参数 id（会话 ID）" });
+  const token = await relayToken(relayDir).catch(() => "");
+  if (!token) return sendJson(res, 401, notLoggedInJson());
+  const r = await relayFetch(relayDir, `/api/mobile-sessions/${encodeURIComponent(id)}/revoke`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}` },
+  });
+  const d = flattenRelayBody(r);
+  // 兼容两种成功形态：HTTP ok，或 body.ok === true（允许企业端 200 + ok:false 表示业务失败）
+  const ok = !!(r.ok && d.ok !== false);
+  if (!ok) {
+    return sendJson(res, (r && r.status) || 502, { ok: false, error: relayErrorMessage(r), relayStatus: (r && r.status) || 0 });
+  }
+  return sendJson(res, 200, { ok: true, relayStatus: (r && r.status) || 200 });
+}
+
 // ---------- 综合状态 ----------
 
 async function composeStatus(relayDir) {
@@ -1038,7 +1142,7 @@ function registerRoutes(ctx, relayDir) {
         if (rt.removedPlist) bits.push("自启动项已删除");
         if (rt.killedPids.length) bits.push(`已结束 ${rt.killedPids.length} 个残留进程`);
         if (rt.removedDir) bits.push("配置目录已清空（账号/密钥/固化运行时等）");
-        bits.push("请重启 dsh web 后完全卸载生效（本插件与远程控制将消失）；如需再次使用，在插件市场重新安装即可。");
+        bits.push("请重启 dsh web 后完全卸载生效（本插件与「远程访问」面板将消失）；如需再次使用，在插件市场重新安装即可。");
         sendJson(res, 200, {
           ok: true,
           ...prof, // removedPatch / removedDep / removedBundle / removedDir(profile 插件目录)
@@ -1092,6 +1196,30 @@ function registerRoutes(ctx, relayDir) {
           relayReachable: pub.ok,
           publicConfig: body
         });
+      },
+    },
+    // 一次性访问密钥（📱 远程访问卡）：GET 即创建新 key，企业端 POST /api/auth-key（Bearer）
+    {
+      method: "GET",
+      path: "/dsh-remote/access-key",
+      handler: async (_req, res) => {
+        await proxyCreateAccessKey(relayDir, res);
+      },
+    },
+    // 已授权设备列表（企业端 POST /api/mobile-sessions，Bearer）
+    {
+      method: "GET",
+      path: "/dsh-remote/mobile-sessions",
+      handler: async (_req, res) => {
+        await proxyMobileSessions(relayDir, res);
+      },
+    },
+    // 取消已授权设备配对（企业端 POST /api/mobile-sessions/:id/revoke，Bearer）
+    {
+      method: "POST",
+      path: "/dsh-remote/mobile-sessions/revoke",
+      handler: async (req, res) => {
+        await proxyRevokeMobileSession(relayDir, req, res);
       },
     },
     {
