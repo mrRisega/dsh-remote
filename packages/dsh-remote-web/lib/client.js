@@ -146,8 +146,70 @@ window.__ModuleLoader__.load({
       ".dru-dev-sub{font-size:11px;color:#8c959f;margin-top:3px}",
       ".dru-dev-tag{font-size:10.5px;color:#8c959f;border:1px solid #d0d7de;border-radius:999px;padding:0 7px;flex:none;white-space:nowrap}",
       ".dru-dev-tag-off{color:#cf222e;border-color:#ffb3b6;background:#fff0f1}",
+      // 左下角「远程访问」快捷小手机图标（安装后常驻；首次点击前带红点）
+      ".dru-fab{position:fixed;left:18px;bottom:18px;z-index:2147482100;width:46px;height:46px;border-radius:50%;background:#0969da;color:#fff;border:none;display:flex;align-items:center;justify-content:center;font-size:22px;line-height:1;box-shadow:0 6px 18px rgba(0,0,0,.28);cursor:pointer;font-family:inherit;padding:0}",
+      ".dru-fab:hover{background:#0860bd}",
+      ".dru-fab-dot{position:absolute;top:2px;right:2px;width:9px;height:9px;border-radius:50%;background:#e5484d;box-shadow:0 0 0 2px #fff;pointer-events:none}",
     ].join("\n");
     document.head.appendChild(styleEl);
+
+    // ── 左下角「远程访问」快捷小手机图标 ──
+    // 常驻于左下角：点击打开 设置页 → 「远程访问」栏目；首次点击前显示小红点（localStorage 一次）。
+    var FAB_SEEN_KEY = "dsh-remote-fab-seen";
+    function clickTextNav(text) {
+      try {
+        var nodes = document.querySelectorAll('button, [role="tab"], [class*="navCell"], [class*="nav"], [class*="sidebar"] a, a');
+        for (var i = 0; i < nodes.length; i++) {
+          var el = nodes[i];
+          var t = (el.textContent || "").trim();
+          if (t === text || t.indexOf(text) === 0) {
+            try { el.click(); return true; } catch (e) { /* 尝试下一个 */ }
+          }
+        }
+      } catch (e) { /* 忽略 */ }
+      return false;
+    }
+    function openRemoteSettings() {
+      if (clickTextNav("远程访问")) return; // 已在栏目内/可直接点到
+      if (clickTextNav("设置")) { /* 进入设置页后再轮询远程访问栏目 */ }
+      var tries = 0;
+      var iv = setInterval(function () {
+        if (clickTextNav("远程访问")) { clearInterval(iv); return; }
+        if (++tries > 40) clearInterval(iv);
+      }, 150);
+      if (typeof iv.unref === "function") iv.unref();
+    }
+    function ensureRemoteFab() {
+      try {
+        if (document.getElementById("dru-remote-fab")) return;
+        if (!document.body) { setTimeout(ensureRemoteFab, 300); return; }
+        var fab = document.createElement("button");
+        fab.id = "dru-remote-fab";
+        fab.className = "dru-fab";
+        fab.type = "button";
+        fab.setAttribute("aria-label", "远程访问");
+        fab.textContent = "📱";
+        var seen = false;
+        try { seen = !!localStorage.getItem(FAB_SEEN_KEY); } catch (e) {}
+        if (!seen) {
+          var dot = document.createElement("span");
+          dot.className = "dru-fab-dot";
+          fab.appendChild(dot);
+        }
+        fab.addEventListener("click", function () {
+          try { localStorage.setItem(FAB_SEEN_KEY, "1"); } catch (e) {}
+          var d = fab.querySelector(".dru-fab-dot");
+          if (d) d.remove();
+          openRemoteSettings();
+        });
+        document.body.appendChild(fab);
+      } catch (e) { /* 非关键 */ }
+    }
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", ensureRemoteFab);
+    } else {
+      setTimeout(ensureRemoteFab, 600);
+    }
 
     // ── 首次安装引导小红点（设置页「远程访问」栏目，localStorage 控制） ────
     // 无 dsh-remote-seen-dot key 视为首次：在设置页导航栏目右上角显示 CSS 圆点；
@@ -921,6 +983,11 @@ window.__ModuleLoader__.load({
       /** 创建（或刷新）一次性访问密钥：GET /dsh-remote/access-key（node 半转发企业端 /api/auth-key）。 */
       function loadAccessKey() {
         if (akeyBusy) return;
+        // 登录前不请求企业端（避免 401/404 噪音）；由账号登录成功后触发
+        if (!(st && st.config && st.config.phone)) {
+          setAkeyMsg(null);
+          return;
+        }
         setAkeyBusy(true);
         api("/dsh-remote/access-key").then(function (b) {
           if (!b || !b.ok) {
@@ -1266,8 +1333,12 @@ window.__ModuleLoader__.load({
         var expMs = akey ? toMs(akey.expires_at) : 0;
         var remainMs = expMs ? expMs - nowTick : 0;
         var loggedInSaaS = !!(st && st.config && st.config.phone);
-        var statusTxt = st === null ? "查询中…" : serviceRunning ? "已连接（可远程访问）" : "等待设备连接";
-        var dotCls = "dru-dot " + (serviceRunning ? "dru-dot-on" : "dru-dot-off");
+        var statusTxt = st === null
+          ? "查询中…"
+          : !loggedInSaaS
+            ? "请先登录（下方账号卡片）后启用远程访问"
+            : serviceRunning ? "已连接（可远程访问）" : "等待设备连接";
+        var dotCls = "dru-dot " + (loggedInSaaS && serviceRunning ? "dru-dot-on" : "dru-dot-off");
         return card("📱 远程访问", [
           h("div", { className: "dru-status-line" },
             h("span", { className: dotCls }),
@@ -1394,7 +1465,8 @@ window.__ModuleLoader__.load({
           // 云端 tab：📱 远程访问（一次性扫码访问 + 已授权设备）+ 账号（手机号登录，官方托管）
           !isLocal ? h("div", null,
             renderAccessCard(),
-            renderDevicesCard(),
+            // 已授权设备：仅登录后展示（登录前不显示，避免空列表/误导）
+            loggedIn && st.config.phone ? renderDevicesCard() : null,
             card("🔑 账号",
               st === null
                 ? h("div", { className: "dru-hint" }, "正在读取远控状态…")

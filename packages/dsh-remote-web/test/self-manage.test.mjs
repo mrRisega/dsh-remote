@@ -55,7 +55,7 @@ test("self 路由：版本可见 + 运行环境状态（无 npx 环境时不谎�
     try {
       const self = await (await fetch(`${base}/dsh-remote/self`)).json();
       assert.equal(self.ok, true);
-      assert.match(self.version, /^\d+\.\d+\.\d+$/, `version 应为 semver，实际 ${self.version}`);
+      assert.match(self.version, /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/, `version 应为 semver(含预发布)，实际 ${self.version}`);
       assert.equal(self.runtimeReady, false, "temp 目录没有 dsh-setup.mjs → runtimeReady=false");
       assert.equal(self.relayDir, tempDir);
     } finally {
