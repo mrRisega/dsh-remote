@@ -1,4 +1,4 @@
-// dsh-remote-ui — node half (host plugin)
+// dsh-remote-web — node half (host plugin)（2026-09 由 dsh-remote-web 更名；卸载/清理兼容旧名）
 //
 // 提供 /dsh-remote/* 同源 HTTP 路由，供浏览器半的配置面板调用：
 //   - 读写 dsh-remote-open/.dsh-config.json（0600）
@@ -144,7 +144,7 @@ function sweepStaleMarkers(relayDir) {
     if (dead === false || (dead === null && expired)) {
       try { rmSync(p, { force: true }); } catch { /* ignore */ }
       appendLogLine(relayDir, AUTO_INSTALL_LOG,
-        `[dsh-remote-ui] 清理残留标记 ${name}（pid=${info.pid ?? "?"}, at=${new Date(info.at).toISOString()}${dead === false ? ", 进程已死" : ", 已超时"}）`);
+        `[dsh-remote-web] 清理残留标记 ${name}（pid=${info.pid ?? "?"}, at=${new Date(info.at).toISOString()}${dead === false ? ", 进程已死" : ", 已超时"}）`);
     }
   }
 }
@@ -392,13 +392,13 @@ function ensureRuntime(relayDir) {
     child.on("error", (e) => {
       clear();
       appendLogLine(relayDir, AUTO_INSTALL_LOG, `[auto-install] 启动失败: ${e.message}`);
-      console.warn(`[dsh-remote-ui] 自动安装子进程启动失败: ${e.message}`);
+      console.warn(`[dsh-remote-web] 自动安装子进程启动失败: ${e.message}`);
     });
     child.unref();
-    console.log(`[dsh-remote-ui] 检测到缺少桌面运行环境,已在后台自动安装(日志: ${log}),完成后将自动启动 bridge`);
+    console.log(`[dsh-remote-web] 检测到缺少桌面运行环境,已在后台自动安装(日志: ${log}),完成后将自动启动 bridge`);
     return false;
   } catch (e) {
-    console.warn(`[dsh-remote-ui] 自动安装启动失败: ${e.message}`);
+    console.warn(`[dsh-remote-web] 自动安装启动失败: ${e.message}`);
     try { rmSync(marker, { force: true }); } catch { /* ignore */ }
     return false;
   }
@@ -789,7 +789,7 @@ async function proxyFeedback(relayDir, req, res, pathname) {
   const url = new URL(suffix.replace(/^\//, ""), base);
   const headers = {
     "x-dsh-device": cfg.device_id || "",
-    "x-dsh-client": "dsh-remote-ui/0.1.0",
+    "x-dsh-client": `dsh-remote-web/${PLUGIN_VERSION}`,
   };
   if (cfg.phone) headers["x-dsh-phone"] = String(cfg.phone);
   const auth = req.headers.authorization;
@@ -836,8 +836,13 @@ async function proxyFeedback(relayDir, req, res, pathname) {
 
 // ---------- 自管理：版本 / 在线更新 / 彻底卸载（面板内“版本与更新”卡片） ----------
 
+/** 插件 id / 包名（2026-09 由 dsh-remote-ui 更名）。 */
+const PLUGIN_ID = "dsh-remote-web";
+/** 更名前 id（≤0.4.9）：彻底卸载/清理时一并移除，防旧拷贝残留。 */
+const PLUGIN_LEGACY_IDS = ["dsh-remote-ui"];
+const PLUGIN_ALL_IDS = [PLUGIN_ID, ...PLUGIN_LEGACY_IDS];
 /** 插件自身发布版本（与 dsh-remote 根包同步递增）。 */
-const PLUGIN_VERSION = "0.4.9";
+const PLUGIN_VERSION = "0.5.0";
 const UPDATE_LOG = ".dsh-update.log";
 const UPDATE_MARKER = ".dsh-update-running";
 
@@ -925,25 +930,37 @@ function uninstallSelf(relayDir, profileDir, patchFile, pkgFile) {
   const out = { removedPatch: false, removedDep: false, removedDir: false, removedBundle: false };
   try {
     const patch = readFileSync(patchFile, "utf8");
+    // 兼容当前与历史（dsh-remote-ui）两种管理标记
     const cleaned = patch
-      .replace(/\n?# >>> dsh-remote-ui .*?# <<< dsh-remote-ui\s*/s, "\n")
+      .replace(/\n?# >>> dsh-remote-(?:web|ui) .*?# <<< dsh-remote-(?:web|ui)\s*/s, "\n")
       .replace(/\n{3,}/g, "\n\n")
       .trimEnd() + "\n";
     if (cleaned !== patch) { writeFileSync(patchFile, cleaned); out.removedPatch = true; }
   } catch { /* 无 patch 忽略 */ }
   try {
     const pkg = JSON.parse(readFileSync(pkgFile, "utf8"));
-    if (pkg.dependencies && pkg.dependencies["dsh-remote-ui"]) { delete pkg.dependencies["dsh-remote-ui"]; out.removedDep = true; }
+    if (pkg.dependencies) {
+      let removed = false;
+      for (const id of PLUGIN_ALL_IDS) {
+        if (pkg.dependencies[id] !== undefined) { delete pkg.dependencies[id]; removed = true; }
+      }
+      if (removed) out.removedDep = true;
+    }
     const bundles = pkg.dsh && pkg.dsh.profile && Array.isArray(pkg.dsh.profile.bundles) ? pkg.dsh.profile.bundles : null;
     if (bundles) {
-      const i = bundles.indexOf("dsh-remote-ui");
-      if (i >= 0) { bundles.splice(i, 1); out.removedBundle = true; }
+      const filtered = bundles.filter((b) => !PLUGIN_ALL_IDS.includes(b));
+      if (filtered.length !== bundles.length) {
+        pkg.dsh.profile.bundles = filtered;
+        out.removedBundle = true;
+      }
     }
     if (out.removedDep || out.removedBundle) writeFileSync(pkgFile, JSON.stringify(pkg, null, 2) + "\n");
   } catch { /* 无 package.json 忽略 */ }
   try {
-    rmSync(join(profileDir, "dsh-remote-ui-plugin"), { recursive: true, force: true });
-    rmSync(join(profileDir, "node_modules", "dsh-remote-ui"), { recursive: true, force: true });
+    for (const id of PLUGIN_ALL_IDS) {
+      rmSync(join(profileDir, `${id}-plugin`), { recursive: true, force: true });
+      rmSync(join(profileDir, "node_modules", id), { recursive: true, force: true });
+    }
     out.removedDir = true;
   } catch { /* ignore */ }
   return out;
@@ -957,8 +974,10 @@ function registerRoutes(ctx, relayDir) {
   let profileDir = join(homedir(), ".dsh", "profiles", "web");
   try {
     const here = fileURLToPath(import.meta.url);
-    // 依次尝试两种安装布局；split()[0] 未命中时返回原串，需显式判断后再试下一种
-    let m = here.split("/dsh-remote-ui-plugin/")[0];
+    // 依次尝试两种安装布局（当前名优先，历史名兜底）；split()[0] 未命中时返回原串，需显式判断后再试下一种
+    let m = here.split("/dsh-remote-web-plugin/")[0];
+    if (m === here) m = here.split("/node_modules/dsh-remote-web/")[0];
+    if (m === here) m = here.split("/dsh-remote-ui-plugin/")[0];
     if (m === here) m = here.split("/node_modules/dsh-remote-ui/")[0];
     if (m !== here) profileDir = m;
   } catch { /* 保持默认 */ }
@@ -1272,7 +1291,7 @@ function registerRoutes(ctx, relayDir) {
           return;
         }
         Promise.resolve(route.handler(req, res)).catch((e) => {
-          ctx.logger?.warn?.(`dsh-remote-ui: ${route.method} ${route.path} failed: ${e?.stack || e}`);
+          ctx.logger?.warn?.(`dsh-remote-web: ${route.method} ${route.path} failed: ${e?.stack || e}`);
           if (!res.headersSent) sendJson(res, 500, { ok: false, error: String(e?.message || e) });
           else res.end();
         });
@@ -1297,10 +1316,10 @@ export function apply(ctx, config = {}) {
   UNINSTALLED_DIRS.delete(relayDir);
   // 清理上次进程残留的安装/更新 marker（宿主被重启/强杀时子进程清理回调会丢失）
   sweepStaleMarkers(relayDir);
-  ctx.effect(() => registerRoutes(ctx, relayDir), "dsh-remote-ui: /dsh-remote routes");
+  ctx.effect(() => registerRoutes(ctx, relayDir), "dsh-remote-web: /dsh-remote routes");
   // 0.1.2-rc.1+ 浏览器会话代持：换取 Harness 会话 Cookie 供 bridge 上游携带（手机点设备不再 401 白页）
-  ctx.effect(() => scheduleHarnessMint(ctx, relayDir), "dsh-remote-ui: harness browser-session mint");
+  ctx.effect(() => scheduleHarnessMint(ctx, relayDir), "dsh-remote-web: harness browser-session mint");
   // 插件市场一键全功能:缺桌面运行环境则自动安装,登录后自动拉起 bridge(不依赖用户跑 npx)
-  ctx.effect(() => scheduleRuntime(relayDir), "dsh-remote-ui: runtime self-provision");
-  ctx.logger?.info?.(`dsh-remote-ui: /dsh-remote routes ready (relayDir=${relayDir})`);
+  ctx.effect(() => scheduleRuntime(relayDir), "dsh-remote-web: runtime self-provision");
+  ctx.logger?.info?.(`dsh-remote-web: /dsh-remote routes ready (relayDir=${relayDir})`);
 }

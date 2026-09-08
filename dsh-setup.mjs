@@ -44,7 +44,7 @@ const REPO_URL = "https://github.com/mrRisega/dsh-remote";
 // npx 每次安装的缓存目录（~/.npm/_npx/<hash>）不固定：缓存一旦清理，指向它的自启动服务
 // 就会像“找不到模块”一样崩溃。因此 npm 形态安装时把 dsh-setup.mjs + clients + 依赖(ws)
 // 固化到 CONFIG_DIR（~/.dsh-remote），自启动服务只指向这个稳定路径。
-// 插件（dsh-remote-ui）的“运行环境已就绪”判断同样以 CONFIG_DIR/dsh-setup.mjs 为准。
+// 插件（dsh-remote-web；2026-09 前为 dsh-remote-ui）的“运行环境已就绪”判断同样以 CONFIG_DIR/dsh-setup.mjs 为准。
 
 function pkgVersion() {
   try {
@@ -462,31 +462,39 @@ async function setup(argv) {
 }
 
 // ---------- plugin：安装/卸载 dsh web 远程控制插件 ----------
-const PLUGIN_MARKER_START = "# >>> dsh-remote-ui (managed by dsh-remote plugin; do not edit)";
-const PLUGIN_MARKER_END = "# <<< dsh-remote-ui";
+/** 当前插件名（2026-09 由 dsh-remote-ui 更名；dsh-remote-web = dsh-remote 的 dsh web 插件半）。 */
+const PLUGIN_ID = "dsh-remote-web";
+/** 更名前的历史插件名（≤0.4.9）：升级安装/卸载时一并清理，避免旧 id 残留导致重复激活。 */
+const PLUGIN_LEGACY_IDS = ["dsh-remote-ui"];
+/** 当前名 + 全部历史名。 */
+const PLUGIN_ALL_IDS = [PLUGIN_ID, ...PLUGIN_LEGACY_IDS];
+const PLUGIN_MARKER_START = `# >>> ${PLUGIN_ID} (managed by dsh-remote plugin; do not edit)`;
+const PLUGIN_MARKER_END = `# <<< ${PLUGIN_ID}`;
 /** 插件在 profile 内的固定本地目录(安装时整目录拷贝)。 */
-const PLUGIN_LOCAL_DIR = "dsh-remote-ui-plugin";
+const PLUGIN_LOCAL_DIR = `${PLUGIN_ID}-plugin`;
+/** 片段是否涉及本插件(当前名或任一历史名)。 */
+const pluginRef = (s) => PLUGIN_ALL_IDS.some((id) => s.includes(id));
 
 /**
- * include 块。name 必须是【裸包名】'dsh-remote-ui'：
- *  - 加载器据此 import 节点半(dsh-remote-ui 由 node_modules 链接解析);
+ * include 块。name 必须是【裸包名】'${PLUGIN_ID}'（≤0.4.9 为 'dsh-remote-ui'）：
+ *  - 加载器据此 import 节点半(${PLUGIN_ID} 由 node_modules 链接解析);
  *  - dsh 客户端模块系统(@deepseek-ai/dsh-client-modules)用 require.resolve(
  *    '<name>/package.json') 从 profile 解析该包并读取 package.json 的
  *    dsh.client 声明 → 注入浏览器半(设置面板 UI)。相对文件路径入口只会加载
  *    节点半、不会注入 UI —— 0.3.7/0.3.8 曾因此丢设置页。
- * 链接由安装器自建(node_modules/dsh-remote-ui → 拷贝出的目录),不依赖 pnpm/npm。
+ * 链接由安装器自建(node_modules/${PLUGIN_ID} → 拷贝出的目录),不依赖 pnpm/npm。
  */
 function pluginBlock(relayDir) {
   return `${PLUGIN_MARKER_START}
 - insert:
-    - id: dsh-remote-ui
-      name: 'dsh-remote-ui'
+    - id: ${PLUGIN_ID}
+      name: '${PLUGIN_ID}'
       config:
         relayDir: '${relayDir}'
 ${PLUGIN_MARKER_END}`;
 }
 
-/** 移除 patch 中所有引用 dsh-remote-ui 的条目块（含其前置注释），返回剩余内容。 */
+/** 移除 patch 中所有引用本插件（当前或历史名）的条目块（含其前置注释），返回剩余内容。 */
 function stripPluginEntries(patch) {
   const lines = patch.split("\n");
   const out = [];
@@ -501,10 +509,10 @@ function stripPluginEntries(patch) {
         block.push(lines[j]);
         j++;
       }
-      if (block.join("\n").includes("dsh-remote-ui")) {
+      if (pluginRef(block.join("\n"))) {
         // 连带删除块前的连续注释（旧版条目说明 / 管理标记），以及块后的收尾标记行
         while (out.length && /^\s*#/.test(out[out.length - 1])) out.pop();
-        if (j < lines.length && /^\s*#/.test(lines[j]) && lines[j].includes("dsh-remote-ui")) j++;
+        if (j < lines.length && /^\s*#/.test(lines[j]) && pluginRef(lines[j])) j++;
         i = j;
         continue;
       }
@@ -535,10 +543,14 @@ function normalizePatchBase(patch) {
 
 /**
  * 把插件整目录拷贝进 profile 的固定子目录并返回该目录。
- * 源(本包 packages/dsh-remote-ui)可能在 npx 临时缓存里,因此必须拷到 profile 内持久化,
+ * 源(本包 packages/${PLUGIN_ID})可能在 npx 临时缓存里,因此必须拷到 profile 内持久化,
  * include 用相对路径直接指向拷贝出的入口,不写依赖、不跑任何包管理器。
  */
 function copyPluginIntoProfile(profileDir, pluginDir) {
+  // 清理历史名残留目录（≤0.4.9 的 dsh-remote-ui-plugin），避免与新版并存
+  for (const id of PLUGIN_LEGACY_IDS) {
+    try { fs.rmSync(path.join(profileDir, `${id}-plugin`), { recursive: true, force: true }); } catch { /* ignore */ }
+  }
   const dest = path.join(profileDir, PLUGIN_LOCAL_DIR);
   fs.rmSync(dest, { recursive: true, force: true });
   fs.cpSync(pluginDir, dest, {
@@ -555,11 +567,15 @@ function copyPluginIntoProfile(profileDir, pluginDir) {
   return dest;
 }
 
-/** 把插件挂到 <profile>/node_modules/dsh-remote-ui(裸包名解析需要),指向拷贝目录;缺失/指错时重建。 */
+/** 把插件挂到 <profile>/node_modules/<PLUGIN_ID>(裸包名解析需要),指向拷贝目录;缺失/指错时重建。 */
 function ensurePluginLinked(profileDir, pluginLocalDir) {
   const nmDir = path.join(profileDir, "node_modules");
-  const nmPlugin = path.join(nmDir, "dsh-remote-ui");
+  const nmPlugin = path.join(nmDir, PLUGIN_ID);
   fs.mkdirSync(nmDir, { recursive: true });
+  // 清理历史名链接（node_modules/dsh-remote-ui），避免解析到旧拷贝
+  for (const id of PLUGIN_LEGACY_IDS) {
+    try { fs.rmSync(path.join(nmDir, id), { recursive: true, force: true }); } catch { /* ignore */ }
+  }
   try {
     if (fs.realpathSync(nmPlugin) === pluginLocalDir) return false;
   } catch { /* 缺失/悬空 → 重建 */ }
@@ -576,50 +592,64 @@ function ensurePluginLinked(profileDir, pluginLocalDir) {
 function declarePluginDep(pkgFile) {
   const pkg = JSON.parse(fs.readFileSync(pkgFile, "utf8"));
   pkg.dependencies = pkg.dependencies || {};
-  pkg.dependencies["dsh-remote-ui"] = `file:./${PLUGIN_LOCAL_DIR}`;
+  for (const id of PLUGIN_LEGACY_IDS) { delete pkg.dependencies[id]; }
+  pkg.dependencies[PLUGIN_ID] = `file:./${PLUGIN_LOCAL_DIR}`;
   fs.writeFileSync(pkgFile, JSON.stringify(pkg, null, 2) + "\n");
 }
 
-/** 把 dsh-remote-ui 加入 dsh.profile.bundles（幂等）。返回是否发生变更。 */
+/** 把 PLUGIN_ID 加入 dsh.profile.bundles（幂等；顺带移除历史名条目）。返回是否发生变更。 */
 function ensureBundleEntry(pkgFile) {
   const pkg = JSON.parse(fs.readFileSync(pkgFile, "utf8"));
   const bundles = pkg.dsh && pkg.dsh.profile && Array.isArray(pkg.dsh.profile.bundles)
     ? pkg.dsh.profile.bundles
     : null;
-  if (bundles && bundles.includes("dsh-remote-ui")) return false;
+  if (bundles && bundles.includes(PLUGIN_ID)) {
+    const hadLegacy = bundles.some((b) => PLUGIN_LEGACY_IDS.includes(b));
+    if (hadLegacy) {
+      pkg.dsh.profile.bundles = bundles.filter((b) => !PLUGIN_LEGACY_IDS.includes(b));
+      fs.writeFileSync(pkgFile, JSON.stringify(pkg, null, 2) + "\n");
+      return true;
+    }
+    return false;
+  }
   pkg.dsh = pkg.dsh || {};
   pkg.dsh.profile = pkg.dsh.profile || {};
-  pkg.dsh.profile.bundles = bundles || [];
-  pkg.dsh.profile.bundles.push("dsh-remote-ui");
+  pkg.dsh.profile.bundles = (bundles || []).filter((b) => !PLUGIN_LEGACY_IDS.includes(b) && b !== PLUGIN_ID);
+  pkg.dsh.profile.bundles.push(PLUGIN_ID);
   fs.writeFileSync(pkgFile, JSON.stringify(pkg, null, 2) + "\n");
   return true;
 }
 
-/** 从 dsh.profile.bundles 移除 dsh-remote-ui（幂等）。返回是否发生变更。 */
+/** 从 dsh.profile.bundles 移除本插件（当前或历史名，幂等）。返回是否发生变更。 */
 function removeBundleEntry(pkgFile) {
   const pkg = JSON.parse(fs.readFileSync(pkgFile, "utf8"));
   const bundles = pkg.dsh && pkg.dsh.profile && Array.isArray(pkg.dsh.profile.bundles)
     ? pkg.dsh.profile.bundles
     : null;
-  if (!bundles || !bundles.includes("dsh-remote-ui")) return false;
-  pkg.dsh.profile.bundles = bundles.filter((b) => b !== "dsh-remote-ui");
+  if (!bundles) return false;
+  const filtered = bundles.filter((b) => !PLUGIN_ALL_IDS.includes(b));
+  if (filtered.length === bundles.length) return false;
+  pkg.dsh.profile.bundles = filtered;
   fs.writeFileSync(pkgFile, JSON.stringify(pkg, null, 2) + "\n");
   return true;
 }
 
 /**
- * 插件安装(pluginCmd 非卸载分支)收敛策略 —— 2026-09-06「重复 ID 崩溃」根治：
- * dsh-remote-ui 是带 dsh.bundle.patch 的 bundle：package.json 的 dsh.profile.bundles
+ * 插件安装(pluginCmd 非卸载分支)收敛策略 —— 2026-09-06「重复 ID 崩溃」根治；
+ * 2026-09 插件由 dsh-remote-ui 更名 dsh-remote-web，本函数同时兼容清理旧名残留：
+ * dsh-remote-web 是带 dsh.bundle.patch 的 bundle：package.json 的 dsh.profile.bundles
  * 声明它后，加载器会自动应用插件自带的 cordis.patch.yml（节点半+浏览器半的唯一激活点）。
  * 若用户级 cordis.patch.yml 再手工 insert 同一个 id，dsh web 启动即报“重复 ID”崩溃。
  * 因此本命令【绝不写用户 include】，只负责：让插件以 bundle 形态可解析，
- * 并清理历史遗留的 include 块。市场形态(github:/npm 依赖)则完全交由市场管理，只清理 include。
+ * 并清理历史遗留的 include 块与旧名(≤0.4.9 dsh-remote-ui)痕迹。
+ * 市场形态(github:/npm 依赖)则完全交由市场管理，只清理 include。
  */
 function convergePluginActivation(profileDir, pkgFile, patchFile, pluginDir, patch) {
   const pkg = JSON.parse(fs.readFileSync(pkgFile, "utf8"));
-  const dep = pkg.dependencies && pkg.dependencies["dsh-remote-ui"];
+  const legacyDep = PLUGIN_LEGACY_IDS.map((id) => pkg.dependencies && pkg.dependencies[id]).find((v) => v !== undefined);
+  const dep = (pkg.dependencies && pkg.dependencies[PLUGIN_ID]) ?? legacyDep;
   const inBundles = !!(pkg.dsh && pkg.dsh.profile && Array.isArray(pkg.dsh.profile.bundles)
-    && pkg.dsh.profile.bundles.includes("dsh-remote-ui"));
+    && pkg.dsh.profile.bundles.some((b) => PLUGIN_ALL_IDS.includes(b)));
   const marketManaged = dep && !String(dep).startsWith("file:"); // github:/npm: 等由市场/包管理器管源码
   const managedByUs = !dep || String(dep).startsWith("file:");   // 无依赖或 file: 拷贝 → 我们管
 
@@ -651,17 +681,17 @@ function convergePluginActivation(profileDir, pkgFile, patchFile, pluginDir, pat
     const linked = ensurePluginLinked(profileDir, pluginLocalDir); // 自建 node_modules 链接
     stripInclude("bundle patch 已是唯一激活点");     // 清历史 include
     console.log(addedBundle
-      ? "✅ 已加入 dsh.profile.bundles（dsh-remote-ui 自带 patch 自动生效）"
-      : "ℹ dsh.profile.bundles 已含 dsh-remote-ui");
+      ? `✅ 已加入 dsh.profile.bundles（${PLUGIN_ID} 自带 patch 自动生效）`
+      : `ℹ dsh.profile.bundles 已含 ${PLUGIN_ID}`);
     console.log(linked
-      ? `✅ 已建立 node_modules/dsh-remote-ui → ${pluginLocalDir}（免包管理器即可解析）`
-      : "✅ node_modules/dsh-remote-ui 已就绪");
+      ? `✅ 已建立 node_modules/${PLUGIN_ID} → ${pluginLocalDir}（免包管理器即可解析）`
+      : `✅ node_modules/${PLUGIN_ID} 已就绪`);
     console.log(`✅ 插件安装完成（bundle 形态，无用户 include）。配置目录: ${CONFIG_DIR}`);
     return;
   }
 
   // 异常形态：有非 file: 依赖但不在 bundles（无法靠 bundle patch 激活）
-  console.log(`ℹ 检测到依赖 dsh-remote-ui(${dep}) 但未声明在 dsh.profile.bundles——插件不会激活。`);
+  console.log(`ℹ 检测到依赖 ${PLUGIN_ID}(${dep}) 但未声明在 dsh.profile.bundles——插件不会激活。`);
   console.log("   请在 dsh 插件市场重新添加该插件，或先执行 `dsh-remote plugin --uninstall` 再一键安装。");
 }
 
@@ -673,7 +703,7 @@ async function pluginCmd(argv) {
     : process.env.DSH_PROFILE_DIR || path.join(os.homedir(), ".dsh", "profiles", "web");
   const pkgFile = path.join(profileDir, "package.json");
   const patchFile = path.join(profileDir, "cordis.patch.yml");
-  const pluginDir = path.join(THIS_DIR, "packages/dsh-remote-ui");
+  const pluginDir = path.join(THIS_DIR, "packages", PLUGIN_ID);
 
   if (!fs.existsSync(pkgFile) || !fs.existsSync(patchFile)) {
     console.error(`❌ 未找到 dsh web profile（${profileDir}）。`);
@@ -681,31 +711,37 @@ async function pluginCmd(argv) {
     process.exit(1);
   }
   if (!fs.existsSync(pluginDir)) {
-    console.error(`❌ 本包缺少 packages/dsh-remote-ui（${pluginDir}）。`);
+    console.error(`❌ 本包缺少 packages/${PLUGIN_ID}（${pluginDir}）。`);
     process.exit(1);
   }
 
   const patch = fs.readFileSync(patchFile, "utf8");
 
   if (uninstall) {
-    // 移除 patch 中的插件条目（兼容旧版无标记条目）
+    // 移除 patch 中的插件条目（兼容旧版无标记条目；旧名 dsh-remote-ui 一并清理）
     const newPatch = stripPluginEntries(patch);
     if (newPatch !== patch) {
       fs.writeFileSync(patchFile, newPatch);
       console.log(`✅ 已从 ${patchFile} 移除插件条目`);
     } else {
-      console.log("ℹ patch 中未发现 dsh-remote-ui 条目。");
+      console.log(`ℹ patch 中未发现 ${PLUGIN_ID}（或历史名）条目。`);
     }
-    fs.rmSync(path.join(profileDir, PLUGIN_LOCAL_DIR), { recursive: true, force: true });
-    fs.rmSync(path.join(profileDir, "node_modules", "dsh-remote-ui"), { recursive: true, force: true });
+    // 清理本地目录与链接：当前名 + 历史名(dsh-remote-ui-plugin / node_modules/dsh-remote-ui)
+    for (const id of PLUGIN_ALL_IDS) {
+      fs.rmSync(path.join(profileDir, `${id}-plugin`), { recursive: true, force: true });
+      fs.rmSync(path.join(profileDir, "node_modules", id), { recursive: true, force: true });
+    }
     try {
       const pkg = JSON.parse(fs.readFileSync(pkgFile, "utf8"));
-      if (pkg.dependencies) delete pkg.dependencies["dsh-remote-ui"];
-      fs.writeFileSync(pkgFile, JSON.stringify(pkg, null, 2) + "\n");
+      let removed = false;
+      for (const id of PLUGIN_ALL_IDS) {
+        if (pkg.dependencies && pkg.dependencies[id] !== undefined) { delete pkg.dependencies[id]; removed = true; }
+      }
+      if (removed) fs.writeFileSync(pkgFile, JSON.stringify(pkg, null, 2) + "\n");
     } catch { /* ignore */ }
     // 同步移除 bundles 声明，避免“bundles 引用已删除包 → dsh web 启动报错”
     try {
-      if (removeBundleEntry(pkgFile)) console.log("✅ 已从 dsh.profile.bundles 移除 dsh-remote-ui");
+      if (removeBundleEntry(pkgFile)) console.log(`✅ 已从 dsh.profile.bundles 移除 ${PLUGIN_ID}`);
     } catch { /* ignore */ }
     console.log("✅ 卸载完成。重启 dsh web 生效。");
     return;

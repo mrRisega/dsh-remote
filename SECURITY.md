@@ -16,7 +16,7 @@ Please report privately through GitHub's security reporting flow:
 
 Include, when possible:
 
-- Affected component (relay-router / bridge / dsh-remote-ui plugin / PWA / docs)
+- Affected component (relay-router / bridge / dsh-remote-web plugin / PWA / docs)
 - Steps to reproduce and a proof of concept (if any)
 - Impact assessment (data disclosure? privilege escalation? denial of service?)
 

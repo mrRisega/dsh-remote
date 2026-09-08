@@ -3,6 +3,22 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-09-08
+
+### Changed
+
+- **Plugin renamed `dsh-remote-ui` → `dsh-remote-web`** (repo dir
+  `packages/dsh-remote-web`, npm `dsh-remote-web`): the package is dsh-remote's
+  dsh web plugin half (remote-control host plugin + settings panel), so `-web`
+  matches what it is; `-ui` read as a pure UI/skin plugin. Installers and the
+  panel's self-uninstall now migrate/clean the legacy name (≤0.4.9
+  `dsh-remote-ui`, `dsh-remote-ui-plugin`, `node_modules/dsh-remote-ui`)
+  alongside the new one, so upgrades and uninstalls leave no double-activation
+  residue.
+- Root CLI bumped to 0.5.0 to ship the renamed plugin and the migration in
+  `dsh-setup.mjs` (dependency key, bundles entry, local copy dir and
+  `node_modules` link all use `dsh-remote-web`; legacy keys are removed).
+
 ## [0.3.1] - 2026-08-30
 
 ### Changed

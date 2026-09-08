@@ -75,7 +75,7 @@ if (!JWT_SECRET) {
 // v2 开源本地认证(自部署模式):DSH_LOCAL_JWT_SECRET 与 DSH_LOCAL_ACCESS_KEYS 同时设置时启用。
 //   - 自部署者不依赖闭源 enterprise 账号体系:bridge/App 用访问密钥调 POST /_login 换本地 JWT;
 //   - router 校验 JWT 时依次尝试 enterprise 密钥与本地密钥;
-//   - 开源自部署与 SaaS 可随时切换(客户端连接模式配置,见 dsh-remote-ui)。
+//   - 开源自部署与 SaaS 可随时切换(客户端连接模式配置,见 dsh-remote-web)。
 const LOCAL_JWT_SECRET = process.env.DSH_LOCAL_JWT_SECRET || "";
 const LOCAL_ACCESS_KEYS = (process.env.DSH_LOCAL_ACCESS_KEYS || "")
   .split(",").map((s) => s.trim()).filter(Boolean);
