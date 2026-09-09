@@ -679,6 +679,8 @@ async function enterMirror(token) {
 function enterDevice(deviceId) {
   const hours = 2;
   document.cookie = `dsh_device=${encodeURIComponent(deviceId)}; path=/; max-age=${hours * 3600}; SameSite=Lax; Secure`;
+  // Phase-4:跳镜像页前写/清一次性 E2EE 交接单(解锁会话→交接;明文/未解锁→清除防串台)
+  dshE2eeHandoverSync(deviceId);
   window.location.replace("/");
 }
 
@@ -954,6 +956,8 @@ function logout(clearForm = false) {
   try { if (typeof e2eeClient !== "undefined") { e2eeClient.sessions.clear(); e2eeClient.params = null; e2eeClient.paramsT = 0; } } catch {}
   try { if (typeof e2eeUpdateBadge === "function") e2eeUpdateBadge(); } catch {}
   try { if (typeof e2eeCloseUnlock === "function") e2eeCloseUnlock(); } catch {}
+  // Phase-4:登出同时清除一次性交接单(镜像页不得残留可复用会话材料)
+  try { if (typeof dshE2eeHandoverClear === "function") dshE2eeHandoverClear(sessionStorage); } catch {}
   setConn("未连接");
   if (clearForm) {
     ["login-phone", "login-pass", "login-captcha", "login-sms-code", "login-sms-captcha", "reg-phone", "reg-sms-code", "reg-sms-captcha", "reg-pass", "reg-pass2"].forEach(id => { const el = $(id); if (el) el.value = ""; });
@@ -1784,6 +1788,27 @@ function wcHasEnvelopeMarker(headers = {}) {
   return wcParseEnvelopeMarker(headers) !== null;
 }
 /* ===DSH-E2EE-WC-CORE-END=== */
+
+/* ===DSH-E2EE-HANDOVER-CORE-START=== */
+// Phase-4 一次性交接单(键 dsh-e2ee-handover;镜像页读后即删)。取舍:只放「已探针互认的
+// 会话材料」{v,s,shk,salt,profile,epoch}(sessId+SHK+saltH 32B b64url),绝不放 MK/密码;
+// 镜像页(side e2ee-shim-script.js)用同 sessId 复用桥端已验证会话(24h TTL)。
+var DSH_E2EE_HANDOVER_KEY = "dsh-e2ee-handover";
+function dshE2eeHandoverEncode(sess) {
+  if (!sess || typeof sess.sessId !== "string" || !/^[0-9a-f]{32}$/i.test(sess.sessId) || !sess.shk || sess.shk.length !== 32 || !sess.saltH || sess.saltH.length !== 32) return null;
+  return JSON.stringify({ v: 2, s: sess.sessId, shk: wcBytesToB64(sess.shk), salt: wcBytesToB64(sess.saltH), profile: String(sess.profile || ""), epoch: Number(sess.epoch) || 0 });
+}
+function dshE2eeHandoverWrite(sess, storage) { try { const raw = dshE2eeHandoverEncode(sess); if (raw) storage.setItem(DSH_E2EE_HANDOVER_KEY, raw); } catch (e) {} }
+function dshE2eeHandoverClear(storage) { try { storage.removeItem(DSH_E2EE_HANDOVER_KEY); } catch (e) {} }
+/* ===DSH-E2EE-HANDOVER-CORE-END=== */
+/** enterDevice 前置(Phase-4):解锁会话→写一次性交接单;明文跳过/未解锁→清(防串台)。 */
+function dshE2eeHandoverSync(deviceId) {
+  try {
+    if (typeof e2eeClient === "undefined") { dshE2eeHandoverClear(sessionStorage); return; }
+    const ent = e2eeClient.sessions.get(deviceId) || null;
+    if (ent && ent.sess) dshE2eeHandoverWrite(ent.sess, sessionStorage); else dshE2eeHandoverClear(sessionStorage);
+  } catch (e) {}
+}
 
 // ---------- E2EE 客户端状态(仅内存;密钥不落 localStorage) ----------
 const E2EE_ERR_TEXT = {

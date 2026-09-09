@@ -52,7 +52,7 @@
     "test:router": "node --test packages/relay-router/test/native-device-selection.test.mjs packages/relay-router/test/quotas.test.mjs",
     "test:plugin": "node --test --test-concurrency=1 packages/dsh-remote-web/test/*.test.mjs",
     "test:bridge": "node --test clients/dsh-remote/test/*.test.mjs",
-    "check": "node --check clients/dsh-remote/dsh-bridge.mjs && node --check dsh-setup.mjs && node --check packages/dsh-remote-web/lib/index.js && node --check packages/dsh-remote-web/lib/client.js && bash -n deploy/install-open.sh"
+    "check": "node --check clients/dsh-remote/dsh-bridge.mjs && node --check clients/dsh-remote/e2ee-shim.mjs && node --check dsh-setup.mjs && node --check packages/dsh-remote-web/lib/index.js && node --check packages/dsh-remote-web/lib/client.js && bash -n deploy/install-open.sh"
   },
   "dependencies": {
     "ws": "^8.18.0"

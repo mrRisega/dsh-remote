@@ -53,6 +53,12 @@
  *     502 + x-dsh-e2ee-error / ws-close 1008,绝不静默降级。
  *   - 控制通道 /_e2ee/ctrl(device/channel 形态)不连上游,跑 §5.2 握手(hello/ack/探针);
  *     数据流 ws-open 携带 &e2ee=<sessId>&w=<8B hex>,探针通过前不转发任何数据。
+ *
+ * E2EE Phase-4(镜像页 shim,见 e2ee-shim.mjs / e2ee-shim-script.js):
+ *   - doHttp 在 text/html 注入 mobile-adapter 之后、压缩/封包之前,对「e2ee.enabled ∧
+ *     DSH_E2EE_SHIM≠0」的官方 dsh web 响应注入镜像页加密 shim(读 native.html 一次性
+ *     交接单重建会话 → 拦截其 /api·/sidebar·/git·/pet 与数据 WS,信封密文化)。
+ *   - 灰度默认关(e2ee.enabled=false)→ 不注入、镜像页保持既有明文路径(零行为)。
  */
 
 import WebSocket from "ws";
@@ -66,6 +72,8 @@ import { promisify } from "node:util";
 import { gzip as gzipCb } from "node:zlib";
 // 移动端适配层(经隧道访问的官方 dsh web 窄屏注入;DSH_MOBILE_ADAPTER=0 可关闭,默认开启)
 import { maybeInjectMobileAdapter } from "./mobile-adapter.mjs";
+// 镜像页 E2EE 加密 shim(Phase-4):text/html 注入;DSH_E2EE_SHIM=0 可关闭,叠加 e2ee.enabled 灰度门
+import { maybeInjectE2eeShim } from "./e2ee-shim.mjs";
 // E2EE(端到端加密)客户端基建(Phase-2):MK 派生/会话密钥/信封/握手/开关
 // 仅在 runTunnel(账号模式)里初始化;被测试 import(未走 main)时保持禁用 → v1 路径不变。
 import {
@@ -451,6 +459,14 @@ async function doHttp(method, path, reqHeaders, body, isB64) {
     if (m.injected) {
       console.log(`[bridge] mobile-adapter 注入 ${path}: ${(buf.length / 1024).toFixed(0)}KB → ${(m.buf.length / 1024).toFixed(0)}KB`);
       buf = m.buf;
+    }
+    // E2EE 镜像页加密 shim(Phase-4):仅桥端 e2ee 启用时注入(e2ee.enabled=false → 零注入零行为)
+    if (e2ee.enabled) {
+      const s = maybeInjectE2eeShim({ buf, contentType });
+      if (s.injected) {
+        console.log(`[bridge] e2ee-shim 注入 ${path}: ${(buf.length / 1024).toFixed(0)}KB → ${(s.buf.length / 1024).toFixed(0)}KB`);
+        buf = s.buf;
+      }
     }
   }
   const compressed = await maybeCompressResponse({
