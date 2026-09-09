@@ -12,7 +12,9 @@
  *   3. E2EE HTTP:信封请求(方法/路径/头/正文)经 router 透明转发 → bridge 解封→上游→封回
  *      → 手机开包还原;篡改密文 → 显式 502 + x-dsh-e2ee-error,绝不静默降级;
  *   4. E2EE WS 数据流(&e2ee=<sessId>&w= 标记):桥剥除标记连上游、逐消息加/解密、echo 一致;
- *   5. 解封失败显式拒绝:disabled bridge 收到信封标记帧 → 502 e2ee_disabled(不误转发明文)。
+ *   5. 解封失败显式拒绝:disabled bridge 收到信封标记帧 → 502 e2ee_disabled(不误转发明文);
+ *   6. **Phase-3 手机端**:native.html 抽取的浏览器 WebCrypto(non-复制实现)跑真实
+ *      解锁握手 + HTTP 信封 + WS 数据流,与桥端互通;密码错误 → e2ee-error bad_key。
  *
  * 用法: node --test --test-concurrency=1 test/e2ee-bridge.test.mjs
  */
@@ -40,6 +42,7 @@ import {
   randomB64,
   randomHex
 } from "../e2ee-client.mjs";
+import { loadNativeWcCore } from "./lib-native-e2ee.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(HERE, "..", "..", "..");
@@ -384,6 +387,132 @@ test("E2EE WS 数据流:&e2ee=&w= 标记 → 桥剥除标记连上游,逐消息�
       data.on("error", (e) => { clearTimeout(t); reject(new Error(`ws e2ee error: ${e.message}`)); });
     });
     assert.equal(echoed, "ping-e2ee-你好");
+  } finally {
+    try { data.close(1000); } catch {}
+  }
+});
+
+// ============================================================
+// Phase-3 手机端:用 native.html 里抽取的「浏览器 WebCrypto」实现
+// (而非测试内复制)跑真实解锁 + HTTP 信封 + WS 数据流,验证手机端与桥端互通。
+// ============================================================
+
+/** 手机端(浏览器 WebCrypto)解锁:hello→ack→deriveShk→探针;密码错 → bad_key。 */
+function wcUnlock(ctrlWsUrl, { mkBytes, params }) {
+  return new Promise((resolve, reject) => {
+    const sessId = wc.wcNewSessId();
+    const aB64 = wc.wcRandomB64(32);
+    const ctrl = new WebSocket(ctrlWsUrl, { headers: { cookie: COOKIE } });
+    let client = null;
+    let settled = false;
+    const done = (v) => { if (!settled) { settled = true; clearTimeout(timer); try { ctrl.close(1000); } catch {} resolve(v); } };
+    const fail = (e) => { if (!settled) { settled = true; clearTimeout(timer); try { ctrl.terminate(); } catch {} reject(e); } };
+    const timer = setTimeout(() => fail(new Error("wc 解锁握手超时")), 10000);
+    ctrl.on("error", (e) => fail(e));
+    ctrl.on("close", () => { if (!settled) fail(new Error("wc ctrl 提前关闭")); });
+    ctrl.on("open", () => {
+      ctrl.send(JSON.stringify({ v: 2, type: "e2ee-hello", role: "phone", s: sessId, a: aB64, salt: params.salt, profile: params.profile, ts: Date.now() }));
+    });
+    ctrl.on("message", (raw) => {
+      (async () => {
+        let msg;
+        try { msg = JSON.parse(String(raw)); } catch { return; }
+        if (!msg || typeof msg !== "object") return;
+        if (msg.type === "e2ee-error") return fail(new Error(`e2ee-error: ${msg.code} ${msg.message || ""}`));
+        if (msg.type === "e2ee-hello-ack" && !client) {
+          const { shk, saltH } = await wc.wcDeriveShk(mkBytes, aB64, msg.b);
+          client = new wc.WcE2eeSession({ sessId, shk, saltH, profile: params.profile, epoch: params.epoch });
+          const probe = await client.seal({ kind: "ctrl", dir: wc.WC_DIR_P2B, counter: 0, data: JSON.stringify({ p: "dsh-e2ee-probe-v1", t: Date.now(), c: 0 }) });
+          ctrl.send(JSON.stringify(probe));
+          return;
+        }
+        if (client && msg.v === 2 && msg.k === "ctrl") {
+          const opened = await client.open({ kind: "ctrl", dir: wc.WC_DIR_B2P, env: msg, counter: msg.c ?? 0 });
+          if (JSON.parse(Buffer.from(opened.data).toString("utf8")).p !== "dsh-e2ee-probe-ok") return fail(new Error("wc probe-ok 载荷不符"));
+          done({ ctrl, client, sessId });
+        }
+      })().catch(fail);
+    });
+  });
+}
+
+let wc;
+
+test("Phase-3 手机 WebCrypto(native.html 抽取)解锁+HTTP+WS 与桥端互通", async () => {
+  wc = await loadNativeWcCore();
+  // 手机拉取参数(与桥同一服务端)→ WebCrypto 派生 MK
+  const params = await fetchE2eeParams(apiBase, signJwt({ sub: "42", phone: "13811110001", plan: "free" }));
+  assert.equal(params.enabled, true);
+  const mk = new Uint8Array(deriveMasterKey(PASSWORD, params.salt, params.kdf));
+  assert.equal(Buffer.from(await wc.wcDeriveMasterKey(PASSWORD, params.salt, params.kdf)).toString("hex"), Buffer.from(mk).toString("hex"), "手机/桥 MK 一致");
+
+  // 1) 解锁握手(device 形态)
+  const { client, sessId } = await wcUnlock(`${routerBase}/remote/${DEV_ON}/_e2ee/ctrl`, { mkBytes: mk, params });
+  assert.equal(sessId.length, 32);
+
+  // 2) 密码错误 → e2ee-error bad_key(可读文案路径)
+  const wrongMk = new Uint8Array(deriveMasterKey("wrong-password", params.salt, params.kdf));
+  await assert.rejects(() => wcUnlock(`${routerBase}/remote/${DEV_ON}/_e2ee/ctrl`, { mkBytes: wrongMk, params }), /bad_key|auth_failed/);
+
+  // 3) HTTP 信封往返(手机 seal → 桥解封 → 上游 → 封回 → 手机开包)
+  const bodyPayload = JSON.stringify({ hello: "phone-webcrypto", n: 7 });
+  const reqPlain = wc.wcEncodeHttpRequestPlain({
+    method: "POST",
+    path: "/api/echo?phone=1",
+    headers: { "content-type": "application/json; charset=utf-8", "x-dsh-test-auth": "phone-secret" },
+    bodyB64: Buffer.from(bodyPayload, "utf8").toString("base64")
+  });
+  const nBytes = new Uint8Array(Buffer.from("0102030405060708090a0b0c", "hex"));
+  const envReq = await client.seal({ kind: "http", dir: wc.WC_DIR_P2B, counter: 0, data: reqPlain, nonceBytes: nBytes });
+  const res = await fetch(`${routerBase}/remote/${DEV_ON}/api/echo?phone=1`, {
+    method: "POST",
+    headers: { ...envelopeRequestHeaders(sessId, "http"), cookie: COOKIE },
+    body: JSON.stringify(envReq)
+  });
+  assert.equal(res.status, 200);
+  assert.ok((res.headers.get("content-type") || "").startsWith("application/vnd.dsh.e2ee-v2"));
+  const envResp = JSON.parse(await res.text());
+  const opened = await client.open({ kind: "http-resp", dir: wc.WC_DIR_B2P, env: envResp, counter: envResp.c ?? 0, reqNonceB64: envReq.n });
+  const rp = wc.wcDecodeHttpResponsePlain(opened.data);
+  assert.equal(rp.status, 200);
+  const up = JSON.parse(Buffer.from(rp.bodyB64, "base64").toString("utf8"));
+  assert.equal(up.method, "POST");
+  assert.equal(up.url, "/api/echo?phone=1");
+  assert.equal(up.auth, "phone-secret");
+  assert.equal(up.body, bodyPayload);
+
+  // 4) WS 数据流:&e2ee=&w=(w=8B hex=16 字符);逐消息 w 信封 echo 一致
+  const w16 = wc.wcRandomHex(8);
+  const wsUrl = `${routerBase}/remote/${DEV_ON}/ws-echo?e2ee=${sessId}&w=${w16}`;
+  const wsUrlObj = new URL(wsUrl);
+  const bridgePath = wsUrlObj.pathname.replace(/^\/remote\/[^/]+/, "") + wsUrlObj.search;
+  const parsed = wc.wcParseWsE2eeParams(bridgePath);
+  assert.equal(parsed.sessId, sessId);
+  assert.equal(parsed.w, w16);
+  assert.equal(parsed.wsLabel, `/ws-echo?w=${w16}`);
+
+  const data = new WebSocket(wsUrl.replace(/^http/, "ws"), { headers: { cookie: COOKIE } });
+  try {
+    const echoed = await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error("wc ws echo 超时")), 10000);
+      data.on("open", async () => {
+        const env = await client.seal({ kind: "w", dir: wc.WC_DIR_P2B, counter: 0, data: "ping-e2ee-phone-你好", wsLabel: parsed.wsLabel });
+        data.send(JSON.stringify(env));
+      });
+      data.on("message", async (raw) => {
+        try {
+          const env = JSON.parse(String(raw));
+          if (env && env.k === "w") {
+            const openedMsg = await client.open({ kind: "w", dir: wc.WC_DIR_B2P, env, counter: env.c, wsLabel: parsed.wsLabel });
+            clearTimeout(t);
+            resolve(Buffer.from(openedMsg.data).toString("utf8"));
+          }
+        } catch (e) { clearTimeout(t); reject(e); }
+      });
+      data.on("close", (code, reason) => { clearTimeout(t); reject(new Error(`wc ws 提前关闭 code=${code} reason=${reason}`)); });
+      data.on("error", (e) => { clearTimeout(t); reject(new Error(`wc ws error: ${e.message}`)); });
+    });
+    assert.equal(echoed, "ping-e2ee-phone-你好");
   } finally {
     try { data.close(1000); } catch {}
   }
