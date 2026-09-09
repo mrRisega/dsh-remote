@@ -804,6 +804,31 @@ async function proxyRevokeMobileSession(relayDir, req, res) {
 
 // ---------- 综合状态 ----------
 
+/**
+ * 读取 bridge 写入的 E2EE 开关状态（<relayDir>/.e2ee-state.json，写入方见
+ * clients/dsh-remote/e2ee-client.mjs 的 writeE2eeStateFile：{enabled, reason, profile, epoch, caps, at}）。
+ * 归一化后只透出固定展示字段（enabled/reason/profile/epoch/caps），at 等调试字段不外泄；
+ * 文件缺失/损坏一律视为「未启用（明文回退）」——面板据此显示普通安全连接。
+ */
+export function readE2eeStateFile(relayDir) {
+  const none = () => ({ enabled: false, reason: "no_state_file", profile: "", epoch: 0, caps: [] });
+  try {
+    const f = join(relayDir, ".e2ee-state.json");
+    if (!existsSync(f)) return none();
+    const s = JSON.parse(readFileSync(f, "utf8"));
+    if (!s || typeof s !== "object") return none();
+    return {
+      enabled: s.enabled === true,
+      reason: typeof s.reason === "string" && s.reason ? s.reason : "",
+      profile: typeof s.profile === "string" ? s.profile : "",
+      epoch: Number.isInteger(s.epoch) && s.epoch >= 0 ? s.epoch : 0,
+      caps: Array.isArray(s.caps) ? s.caps.filter((c) => typeof c === "string") : [],
+    };
+  } catch {
+    return none();
+  }
+}
+
 async function composeStatus(relayDir) {
   const cfg = loadConfig(relayDir);
   const launchd = launchdStatus();
@@ -838,6 +863,9 @@ async function composeStatus(relayDir) {
       manual,
       running: launchd.running || manual.bridge.length > 0,
       bindError,
+      // E2EE 开关状态（bridge 写 .e2ee-state.json；文件缺失 = 未启用明文）：
+      // {enabled, reason, profile, epoch, caps}，供面板「📱 远程访问」卡展示加密状态。
+      e2ee: readE2eeStateFile(relayDir),
     },
     host: hostname(),
   };
