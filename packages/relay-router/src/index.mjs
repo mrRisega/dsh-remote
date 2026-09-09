@@ -186,6 +186,12 @@ const STRIP_RES_HEADERS = new Set([
   "connection", "keep-alive", "upgrade"
 ]);
 
+/** 信封信号头检测(E2EE 密文帧;router 不解析 body,仅识别/计数)。 */
+function isE2eeMarked(headers) {
+  const ct = String(headers?.["content-type"] || "").toLowerCase();
+  return ct.startsWith("application/vnd.dsh.e2ee-v2") || Boolean(headers?.["x-dsh-e2ee"]);
+}
+
 function sanitizeFwdHeaders(headers) {
   const out = {};
   for (const [k, v] of Object.entries(headers || {})) {
@@ -423,8 +429,26 @@ function parseRemote(urlPath) {
  * 并以 x-dsh-remote-device 头（HTTP）/ ?device= 参数（WS）/ dsh_device cookie 指明目标设备——
  * 相当于把设备选择从 URL 首段挪到 header/参数。中继需把这些“channel 请求”还原为普通
  * /remote/<device>/<原路径> 转发，否则首段会被当成设备号（如 “api”）→ 502 设备离线。
+ *
+ * "_e2ee" = E2EE 控制通道(协议 docs/e2ee-protocol.md §6.2):/remote/_e2ee/ctrl + 设备头
+ * (channel 形态)或 /remote/<deviceId>/_e2ee/ctrl(device 形态)都归一为上游路径 /_e2ee/ctrl,
+ * 由 bridge 在 /_e2ee/* 本地应答 §5.2 握手,router 只是把该 ws 当普通流透传、不解析。
+ *
+ * E2EE 密文与信封(content-type: application/vnd.dsh.e2ee-v2 / x-dsh-e2ee 头 /
+ * ws-open query 的 e2ee= 参数)对 router 是**透明载荷**:不在 STRIP_* 头集合内、不解析 body、
+ * 仅按“信封即信号”做计数观测(noteE2ee),帧协议与 http / ws-open / ws-msg / ws-close /
+ * __chunk 分块及配额逻辑全部照旧。
  */
-const CHANNEL_MARKERS = new Set(["api", "sidebar", "git", "pet"]);
+const CHANNEL_MARKERS = new Set(["api", "sidebar", "git", "pet", "_e2ee"]);
+
+/** E2EE 标记帧观测(透传 + 计数;不解析密文 body)。每 (kind, 设备) 首次打印一行。 */
+const e2eeObserved = new Set();
+function noteE2ee(dev, kind) {
+  const key = `${kind}:${dev.deviceId}`;
+  if (e2eeObserved.has(key)) return;
+  e2eeObserved.add(key);
+  console.log(`[router] e2ee ${kind} 帧(设备 ${dev.deviceId}) → 信封密文透明转发(不解析)`);
+}
 
 /** 取「/remote/<deviceId>/<path>[?query]」,path 含查询串,保持原样转发。 */
 function remotePathWithQuery(url) {
@@ -547,7 +571,7 @@ const server = http.createServer(async (req, res) => {
     }
     const list = [...devices.values()]
       .filter((d) => d.ws.readyState === WebSocket.OPEN && String(d.userId) === String(claims.sub))
-      .map((d) => ({ id: d.deviceId, name: d.name || d.deviceId }));
+      .map((d) => ({ id: d.deviceId, name: d.name || d.deviceId, caps: d.caps || [] })); // caps 纯透传(E2EE 能力,不校验不解释)
     if (list.length > 0) reportMilestone(claims.sub, "devices"); // 手机端成功拉到设备列表(首条上报)
     const r = jsonBody(200, { devices: list });
     res.writeHead(r.status, r.headers);
@@ -608,6 +632,9 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   const { claims, dev } = auth;
+
+  // E2EE:信封即信号 —— 标记头存在即说明正文是密文(透明转发,不解析;计数观测)
+  if (isE2eeMarked(req.headers)) noteE2ee(dev, "http");
 
   // 读请求体(上限内)→ 发帧给 bridge
   let bodyBuf = Buffer.alloc(0);
@@ -674,7 +701,7 @@ bridgeWss.on("connection", (ws, req) => {
     receive(raw, (frame) => {
       if (!frame || typeof frame !== "object") return;
       if (frame.type === "tunnel-register") {
-        const { deviceId, token, name } = frame;
+        const { deviceId, token, name, caps } = frame;
         const claims = verifyAnyJwt(token);
         if (!claims) {
           try {
@@ -709,6 +736,7 @@ bridgeWss.on("connection", (ws, req) => {
           userId: String(claims.sub),
           plan: claims.plan || "free",
           name: typeof name === "string" ? name : deviceId,
+          caps: Array.isArray(caps) ? caps.map(String).filter(Boolean) : [], // E2EE caps 原样记录(§6.2)
           connectedAt: Date.now()
         };
         // v2:pro_max 同时在线设备数上限(后台可配);超限拒绝新连接
@@ -932,6 +960,10 @@ server.on("upgrade", (req, socket, head) => {
     return;
   }
   const { claims, dev } = auth;
+
+  // E2EE 标记数据流(ws-open query 带 e2ee=,§4.6):router 把参数原样透传给 bridge(它负责剥离),
+  // 这里仅识别 + 计数观测,不解析任何载荷。
+  if (url.searchParams.get("e2ee")) noteE2ee(dev, "ws");
 
   const id = nextFrameId();
   const pu = {

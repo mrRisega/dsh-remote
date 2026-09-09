@@ -42,6 +42,17 @@
  *   DSH_BRIDGE_LOCAL_KEY   开源自部署:访问密钥(设后经 router POST /_login 换本地 JWT,免账号体系)
  *   DSH_BRIDGE_HEARTBEAT_MS 隧道心跳间隔(默认 15000ms)
  *   DSH_MOBILE_ADAPTER   经隧道访问的官方 dsh web 移动端适配注入开关:0 关闭(默认开启,仅 ≤820px 生效)
+ *
+ * E2EE(Phase-2,见 docs/e2ee-protocol.md):
+ *   - 账号模式(非 DSH_BRIDGE_LOCAL_KEY)启动时用 device-login 同一账号密码派生 MK(仅内存,
+ *     不落盘);服务端 /api/e2ee-params 返回 enabled=false / 401 / 无密码 / 派生失败 → 明文 v1 回退。
+ *   - 开关与状态写入 <relayDir>/.e2ee-state.json {enabled, reason, profile, epoch, caps};
+ *     DSH_BRIDGE_E2EE=0 或配置 e2ee:false 可本地关闭;DSH_BRIDGE_E2EE_STATE 可覆盖状态文件路径。
+ *   - 帧体带信封标记(content-type: application/vnd.dsh.e2ee-v2 或 x-dsh-e2ee)= 已加密:
+ *     HTTP 解封→转发上游→响应封回;WS 逐消息封/解。任何解封失败显式
+ *     502 + x-dsh-e2ee-error / ws-close 1008,绝不静默降级。
+ *   - 控制通道 /_e2ee/ctrl(device/channel 形态)不连上游,跑 §5.2 握手(hello/ack/探针);
+ *     数据流 ws-open 携带 &e2ee=<sessId>&w=<8B hex>,探针通过前不转发任何数据。
  */
 
 import WebSocket from "ws";
@@ -55,6 +66,18 @@ import { promisify } from "node:util";
 import { gzip as gzipCb } from "node:zlib";
 // 移动端适配层(经隧道访问的官方 dsh web 窄屏注入;DSH_MOBILE_ADAPTER=0 可关闭,默认开启)
 import { maybeInjectMobileAdapter } from "./mobile-adapter.mjs";
+// E2EE(端到端加密)客户端基建(Phase-2):MK 派生/会话密钥/信封/握手/开关
+// 仅在 runTunnel(账号模式)里初始化;被测试 import(未走 main)时保持禁用 → v1 路径不变。
+import {
+  E2eeError,
+  E2eeService,
+  ENVELOPE_CONTENT_TYPE,
+  decodeHttpRequestPlain,
+  encodeHttpResponsePlain,
+  hasEnvelopeMarker,
+  parseWsE2eeParams,
+  writeE2eeStateFile
+} from "./e2ee-client.mjs";
 
 // ---------- 强制直连:清除代理环境变量 ----------
 // 家庭网络常配 Clash 等代理(127.0.0.1:7890),node 的 ws/fetch 会继承
@@ -193,6 +216,16 @@ const DEVICE_ID = resolveDeviceIdentity();
 const CHUNK_SIZE = 200 * 1024;
 // 单个 HTTP 请求的兜底超时(秒)。dsh 的 prompt 等操作可能跑很久,给足余量。
 const HTTP_TIMEOUT_MS = 120_000;
+
+// ---------- E2EE 运行时(默认禁用;main() 启动时按配置/服务端开关初始化) ----------
+
+/**
+ * E2EE 服务实例。enabled=false 时所有帧处理走原 v1 明文路径;
+ * 只有「账号模式 ∧ 配置未关闭 ∧ 服务端 e2ee.enabled ∧ 有密码且 MK 派生成功」才为 enabled。
+ */
+let e2ee = new E2eeService({ enabled: false, reason: "not_initialized" });
+/** 控制通道(/_e2ee/ctrl)连接:frameId → { kind:"ctrl", sessId|null }(不连上游)。 */
+const ctrlConns = new Map();
 
 // 转发请求时剥离的浏览器/代理头(围栏只认 Host + Origin + Sec-Fetch-*):
 //  - Host:fetch 自动取上游 authority(127.0.0.1:3080)→ loopback 围栏通过;
@@ -445,6 +478,48 @@ export async function handleHttpFrame(dchOrSend, frame) {
   const send = toSender(dchOrSend);
   const { id, method = "GET", path = "/", headers = {}, body, bodyBase64: isB64 } = frame;
   const t0 = Date.now();
+  // E2EE 信封标记即信号(§4.3):有标记=加密,无标记=明文 v1。
+  // 解封失败绝不静默降级 → 明文错误 + x-dsh-e2ee-error 头 + 日志。
+  if (hasEnvelopeMarker(headers)) {
+    if (!e2ee.enabled) {
+      console.error(`[bridge] e2ee http ${method} ${path}: bridge 未启用 E2EE,拒绝解封(不静默降级)`);
+      return sendE2eeHttpError(send, id, new E2eeError("e2ee_disabled", "bridge 端未启用端到端加密(请检查账号密码/服务端开关)"));
+    }
+    try {
+      const bodyText = Buffer.from(String(body || ""), "base64").toString("utf8");
+      let env;
+      try {
+        env = JSON.parse(bodyText);
+      } catch {
+        throw new E2eeError("bad_envelope", "帧体不是合法 E2EE 信封 JSON");
+      }
+      // 防重放 + 会话校验(unknown_session / not_verified / replay 在此抛出)
+      const session = e2ee.guardHttpRequest(String(env?.s || ""), env);
+      const opened = session.open({ kind: "http", dir: "p2b", env, counter: env?.c ?? 0 });
+      const req = decodeHttpRequestPlain(opened.data);
+      const reply = await doHttp(req.method, req.path, req.headers, req.bodyB64, true);
+      const bodyBuffer = Buffer.from(reply.body, "base64");
+      const plain = encodeHttpResponsePlain({ status: reply.status, headers: reply.headers, bodyBuffer });
+      // 响应压缩已发生在 doHttp(明文侧,gzip 在加密前 §4.7);信封用 http-resp kind
+      const respEnv = session.seal({ kind: "http-resp", dir: "b2p", counter: env?.c ?? 0, data: plain, reqNonceB64: String(env?.n || "") });
+      send({
+        id,
+        type: "http",
+        status: 200, // 外层一律 200,真实状态在信封明文 st 里(§4.3)
+        headers: {
+          "content-type": ENVELOPE_CONTENT_TYPE,
+          "x-dsh-e2ee": `v=2;s=${env.s};k=http-resp`
+        },
+        body: Buffer.from(JSON.stringify(respEnv)).toString("base64"),
+        bodyBase64: true
+      });
+      console.log(`[bridge] e2ee http ${req.method} ${req.path} → ${reply.status} (${Date.now() - t0}ms, 信封 ${(reply.body.length * 3 / 4 / 1024).toFixed(0)}KB)`);
+      return;
+    } catch (e) {
+      console.error(`[bridge] e2ee http ${method} ${path} 解封失败: ${e.message || e}(不回退明文)`);
+      return sendE2eeHttpError(send, id, e);
+    }
+  }
   try {
     const reply = await doHttp(method, path, headers, body, !!isB64);
     reply.id = id;
@@ -455,6 +530,24 @@ export async function handleHttpFrame(dchOrSend, frame) {
     console.log(`[bridge] ${method} ${path} 上游错误: ${e.message}`);
     send({ id, type: "http", status: 502, headers: { "content-type": "application/json" }, body: Buffer.from(JSON.stringify({ error: String(e.message || e) })).toString("base64"), bodyBase64: true });
   }
+}
+
+/** E2EE 失败回包:明文(无信封标记)+ x-dsh-e2ee-error,绝不把无法解密的密文当正文转发。 */
+function sendE2eeHttpError(send, id, err) {
+  const code = err instanceof E2eeError ? err.code : "e2ee_failed";
+  const message = `⚠ 无法解密/未加密(${code}): ${err?.message || code}`;
+  send({
+    id,
+    type: "http",
+    status: 502,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+      "x-dsh-e2ee-error": code
+    },
+    body: Buffer.from(JSON.stringify({ error: { code, message } })).toString("base64"),
+    bodyBase64: true
+  });
 }
 
 /** 旧协议(无 type):body 为原始文本,回包 body 为原始文本。 */
@@ -477,24 +570,138 @@ export async function handleLegacyFrame(dchOrSend, frame) {
 // ---- WebSocket 透传 ----
 
 // ws 会话表:frame id → ws 客户端。DataChannel 断开时统一关闭。
+//  - 普通/数据流:{ ws, opened, e2ee? };
+//  - e2ee 数据流额外带 e2ee:{ s(E2eeSession), wsLabel, p2bLast, b2pLast };
+//  - 控制通道(/_e2ee/ctrl)不连上游,单列 ctrlConns。
 const wsSessions = new Map();
+
+/** E2EE 错误码 → 手机可读文案(明文 e2ee-error;绝不静默)。 */
+function e2eeCodeOf(err) {
+  return err instanceof E2eeError ? err.code : "e2ee_failed";
+}
+
+function sendCtrlMsg(send, id, obj) {
+  send({ id, type: "ws-msg", data: JSON.stringify(obj), binary: false });
+}
+
+function sendCtrlError(send, id, code, extra = "") {
+  console.error(`[bridge] e2ee ctrl 错误: ${code}${extra ? " — " + extra : ""}`);
+  sendCtrlMsg(send, id, { v: 2, type: "e2ee-error", code, ...(extra ? { message: extra } : {}) });
+}
+
+/** 控制通道 ws-open:不连上游,应答 ok 后按 §5.2 跑握手(hello/ack → 探针)。 */
+function openControlWs(send, id) {
+  if (!e2ee.enabled) {
+    console.log(`[bridge] e2ee ctrl 被拒(桥端未启用): id=${id}`);
+    send({ id, type: "ws-open", ok: false, code: 1008, reason: "e2ee_disabled:bridge 未启用端到端加密" });
+    return;
+  }
+  wsSessions.delete(id);
+  ctrlConns.set(id, { sessId: null });
+  send({ id, type: "ws-open", ok: true });
+  console.log(`[bridge] e2ee ctrl 通道已开 (id=${id}),等待 hello`);
+}
+
+/** 控制通道消息:明文 hello / AEAD 探针信封(§5.2)。 */
+function handleCtrlMessage(send, id, rawText) {
+  const conn = ctrlConns.get(id);
+  if (!conn) return;
+  let obj;
+  try {
+    obj = JSON.parse(rawText);
+  } catch {
+    sendCtrlError(send, id, "bad_msg", "非 JSON 控制消息");
+    return;
+  }
+  if (!obj || typeof obj !== "object") return;
+  if (obj.type === "e2ee-hello") {
+    try {
+      const { session, ack } = e2ee.handleHello(obj);
+      conn.sessId = session.sessId;
+      sendCtrlMsg(send, id, ack);
+    } catch (e) {
+      sendCtrlError(send, id, e2eeCodeOf(e), e?.message || "");
+    }
+    return;
+  }
+  if (obj.v === 2 && obj.k === "ctrl") {
+    // AEAD 探针(密文信封);失败 → bad_key 提示手机“密码/密钥不一致”,绝不静默
+    if (!conn.sessId) {
+      sendCtrlError(send, id, "unknown_session", "探针先于 hello");
+      return;
+    }
+    try {
+      const { reply } = e2ee.handleProbe(conn.sessId, obj);
+      sendCtrlMsg(send, id, reply);
+    } catch (e) {
+      const code = e2eeCodeOf(e);
+      // 探针解密失败对手机语义统一为 bad_key(§5.2;密码不一致/改密未更新)
+      sendCtrlError(send, id, code === "auth_failed" || code === "bad_key" ? "bad_key" : code, e?.message || "");
+    }
+    return;
+  }
+  // 其余控制消息忽略
+}
 
 export async function handleWsOpen(dchOrSend, frame) {
   const send = toSender(dchOrSend);
   const { id, path = "/", headers = {} } = frame;
+  // 控制通道(device 形态 /remote/<dev>/_e2ee/ctrl 与 channel 形态都归一到 /_e2ee/ctrl)
+  if (path.startsWith("/_e2ee/")) {
+    return openControlWs(send, id);
+  }
+  // e2ee 标记数据流:&e2ee=<sessId>&w=<8B hex>(§4.6);未启用/会话未验证 → 显式拒绝
+  const tagged = parseWsE2eeParams(path);
+  if (tagged) {
+    if (!e2ee.enabled) {
+      send({ id, type: "ws-open", ok: false, code: 1008, reason: "e2ee_disabled:bridge 未启用端到端加密(请用明文连接)" });
+      return;
+    }
+    const session = e2ee.sessionOf(tagged.sessId);
+    if (!session || !session.verified) {
+      console.error(`[bridge] e2ee ws 拒绝(会话未解锁/未验证): ${path}`);
+      send({ id, type: "ws-open", ok: false, code: 1008, reason: "e2ee_session_locked:请先解锁完成握手(检查密码)" });
+      return;
+    }
+    // 探测前不转发任何数据(§4.6/§5.2:探针通过后数据流才可建);此时已验证 → 安全
+  }
   if (wsSessions.has(id)) { try { wsSessions.get(id).ws.terminate(); } catch {} wsSessions.delete(id); }
-  const safe = safePath(path);
+  const safe = safePath(tagged ? tagged.upstreamPath : path);
   if (safe === null) { send({ id, type: "ws-open", ok: false, code: 400, reason: "非法路径" }); return; }
   const url = `${UPSTREAM.replace(/^http/, "ws")}${safe}`;
   const ws = new WebSocket(url, { headers: buildWsHeaders(headers), followRedirects: false });
   const session = { ws, opened: false };
+  if (tagged && e2ee.enabled) {
+    // 会话必须已 verified(上面已校验),给该流独立的收发密钥与方向计数
+    session.e2ee = { s: e2ee.sessionOf(tagged.sessId), wsLabel: tagged.wsLabel, p2bLast: -1, b2pLast: -1 };
+  }
   wsSessions.set(id, session);
   ws.on("open", () => {
     session.opened = true;
-    console.log(`[bridge] ws-open ${path} (id=${id})`);
+    console.log(`[bridge] ws-open ${session.e2ee ? "(e2ee) " : ""}${safe} (id=${id})`);
     send({ id, type: "ws-open", ok: true });
   });
   ws.on("message", (data, isBinary) => {
+    // 上游 → 手机:加密流逐条封信封(b2p 独立计数);明文流原样透传
+    if (session.e2ee) {
+      try {
+        const e2 = session.e2ee;
+        e2.b2pLast += 1;
+        const plain = isBinary ? Buffer.from(data) : Buffer.from(String(data), "utf8");
+        const env = e2.s.seal({
+          kind: "w",
+          dir: "b2p",
+          counter: e2.b2pLast,
+          data: plain,
+          t: isBinary ? 1 : 0,
+          wsLabel: e2.wsLabel
+        });
+        send({ id, type: "ws-msg", data: JSON.stringify(env), binary: false });
+      } catch (e) {
+        console.error(`[bridge] e2ee ws 上游→手机 封包失败(id=${id}): ${e.message}`);
+      }
+      return;
+    }
     const payload = isBinary ? Buffer.from(data).toString("base64") : data.toString();
     send({ id, type: "ws-msg", data: payload, binary: isBinary });
   });
@@ -515,8 +722,37 @@ export async function handleWsOpen(dchOrSend, frame) {
 
 export function handleWsMessage(_dchOrSend, frame) {
   const { id, data, binary } = frame;
+  const conn = ctrlConns.get(id);
+  if (conn) {
+    // 控制通道消息不走上游
+    if (binary) {
+      sendCtrlError(toSender(_dchOrSend), id, "bad_msg", "控制通道只接受文本消息");
+      return;
+    }
+    handleCtrlMessage(toSender(_dchOrSend), id, String(data));
+    return;
+  }
   const session = wsSessions.get(id);
   if (!session || !session.opened || session.ws.readyState !== WebSocket.OPEN) return;
+  if (session.e2ee) {
+    // 加密流:逐条解封 → 原文转发上游;AEAD 失败 → 1008 关闭并回告(不静默降级)
+    try {
+      const env = JSON.parse(binary ? Buffer.from(data, "base64").toString("utf8") : String(data));
+      const e2 = session.e2ee;
+      if (!env || env.v !== 2 || env.k !== "w") throw new E2eeError("bad_envelope", "e2ee ws 消息不是 w 信封");
+      if (!Number.isInteger(env.c) || env.c <= e2.p2bLast) throw new E2eeError("replay", `e2ee ws 计数重放/乱序 ${env.c}`);
+      const opened = e2.s.open({ kind: "w", dir: "p2b", env, counter: env.c, wsLabel: e2.wsLabel });
+      e2.p2bLast = env.c;
+      if (opened.t === 1) session.ws.send(opened.data);
+      else session.ws.send(opened.data.toString("utf8"));
+    } catch (e) {
+      console.error(`[bridge] e2ee ws 解封失败(id=${id}): ${e.message || e}(不回退明文,1008 关闭)`);
+      try { session.ws.close(1008, "⚠ e2ee 消息无法解密"); } catch {}
+      wsSessions.delete(id);
+      try { toSender(_dchOrSend)({ id, type: "ws-close", code: 1008, reason: "⚠ e2ee 消息无法解密" }); } catch {}
+    }
+    return;
+  }
   try {
     if (binary) session.ws.send(Buffer.from(data, "base64"));
     else session.ws.send(String(data));
@@ -525,17 +761,23 @@ export function handleWsMessage(_dchOrSend, frame) {
 
 export function handleWsClose(_dchOrSend, frame) {
   const { id, code, reason } = frame;
+  const conn = ctrlConns.get(id);
+  if (conn) {
+    ctrlConns.delete(id);
+    return;
+  }
   const session = wsSessions.get(id);
   if (!session) return;
   try { session.ws.close(code && typeof code === "number" ? code : 1000, reason || ""); } catch {}
 }
 
-/** DataChannel 断开:关闭所有 ws 会话。 */
+/** DataChannel 断开:关闭所有 ws 会话与控制通道。 */
 export function closeAllWsSessions() {
   for (const session of wsSessions.values()) {
     try { session.ws.terminate(); } catch {}
   }
   wsSessions.clear();
+  ctrlConns.clear();
 }
 
 // ============================================================
@@ -674,7 +916,8 @@ function connectTunnel(token) {
     tunnelRetry = 0;
     console.log(`[bridge] 隧道已连 ${endpoint},注册 ${DEVICE_ID}...`);
     try {
-      ws.send(JSON.stringify({ type: "tunnel-register", deviceId: DEVICE_ID, token, name: os.hostname() || "dsh-bridge" }));
+      // caps:bridge E2EE 能力上报(§6.2/§7.1;router 纯透传)。enabled=false → 空数组(明文回退)
+      ws.send(JSON.stringify({ type: "tunnel-register", deviceId: DEVICE_ID, token, name: os.hostname() || "dsh-bridge", caps: e2ee.caps() }));
     } catch (e) { console.log(`[bridge] 注册发送失败: ${e.message}`); }
     heartbeat = setInterval(() => {
       if (!pongReceived) {
@@ -715,12 +958,40 @@ function connectTunnel(token) {
   ws.on("error", (e) => console.log(`[bridge] 隧道错误: ${e.message || ""}`));
 }
 
+/**
+ * E2EE 启动初始化(账号模式):拉取服务端参数 → 用本机账号密码派生 MK(仅内存)。
+ * 任何一步不满足都禁用 E2EE(reason 记录),bridge 走原 v1 明文路径,不影响隧道。
+ * 启用结果写入 relayDir/.e2ee-state.json(供 Phase-4 UI 读取:{enabled, reason, ...})。
+ * 状态文件路径策略:显式 DSH_BRIDGE_CONFIG / DSH_BRIDGE_E2EE_STATE 时落盘(生产必设),
+ * 否则只打日志(避免污染仓库/非托管目录)。
+ */
+async function initE2ee(token) {
+  const cfg = loadLocalConfig();
+  const localMode = Boolean(process.env.DSH_BRIDGE_LOCAL_KEY); // 自建模式不启用(§6.6)
+  const userDisabled = process.env.DSH_BRIDGE_E2EE === "0" || cfg.e2ee === false;
+  const allowed = !localMode && !userDisabled;
+  // 密码与 device-login 同源:env 优先,其次 .dsh-config.json(本机 0600 保存的账号密码)
+  const password = PASSWORD || (typeof cfg.password === "string" && cfg.password ? cfg.password : "");
+  e2ee = await E2eeService.init({ apiBase: API_BASE, token, password, allowed });
+  const st = e2ee.state();
+  const stateFileDir = process.env.DSH_BRIDGE_E2EE_STATE || path.dirname(CONFIG_PATH);
+  if (process.env.DSH_BRIDGE_CONFIG || process.env.DSH_BRIDGE_E2EE_STATE) {
+    writeE2eeStateFile(stateFileDir, { enabled: st.enabled, reason: st.reason, profile: st.profile, epoch: st.epoch, caps: e2ee.caps() });
+  }
+  if (st.enabled) {
+    console.log(`[bridge] 🔒 E2EE 已启用(caps=[${e2ee.caps().join(",")}], profile=${st.profile}, epoch=${st.epoch});MK 仅驻内存`);
+  } else {
+    console.log(`[bridge] e2ee 未启用(${st.reason}) → 明文 v1 路径照常(能力不上报)`);
+  }
+}
+
 async function runTunnel() {
   const token = await resolveToken();
   if (!token) {
     console.error("[bridge] 隧道模式需要账号认证:请设 DSH_BRIDGE_TOKEN,或 DSH_BRIDGE_PHONE+DSH_BRIDGE_PASSWORD");
     process.exit(1);
   }
+  await initE2ee(token);
   await registerDeviceInAccount(token);
   connectTunnel(token);
   setTimeout(() => {
