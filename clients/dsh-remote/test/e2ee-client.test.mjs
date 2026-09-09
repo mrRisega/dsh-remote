@@ -294,6 +294,19 @@ test("E2eeService:disabled 状态 caps 为空;enabled 后 caps=['e2ee-v2']", () 
   assert.equal(on.state().reason, "ok");
 });
 
+test("E2eeService.introGrant:启用时一次性下发派生 MK(32B b64url);禁用时抛 e2ee_disabled", () => {
+  const off = new E2eeService({ enabled: false, reason: "server_disabled" });
+  assert.throws(() => off.introGrant(), (e) => e.code === "server_disabled" || e.code === "e2ee_disabled");
+  const mk = deriveMasterKey("unit-password", SALT_B64);
+  const on = new E2eeService({ enabled: true, mk, salt: SALT_B64, profile: "pbkdf2-sha256-600k", epoch: 3 });
+  const g = on.introGrant();
+  assert.equal(g.profile, "pbkdf2-sha256-600k");
+  assert.equal(g.epoch, 3);
+  assert.equal(typeof g.mk, "string");
+  assert.equal(Buffer.from(g.mk, "base64url").length, 32);
+  assert.equal(Buffer.from(g.mk, "base64url").toString("hex"), mk.toString("hex"), "引导下发的 MK 应与桥端派生 MK 一致(否则手机无法通过探针)");
+});
+
 test("E2eeService.init:服务端 enabled=false/401/无密码/禁用开关 → 明文回退原因", async () => {
   // 无密码
   const noPw = await E2eeService.init({ apiBase: "http://127.0.0.1:1", token: "t", password: "" });

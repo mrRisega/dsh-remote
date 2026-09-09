@@ -323,7 +323,7 @@ test("二维码缺失容错 + 未登录引导文案（源码级约束）", () =>
   assert.match(SOURCE, /window\.open/);
   // 自动刷新/状态轮询定时器与清理
   assert.match(SOURCE, /KEY_AUTO_REFRESH_MS = 25000/);
-  assert.match(SOURCE, /STATUS_POLL_MS = 5000/);
+  assert.match(SOURCE, /STATUS_POLL_MS = 30000/); // 审计降频:原 5s→30s,页面隐藏暂停
   assert.match(SOURCE, /clearInterval\(rotateIv\)/);
   assert.match(SOURCE, /clearInterval\(pollIv\)/);
   // 文案与行为关键词

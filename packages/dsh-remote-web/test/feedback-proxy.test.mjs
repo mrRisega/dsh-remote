@@ -104,7 +104,8 @@ test("反馈配置：默认走 api_url（生产 relay-api 同源反馈端点）�
     assert.equal(body.ok, true);
     assert.equal(body.reachable, true);
     assert.equal(body.deviceId, "dev-cfgcheck");
-    assert.equal(body.phone, "13900000000");
+    // 隐私契约(2026-09):反馈配置不下发明文手机号,只给掩码(提交时服务端另附 x-dsh-phone 真号)
+    assert.equal(body.phone, "139****0000");
     // 代理把 /dsh-remote/feedback/api/feedback/captcha 映射到 {api_url}/api/feedback/captcha
     const cap = await fetch(`http://127.0.0.1:${host.address().port}/dsh-remote/feedback/api/feedback/captcha`);
     assert.equal(cap.status, 201);

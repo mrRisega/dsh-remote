@@ -300,30 +300,31 @@ test("红点只挂在设置页「远程访问」栏目导航（navCell）：普�
   assert.equal(plainBtn.children.length, 0, "非栏目导航按钮不得注入红点（不遮挡官方按钮）");
 });
 
-// ---------- 入口收敛：不再向官方侧栏注入任何按钮 / 导航点击机器 ----------
-// 用户从官方「设置」进入 → 点 settings.section「远程访问」栏目（官方扩展点，天然不冲突），
-// 官方「设置」按钮保持原样、不被遮挡。旧 Bug A 侧栏注入实现（容器限定点击流 + 独立按钮 +
-// 红点 + openRemoteSettings/__dshRemoteNav）已整段移除，红点只保留在设置页栏目导航 navCell 上。
+// ---------- 侧栏「远程访问」快捷入口（2026-09 恢复注入：与官方「设置」共存、不遮挡） ----------
+// 用户要求：左侧官方「设置」按钮旁保留「📱 远程访问」快捷按钮。实现要点（防 Bug A 复发）：
+//   - 独立 <button id=dru-nav-remote>（绝不 cloneNode → 不继承官方事件委托/点击热区），
+//     插在官方「设置」按钮之前；
+//   - 候选限定官方导航（class 含 navCell 或位于导航容器）+ 短文本/aria 精确匹配；
+//   - 命中排除自身（防递归）与“菜单/更多”语义节点；不点工作区会话行；
+//   - openRemoteSettings：栏目已开直接点；未开先点官方「设置」再 ≤3s 轮询补点；
+//   - 红点（.dru-reddot / .dru-nav-remote-dot）用同一 dsh-remote-seen-dot key，点击即收起。
 
-test("源码约束：侧栏注入按钮/导航点击机器已移除，官方「设置」不被抢、红点仅保留在设置页栏目导航", () => {
-  // 不再存在：侧栏 DOM 注入 / 导航容器点击 / 暴露给宿主与自动化的 open 入口
-  assert.doesNotMatch(SOURCE, /injectSidebarRemoteEntry/);
-  assert.doesNotMatch(SOURCE, /dru-nav-remote/);
-  assert.doesNotMatch(SOURCE, /dsh-remote-nav-seen/);
-  assert.doesNotMatch(SOURCE, /openRemoteSettings/);
-  assert.doesNotMatch(SOURCE, /clickNavToken/);
-  assert.doesNotMatch(SOURCE, /remoteSectionVisible/);
-  assert.doesNotMatch(SOURCE, /__dshRemoteNav/);
-  assert.doesNotMatch(SOURCE, /data-dru-remote/);
-  assert.doesNotMatch(SOURCE, /NAV_ENTRY_ID/);
-  assert.doesNotMatch(SOURCE, /NAV_CONTAINER_SEL/);
-  assert.doesNotMatch(SOURCE, /NAV_TEXT_MAX/);
-  assert.doesNotMatch(SOURCE, /dru-fab/);
-  // 官方按钮不被克隆 / 包装 / 挪位（克隆曾继承官方事件委托与热区 → Bug A）
+test("源码约束：侧栏注入「远程访问」按钮与官方「设置」共存；独立按钮非克隆；导航点击安全", () => {
+  // 注入存在：入口 id / 挂载函数 / 打开函数 / 心跳保证
+  assert.match(SOURCE, /dru-nav-remote/);
+  assert.match(SOURCE, /navEnsureStart/);
+  assert.match(SOURCE, /openRemoteSettings/);
+  assert.match(SOURCE, /__dshRemoteNav/);
+  assert.match(SOURCE, /data-dru-remote/);
+  assert.match(SOURCE, /NAV_ENTRY_ID/);
+  // 安全设计：绝不克隆官方按钮；候选限定 navCell/导航容器 + 短文本；排除自身；排除菜单语义
   assert.doesNotMatch(SOURCE, /cloneNode/);
-  // 唯一保留的 DOM 注入 = 设置页栏目导航红点（.dru-reddot，navCell 右上角，pointer-events:none）
-  assert.match(SOURCE, /dru-reddot/);
   assert.match(SOURCE, /navCell/);
+  assert.match(SOURCE, /NAV_TEXT_MAX/);
+  assert.match(SOURCE, /el\.id === NAV_ENTRY_ID/);
+  assert.match(SOURCE, /NAV_BAD_RE/);
+  // 红点仍在（官方栏目 navCell + 快捷按钮首用同 key）
+  assert.match(SOURCE, /dru-reddot/);
   assert.match(SOURCE, /dsh-remote-seen-dot/);
 });
 

@@ -238,6 +238,11 @@
     .retain-text { font-size: 13.5px; color: var(--text); line-height: 1.9; margin-bottom: 16px; text-align: left; }
     .retain-btns { display: flex; gap: 10px; }
     .retain-btns .auth-btn { flex: 1; margin: 0; }
+    .retain-result { display: none; text-align: left; }
+    .retain-result.show { display: block; }
+    .retain-result .ok-line { font-size: 13.5px; line-height: 1.9; color: var(--text); margin: 2px 0 14px; }
+    .retain-later { margin-top: 12px; text-align: center; }
+    .retain-later button { font-size: 12.5px; color: var(--muted); text-decoration: underline; background: none; border: none; cursor: pointer; }
     #retain-modal { z-index: 950; }
 
     /* ---------- E2EE(端到端加密)Phase-3:状态徽标 / 能力标记 / 解锁层 ----------
@@ -487,15 +492,25 @@ var _hmt = _hmt || [];
   </div>
 </div>
 
-<!-- 挽留弹窗 -->
+<!-- 支付状态确认弹层(2026-09:替代原「挽留别走」弹窗;关闭收款码时询问支付结果并上报) -->
 <div class="modal-overlay hidden" id="retain-modal">
   <div class="modal-card retain-card">
-    <h3>💛 先别走呀～</h3>
-    <div class="retain-text" id="retain-text"></div>
-    <div class="retain-btns">
-      <button type="button" class="auth-btn ghost" id="retain-stay">我再想想</button>
-      <button type="button" class="auth-btn danger" id="retain-leave">残忍离开</button>
+    <div id="payask-question">
+      <h3>💳 完成支付了吗？</h3>
+      <div class="retain-text" id="retain-text"></div>
+      <div class="retain-btns">
+        <button type="button" class="auth-btn ghost" id="payask-cancel">取消支付</button>
+        <button type="button" class="auth-btn" id="payask-done">支付完成</button>
+      </div>
     </div>
+    <div class="retain-result" id="payask-result">
+      <h3>✅ 已记录支付完成</h3>
+      <div class="ok-line" id="payask-result-text"></div>
+      <div class="retain-btns">
+        <button type="button" class="auth-btn" id="payask-ok">知道了</button>
+      </div>
+    </div>
+    <div class="retain-later"><button type="button" id="payask-later">稍后再说</button></div>
   </div>
 </div>
 
@@ -937,6 +952,11 @@ async function doLogin() {
     state.token = res.data.token; state.user = res.data.user;
     localStorage.setItem("dsh_token", state.token);
     localStorage.setItem("dsh_user", JSON.stringify(state.user));
+    // 免二次输密码:密码登录时在内存保留一份(仅本页会话),随即清空输入框(卫生:不再残留 DOM)
+    if (loginMode === "pass") {
+      const pw = $("login-pass").value;
+      if (pw) { e2eePendingPassword = pw; $("login-pass").value = ""; }
+    }
     msg.className = "auth-msg ok"; msg.textContent = "✅ 登录成功,正在进入...";
     enterMirror(res.data.token);
   } else {
@@ -973,6 +993,8 @@ async function doRegister() {
     state.token = res.data.token; state.user = res.data.user;
     localStorage.setItem("dsh_token", state.token);
     localStorage.setItem("dsh_user", JSON.stringify(state.user));
+    // 注册即登录:同样内存保留密码用于免二次解锁,随即清空密码输入框
+    if (password) { e2eePendingPassword = password; $("reg-pass").value = ""; $("reg-pass2").value = ""; }
     msg.className = "auth-msg ok"; msg.textContent = "✅ 注册成功,已自动登录,正在进入...";
     enterMirror(res.data.token);
   } else {
@@ -1043,11 +1065,14 @@ function logout(clearForm = false) {
   document.cookie = "dsh_device=; path=/; max-age=0; SameSite=Lax; Secure";
   if (token) fetch(API_BASE + "/api/logout", { method: "POST", headers: { authorization: `Bearer ${token}` } }).catch(() => {});
   // E2EE:清空内存会话/参数(协议 §5.1:密钥只存内存,退出即失效)
+  e2eePendingPassword = null; // 内存中的登录密码随退出即失效
+  e2eeMkClear(); e2eeStoredMk = null; // 本机记住的解锁材料(MK)随退出清除
   try { if (typeof e2eeClient !== "undefined") { e2eeClient.sessions.clear(); e2eeClient.params = null; e2eeClient.paramsT = 0; } } catch {}
   try { if (typeof e2eeUpdateBadge === "function") e2eeUpdateBadge(); } catch {}
   try { if (typeof e2eeCloseUnlock === "function") e2eeCloseUnlock(); } catch {}
-  // Phase-4:登出同时清除一次性交接单(镜像页不得残留可复用会话材料)
+  // Phase-4:登出同时清除一次性交接单与「记住本机」持久交接单(镜像页不得残留可复用会话材料)
   try { if (typeof dshE2eeHandoverClear === "function") dshE2eeHandoverClear(sessionStorage); } catch {}
+  try { if (typeof dshE2eeHandoverClear === "function") dshE2eeHandoverClear(localStorage); } catch {}
   setConn("未连接");
   if (clearForm) {
     ["login-phone", "login-pass", "login-captcha", "login-sms-code", "login-sms-captcha", "reg-phone", "reg-sms-code", "reg-sms-captcha", "reg-pass", "reg-pass2", "reset-phone", "reset-captcha", "reset-sms-code", "reset-pass"].forEach(id => { const el = $(id); if (el) el.value = ""; });
@@ -1377,8 +1402,7 @@ async function refreshDevices() {
 // ---------- v2 推广页(产品介绍/月付年付/价格对比/购买/安装引导/邀请) ----------
 
 let promoBilling = "monthly";   // "monthly" | "yearly"
-let qrRetentionShown = false;   // 挽留层只出现一次,之后关闭直接关
-let promoPlanName = "PRO";      // 当前点击购买对应的套餐名(挽留文案用)
+let promoPlanName = "PRO";      // 当前点击购买对应的套餐名(支付状态确认文案用)
 
 /** 套餐价格:月价取 prices.{key};年价优先 prices.{key}_yearly,缺失按 9 折兜底。 */
 function promoPriceOf(key) {
@@ -1426,6 +1450,12 @@ function renderPromoPlans() {
     </div>`;
   $("promo-buy").querySelectorAll("[data-plan]").forEach(btn => {
     btn.onclick = () => {
+      // 支付需登录(收款为人工开通,必须能定位账号):未登录点击 → 引导先登录
+      if (!state.token) {
+        toast("请先登录账号后再购买(便于为你开通)", 3000);
+        setView("login");
+        return;
+      }
       reportUpgradeIntent("buy_click"); // 第二层:点购买即上报
       openQrModal(btn.dataset.plan);
     };
@@ -1473,20 +1503,42 @@ function openQrModal(plan) {
   $("qr-modal").classList.remove("hidden");
 }
 
-/** 关闭二维码层:首次先弹挽留层,挽留出现过后再关则直接关闭。 */
+/** 关闭二维码层 → 弹「支付状态确认」(替代原挽留弹窗):支付完成 / 取消支付 / 稍后再说。 */
 function closeQrAttempt() {
-  if (!qrRetentionShown) {
-    qrRetentionShown = true;
-    $("retain-text").textContent = `先别走呀～开通 ${promoPlanName} 后不限流量不限速,电脑随时在线,一年下来每天不到几毛钱～再想想嘛?`;
-    $("retain-modal").classList.remove("hidden");
-  } else {
-    closeQrLayers();
-  }
+  $("qr-modal").classList.add("hidden");
+  showPayAsk();
 }
-/** 关闭全部弹层(二维码 + 挽留)。 */
+/** 展示支付状态确认弹层(两按钮:支付完成 / 取消支付;小字:稍后再说不打扰)。 */
+function showPayAsk() {
+  const wechat = String(((pubConfig && pubConfig.upgrade) || {}).wechat || "").trim();
+  $("retain-text").textContent =
+    `已打开 ${promoPlanName} 收款二维码。如果你已完成微信支付,点「支付完成」我们会把记录提交给开发者,尽快核实并为你开通;` +
+    (wechat ? `如迟迟未开通可加客服微信:「${wechat}」。` : "");
+  $("payask-question").style.display = "";
+  $("payask-result").classList.remove("show");
+  $("retain-modal").classList.remove("hidden");
+}
+/** 「支付完成」:上报 pay_success(后台可按此筛选→核实款项→人工开通)并给用户结果反馈。 */
+function payAskDone() {
+  const wechat = String(((pubConfig && pubConfig.upgrade) || {}).wechat || "").trim();
+  reportUpgradeIntent("pay_success"); // 支付完成上报
+  $("payask-question").style.display = "none";
+  const txt = $("payask-result-text");
+  txt.textContent = "你已完成支付的信息已上报(支付完成上报),我们会尽快核对并开通。" +
+    (wechat ? `长时间未开通请加客服微信「${wechat}」并备注手机号,便于快速处理。` : "如长时间未开通请稍后在「我的-升级」中再次提交。");
+  $("payask-result").classList.add("show");
+}
+/** 「取消支付」:上报 pay_cancel 后关闭全部弹层。 */
+function payAskCancel() {
+  reportUpgradeIntent("pay_cancel"); // 取消支付上报
+  closeQrLayers();
+}
+/** 关闭全部弹层(二维码 + 支付状态确认)。 */
 function closeQrLayers() {
   $("retain-modal").classList.add("hidden");
   $("qr-modal").classList.add("hidden");
+  $("payask-result").classList.remove("show");
+  $("payask-question").style.display = "";
 }
 
 async function renderPromo() {
@@ -1930,9 +1982,21 @@ function dshE2eeHandoverClear(storage) { try { storage.removeItem(DSH_E2EE_HANDO
 /** enterDevice 前置(Phase-4):解锁会话→写一次性交接单;明文跳过/未解锁→清(防串台)。 */
 function dshE2eeHandoverSync(deviceId) {
   try {
-    if (typeof e2eeClient === "undefined") { dshE2eeHandoverClear(sessionStorage); return; }
+    if (typeof e2eeClient === "undefined") {
+      dshE2eeHandoverClear(sessionStorage);
+      try { dshE2eeHandoverClear(localStorage); } catch (e) {}
+      return;
+    }
     const ent = e2eeClient.sessions.get(deviceId) || null;
-    if (ent && ent.sess) dshE2eeHandoverWrite(ent.sess, sessionStorage); else dshE2eeHandoverClear(sessionStorage);
+    if (ent && ent.sess) {
+      dshE2eeHandoverWrite(ent.sess, sessionStorage);
+      // 记住本机(2026-09):同一交接单同时写 localStorage —— 刷新镜像页后可自动恢复加密
+      // (登出时清除;与 localStorage 中的派生 MK 同策略)。
+      try { dshE2eeHandoverWrite(ent.sess, localStorage); } catch (e) {}
+    } else {
+      dshE2eeHandoverClear(sessionStorage);
+      try { dshE2eeHandoverClear(localStorage); } catch (e) {}
+    }
   } catch (e) {}
 }
 
@@ -1952,6 +2016,22 @@ const E2EE_ERR_TEXT = {
   ws_timeout: "加密握手超时,请检查网络后重试。",
   derive_failed: "密钥派生失败,请确认密码后重试。"
 };
+
+// 自动解锁(2026-09,免二次输密码):登录/注册时用户刚输入过密码,在本页内存保留一份,
+// 点选 E2EE 设备时静默解锁。发送给服务端?否。短信/扫码登录无密码 → 自动引导或解锁层。
+let e2eePendingPassword = null;
+
+// 解锁材料持久化(2026-09 用户决策「刷新后仍保持加密」):解锁成功后把派生 MK 存入
+// localStorage(与镜像页同源共用),刷新/重开 /app 后点设备仍自动加密进入,不再要求重输密码。
+// 注意(如实告知):localStorage 与同源页面(含被控的镜像 dsh web)脚本等价可读,此选项≈
+// 「记住本机密码」;退出登录即清除。协议 §5.1 [DECISION-2026-09] 已按产品决策更新该边界。
+var E2EE_MK_STORE_KEY = "dsh-e2ee-mk-v1";
+function e2eeMkLoad() {
+  try { var s = localStorage.getItem(E2EE_MK_STORE_KEY); return s && s.length >= 32 ? s : null; } catch (e) { return null; }
+}
+function e2eeMkSave(mkB64) { try { if (mkB64) localStorage.setItem(E2EE_MK_STORE_KEY, String(mkB64)); } catch (e) {} }
+function e2eeMkClear() { try { localStorage.removeItem(E2EE_MK_STORE_KEY); } catch (e) {} }
+let e2eeStoredMk = e2eeMkLoad(); // 启动即读:刷新/重开后自动解锁可用
 
 const e2eeClient = {
   params: null,          // {enabled, reason, profile, salt, kdf, epoch, status}
@@ -2017,13 +2097,18 @@ function e2eeCtrlWsUrl(deviceId) {
 /**
  * §5.2 手机侧全握手:hello → hello-ack → deriveShk → 探针(ctrl AEAD)→ probe-ok。
  * @param {string} deviceId
- * @param {object} o { password, params }
+ * @param {object} o { password?, params, mkBytes? }
+ *   password=账号密码时现场派生 MK;mkBytes(32B,方案A 桌面授权引导下发)=直接用,免输密码。
  * @returns {Promise<{sessId:string, sess:WcE2eeSession}>} verified 后返回
  */
-function e2eeUnlockHandshake(deviceId, { password, params }) {
+function e2eeUnlockHandshake(deviceId, { password, params, mkBytes }) {
   return new Promise((resolve, reject) => {
     const sessId = wcNewSessId();
     const aB64 = wcRandomB64(32);
+    if (mkBytes && mkBytes.length !== WC_MK_BYTES) {
+      reject(wcErr("derive_failed", E2EE_ERR_TEXT.derive_failed));
+      return;
+    }
     let ws;
     let timer = null;
     let settled = false;
@@ -2056,7 +2141,7 @@ function e2eeUnlockHandshake(deviceId, { password, params }) {
       }
       if (msg.type === "e2ee-hello-ack") {
         try {
-          const mk = await wcDeriveMasterKey(password, params.salt, params.kdf);
+          const mk = mkBytes || await wcDeriveMasterKey(password, params.salt, params.kdf);
           const { shk, saltH } = await wcDeriveShk(mk, aB64, String(msg.b || ""));
           session = new WcE2eeSession({ sessId, shk, saltH, profile: params.profile, epoch: params.epoch });
           const probe = await session.seal({
@@ -2088,22 +2173,85 @@ function e2eeUnlockHandshake(deviceId, { password, params }) {
   });
 }
 
-/** 解锁设备:密码 → 派生 MK → ctrl 握手(探针通过即「双方 MK 一致」)。会话仅存内存。 */
+/** 解锁/引导成功后的统一收尾:会话仅存内存 + 刷新徽标。 */
+function e2eeCommitSession(deviceId, params, r) {
+  e2eeClient.sessions.set(deviceId, { params, sess: r.sess, unlockedAt: Date.now() });
+  e2eeClient.deviceName.set(deviceId, e2eeClient.deviceName.get(deviceId) || deviceId);
+  e2eeUpdateBadge();
+  return { ok: true, code: "ok", sessId: r.sessId };
+}
+
+/** 解锁设备:密码 → 派生 MK → ctrl 握手(探针通过即「双方 MK 一致」)。会话仅存内存;
+ *  成功后派生 MK 按用户决策写入 localStorage(刷新后自动解锁用,退出登录清除)。 */
 async function e2eeUnlockDevice(deviceId, password) {
   if (!e2eeSubtleAvailable()) return { ok: false, code: "no_webcrypto", text: "当前浏览器不支持端到端加密所需的安全环境,请用系统浏览器(HTTPS)重试;已按明文路径继续。" };
   const params = await e2eeGetParams(true);
   if (!params.enabled) return { ok: false, code: params.reason, text: E2EE_ERR_TEXT[params.reason] || "服务端未启用端到端加密,已按明文路径继续。" };
   if (typeof password !== "string" || password.length < 1) return { ok: false, code: "no_password", text: "请输入账号密码" };
+  let mkBytes;
+  try {
+    mkBytes = await wcDeriveMasterKey(password, params.salt, params.kdf);
+  } catch (e) {
+    return { ok: false, code: "derive_failed", text: E2EE_ERR_TEXT.derive_failed };
+  }
   let r;
   try {
-    r = await e2eeUnlockHandshake(deviceId, { password, params });
+    r = await e2eeUnlockHandshake(deviceId, { params, mkBytes });
   } catch (e) {
     return { ok: false, code: e && e.code ? e.code : "e2ee_failed", text: (e && e.message) || "解锁失败,请重试" };
   }
-  e2eeClient.sessions.set(deviceId, { params, sess: r.sess, unlockedAt: Date.now() });
-  e2eeClient.deviceName.set(deviceId, e2eeClient.deviceName.get(deviceId) || deviceId);
-  e2eeUpdateBadge();
-  return { ok: true, code: "ok", sessId: r.sessId };
+  const out = e2eeCommitSession(deviceId, params, r);
+  if (out.ok) e2eeMkSave(wcBytesToB64(mkBytes)); // 记住本机解锁(刷新后自动加密)
+  return out;
+}
+
+/**
+ * 桌面授权引导解锁(方案A,2026-09):扫码/一次性链接等「未持有密码」的进入方式,向电脑端
+ * bridge 请求一次性引导(同账号经路由授权);拿到派生 MK 后直接完成同一 hello/probe 握手,
+ * 全程无需输入账号密码。MK 仅在本页内存参与派生,不落盘。信任模型见 docs/e2ee-protocol.md §5.4。
+ */
+async function e2eeIntroUnlockDevice(deviceId, mkB64) {
+  if (!e2eeSubtleAvailable()) return { ok: false, code: "no_webcrypto", text: "当前浏览器不支持端到端加密所需的安全环境,请用系统浏览器(HTTPS)重试;已按明文路径继续。" };
+  const params = await e2eeGetParams(true);
+  if (!params.enabled) return { ok: false, code: params.reason, text: E2EE_ERR_TEXT[params.reason] || "服务端未启用端到端加密,已按明文路径继续。" };
+  let mkBytes;
+  try {
+    mkBytes = wcB64ToBytes(mkB64);
+    if (!mkBytes || mkBytes.length !== WC_MK_BYTES) throw new Error("bad len");
+  } catch {
+    return { ok: false, code: "bad_intro", text: "电脑端引导数据无效,请重试或改用账号密码解锁" };
+  }
+  let r;
+  try {
+    r = await e2eeUnlockHandshake(deviceId, { params, mkBytes });
+  } catch (e) {
+    return { ok: false, code: e && e.code ? e.code : "e2ee_failed", text: (e && e.message) || "引导解锁失败,请重试" };
+  }
+  const out = e2eeCommitSession(deviceId, params, r);
+  if (out.ok) e2eeMkSave(mkB64); // 与密码解锁同策略:记住本机,刷新后自动加密
+  return out;
+}
+
+/** 向电脑端请求一次性 E2EE 引导(方案A)。端点经 relay-router 同账号授权到本设备桥端。 */
+async function e2eeRequestIntro(deviceId) {
+  try {
+    const r = await fetch(`${window.location.origin}/remote/${encodeURIComponent(deviceId)}/_e2ee/intro`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ v: 2, grant: "desktop-intro", ts: Date.now() }),
+      signal: AbortSignal.timeout(8000),
+      cache: "no-store"
+    });
+    const d = await r.json().catch(() => null);
+    if (!d) return { ok: false, code: "bad_intro", text: "电脑端引导响应异常(" + r.status + ")" };
+    if (r.status !== 200 || d.ok !== true || typeof d.mk !== "string") {
+      const code = (d && d.error && d.error.code) || "intro_failed";
+      return { ok: false, code: code, text: (d && d.error && d.error.message) || ("电脑端拒绝引导(" + r.status + ")") };
+    }
+    return { ok: true, mk: d.mk };
+  } catch (e) {
+    return { ok: false, code: "intro_network", text: "电脑端引导请求失败:" + (e && e.message ? e.message : e) };
+  }
 }
 
 /** 会话状态查询(供 Phase-4 插件/徽标读取;字段名即对外约定)。 */
@@ -2179,6 +2327,7 @@ async function e2eeDoUnlock() {
   if (r.ok) {
     msg.className = "e2ee-unlock-msg ok";
     msg.textContent = "✅ 已与电脑端确认密码一致,加密会话就绪(密钥仅存本页内存)。";
+    if (pw) e2eePendingPassword = pw; // 纠正成功后同步内存密码,后续设备不再要求重复输入
     const after = unlockCtx.after;
     const name = unlockCtx.name;
     go.disabled = false;
@@ -2228,10 +2377,60 @@ async function e2eeMaybeGateThenEnter(deviceId, name, caps) {
     return;
   }
   e2eeClient.deviceName.set(deviceId, name || deviceId);
-  // 已解锁过(同页内存会话)→ 直接进入(镜像页;Phase-4 起在镜像页内复用加密传输)
-  if (e2eeClient.sessions.has(deviceId)) {
-    enterDevice(deviceId);
-    return;
+  // 已解锁过(同页内存会话)→ 直接进入;但桥端会话 24h TTL(e2ee-client prune),
+  // 超过 24h 的内存会话视为失效,避免直进撞桥端已过期会话。
+  const prev = e2eeClient.sessions.get(deviceId);
+  if (prev && prev.sess) {
+    const fresh = !prev.unlockedAt || (Date.now() - prev.unlockedAt < 24 * 3600 * 1000);
+    if (fresh) { enterDevice(deviceId); return; }
+    e2eeClient.sessions.delete(deviceId);
+  }
+  // 免二次输密码(2026-09):依次尝试自动解锁候选,失败按语义降级:
+  //   ① 内存密码(本次登录/注册刚输过)→ e2eeUnlockDevice(内部同时落 localStorage);
+  //   ② localStorage 记住的派生 MK(刷新/重开仍加密,2026-09 用户决策);
+  //   ③ 桌面授权引导(扫码/一次性链接等从未持有密码,方案A)。
+  //   密码不一致/会话失效类 → 弹解锁层人工纠正(绝不因 bad_key 静默明文);
+  //   服务端未启用/无能力等 → toast 提示后明文进入(与既有分支语义一致)。
+  const autoResult = async (label, fn, okText) => {
+    try {
+      const r = await fn();
+      if (r.ok) {
+        toast(okText || `🔒 ${name || deviceId} 端到端加密会话已建立`, 2200);
+        enterDevice(deviceId);
+        return "entered";
+      }
+      const needManual = ["bad_key", "auth_failed", "params", "unknown_session", "not_verified", "replay", "ws_closed", "ws_timeout", "derive_failed", "bad_intro", "intro_failed", "intro_network"];
+      if (!needManual.includes(r.code)) {
+        toast((r.text || "已按明文路径继续"), 3500);
+        enterDevice(deviceId);
+        return "plain";
+      }
+      if (label !== "intro") toast(`⚠ ${label}未成功(${r.code})`, 3600);
+    } catch (e) { /* 落到下一候选/模态 */ }
+    return "manual";
+  };
+  if (e2eePendingPassword) {
+    const st = await autoResult("自动解锁", () => e2eeUnlockDevice(deviceId, e2eePendingPassword), `🔒 ${name || deviceId} 端到端加密会话已自动建立`);
+    if (st !== "manual") return;
+  }
+  if (!e2eePendingPassword && e2eeStoredMk) {
+    // 记住本机:用 localStorage 里的派生 MK 直接自动解锁(刷新后仍加密,无需再输密码)
+    const st = await autoResult("记住本机解锁", () => e2eeIntroUnlockDevice(deviceId, e2eeStoredMk), `🔒 ${name || deviceId} 已自动加密进入(记住本机)`);
+    if (st !== "manual") return;
+  }
+  if (!e2eePendingPassword && !e2eeStoredMk) {
+    // 桌面授权引导(扫码/一次性链接等无密码路径,方案A):电脑端 bridge 经同账号授权通道下发 MK
+    const intro = await e2eeRequestIntro(deviceId).catch(() => ({ ok: false, code: "intro_network", text: "引导请求失败" }));
+    if (intro.ok) {
+      const st = await autoResult("intro", () => e2eeIntroUnlockDevice(deviceId, intro.mk), `🔒 ${name || deviceId} 已由电脑端授权自动建立加密会话`);
+      if (st !== "manual") return;
+      toast("⚠ 自动引导未成功,可改用账号密码解锁", 3600);
+    } else if (["no_webcrypto", "disabled", "e2ee_disabled", "no_cap"].includes(intro.code)) {
+      toast((intro.text || "已按明文路径继续"), 3500);
+      enterDevice(deviceId);
+      return;
+    }
+    // 引导不可达/被拒(旧电脑端等):落到下方模态,让用户输密码
   }
   e2eeOpenUnlock(deviceId, name, () => enterDevice(deviceId));
 }
@@ -2409,9 +2608,11 @@ $("promo-tab-yearly").onclick = () => switchPromoBilling("yearly");
 // 支付二维码弹层:关闭(× 或遮罩)先走挽留逻辑
 $("qr-modal-close").onclick = closeQrAttempt;
 $("qr-modal").addEventListener("click", (e) => { if (e.target === $("qr-modal")) closeQrAttempt(); });
-// 挽留弹层:「我再想想」回二维码层继续看;「残忍离开」关闭全部
-$("retain-stay").onclick = () => $("retain-modal").classList.add("hidden");
-$("retain-leave").onclick = closeQrLayers;
+// 支付状态确认(替代挽留):支付完成→上报 pay_success 并给反馈;取消支付→上报 pay_cancel;稍后再说→不打扰
+$("payask-done").onclick = payAskDone;
+$("payask-cancel").onclick = payAskCancel;
+$("payask-later").onclick = closeQrLayers;
+$("payask-ok").onclick = () => $("retain-modal").classList.add("hidden");
 $("btn-promo-back").onclick = () => {
   history.replaceState(null, "", window.location.pathname);
   if (state.token) { setView("devices"); refreshDevices(); }

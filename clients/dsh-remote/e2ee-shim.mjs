@@ -84,6 +84,11 @@ const STYLE = `
 }
 #dsh-e2ee-badge.expanded .dsh-e2ee-badge-note { display: block; }
 #dsh-e2ee-badge .dsh-e2ee-badge-note a { color: #0b57d0; text-decoration: underline; }
+/* 自动收缩态(2026-09):加密态展示数秒后缩成仅 🔒 芯片,不挡右上界面;悬停/点击即展开 */
+#dsh-e2ee-badge.collapsed { padding: 5px 7px; gap: 0; max-width: 40px; }
+#dsh-e2ee-badge.collapsed .dsh-e2ee-badge-txt,
+#dsh-e2ee-badge.collapsed .dsh-e2ee-badge-note { display: none; }
+#dsh-e2ee-badge { transition: padding .25s ease, max-width .25s ease; }
 @media (max-width: 480px) {
   #dsh-e2ee-badge { padding: 5px 10px; font-size: 11px; }
 }

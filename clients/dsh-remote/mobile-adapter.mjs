@@ -221,6 +221,41 @@ const STYLE = `
 
 const SCRIPT = `(() => {
   "use strict";
+
+  /* —— 主机门解除(2026-09):镜像页(如 n.risegao.cn)经设备流认证回连同一台 127.0.0.1:3080,
+     桥已把 Host 回环化并剥 Origin(不扩大信任面)。官方客户端以 transport.ownsHost 判定
+     「自有主机」,非回环域名下不置 true 会把设置页置为 memory(不可用)镜像 →
+     模型/提供方设置无法加载(“Settings are unavailable in this browser”)。
+     在模块执行前安装定义陷阱:任何 __DSH_TRANSPORT__ 赋值都带 ownsHost=true。 —— */
+  (function () {
+    function forceOwns(v) {
+      try {
+        if (v && typeof v === "object") {
+          const d = Object.getOwnPropertyDescriptor(v, "ownsHost");
+          if (!d || d.configurable || d.writable) {
+            try {
+              Object.defineProperty(v, "ownsHost", { configurable: true, enumerable: true, get() { return true; }, set() {} });
+            } catch (e) { v.ownsHost = true; }
+          } else { v.ownsHost = true; }
+        }
+      } catch (e) { /* 忽略 */ }
+      return v;
+    }
+    let tr = (() => { try { return globalThis.__DSH_TRANSPORT__ || null; } catch (e) { return null; } })();
+    if (tr) { tr = forceOwns(tr); }
+    else { tr = { ownsHost: true }; } // 壳未注入 transport 的镜像页也按「自有主机」处理
+    try {
+      Object.defineProperty(globalThis, "__DSH_TRANSPORT__", {
+        configurable: true,
+        enumerable: true,
+        get() { return tr; },
+        set(v) { tr = v ? forceOwns(v) : tr; }
+      });
+    } catch (e) {
+      try { globalThis.__DSH_TRANSPORT__ = tr; } catch (e2) { /* 忽略 */ }
+    }
+  })();
+
   try {
     const HOST_RE = new RegExp(${JSON.stringify(RUNTIME_HOST_RE.source)});
     const NARROW = () => window.innerWidth <= 820;
@@ -246,8 +281,8 @@ const SCRIPT = `(() => {
 
     /* ================= 鲸鱼挂件手机辅助(仅 ≤820 生效;挂件类名 .dshwv-* 稳定) ========= */
     let whaleGuardsOn = false;
-    let whaleHitMap = null;
-    let whaleUnstuckDone = false;
+    let whaleHitMap = null;    let whaleUnstuckDone = false;
+    let drawerAutoCloseOn = false; // 窄屏“选中会话后自动收抽屉”委托只挂一次
 
     const WHALE_IMG = () => document.querySelector(".dshwv-img");
     const WHALE_ROOT = () => document.querySelector(".dshwv-root");
@@ -477,6 +512,25 @@ const SCRIPT = `(() => {
         new MutationObserver(sync).observe(frame, { attributes: true, attributeFilter: ["data-sidebar-collapsed", "data-details-collapsed"] });
       } catch (e2) { /* 退化:仅在下次 boot 同步 */ }
       sync();
+      /* 窄屏抽屉:点选会话(激活行)/点侧栏内「新建会话」后自动收起(官方不做;适配层点官方 toggle)。
+         仅当:窄屏 && 抽屉展开 && 点击发生在侧栏抽屉内;行内「⋯」按钮 stopPropagation 不会误触。 */
+      if (!drawerAutoCloseOn) {
+        drawerAutoCloseOn = true;
+        document.addEventListener("click", (e) => {
+          try {
+            if (!NARROW() || !expanded()) return;
+            const t = e.target;
+            if (!t || !t.closest) return;
+            if (t.closest(".dsh-ma-scrim, .dsh-ma-hamburger")) return;
+            if (!t.closest(".dsh-ma-sidebar")) return; // 只处理抽屉内的点选
+            const row = t.closest('[role="treeitem"][aria-selected]');
+            const isNew = t.closest('[aria-label*="新建会话"], [aria-label*="New session" i]');
+            if (!row && !isNew) return;
+            const togg = toggleOf();
+            if (togg) setTimeout(() => { try { togg.click(); } catch (e5) { /* ignore */ } }, 0);
+          } catch (e6) { /* 忽略 */ }
+        });
+      }
       whaleHookInit();
       watchSettings();
     };

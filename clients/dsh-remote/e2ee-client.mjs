@@ -590,6 +590,23 @@ export class E2eeService {
     return this.enabled ? [E2EE_CAP] : [];
   }
 
+  /**
+   * 桌面授权引导(方案A,2026-09 用户决策):供同账号手机端在「从未持有密码」的场景(扫码/
+   * 一次性链接登录)下免输密码建立 E2EE。桥端在内存中持有派生 MK,此处一次性下发 MK
+   * (base64url,仅内存转发;不落盘、不写日志)。调用前提:请求已由 relay-router 按
+   * dsh_token cookie 完成「同账号」授权(device/channel 形态都只到本设备)——
+   * 信任模型见 docs/e2ee-protocol.md §5.4 [DECISION]:引导瞬间以「持有效扫码会话=账号本人」
+   * 为准,存在被中继主动冒充的理论窗口(与扫码登录产品一致);引导后数据面照常走
+   * hello/probe 探针(双方已同持 MK)与 AEAD 信封。
+   * @returns {{mk:string, profile:string, epoch:number}}
+   */
+  introGrant() {
+    if (!this.enabled || !Buffer.isBuffer(this.mk) || this.mk.length !== MK_BYTES) {
+      throw new E2eeError(this.reason || "e2ee_disabled", "电脑端未启用端到端加密,无法授权引导(请先在电脑端登录并确认密码已生效)");
+    }
+    return { mk: this.mk.toString("base64url"), profile: this.profile, epoch: this.epoch };
+  }
+
   state() {
     return { enabled: this.enabled, reason: this.reason, profile: this.profile, epoch: this.epoch };
   }

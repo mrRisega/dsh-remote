@@ -65,11 +65,16 @@ test("推广页:月付/年付 Tab、版本对比表、两层购买意愿上报�
   // 立即购买按钮(PRO 与 Pro Max 各一个)
   assert.match(APP, /立即购买 PRO/);
   assert.match(APP, /立即购买 Pro Max/);
-  // 支付二维码弹层 + 挽留弹层(先挽留再关闭)
+  // 支付二维码弹层 + 关闭后的“支付状态确认”(支付完成/取消支付,原挽留弹窗已移除)
   assert.match(APP, /qr-modal/);
-  assert.match(APP, /retain-modal/);
-  assert.match(APP, /我再想想/);
-  assert.match(APP, /残忍离开/);
+  assert.match(APP, /payask-done/);
+  assert.match(APP, /payask-cancel/);
+  assert.match(APP, /payask-result/);
+  assert.match(APP, /支付完成/);
+  assert.match(APP, /取消支付/);
+  assert.match(APP, /稍后再说/);
+  assert.doesNotMatch(APP, /我再想想/);
+  assert.doesNotMatch(APP, /残忍离开/);
 });
 
 test("登录卡片已登录区移除「切换账号」按钮,保留「退出登录」", () => {
@@ -165,8 +170,13 @@ test("E2EE 门控:仅「账号 enabled ∧ 设备 caps=e2ee-v2」才走解锁流
   // 设备行渲染须携带 caps(供门控读取;离线行不可进入)
   assert.match(APP, /data-caps=/);
   assert.match(APP, /class="device off"/);
-  // 内存会话(同页已解锁 → 直接进入,不重复弹层)
-  assert.match(APP, /e2eeClient\.sessions\.has\(deviceId\)/);
+  // 内存会话(同页已解锁且 24h 内 → 直接进入,不重复弹层;过期则删除走重新解锁)
+  assert.match(APP, /e2eeClient\.sessions\.get\(deviceId\)/);
+  assert.match(APP, /24 \* 3600 \* 1000/);
+  // 免二次输密码候选:内存密码 / 记住本机(localStorage MK)/ 桌面授权引导 → 失败才落解锁层
+  assert.match(APP, /e2eePendingPassword/);
+  assert.match(APP, /e2eeStoredMk/);
+  assert.match(APP, /e2eeRequestIntro\(deviceId\)/);
 });
 
 test("E2EE 状态字段(Phase-4 约定):徽标/状态取自 e2eeStateFor 命名", () => {

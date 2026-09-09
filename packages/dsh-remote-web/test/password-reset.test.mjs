@@ -255,7 +255,8 @@ async function runResetFlow(opts = {}) {
 
   const smsReq = plugin.requests.find((r) => r.path === "/dsh-remote/sms-code");
   assert.ok(smsReq, "应请求 /dsh-remote/sms-code（复用短信防刷路径）");
-  assert.deepEqual(smsReq.body, { phone: "13800000000", captcha_id: "cap-pwd-1", captcha_answer: "654321" });
+  // 隐私契约(2026-09):账号卡改密不再把明文手机号发给浏览器/请求体 —— client 传空,由插件节点半回填本机账号
+  assert.deepEqual(smsReq.body, { phone: "", captcha_id: "cap-pwd-1", captcha_answer: "654321" });
 
   // 填写短信验证码 + 新密码(≥8) → 确认修改
   tree = plugin.render();
@@ -277,8 +278,8 @@ test("修改密码成功流：sms-code → password/reset → 本地登出（清
   const resetReq = plugin.requests.find((r) => r.path === "/dsh-remote/password/reset");
   assert.ok(resetReq, "应 POST /dsh-remote/password/reset");
   assert.equal(resetReq.method, "POST");
-  assert.deepEqual(resetReq.body, { phone: "13800000000", sms_code: "123456", new_password: "newpass123" },
-    "应提交 {phone,sms_code,new_password}");
+  assert.deepEqual(resetReq.body, { phone: "", sms_code: "123456", new_password: "newpass123" },
+    "应提交 {phone,sms_code,new_password}(账号卡改密 phone 为空,由服务端回填本机账号)");
 
   assert.ok(plugin.requests.some((r) => r.path === "/dsh-remote/logout"), "重置成功后应本地登出（清旧口令配置）");
   assert.ok(plugin.removed.includes("dsh-feedback-threads"), "重置成功登出应清除本机反馈线程凭据");
