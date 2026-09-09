@@ -992,7 +992,7 @@ window.__ModuleLoader__.load({
     // 见 clients/dsh-remote/e2ee-client.mjs），node 半随 /dsh-remote/status 以 service.e2ee 下发；
     // 此处只做“可读文案”映射（协议 docs/e2ee-protocol.md §2.3/§7.3）。
     var E2EE_DISABLED_COPY = {
-      server_disabled: "等待服务端开启 E2EE（灰度中，当前为加密准备）",
+      server_disabled: "端到端加密暂不可用（当前为普通安全连接 HTTPS）",
       params_unreachable: "当前为普通安全连接（HTTPS）",
       disabled_by_config: "当前为普通安全连接（HTTPS）",
       derive_failed: "账号密码已变更，需在「🔑 账号」重新登录后恢复端到端加密（当前为普通安全连接（HTTPS））",
