@@ -41,6 +41,7 @@
  *   DSH_BRIDGE_API         账号 API 地址(默认云端服务地址;自建模式无需设置)
  *   DSH_BRIDGE_LOCAL_KEY   开源自部署:访问密钥(设后经 router POST /_login 换本地 JWT,免账号体系)
  *   DSH_BRIDGE_HEARTBEAT_MS 隧道心跳间隔(默认 15000ms)
+ *   DSH_MOBILE_ADAPTER   经隧道访问的官方 dsh web 移动端适配注入开关:0 关闭(默认开启,仅 ≤820px 生效)
  */
 
 import WebSocket from "ws";
@@ -52,6 +53,8 @@ import { randomBytes, generateKeyPairSync, createHash } from "node:crypto";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { gzip as gzipCb } from "node:zlib";
+// 移动端适配层(经隧道访问的官方 dsh web 窄屏注入;DSH_MOBILE_ADAPTER=0 可关闭,默认开启)
+import { maybeInjectMobileAdapter } from "./mobile-adapter.mjs";
 
 // ---------- 强制直连:清除代理环境变量 ----------
 // 家庭网络常配 Clash 等代理(127.0.0.1:7890),node 的 ws/fetch 会继承
@@ -404,12 +407,22 @@ async function doHttp(method, path, reqHeaders, body, isB64) {
   }
   const res = await fetch(url, { ...init, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
   let buf = Buffer.from(await res.arrayBuffer());
+  // 移动端适配层:text/html(含 </head> 且匹配官方特征)在 gzip 前注入响应式 <style>/<script>;
+  // 非 html / SSE / 二进制 / 上游已压缩等其余响应一律原样(env DSH_MOBILE_ADAPTER=0 关闭)。
   // sanitizeResponseHeaders 会剥 content-encoding(undici 已解压,原头会误导浏览器);
   // 若我们自行 gzip,必须在 sanitize 之后把 content-encoding: gzip 补回,手机才能正确解压。
   const headers = sanitizeResponseHeaders(Object.fromEntries(res.headers.entries()));
+  const contentType = res.headers.get("content-type") || "";
+  if (!contentType.includes("text/event-stream")) { // SSE 长连不缓冲不注入(见模块注释)
+    const m = maybeInjectMobileAdapter({ buf, contentType });
+    if (m.injected) {
+      console.log(`[bridge] mobile-adapter 注入 ${path}: ${(buf.length / 1024).toFixed(0)}KB → ${(m.buf.length / 1024).toFixed(0)}KB`);
+      buf = m.buf;
+    }
+  }
   const compressed = await maybeCompressResponse({
     buf,
-    contentType: res.headers.get("content-type") || "",
+    contentType,
     contentEncoding: res.headers.get("content-encoding") || "",
     acceptEncoding: headerValue(reqHeaders, "accept-encoding"),
     status: res.status,
