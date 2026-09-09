@@ -251,3 +251,78 @@ test("二维码缺失容错 + 未登录引导文案（源码级约束）", () =>
   assert.match(SOURCE, /带登录态/);
   assert.match(SOURCE, /通过手机或另一台电脑远程使用同一份 dsh web/);
 });
+
+// ---------- 端到端加密（E2EE，Phase-5）状态徽标 ----------
+
+const E2EE_STATE = {
+  enabled: { enabled: true, reason: "ok", profile: "pbkdf2-sha256-600k", epoch: 1, caps: ["e2ee-v2"] },
+  serverDisabled: { enabled: false, reason: "server_disabled", profile: "", epoch: 0, caps: [] },
+  paramsUnreachable: { enabled: false, reason: "params_unreachable", profile: "", epoch: 0, caps: [] },
+  localDisabled: { enabled: false, reason: "disabled_by_config", profile: "", epoch: 0, caps: [] },
+  deriveFailed: { enabled: false, reason: "derive_failed", profile: "", epoch: 0, caps: [] },
+  unknownReason: { enabled: false, reason: "brand_new_reason_x", profile: "", epoch: 0, caps: [] },
+};
+
+function stateWith(service) {
+  return { config: { phone: "13800000000", deviceId: "dev-x", mode: "saas" }, service, remoteUrl: "https://app.test/" };
+}
+
+function e2eeLine(tree) {
+  return find(tree, (n) => n.props && typeof n.props.className === "string" && n.props.className.indexOf("dru-e2ee-line") === 0);
+}
+
+test("E2EE 徽标：已启用 → “🔒 端到端加密已启用（手机解锁后生效）”（service.e2ee 字段驱动）", () => {
+  const plugin = loadPlugin();
+  plugin.states[0] = stateWith({ running: true, e2ee: E2EE_STATE.enabled });
+  const tree = plugin.render();
+  const line = e2eeLine(tree);
+  assert.ok(line, "启用态应在「📱 远程访问」卡渲染加密状态行");
+  assert.match(String(line.props.className), /ok/, "启用态状态行应为绿色（ok）标记");
+  assert.ok(textHas(tree, "🔒 端到端加密已启用"), "应显示“端到端加密已启用”徽标文案");
+  assert.ok(textHas(tree, "手机解锁后生效"), "应提示“手机解锁后生效”（bridge 就绪、手机解锁后方生效）");
+});
+
+test("E2EE 徽标：未启用原因映射可读文案（灰度等待 / 参数不可达 / 本地关闭 / 改密 / 未知兜底）", () => {
+  const cases = [
+    [E2EE_STATE.serverDisabled, "等待服务端开启 E2EE"],
+    [E2EE_STATE.paramsUnreachable, "当前为普通安全连接（HTTPS）"],
+    [E2EE_STATE.localDisabled, "当前为普通安全连接（HTTPS）"],
+    [E2EE_STATE.deriveFailed, "账号密码已变更"],
+    [E2EE_STATE.unknownReason, "当前为普通安全连接（HTTPS）"], // 未知 reason → 兜底
+  ];
+  for (const [e2ee, text] of cases) {
+    const plugin = loadPlugin();
+    plugin.states[0] = stateWith({ running: true, e2ee });
+    const tree = plugin.render();
+    assert.ok(textHas(tree, text), `reason=${e2ee.reason} 应映射为可读文案: ${text}`);
+    const line = e2eeLine(tree);
+    assert.ok(line && !/ ok/.test(String(line.props.className)), `reason=${e2ee.reason} 非启用态不应带 ok 标记`);
+  }
+});
+
+test("E2EE 徽标：未登录 / host 未下发 e2ee → 不打扰（不渲染状态行）", () => {
+  // 未登录（config 无 phone）即便 bridge 上报 enabled 也不打扰
+  const anon = loadPlugin();
+  anon.states[0] = { config: { deviceId: "dev-x", mode: "saas" }, service: { running: true, e2ee: E2EE_STATE.enabled } };
+  assert.equal(e2eeLine(anon.render()), undefined, "未登录不应渲染 E2EE 状态行");
+  assert.ok(!textHas(anon.render(), "手机解锁后生效"), "未登录不应出现加密徽标文案");
+
+  // 已登录但 service 无 e2ee（旧 host / 未下发）→ 不渲染
+  const oldHost = loadPlugin();
+  oldHost.states[0] = stateWith({ running: true });
+  assert.equal(e2eeLine(oldHost.render()), undefined, "未下发 service.e2ee 时不应渲染状态行");
+});
+
+test("E2EE 徽标（源码级约束）：client 含徽标字段/文案与 reason 映射表", () => {
+  assert.match(SOURCE, /service\.e2ee/);
+  assert.match(SOURCE, /\.e2ee-state\.json/);
+  assert.match(SOURCE, /端到端加密已启用（手机解锁后生效）/);
+  assert.match(SOURCE, /等待服务端开启 E2EE（灰度中，当前为加密准备）/);
+  assert.match(SOURCE, /当前为普通安全连接（HTTPS）/);
+  assert.match(SOURCE, /server_disabled/);
+  assert.match(SOURCE, /params_unreachable/);
+  assert.match(SOURCE, /disabled_by_config/);
+  assert.match(SOURCE, /derive_failed/);
+  assert.match(SOURCE, /describeE2ee/);
+  assert.match(SOURCE, /dru-e2ee-line/);
+});

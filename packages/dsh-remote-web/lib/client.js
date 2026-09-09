@@ -146,6 +146,9 @@ window.__ModuleLoader__.load({
       ".dru-dev-sub{font-size:11px;color:#8c959f;margin-top:3px}",
       ".dru-dev-tag{font-size:10.5px;color:#8c959f;border:1px solid #d0d7de;border-radius:999px;padding:0 7px;flex:none;white-space:nowrap}",
       ".dru-dev-tag-off{color:#cf222e;border-color:#ffb3b6;background:#fff0f1}",
+      // Phase-5:端到端加密(E2EE)状态行 —— 启用=绿字绿点,未启用=灰字(纯文字状态行,不打扰)
+      ".dru-e2ee-line{display:flex;align-items:center;gap:7px;margin-top:6px;font-size:12px;line-height:1.5;color:#57606a}",
+      ".dru-e2ee-line.ok{color:#1a7f37}",
       // 左下角「远程访问」快捷小手机图标（安装后常驻；首次点击前带红点）
       ".dru-fab{position:fixed;left:18px;bottom:18px;z-index:2147482100;width:46px;height:46px;border-radius:50%;background:#0969da;color:#fff;border:none;display:flex;align-items:center;justify-content:center;font-size:22px;line-height:1;box-shadow:0 6px 18px rgba(0,0,0,.28);cursor:pointer;font-family:inherit;padding:0}",
       ".dru-fab:hover{background:#0860bd}",
@@ -984,6 +987,26 @@ window.__ModuleLoader__.load({
       );
     }
 
+    // ── 端到端加密（E2EE，Phase-5）：bridge 状态 → 可读文案映射 ─────────────
+    // bridge 启停时把开关结果写入 <relayDir>/.e2ee-state.json（{enabled,reason,profile,epoch,caps}，
+    // 见 clients/dsh-remote/e2ee-client.mjs），node 半随 /dsh-remote/status 以 service.e2ee 下发；
+    // 此处只做“可读文案”映射（协议 docs/e2ee-protocol.md §2.3/§7.3）。
+    var E2EE_DISABLED_COPY = {
+      server_disabled: "等待服务端开启 E2EE（灰度中，当前为加密准备）",
+      params_unreachable: "当前为普通安全连接（HTTPS）",
+      disabled_by_config: "当前为普通安全连接（HTTPS）",
+      derive_failed: "账号密码已变更，需在「🔑 账号」重新登录后恢复端到端加密（当前为普通安全连接（HTTPS））",
+    };
+    var E2EE_DISABLED_FALLBACK = "当前为普通安全连接（HTTPS）";
+    /** 把 service.e2ee 归一化为可读状态行；e2ee 缺失/旧 host 未下发 → null（不打扰）。 */
+    function describeE2ee(e2ee) {
+      if (!e2ee || typeof e2ee !== "object") return null;
+      if (e2ee.enabled === true) return { kind: "ok", text: "🔒 端到端加密已启用（手机解锁后生效）" };
+      var reason = typeof e2ee.reason === "string" && e2ee.reason ? e2ee.reason : "";
+      var text = E2EE_DISABLED_COPY[reason] || E2EE_DISABLED_FALLBACK; // reason 未知 → 兜底
+      return { kind: "off", text: text };
+    }
+
     // ── 面板主体（渲染于设置页 settings.section 栏目内） ─────────────────────
     function RemoteControlSection(props) {
 
@@ -1477,11 +1500,23 @@ window.__ModuleLoader__.load({
             ? "请先登录（下方账号卡片）后启用远程访问"
             : serviceRunning ? "已连接（可远程访问）" : "等待设备连接";
         var dotCls = "dru-dot " + (loggedInSaaS && serviceRunning ? "dru-dot-on" : "dru-dot-off");
+        // Phase-5:端到端加密(E2EE)状态行 —— 未登录/旧 host 未下发 e2ee 一律不渲染
+        // （桌面宽屏与手机镜像共用同一面板：纯文字状态行、不弹层不打扰）；启用=绿点绿字，
+        // 未启用=灰字 + 原因映射（server_disabled 等待灰度开启 / 其余回退普通 HTTPS）。
+        function renderE2eeBadge() {
+          if (!loggedInSaaS) return null;
+          var e = describeE2ee(st && st.service && st.service.e2ee);
+          if (!e) return null;
+          return h("div", { className: "dru-e2ee-line" + (e.kind === "ok" ? " ok" : "") },
+            h("span", { className: "dru-dot " + (e.kind === "ok" ? "dru-dot-on" : "dru-dot-off") }),
+            h("span", null, e.text));
+        }
         return card("📱 远程访问", [
           h("div", { className: "dru-status-line" },
             h("span", { className: dotCls }),
             h("span", null, statusTxt)
           ),
+          renderE2eeBadge(),
           akeyMsg ? h("div", { className: "dru-msg dru-msg-" + akeyMsg.kind, style: { marginTop: 8 } }, akeyMsg.text) : null,
           hasKey ? h("div", null, [
             h("div", { className: "dru-url big", style: { marginTop: 8 } },
@@ -1692,7 +1727,7 @@ window.__ModuleLoader__.load({
             h("div", { className: "dru-hint", style: { marginBottom: 6 } }, "📱 远程访问：用手机或另一台电脑的浏览器，随时随地使用同一份 dsh web——人在哪都能用（免公网 IP、免内网穿透）；官方托管中继，4G/5G 即用，也可自建服务。"),
             h("div", { className: "dru-hint", style: { marginBottom: 6 } }, "🛠 电脑端一键安装：bridge 与「远程访问」面板一次到位——云端/自建切换、账号登录、bridge 启停、一次性扫码访问、已授权设备管理、意见反馈都在这里。"),
             h("div", { className: "dru-hint", style: { marginBottom: 6 } }, "🔒 安全与通道：HTTP / WebSocket 全量透传，一次性访问密钥认证，面板实时显示设备与已授权设备列表；服务端可配置流量配额。"),
-            h("div", { className: "dru-hint" }, "🛡 端到端流量保护：可选对通道做端到端加密保护，传输全程不暴露本机公网 IP（详见项目 README「安全」说明）。")
+            h("div", { className: "dru-hint" }, "🛡 端到端加密（灰度开启中）：服务端开启后，手机↔电脑之间的消息内容用「你的账号密码派生密钥」端到端加密——密钥与密码不落服务端（仅存校验值），中继只可见路径/大小/时间（详见 README「安全与隐私」）。")
           ]),
           // 版本与更新（自管理：检测新版 / 一键在线更新 / 彻底卸载）
           h(SelfManageCard, null),
