@@ -122,7 +122,7 @@ test("composeStatus：.e2ee-state.json 启用 → /dsh-remote/status 的 service
       enabled: true, reason: "ok", profile: "pbkdf2-sha256-600k", epoch: 2, caps: ["e2ee-v2"],
     });
 
-    // 2) bridge 未启用（服务端灰度关）→ 原样上报 reason，供面板映射可读文案
+    // 2) bridge 未启用（服务端关闭/不支持）→ 原样上报 reason，供面板映射可读文案
     await writeFile(stateFile, JSON.stringify({ enabled: false, reason: "server_disabled", profile: "", epoch: 0, caps: [] }));
     status = await (await fetch(`${boot.base}/dsh-remote/status`)).json();
     assert.equal(status.service.e2ee.enabled, false);

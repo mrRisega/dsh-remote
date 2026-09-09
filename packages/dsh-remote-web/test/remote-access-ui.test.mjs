@@ -22,6 +22,12 @@ function find(tree, predicate) {
   return match;
 }
 
+function findAll(tree, predicate) {
+  const out = [];
+  walk(tree, (node) => { if (predicate(node)) out.push(node); });
+  return out;
+}
+
 /** 文本子节点包含子串（用于动态拼接文案断言）。 */
 function textHas(tree, substr) {
   return !!find(tree, (node) => (node.children || []).some((c) => typeof c === "string" && c.includes(substr)));
@@ -108,10 +114,18 @@ function loadPlugin(opts = {}) {
       }
       if (path === "/dsh-remote/mobile-sessions") {
         sessionsCalls++;
-        return response(200, { ok: true, sessions: sessionsCalls === 1 ? SESSIONS_1 : [] }); // 取消配对后的刷新 → 空列表
+        // 默认：首次给列表，后续刷新给空（模拟已全部清理）；测试可传 opts.sessions 固定列表
+        const list = opts.sessions !== undefined ? opts.sessions : (sessionsCalls === 1 ? SESSIONS_1 : []);
+        return response(200, { ok: true, sessions: list });
       }
       if (path === "/dsh-remote/mobile-sessions/revoke") {
         return response(200, { ok: true });
+      }
+      if (path === "/dsh-remote/mobile-sessions/delete") {
+        return response(200, { ok: true });
+      }
+      if (path === "/dsh-remote/mobile-sessions/purge") {
+        return response(200, { ok: true, removed: 1 });
       }
       if (path === "/dsh-remote/account") return response(200, { ok: true, account: { phone: "13800000000", plan: "free", plan_source: "plan", invite_code: "ABC12345" } });
       return response(200, { ok: true });
@@ -172,7 +186,7 @@ test("📱 远程访问卡：bridge 在线 → 绿点文案；登录态点「生
   assert.ok(qr && qr.props?.alt === "远程访问二维码", "应渲染服务端返回的二维码 <img>");
   // 到期倒计时/有效至文案
   assert.ok(textHas(tree, "有效至") && textHas(tree, "剩余"), "应显示「有效至 HH:MM:SS / 剩余 xx:xx」倒计时");
-  assert.ok(textHas(tree, "访问一次后失效"), "应说明一次性/30 分钟语义");
+  assert.ok(textHas(tree, "用一次即失效"), "应说明一次性/30 分钟语义（精简一句）");
 });
 
 test("已授权设备：展开列表（label/os/browser/时间）→ 取消配对二次确认 → 成功提示并刷新", async () => {
@@ -216,6 +230,76 @@ test("已授权设备：展开列表（label/os/browser/时间）→ 取消配�
   assert.ok(textHas(tree, "暂无已授权设备（手机扫码后出现）"), "刷新后空态文案应出现");
 });
 
+test("已授权设备行内操作：活跃行有 取消配对+删除记录，已取消行有 删除记录；删除记录二次确认 → DELETE delete {id}", async () => {
+  const plugin = loadPlugin({ sessions: SESSIONS_1 }); // 固定列表：操作后重拉仍保留，便于断言行内按钮
+  plugin.states[0] = { config: { phone: "13800000000", deviceId: "dev-x" }, service: { running: true } };
+  let tree = plugin.render();
+  const openBtn = find(tree, (n) => typeof n.props?.onClick === "function" && (n.children || []).some((c) => typeof c === "string" && c.includes("已授权设备")));
+  openBtn.props.onClick();
+  await flush();
+  await flush();
+  tree = plugin.render();
+
+  // 行内按钮：活跃行（ms_1）应有「取消配对」+「删除记录」；已取消行（ms_2）只应有「删除记录」
+  const delBtns = findAll(tree, (n) => typeof n.props?.onClick === "function" && (n.children || []).some((c) => typeof c === "string" && c.includes("删除记录")));
+  assert.ok(delBtns.length >= 2, "每行（含已取消/历史）都应有「删除记录」按钮");
+  assert.ok(find(tree, (n) => typeof n.props?.onClick === "function" && (n.children || []).some((c) => typeof c === "string" && c.includes("取消配对"))),
+    "活跃行应有「取消配对」按钮");
+  // 底部有「清理已解绑」入口（卡片底部）
+  assert.ok(textHas(tree, "清理已解绑"), "卡片底部应提供「清理已解绑」");
+
+  // 删除 ms_1：第一次点击进入确认态（不请求）
+  delBtns[0].props.onClick();
+  tree = plugin.render();
+  assert.ok(textHas(tree, "再点一次确认删除记录"), "删除记录需二次确认");
+  assert.ok(!plugin.requests.some((r) => r.path === "/dsh-remote/mobile-sessions/delete"), "首次点击不应发 DELETE");
+
+  // 第二次点击 → DELETE /dsh-remote/mobile-sessions/delete {id} → 提示 + 刷新列表
+  const listBefore = plugin.requests.filter((r) => r.path === "/dsh-remote/mobile-sessions").length;
+  find(tree, (n) => typeof n.props?.onClick === "function" && (n.children || []).some((c) => typeof c === "string" && c.includes("再点一次确认删除记录"))).props.onClick();
+  await flush();
+  await flush();
+  await flush();
+  const del = plugin.requests.find((r) => r.path === "/dsh-remote/mobile-sessions/delete");
+  assert.ok(del, "确认后应 DELETE /dsh-remote/mobile-sessions/delete");
+  assert.equal(del.method, "DELETE");
+  assert.deepEqual(del.body, { id: "ms_1" }, "行内删除应带上该行 session id");
+  assert.ok(plugin.requests.filter((r) => r.path === "/dsh-remote/mobile-sessions").length > listBefore, "删除后应重拉设备列表");
+  tree = plugin.render();
+  assert.ok(textHas(tree, "已删除该设备的记录"), "删除成功应有可读提示");
+});
+
+test("已授权设备：卡片底部「清理已解绑」→ 二次确认 → POST purge → 提示条数 + 刷新列表", async () => {
+  const plugin = loadPlugin({ sessions: SESSIONS_1 });
+  plugin.states[0] = { config: { phone: "13800000000", deviceId: "dev-x" }, service: { running: true } };
+  let tree = plugin.render();
+  const openBtn = find(tree, (n) => typeof n.props?.onClick === "function" && (n.children || []).some((c) => typeof c === "string" && c.includes("已授权设备")));
+  openBtn.props.onClick();
+  await flush();
+  await flush();
+  tree = plugin.render();
+
+  // 底部 purge 按钮：带 1 条已解绑计数
+  const purgeBtn = find(tree, (n) => typeof n.props?.onClick === "function" && (n.children || []).some((c) => typeof c === "string" && c.includes("清理已解绑")));
+  assert.ok(purgeBtn, "卡片底部应有「清理已解绑」按钮");
+  purgeBtn.props.onClick();
+  tree = plugin.render();
+  assert.ok(textHas(tree, "再点一次确认清理已解绑"), "清理已解绑需二次确认");
+  assert.ok(!plugin.requests.some((r) => r.path === "/dsh-remote/mobile-sessions/purge"), "首次点击不应发请求");
+
+  const listBefore = plugin.requests.filter((r) => r.path === "/dsh-remote/mobile-sessions").length;
+  find(tree, (n) => typeof n.props?.onClick === "function" && (n.children || []).some((c) => typeof c === "string" && c.includes("再点一次确认清理已解绑"))).props.onClick();
+  await flush();
+  await flush();
+  await flush();
+  const purge = plugin.requests.find((r) => r.path === "/dsh-remote/mobile-sessions/purge");
+  assert.ok(purge, "确认后应 POST /dsh-remote/mobile-sessions/purge");
+  assert.equal(purge.method, "POST");
+  assert.ok(plugin.requests.filter((r) => r.path === "/dsh-remote/mobile-sessions").length > listBefore, "清理后应重拉设备列表");
+  tree = plugin.render();
+  assert.ok(textHas(tree, "已清理 1 条已解绑记录"), "应提示清理条数（可读）");
+});
+
 test("升级/续费按钮：点击 → GET /dsh-remote/access-key → window.open(url)（带登录态打开）", async () => {
   const plugin = loadPlugin();
   plugin.states[0] = { config: { phone: "13800000000", deviceId: "dev-x" }, service: { running: true } };
@@ -250,6 +334,18 @@ test("二维码缺失容错 + 未登录引导文案（源码级约束）", () =>
   assert.match(SOURCE, /已连接（可远程访问）/);
   assert.match(SOURCE, /带登录态/);
   assert.match(SOURCE, /通过手机或另一台电脑远程使用同一份 dsh web/);
+  // 已授权设备管理（delete/purge 代理路由与按钮）
+  assert.match(SOURCE, /dsh-remote\/mobile-sessions\/delete/);
+  assert.match(SOURCE, /dsh-remote\/mobile-sessions\/purge/);
+  assert.match(SOURCE, /删除记录/);
+  assert.match(SOURCE, /清理已解绑/);
+  assert.match(SOURCE, /再点一次确认删除记录/);
+  assert.match(SOURCE, /再点一次确认清理已解绑/);
+  // 文案精简：二维码说明压成一句、右侧长段压成一句
+  assert.match(SOURCE, /扫码即进入，30 分钟有效、用一次即失效。/);
+  assert.match(SOURCE, /打开链接\/扫码进入即登录态；同设备重复扫码只更新授权，不新增设备。/);
+  assert.doesNotMatch(SOURCE, /每次生成的链接 30 分钟有效、访问一次后失效/);
+  assert.doesNotMatch(SOURCE, /手机上打开链接点「进入」即可像在本机一样使用 dsh web/);
 });
 
 // ---------- 端到端加密（E2EE，Phase-5）状态徽标 ----------
@@ -282,9 +378,9 @@ test("E2EE 徽标：已启用 → “🔒 端到端加密已启用（手机解�
   assert.ok(textHas(tree, "手机解锁后生效"), "应提示“手机解锁后生效”（bridge 就绪、手机解锁后方生效）");
 });
 
-test("E2EE 徽标：未启用原因映射可读文案（灰度等待 / 参数不可达 / 本地关闭 / 改密 / 未知兜底）", () => {
+test("E2EE 徽标：未启用原因映射可读文案（服务端关闭 / 参数不可达 / 本地关闭 / 改密 / 未知兜底）", () => {
   const cases = [
-    [E2EE_STATE.serverDisabled, "等待服务端开启 E2EE"],
+    [E2EE_STATE.serverDisabled, "端到端加密暂不可用（当前为普通安全连接 HTTPS）"],
     [E2EE_STATE.paramsUnreachable, "当前为普通安全连接（HTTPS）"],
     [E2EE_STATE.localDisabled, "当前为普通安全连接（HTTPS）"],
     [E2EE_STATE.deriveFailed, "账号密码已变更"],
@@ -316,8 +412,9 @@ test("E2EE 徽标：未登录 / host 未下发 e2ee → 不打扰（不渲染状
 test("E2EE 徽标（源码级约束）：client 含徽标字段/文案与 reason 映射表", () => {
   assert.match(SOURCE, /service\.e2ee/);
   assert.match(SOURCE, /\.e2ee-state\.json/);
-  assert.match(SOURCE, /端到端加密已启用（手机解锁后生效）/);
-  assert.match(SOURCE, /等待服务端开启 E2EE（灰度中，当前为加密准备）/);
+  assert.match(SOURCE, /🔒 端到端加密已启用（手机解锁后生效）/);
+  assert.match(SOURCE, /端到端加密暂不可用（当前为普通安全连接 HTTPS）/);
+  assert.doesNotMatch(SOURCE, /等待服务端开启 E2EE/);   // 已正式开启，不再出现“灰度等待”措辞
   assert.match(SOURCE, /当前为普通安全连接（HTTPS）/);
   assert.match(SOURCE, /server_disabled/);
   assert.match(SOURCE, /params_unreachable/);

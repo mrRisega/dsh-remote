@@ -87,6 +87,7 @@ function loadPlugin(opts = {}) {
   });
 
   const allCreated = [];
+  const intervals = [];
   const doc = {
     createElement(tag) { const el = makeEl(tag); allCreated.push(el); return el; },
     head: makeEl("head"),
@@ -95,7 +96,11 @@ function loadPlugin(opts = {}) {
       const cls = sel.charAt(0) === "." ? sel.slice(1) : "";
       return allCreated.find((el) => el.className === cls) || null;
     },
-    querySelectorAll(sel) { return sel === "button" ? (opts.navCells || []) : []; },
+    querySelectorAll(sel) {
+      if (sel === "button") return opts.navCells || [];
+      if (typeof opts.navQuery === "function") return opts.navQuery(sel);
+      return [];
+    },
   };
 
   let lastObserver = null;
@@ -129,7 +134,7 @@ function loadPlugin(opts = {}) {
       return response(200, { body: { ok: true } });
     },
     navigator: { clipboard: { writeText: async () => {} } },
-    setInterval() { return 1; },
+    setInterval(cb, ms) { intervals.push({ cb, ms }); return intervals.length; },
     clearInterval() {},
     setTimeout() { return 1; },
     Set,
@@ -152,6 +157,8 @@ function loadPlugin(opts = {}) {
 
   return {
     registered, metas, injects, requests, removed, states, localStorage,
+    intervals,
+    navWindow: sandbox.window,
     lastObserver: () => lastObserver,
     renderSection() { hook = 0; return registered.get("dsh-remote")({ close() {} }); },
   };
@@ -203,7 +210,7 @@ test("登录态账号区：无「切换账号」，有「退出登录」，头�
     "📱 远程访问：用手机或另一台电脑的浏览器，随时随地使用同一份 dsh web——人在哪都能用（免公网 IP、免内网穿透）；官方托管中继，4G/5G 即用，也可自建服务。",
     "🛠 电脑端一键安装：bridge 与「远程访问」面板一次到位——云端/自建切换、账号登录、bridge 启停、一次性扫码访问、已授权设备管理、意见反馈都在这里。",
     "🔒 安全与通道：HTTP / WebSocket 全量透传，一次性访问密钥认证，面板实时显示设备与已授权设备列表；服务端可配置流量配额。",
-    "🛡 端到端加密（灰度开启中）：服务端开启后，手机↔电脑之间的消息内容用「你的账号密码派生密钥」端到端加密——密钥与密码不落服务端（仅存校验值），中继只可见路径/大小/时间（详见 README「安全与隐私」）。",
+    "🛡 端到端加密：手机↔电脑之间的消息内容用「你的账号密码派生密钥」端到端加密——密钥与密码不落服务端（仅存校验值），中继只可见路径/大小/时间（详见 README「安全与隐私」）。",
   ];
   for (const p of points) {
     assert.ok(find(tree, (n) => n.children?.includes(p)), `说明卡片应含要点: ${p.slice(0, 12)}…`);
@@ -277,6 +284,61 @@ test("红点已看过（localStorage 有 key）时不注入，重启 DSH Web 不
   assert.equal(navCell.children.length, 0, "已看过时不应再注入红点");
 });
 
+// ---------- 侧栏入口「远程访问」点击流（openRemoteSettings） ----------
+
+/** 简易导航节点：带 aria-label/text/class/role 的“按钮”，记录点击并支持 data-dru-remote 标记。 */
+function navNode({ id = "", text = "", aria = "", cls = "", role = "", tag = "button" } = {}) {
+  const node = {
+    id,
+    className: cls,
+    textContent: text,
+    tagName: tag,
+    _attrs: {},
+    _clicked: 0,
+    getAttribute(k) { return k in this._attrs ? this._attrs[k] : null; },
+    setAttribute(k, v) { this._attrs[k] = String(v); },
+    click() { this._clicked++; },
+  };
+  if (aria) node._attrs["aria-label"] = aria;
+  if (role) node._attrs.role = role;
+  return node;
+}
+
+test("侧栏入口点击流：远程栏目项已存在（navCell/aria-label，含 emoji 前缀）→ 直接命中栏目，不点注入项自身", () => {
+  const injected = navNode({ id: "dru-nav-remote", text: "📱 远程访问", cls: "navCell-clone" }); // 注入的侧栏项
+  const settingsNav = navNode({ text: "设置", cls: "navCell-set" });
+  const remoteCell = navNode({ aria: "远程访问", cls: "VOzbGW_navCell", tag: "button" }); // 纯图标+aria-label 的栏目项
+  const nodes = [injected, settingsNav, remoteCell];
+  const plugin = loadPlugin({ navQuery: () => nodes });
+  plugin.navWindow.__dshRemoteNav.open();
+  assert.equal(remoteCell._clicked, 1, "应命中「远程访问」栏目项（aria-label 亦可读）");
+  assert.equal(remoteCell.getAttribute("data-dru-remote"), "1", "命中后应打 data-dru-remote 标记（加速二次命中）");
+  assert.equal(injected._clicked, 0, "不得点击注入的侧栏项自身（防递归）");
+  assert.equal(settingsNav._clicked, 0, "栏目已存在时无需退化点「设置」");
+  assert.equal(plugin.intervals.filter((x) => x.ms === 150).length, 0, "直接命中后不应启动轮询");
+});
+
+test("侧栏入口点击流：栏目项尚未挂载 → 先点「设置」，轮询到点后再补点「远程访问」（全程不点注入项）", () => {
+  const injected = navNode({ id: "dru-nav-remote", text: "📱 远程访问", cls: "navCell-clone" });
+  const settingsNav = navNode({ text: "设置", cls: "navCell-set" });
+  const remoteCell = navNode({ text: "📱 远程访问", cls: "VOzbGW_navCell" }); // 设置页打开后才挂载
+  const nodes = [injected, settingsNav]; // 初始只有注入项 + 「设置」
+  const plugin = loadPlugin({ navQuery: () => nodes });
+  plugin.navWindow.__dshRemoteNav.open();
+
+  assert.equal(settingsNav._clicked, 1, "栏目不可达时应点「设置」进入设置页");
+  assert.equal(injected._clicked, 0, "不得点击注入的侧栏项自身");
+  const poll = plugin.intervals.find((x) => x.ms === 150);
+  assert.ok(poll, "应启动 150ms 轮询等待栏目挂载");
+
+  nodes.push(remoteCell); // 设置页已打开，栏目项挂载
+  poll.cb();
+  assert.equal(remoteCell._clicked, 1, "轮询到点后应补点「远程访问」栏目");
+  assert.equal(remoteCell.getAttribute("data-dru-remote"), "1", "栏目命中后应打标记");
+  assert.equal(settingsNav._clicked, 1, "「设置」只应点一次");
+  assert.equal(injected._clicked, 0, "轮询过程也不得点注入项自身");
+});
+
 test("源码约束：无侧边栏入口/浮动面板/切换账号；命名统一为「远程访问」；新增访问密钥/设备路由", () => {
   // 只断言“代码形态”不存在（注释里允许出现说明文字）
   assert.doesNotMatch(SOURCE, /slots\.inject\("sidebar\.footer\.action"/);
@@ -294,6 +356,13 @@ test("源码约束：无侧边栏入口/浮动面板/切换账号；命名统一
   assert.match(SOURCE, /dsh-remote\/access-key/);
   assert.match(SOURCE, /dsh-remote\/mobile-sessions/);
   assert.match(SOURCE, /order: 30/);
+  // 侧栏入口导航加固：aria-label/role 扫描、data-dru-remote 标记、排除注入项防递归、进设置后轮询
+  assert.match(SOURCE, /data-dru-remote/);
+  assert.match(SOURCE, /dru-nav-remote/);
+  assert.match(SOURCE, /aria-label/);
+  assert.match(SOURCE, /remoteSectionVisible/);
+  assert.match(SOURCE, /openRemoteSettings/);
+  assert.match(SOURCE, /__dshRemoteNav/);
   // 清理时机：退出登录成功回调内、登录账号变化时、切换自建服务时
   assert.match(SOURCE, /post\("\/dsh-remote\/logout"\)\.then\(function \(body\) \{[\s\S]*?fbClearThreads\(\);/);
   assert.match(SOURCE, /if \(prevPhone !== phone\.trim\(\)\) fbClearThreads\(\);/);

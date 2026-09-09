@@ -81,6 +81,43 @@ test("Router 错误页「返回登录」带显式退出意图 /app/?logout=1", (
   assert.match(ROUTER, /\/app\/\?logout=1/);
 });
 
+test("推广页 /app/promo?auth= 快捷登录:promo 路由消费 auth → exchange,成功停留刷新已登录态", () => {
+  // boot 判定 promo 页(pathname endsWith /promo)
+  assert.match(APP, /endsWith\("\/promo"\)/);
+  // promo 分支同样解析 ?auth= 并复用同一 exchange 端点(设备页 auth 分支不受影响)
+  assert.match(APP, /\/api\/auth-key\/exchange/);
+  assert.match(APP, /stayOnPromo:\s*true/);
+  // 交换进行中/失败的可读提示常驻区(banner)
+  assert.match(APP, /promo-auth-banner/);
+  // 成功路径:停留 promo 页、写 cookie 并重渲染为已登录内容(不跳设备页)
+  assert.match(APP, /void renderPromo\(\)/);
+  // 失败可读提示 + 隐去地址栏 auth 明文
+  assert.match(APP, /链接已失效/);
+  assert.match(APP, /返回电脑端/);
+  assert.match(APP, /history\.replaceState/);
+});
+
+test("忘记密码(短信重置):登录卡入口 + 重置表单字段与端点契约字段齐备", () => {
+  // 登录卡「忘记密码?」入口
+  assert.match(APP, /btn-forgot-pass/);
+  assert.match(APP, /忘记密码/);
+  // 重置小表单:手机号 + 图形验证码 + 短信验证码 + 新密码
+  assert.match(APP, /reset-phone/);
+  assert.match(APP, /reset-captcha-img/);
+  assert.match(APP, /reset-sms-code/);
+  assert.match(APP, /reset-pass/);
+  // 提示:重置后所有已授权设备/会话将失效,需重新登录与解锁
+  assert.match(APP, /所有已授权设备\/会话将失效/);
+  assert.match(APP, /重新登录与解锁/);
+  // 端点与契约字段(body {phone,sms_code,new_password} → 200 {ok:true})
+  assert.match(APP, /\/api\/password\/reset/);
+  assert.match(APP, /new_password/);
+  assert.match(APP, /sms_code/);
+  // 成功后清本地 token/cookie/threads,并提示用新密码登录
+  assert.match(APP, /dsh-feedback-threads/);
+  assert.match(APP, /请用新密码登录/);
+});
+
 // ============================================================
 // E2EE Phase-3 源码级契约(native.html 手机端客户端;docs/e2ee-protocol.md §2.3/§3.4/§5/§6.4)
 // ============================================================

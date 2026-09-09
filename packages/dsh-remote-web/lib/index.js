@@ -4,7 +4,8 @@
 //   - 读写配置目录下 .dsh-config.json（0600）
 //   - 查询/启停 bridge（launchctl，plist 缺失时自动生成，逻辑与 dsh-setup.mjs 一致）
 //   - 代理 relay API（captcha / register / login / public-config），直连、不走系统代理；
-//     另代理企业端一次性访问密钥 / 授权设备（/api/auth-key、/api/mobile-sessions、…/revoke，Bearer）供面板「📱 远程访问」卡使用
+//     另代理企业端一次性访问密钥 / 授权设备（/api/auth-key、/api/mobile-sessions、…/revoke、
+//     DELETE …/:id、POST …/purge，Bearer）供面板「📱 远程访问」卡使用
 //   - 自管理 self*（版本可见 / 新版检测 / 一键在线更新 / 彻底卸载）：插件市场没有更新卸载按钮，
 //     面板内即官方管理入口；更新=后台 npx 按 dist-tag(默认 latest,DSH_UPDATE_TAG 可切 beta/alpha)（幂等补齐运行环境并重启 bridge）；
 //     彻底卸载=profile 插件清理（uninstallSelf）+ 运行时清理（uninstallRuntime：停 bridge 自启动 /
@@ -802,6 +803,51 @@ async function proxyRevokeMobileSession(relayDir, req, res) {
   return sendJson(res, 200, { ok: true, relayStatus: (r && r.status) || 200 });
 }
 
+/**
+ * DELETE /dsh-remote/mobile-sessions/delete（body {id}）→ 删除本机该设备的授权记录
+ * （企业端 DELETE /api/mobile-sessions/:id，Bearer：本人整行删除并拉黑 jti）。
+ */
+async function proxyDeleteMobileSession(relayDir, req, res) {
+  const body = await readJsonBody(req);
+  if (body.__parseError) return sendJson(res, 400, { ok: false, error: "JSON 解析失败" });
+  const id = String(body.id ?? "").trim();
+  if (!id) return sendJson(res, 400, { ok: false, error: "缺少参数 id（会话 ID）" });
+  const token = await relayToken(relayDir).catch(() => "");
+  if (!token) return sendJson(res, 401, notLoggedInJson());
+  const r = await relayFetch(relayDir, `/api/mobile-sessions/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    headers: { authorization: `Bearer ${token}` },
+  });
+  const d = flattenRelayBody(r);
+  const ok = !!(r.ok && d.ok !== false);
+  if (!ok) {
+    return sendJson(res, (r && r.status) || 502, { ok: false, error: relayErrorMessage(r), relayStatus: (r && r.status) || 0 });
+  }
+  return sendJson(res, 200, { ok: true, relayStatus: (r && r.status) || 200 });
+}
+
+/**
+ * POST /dsh-remote/mobile-sessions/purge → 清理本人所有已解绑（revoked）记录
+ * （企业端 POST /api/mobile-sessions/purge，Bearer）。
+ */
+async function proxyPurgeMobileSessions(relayDir, res) {
+  const token = await relayToken(relayDir).catch(() => "");
+  if (!token) return sendJson(res, 401, notLoggedInJson());
+  const r = await relayFetch(relayDir, "/api/mobile-sessions/purge", {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}` },
+  });
+  const d = flattenRelayBody(r);
+  const ok = !!(r.ok && d.ok !== false);
+  if (!ok) {
+    return sendJson(res, (r && r.status) || 502, { ok: false, error: relayErrorMessage(r), relayStatus: (r && r.status) || 0 });
+  }
+  const removed = Number.isInteger(d.removed) ? d.removed : null;
+  const payload = { ok: true, relayStatus: (r && r.status) || 200 };
+  if (removed !== null) payload.removed = removed;
+  return sendJson(res, 200, payload);
+}
+
 // ---------- 综合状态 ----------
 
 /**
@@ -974,7 +1020,7 @@ const PLUGIN_ID = "dsh-remote-web";
 const PLUGIN_LEGACY_IDS = ["dsh-remote-ui"];
 const PLUGIN_ALL_IDS = [PLUGIN_ID, ...PLUGIN_LEGACY_IDS];
 /** 插件自身发布版本（与 dsh-remote 根包同步递增）。 */
-const PLUGIN_VERSION = "0.6.0-beta.8";
+const PLUGIN_VERSION = "0.6.0-beta.9";
 const UPDATE_LOG = ".dsh-update.log";
 const UPDATE_MARKER = ".dsh-update-running";
 
@@ -1248,6 +1294,22 @@ function registerRoutes(ctx, relayDir) {
       path: "/dsh-remote/mobile-sessions/revoke",
       handler: async (req, res) => {
         await proxyRevokeMobileSession(relayDir, req, res);
+      },
+    },
+    // 删除已授权设备记录（整行删除并拉黑 jti；企业端 DELETE /api/mobile-sessions/:id，Bearer）
+    {
+      method: "DELETE",
+      path: "/dsh-remote/mobile-sessions/delete",
+      handler: async (req, res) => {
+        await proxyDeleteMobileSession(relayDir, req, res);
+      },
+    },
+    // 清理本人全部已解绑（revoked）记录（企业端 POST /api/mobile-sessions/purge，Bearer）
+    {
+      method: "POST",
+      path: "/dsh-remote/mobile-sessions/purge",
+      handler: async (_req, res) => {
+        await proxyPurgeMobileSessions(relayDir, res);
       },
     },
     {
