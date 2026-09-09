@@ -8,6 +8,8 @@
 //   - settings.section：设置页「远程访问」栏目（位于「Agent 预设」下方，官方扩展点）
 //   - 栏目内联渲染配置面板（浅色高对比 UI，遵循主流登录体验）
 //     · 登录态：已登录显示账号 + 退出登录；未登录显示 登录/注册 tabs
+//     · 🔒 修改密码：已登录账号经 图形验证码+短信验证码 重置（/dsh-remote/password/reset 代理）；
+//       成功后全部已授权设备/会话失效 → 本地登出并提示用新密码重新登录（覆盖本机 config 密码）
 //     · 登录要求图形验证码；注册要求两次密码 + 图形验证码
 //     · 📱 远程访问卡：一次性访问密钥（扫码/直接打开/复制 + 到期倒计时自动刷新）与已授权设备管理
 //     · bridge 状态与启停开关 + 关于 dsh-remote 说明卡片
@@ -156,30 +158,38 @@ window.__ModuleLoader__.load({
     ].join("\n");
     document.head.appendChild(styleEl);
 
-    // ── 侧边栏「远程访问」快捷入口（挂到官方设置按钮上方一行，用 dsh 自身的挂载位） ──
-    // 不用 fixed 悬浮层（会遮挡官方按钮）；改为在左侧主菜单的「设置」按钮上方克隆一行同款导航项：
-    // 点击 = 打开 设置页 → 「远程访问」栏目；首次点击前该入口右上角带小红点（localStorage 一次）。
-    // 导航命中策略（兼容宿主差异）：候选 = [class*=navCell] / [role=tab] / [role=menuitem] /
-    // [aria-label]（纯图标项常只有 aria-label 可读）；文本优先取 aria-label，再取 textContent，
-    // 因此 emoji/图标前缀（如 🖥/📱）不影响子串命中。命中「远程访问」栏目项后打 data-dru-remote
-    // 标记（同一设置页生命周期内二次命中直接走标记，无需重扫）。始终排除本插件注入的侧栏项
-    // （id=dru-nav-remote），避免点到自己造成递归。
+    // ── 侧边栏「远程访问」快捷入口（独立按钮，挂在官方「设置」上方；Bug A 修复） ──
+    // 用户实测 Bug A：入口视觉在左侧（官方「设置」上方），点击却落在工作区会话行——
+    // 会话标题含「远程访问」（如“分析竞品远程访问功能”）被旧逻辑当成导航项点中。
+    // 根因：旧实现用 document 级 querySelectorAll + textContent「包含匹配」扫全文档，
+    // 会话标题也命中；且注入项 clone 官方按钮可能继承官方事件委托/点击热区。
+    // 修复（本段全部导航点击逻辑）：
+    //   1) 候选扫描一律限定在「侧栏/主导航容器」内（[role=navigation]/<nav>/class 含
+    //      sidebar|navRail|navPanel|navigation|sidenav|appnav 等；兜底：含「设置」导航项或
+    //      navCell 的元素向上找最近容器）。绝不 document 全量扫可点元素去点击。
+    //   2) 命中收紧：aria-label/title 等于或 startsWith(token)；textContent 仅当短文本
+    //      （trim ≤ NAV_TEXT_MAX=10 且不含换行——长会话标题天然被拒）且 等于/以 token 开头/
+    //      含 token 但短；同时排除 class 带 menu/context/more/kebab 等“菜单/更多”语义的节点。
+    //   3) 注入项改为自有独立 <button id=dru-nav-remote>（不再复制官方按钮元素，避免继承
+    //      官方委托与热区），自带 click → openRemoteSettings()。
+    //   4) openRemoteSettings：栏目已在 DOM 直接返回 → 各容器内点「远程访问」栏目项 →
+    //      容器内点「设置」→ 轮询 ≤3s（20×150ms）容器内补点「远程访问」；绝不点工作区内容。
     var NAV_SEEN_KEY = "dsh-remote-nav-seen";
     var NAV_ENTRY_ID = "dru-nav-remote";
     var NAV_MARK = "data-dru-remote";
-    var NAV_CAND_SEL = '[class*="navCell"], [role="tab"], [role="menuitem"], [aria-label]';
-    var NAV_ANY_SEL = 'button, a, [role="button"], [class*="nav"] button, [class*="sidebar"] a';
+    /** 导航候选（仅在导航容器内查询）：navCell（shell hashed 类）/tab/menuitem/button/a/aria-label。 */
+    var NAV_CAND_SEL = '[class*="navCell"], [role="tab"], [role="menuitem"], [role="button"], button, a, [aria-label]';
+    /** 侧栏/主导航容器定位选择器（先定位容器，再在容器内做候选查询）。 */
+    var NAV_CONTAINER_SEL = '[role="navigation"], nav, [class*="sidebar"], [class*="navRail"], [class*="navPanel"], [class*="sidenav"], [class*="appnav"], [class*="navigation"]';
+    /** 候选节点 class 命中这些语义（菜单/更多/下拉…）→ 视为会话行“⋯”等，绝不点击。 */
+    var NAV_BAD_CLS_RE = /(^|[^a-z0-9])(menu|context|more|kebab|dropdown|popover|toolbar)($|[^a-z0-9])/i;
+    /** textContent 短文本上限：超过即视为长文本（会话标题等），textContent 命中一律拒绝。 */
+    var NAV_TEXT_MAX = 10;
+    /** openRemoteSettings 轮询上限：150ms × 20 = 3s（≤3s），到时放弃，不再无限轮询。 */
+    var NAV_POLL_MAX = 20;
+    /** 向上找“最近容器”的最大步数（防误上到整页）。 */
+    var NAV_UP_MAX = 8;
 
-    /** 元素导航文本：优先 aria-label（纯图标导航常见），再拼 textContent；去空白差异。 */
-    function navTextOf(el) {
-      var t = "";
-      try {
-        var al = el.getAttribute && el.getAttribute("aria-label");
-        if (al) t += " " + al;
-      } catch (e) {}
-      try { if (el.textContent) t += " " + el.textContent; } catch (e2) {}
-      return t.replace(/\s+/g, " ").trim();
-    }
     /** 候选是否“可点导航项”：按钮/链接/tab/menuitem/navCell（排除无交互的装饰容器）。 */
     function isNavClickable(el) {
       try {
@@ -190,55 +200,175 @@ window.__ModuleLoader__.load({
         return String(el.className || "").indexOf("navCell") !== -1;
       } catch (e) { return false; }
     }
-    /** 在候选列表里找文本含 token 的导航项并返回（命中「远程访问」时打标记）。 */
+    /** 节点 class 是否带“菜单/更多”语义（会话行的 ⋯/右键菜单等）→ 不可作为导航候选。 */
+    function isBadNavClass(el) {
+      try { return NAV_BAD_CLS_RE.test(String(el.className || "")); } catch (e) { return false; }
+    }
+    /** 是否语义化导航容器：role=navigation/menu 或 class 含 sidebar/navRail/navPanel 等。 */
+    function isNavContainerEl(el) {
+      try {
+        var role = el.getAttribute && el.getAttribute("role") || "";
+        if (role === "navigation" || role === "menu") return true;
+        return NAV_CONTAINER_RE.test(String(el.className || ""));
+      } catch (e) { return false; }
+    }
+    var NAV_CONTAINER_RE = /sidebar|navRail|navPanel|sidenav|appnav|navigation/i;
+    /** 候选可用性：可点 + 非“菜单/更多”语义 class。 */
+    function isUsableNavCandidate(el) {
+      try {
+        if (!isNavClickable(el)) return false;
+        if (isBadNavClass(el)) return false;
+        return true;
+      } catch (e) { return false; }
+    }
+    /**
+     * 收紧后的命中规则（aria/title 与可见短文本任一命中即可，语义更贴近官方按钮：
+     * 官方按钮可能带 aria-label/title，也可能只有可见文字）：
+     *  - aria-label/title：等于 token 或以 token 开头（长度不限，纯图标导航常见）；
+     *  - textContent：仅短文本（trim ≤10 且不含换行——长会话标题被拒）且
+     *    等于 / 以 token 开头 / 含 token 但文本短。
+     */
+    function navTextHits(el, token) {
+      try {
+        var al = el.getAttribute && el.getAttribute("aria-label");
+        var attr = al && String(al).trim() ? String(al).trim() : "";
+        if (!attr) { var tt = el.getAttribute && el.getAttribute("title"); if (tt && String(tt).trim()) attr = String(tt).trim(); }
+        if (attr && (attr === token || attr.indexOf(token) === 0)) return true;
+      } catch (e) {}
+      var t = "";
+      try { t = (el.textContent || "").replace(/\s+/g, " ").trim(); } catch (e2) {}
+      if (!t || /\r|\n/.test(t) || t.length > NAV_TEXT_MAX) return false; // 长文本/多行 → 拒绝
+      return t === token || t.indexOf(token) === 0 || t.indexOf(token) !== -1;
+    }
+    /**
+     * 在候选列表里找命中 token 的导航项（命中「远程访问」时打 data-dru-remote 标记，
+     * 二次命中直接走标记，无需重扫）。始终排除注入项自身（id=dru-nav-remote）防递归。
+     */
     function pickNavHit(nodes, token, excludeId, preferMarked) {
       try {
         for (var i = 0; i < nodes.length; i++) {
           var el = nodes[i];
           if (excludeId && el.id === excludeId) continue; // 排除注入项自身，防递归
-          if (!isNavClickable(el)) continue;
+          if (!isUsableNavCandidate(el)) continue;
           var marked = !!el.getAttribute && el.getAttribute(NAV_MARK) === "1";
           if (preferMarked && !marked) continue;
           if (!preferMarked && marked) continue;
-          if (navTextOf(el).indexOf(token) === -1) continue;
+          if (!navTextHits(el, token)) continue;
           if (token === "远程访问") { try { el.setAttribute(NAV_MARK, "1"); } catch (e) {} }
           return el;
         }
       } catch (e) { /* 忽略 */ }
       return null;
     }
+    /** 统计容器内可用导航候选数量（用于向上定位“最近容器”）。 */
+    function navLikeCount(container) {
+      try {
+        var nodes = container.querySelectorAll(NAV_CAND_SEL) || [];
+        var n = 0;
+        for (var i = 0; i < nodes.length; i++) { if (isUsableNavCandidate(nodes[i])) n++; }
+        return n;
+      } catch (e) { return 0; }
+    }
+    /** 从某导航叶子向上找“最近容器”（语义容器或 ≥2 个可用候选的层）。 */
+    function navContainerAbove(leaf) {
+      var p = leaf && leaf.parentNode ? leaf.parentNode : null;
+      var steps = 0;
+      while (p && p !== document.documentElement && steps < NAV_UP_MAX) {
+        if (isNavContainerEl(p)) return p;
+        if (navLikeCount(p) >= 2) return p;
+        p = p.parentNode;
+        steps++;
+      }
+      return null;
+    }
+    /** 全文档找一个命中 token 的短导航叶子（仅用于“定位容器”，不点击）。 */
+    function navLeafByToken(token) {
+      try {
+        var all = document.querySelectorAll(NAV_CAND_SEL) || [];
+        for (var i = 0; i < all.length; i++) {
+          var el = all[i];
+          if (el.id === NAV_ENTRY_ID) continue;
+          if (!isUsableNavCandidate(el)) continue;
+          if (!navTextHits(el, token)) continue;
+          return el;
+        }
+      } catch (e) {}
+      return null;
+    }
+    /** 全文档找一个 navCell 叶子（shell 设置页导航按钮；用于兜底定位容器）。 */
+    function navCellLeaf() {
+      try {
+        var all = document.querySelectorAll('[class*="navCell"]') || [];
+        for (var i = 0; i < all.length; i++) {
+          var el = all[i];
+          if (el.id === NAV_ENTRY_ID) continue;
+          if (!isUsableNavCandidate(el)) continue;
+          return el;
+        }
+      } catch (e) {}
+      return null;
+    }
     /**
-     * 点击“文本含 token”的导航项：① 已打 data-dru-remote 标记的（远程栏目）优先；
-     * ② [class*=navCell]/[role=tab]/[role=menuitem]/[aria-label] 语义候选；
-     * ③ 任意按钮/链接兜底。全部失败返回 false（调用方决定是否退化进「设置」）。
+     * 定位侧栏/主导航容器（此后所有候选命中都在这些容器内进行，绝不扫 main/内容区/会话列表）：
+     *   ① 语义容器：[role=navigation]/<nav>/class 含 sidebar|navRail|navPanel|sidenav|appnav|navigation；
+     *   ② 兜底：从全文档命中「设置」的短导航叶子向上找最近容器；
+     *   ③ 再兜底：从任意 navCell 叶子向上找最近容器（设置页栏目导航）。
+     * 返回去嵌套后的容器数组（保持调用次序，document 不在容器内）。
+     */
+    function navContainers() {
+      var out = [];
+      var push = function (el) {
+        if (!el || typeof el.querySelectorAll !== "function") return;
+        if (out.indexOf(el) !== -1) return;
+        var nested = false;
+        for (var j = 0; j < out.length; j++) {
+          try { if (out[j].contains && out[j].contains(el)) { nested = true; break; } } catch (e) {}
+        }
+        if (!nested) out.push(el);
+      };
+      try {
+        var sem = document.querySelectorAll(NAV_CONTAINER_SEL) || [];
+        for (var i = 0; i < sem.length; i++) push(sem[i]);
+      } catch (e) {}
+      var seed = navLeafByToken("设置");
+      if (seed) push(navContainerAbove(seed));
+      var cell = navCellLeaf();
+      if (cell) push(navContainerAbove(cell));
+      return out;
+    }
+    /**
+     * 在全部侧栏/导航容器内点击“命中 token”的导航项（②：导航文字可能不同名/纯图标，
+     * 交给命中器）。只查容器内候选，绝不 document 全量点击。全部失败返回 false。
      */
     function clickNavToken(token, excludeId) {
-      try {
+      var containers = navContainers();
+      for (var c = 0; c < containers.length; c++) {
+        var nodes = null;
+        try { nodes = containers[c].querySelectorAll(NAV_CAND_SEL); } catch (e) { nodes = null; }
+        if (!nodes) continue;
         if (token === "远程访问") {
-          var all = document.querySelectorAll(NAV_CAND_SEL + ", " + NAV_ANY_SEL);
-          var hit = pickNavHit(all, token, excludeId, true);
-          if (hit) { try { hit.click(); } catch (e) {} return true; }
+          var hitMarked = pickNavHit(nodes, token, excludeId, true);
+          if (hitMarked) { try { hitMarked.click(); } catch (e2) {} return true; }
         }
-        var sem = document.querySelectorAll(NAV_CAND_SEL);
-        var hit2 = pickNavHit(sem, token, excludeId, false);
-        if (hit2) { try { hit2.click(); } catch (e) {} return true; }
-        var any = document.querySelectorAll(NAV_ANY_SEL);
-        var hit3 = pickNavHit(any, token, excludeId, false);
-        if (hit3) { try { hit3.click(); } catch (e) {} return true; }
-      } catch (e) { /* 忽略 */ }
+        var hit = pickNavHit(nodes, token, excludeId, false);
+        if (hit) { try { hit.click(); } catch (e3) {} return true; }
+      }
       return false;
     }
     /** 「远程访问」栏目内容区是否已在 DOM（设置页已选中该栏目）。 */
     function remoteSectionVisible() {
       try {
         var el = document.querySelector(".dru-settings-section");
-        return !!el && (!document.body || document.body.contains(el));
+        if (!el) return false;
+        if (document.body && !document.body.contains(el)) return false;
+        if (el.getAttribute && (el.getAttribute("aria-hidden") === "true" || el.getAttribute("hidden") !== null)) return false;
+        return true;
       } catch (e) { return false; }
     }
     /**
      * 打开设置页「远程访问」栏目（侧栏注入项/面板内“去设置”等共用入口）：
-     * 已在栏目内容区 → 不动；否则先找栏目项直接点；点不到 → 点「设置」进设置页，
-     * 再轮询（栏目项异步挂载）补点「远程访问」。全程排除注入项自身防递归。
+     * 栏目已在 DOM → 直接返回；否则容器内点「远程访问」栏目项 → 容器内点「设置」进设置页，
+     * 再轮询（≤3s：20×150ms，NAV_POLL_MAX）容器内补点「远程访问」。全程不点工作区内容。
      */
     function openRemoteSettings() {
       if (remoteSectionVisible()) return;
@@ -247,7 +377,7 @@ window.__ModuleLoader__.load({
       var tries = 0;
       var iv = setInterval(function () {
         if (remoteSectionVisible() || clickNavToken("远程访问", NAV_ENTRY_ID)) { clearInterval(iv); return; }
-        if (++tries > 40) clearInterval(iv);
+        if (++tries >= NAV_POLL_MAX) clearInterval(iv); // ≤3s 轮询上限
       }, 150);
       if (typeof iv.unref === "function") iv.unref();
     }
@@ -262,50 +392,53 @@ window.__ModuleLoader__.load({
         var iv = setInterval(function () {
           try {
             if (document.getElementById(NAV_ENTRY_ID)) { clearInterval(iv); return; }
-            // 在左侧主导航找「设置」按钮：语义候选优先，文本开头为“设置”或 aria-label 恰为“设置”
-            // （兼容文字不同名/带 emoji 图标的情况：能读到的标识仍是“设置”）。
-            var nodes = document.querySelectorAll(NAV_CAND_SEL + ", " + NAV_ANY_SEL);
+            // 只在导航容器内找「设置」按钮（可点 + 短文本/aria 命中），绝不 document 全量找。
+            var containers = navContainers();
             var settingsBtn = null;
-            for (var i = 0; i < nodes.length; i++) {
-              var el = nodes[i];
-              if (el.id === NAV_ENTRY_ID) continue;
-              if (!isNavClickable(el)) continue;
-              var label = (el.getAttribute && el.getAttribute("aria-label")) || "";
-              var t = (el.textContent || "").trim();
-              var hit = label === "设置" || label.indexOf("设置") === 0 ||
-                t === "设置" || t.indexOf("设置") === 0 || t.indexOf("设置 ") === 0;
-              if (!hit) continue;
-              settingsBtn = el;
-              break;
+            for (var c = 0; c < containers.length; c++) {
+              var nodes = null;
+              try { nodes = containers[c].querySelectorAll(NAV_CAND_SEL); } catch (e) { nodes = null; }
+              if (!nodes) continue;
+              var hit = pickNavHit(nodes, "设置", NAV_ENTRY_ID, false);
+              if (hit) { settingsBtn = hit; break; }
             }
             if (!settingsBtn || !settingsBtn.parentNode) {
               if (++tries > 80) clearInterval(iv);
               return;
             }
-            var entry = settingsBtn.cloneNode(false);
+            // 独立按钮：不复用官方按钮元素（避免继承官方事件委托/点击热区 → Bug A 误点会话行）。
+            var entry = document.createElement("button");
             entry.id = NAV_ENTRY_ID;
-            entry.removeAttribute("data-view");
-            entry.removeAttribute("href");
-            entry.textContent = "";
+            entry.setAttribute("type", "button");
             entry.setAttribute("role", "button");
             entry.setAttribute("tabindex", "0");
             entry.setAttribute("aria-label", "远程访问");
             entry.textContent = "📱 远程访问";
+            entry.style.cssText = "display:flex;align-items:center;gap:6px;box-sizing:border-box;width:100%;" +
+              "padding:8px 10px;margin:2px 0;border:1px solid transparent;background:transparent;" +
+              "border-radius:8px;color:inherit;font-family:inherit;font-size:13px;line-height:1.4;" +
+              "cursor:pointer;text-align:left;position:relative";
             var seen = false;
             try { seen = !!localStorage.getItem(NAV_SEEN_KEY); } catch (e) {}
             if (!seen) {
               var dot = document.createElement("span");
+              dot.setAttribute("aria-hidden", "true");
               dot.style.cssText = "position:absolute;top:4px;right:10px;width:8px;height:8px;border-radius:50%;background:#e5484d;pointer-events:none";
-              entry.style.position = "relative";
               entry.appendChild(dot);
             }
             entry.addEventListener("click", function () {
               try { localStorage.setItem(NAV_SEEN_KEY, "1"); } catch (e) {}
-              var d = entry.querySelector("span[style]");
-              if (d && /background:#e5484d/.test(d.getAttribute("style") || "")) d.remove();
+              var dots = entry.children || [];
+              for (var i = 0; i < dots.length; i++) {
+                var d = dots[i];
+                if (d.getAttribute && d.getAttribute("aria-hidden") === "true" && /background:#e5484d/.test(d.style && d.style.cssText || "")) {
+                  try { entry.removeChild(d); } catch (e2) {}
+                  break;
+                }
+              }
               openRemoteSettings();
             });
-            settingsBtn.parentNode.insertBefore(entry, settingsBtn); // 设置在入口下方
+            settingsBtn.parentNode.insertBefore(entry, settingsBtn); // 官方「设置」在入口下方
             clearInterval(iv);
           } catch (e) { /* 忽略单次失败,继续重试 */ }
         }, 300);
@@ -1133,6 +1266,14 @@ window.__ModuleLoader__.load({
       var armedDevArr = useState(null); var armedDev = armedDevArr[0]; var setArmedDev = armedDevArr[1]; // 待二次确认的 session id（取消配对）
       var armedDelArr = useState(null); var armedDel = armedDelArr[0]; var setArmedDel = armedDelArr[1]; // 待二次确认的 session id（删除记录）
       var purgeArmedArr = useState(false); var purgeArmed = purgeArmedArr[0]; var setPurgeArmed = purgeArmedArr[1]; // 清理已解绑二次确认
+      // ── 🔒 修改密码（已登录 SaaS，短信重置）状态：放在全部既有字段之后，保持既有 hook 序号 ──
+      // 成功后企业端使该账号全部授权设备/会话失效（含 E2EE 派生口令）→ 本地登出、用新密码重新登录。
+      var pwdOpenArr = useState(false); var pwdOpen = pwdOpenArr[0]; var setPwdOpen = pwdOpenArr[1];   // 小表单展开
+      var pwdCapArr = useState(null); var pwdCap = pwdCapArr[0]; var setPwdCap = pwdCapArr[1];          // {id,svg} 图形验证码
+      var pwdCapTxtArr = useState(""); var pwdCapTxt = pwdCapTxtArr[0]; var setPwdCapTxt = pwdCapTxtArr[1];
+      var pwdSmsArr = useState(""); var pwdSms = pwdSmsArr[0]; var setPwdSms = pwdSmsArr[1];
+      var pwdSmsBtnArr = useState("获取验证码"); var pwdSmsBtn = pwdSmsBtnArr[0]; var setPwdSmsBtn = pwdSmsBtnArr[1];
+      var pwdNewArr = useState(""); var pwdNew = pwdNewArr[0]; var setPwdNew = pwdNewArr[1];            // 新密码（≥8）
 
       var refresh = useCallback(function () {
         setBusy("status");
@@ -1474,6 +1615,83 @@ window.__ModuleLoader__.load({
           .finally(function () { setBusy(""); });
       };
 
+      // ---------- 🔒 修改密码（已登录 SaaS，短信重置；企业端公开 POST /api/password/reset） ----------
+      // 图形验证码 + 短信验证码复用既有 /dsh-remote/captcha、/dsh-remote/sms-code 防刷路径；
+      // 新密码 ≥8 位。成功后企业端使全部授权设备/会话失效（含 E2EE 派生口令），
+      // 且桌面端配置 config.phone/password 里的旧口令已不可用 → 本地登出（清 threads/会话），
+      // 提示用新密码重新登录（登录成功会把新密码写回本地 config，覆盖旧口令并重建 E2EE 派生）。
+      function pwdLoadCaptcha() {
+        setPwdCap({ id: null, svg: '<span class="dru-hint">加载中</span>' });
+        fetch("/dsh-remote/captcha").then(function (r) {
+          return r.text().then(function (text) {
+            if (!r.ok) throw new Error("http " + r.status);
+            var body = null; try { body = JSON.parse(text); } catch (e) { body = null; }
+            if (body && body.captcha_id) setPwdCap({ id: body.captcha_id, svg: body.svg || "" });
+            else if (body && body.svg) setPwdCap({ id: null, svg: body.svg });
+            else setPwdCap({ id: null, svg: null });
+          });
+        }).catch(function () { setPwdCap({ id: null, svg: null }); });
+      }
+      /** 发送修改密码用的短信验证码（图形验证码防刷；captcha_invalid → 重载验证码提示重试）。 */
+      var sendPwdSms = function () {
+        var ph = (st && st.config && st.config.phone) || "";
+        if (!/^1\d{10}$/.test(ph)) { setMsg("err", "请先登录手机号账号再修改密码（以当前账号为准）"); return; }
+        if (!pwdCap || !pwdCap.id || !pwdCapTxt.trim()) { setMsg("err", "请输入图中验证码（点击图片可刷新）"); return; }
+        setBusy("pwd-sms");
+        post("/dsh-remote/sms-code", { phone: ph, captcha_id: pwdCap.id, captcha_answer: pwdCapTxt.trim() })
+          .then(function (body) {
+            var testCode = body && (body.test_code || (body.body && body.body.test_code));
+            setPwdCap(null); setPwdCapTxt(""); // 验证码一次性：发送后失效
+            if (testCode) setMsg("ok", "验证码已发送(测试码: " + testCode + ")");
+            else setMsg("ok", "验证码已发送");
+            var s = 60; setPwdSmsBtn(s + "s");
+            var t = setInterval(function () { s--; if (s <= 0) { clearInterval(t); setPwdSmsBtn("获取验证码"); } else setPwdSmsBtn(s + "s"); }, 1000);
+          })
+          .catch(function (e) {
+            var relayError = e.body && e.body.body && e.body.body.error;
+            if (relayError && relayError.code === "captcha_invalid") {
+              setPwdCapTxt(""); pwdLoadCaptcha();
+              setMsg("err", "发送次数较多，请输入图中验证码后重试");
+            } else setMsg("err", "发送失败: " + e.message);
+          })
+          .finally(function () { setBusy(""); });
+      };
+      /** 确认修改密码：POST /dsh-remote/password/reset → 成功后本地登出，提示用新密码登录。 */
+      var doChangePwd = function () {
+        var ph = (st && st.config && st.config.phone) || "";
+        if (!/^1\d{10}$/.test(ph)) { setMsg("err", "请先登录手机号账号（修改密码以当前账号为准）"); return; }
+        if (!pwdSms.trim()) { setMsg("err", "请填写短信验证码"); return; }
+        if (pwdNew.length < 8) { setMsg("err", "新密码至少 8 位"); return; }
+        setBusy("pwd-reset");
+        post("/dsh-remote/password/reset", { phone: ph, sms_code: pwdSms.trim(), new_password: pwdNew })
+          .then(function (body) {
+            var ok = !!(body && (body.ok === true || (body.body && body.body.ok === true)));
+            if (!ok) {
+              var relayBody = (body && body.body) || body || {};
+              var errText = (relayBody.error && (relayBody.error.message || relayBody.error))
+                || relayBody.detail || ("修改失败(" + ((body && body.status) || "?") + ")");
+              setMsg("err", "修改失败：" + String(errText));
+              setPwdSms(""); // 短信验证码一次性：失败后需重新获取
+              return undefined;
+            }
+            // 成功：全部授权设备/会话已失效（含 E2EE）→ 本地登出清掉 config 旧口令与本地凭据，
+            // 提示用新密码重新登录（登录会把新口令写入 config 并重启 bridge / 重建 E2EE）。
+            setBusy("pwd-logout");
+            return post("/dsh-remote/logout").then(function (lb) {
+              setSt(lb); setAccount(null); setQuota(null);
+              setAkey(null); setAkeyMsg(null);
+              fbClearThreads();
+              setPwdOpen(false); setPwdSms(""); setPwdNew(""); setPwdCap(null); setPwdCapTxt(""); setPwdSmsBtn("获取验证码");
+              setMsg("ok", "✅ 密码已修改成功：所有已授权设备与会话已失效，本机已退出登录。" +
+                "请在下方账号卡用「新密码」重新登录——登录会更新本机保存的密码并重新启用端到端加密（E2EE）。");
+            }).catch(function (e) {
+              setMsg("err", "密码已修改成功，但本机退出登录失败：" + e.message + "（建议手动「退出登录」后用新密码重新登录，以更新本机配置密码）");
+            });
+          })
+          .catch(function (e) { setMsg("err", "修改失败: " + e.message); })
+          .finally(function () { setBusy(""); });
+      };
+
       var toggleBridge = function (start) {
         setBusy(start ? "start" : "stop");
         post(start ? "/dsh-remote/start" : "/dsh-remote/stop")
@@ -1553,11 +1771,43 @@ window.__ModuleLoader__.load({
               busy === "upgrade" ? "生成链接中…" : (!isMember ? "🚀 升级 PRO" : source === "trial" ? "🚀 转正式 PRO" : "🔄 续费会员")),
             h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "", onClick: function () { setView("invite"); loadInvite(); } }, "🎯 邀请好友赚会员"),
             h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "", onClick: function () { setView("feedback"); } }, "💬 用户反馈"),
+            h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "", onClick: function () {
+              var next = !pwdOpen;
+              setPwdOpen(next);
+              setMessage(null);
+              if (next && !pwdCap) pwdLoadCaptcha();
+            } }, pwdOpen ? "收起修改密码" : "🔒 修改密码"),
             h("button", { type: "button", className: "dru-btn dru-btn-danger", disabled: busy !== "", onClick: function () { doLogout(false); } }, "退出登录")
           ),
           h("div", { className: "dru-hint", style: { marginTop: 8 } },
             "升级/续费以带登录态方式打开：点击后生成一次性访问链接并直接跳转，无需重新登录。" +
-            (endsAt && isMember ? "到期后如需继续使用会员权益，请在到期前续费。" : ""))
+            (endsAt && isMember ? "到期后如需继续使用会员权益，请在到期前续费。" : "")),
+          pwdOpen ? renderChangePwdForm() : null
+        );
+      }
+
+      // ---------- 🔒 修改密码小表单（登录态账号卡内展开；短信验证码重置） ----------
+      function renderChangePwdForm() {
+        var ph = (st && st.config && st.config.phone) || "";
+        return h("div", { className: "dru-card", style: { marginTop: 10, border: "1px dashed #d0d7de" } },
+          h("h3", null, "🔒 修改密码（短信验证）"),
+          h("div", { className: "dru-hint", style: { marginBottom: 8 } },
+            "修改后所有已授权设备与会话将失效，需重新登录与解锁（E2EE 用新密码重新派生）。"),
+          field("手机号", h("input", { className: "dru-input", type: "tel", value: ph, disabled: true, readOnly: true, title: "以当前登录账号为准" })),
+          field("图形验证码", h("div", { className: "dru-captcha" },
+            input({ value: pwdCapTxt, placeholder: "图中数字", autoComplete: "off", inputMode: "numeric", maxLength: 6, onChange: function (e) { setPwdCapTxt(e.target.value); } }),
+            h("div", { className: "dru-captcha-box", title: "看不清？点击刷新", onClick: function () { pwdLoadCaptcha(); }, dangerouslySetInnerHTML: pwdCap && pwdCap.svg && pwdCap.svg.indexOf("<svg") === 0 ? { __html: pwdCap.svg } : void 0 },
+              pwdCap && pwdCap.svg && pwdCap.svg.indexOf("<svg") !== 0 ? pwdCap.svg : null)
+          )),
+          field("短信验证码", h("div", { className: "dru-captcha" },
+            input({ value: pwdSms, placeholder: "6 位验证码", autoComplete: "off", inputMode: "numeric", maxLength: 6, onChange: function (e) { setPwdSms(e.target.value); } }),
+            h("button", { type: "button", className: "dru-btn dru-btn-ghost", style: { flex: "none", padding: "0 14px" }, disabled: busy !== "", onClick: sendPwdSms }, pwdSmsBtn)
+          )),
+          field("新密码（至少 8 位）", input({ type: "password", value: pwdNew, minLength: 8, autoComplete: "new-password", placeholder: "至少 8 位", onChange: function (e) { setPwdNew(e.target.value); } })),
+          h("div", { className: "dru-hint", style: { marginBottom: 8 } },
+            "修改成功后，本机保存的旧密码会被清除并退出登录；请用新密码重新登录（登录会更新本机配置密码并重新启用远程访问与端到端加密）。"),
+          h("button", { type: "button", className: "dru-btn dru-btn-danger", style: { width: "100%" }, disabled: busy !== "", onClick: doChangePwd },
+            busy === "pwd-reset" ? "提交中…" : busy === "pwd-logout" ? "已修改，正在退出本地登录…" : "确认修改密码")
         );
       }
 

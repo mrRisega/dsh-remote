@@ -1020,7 +1020,7 @@ const PLUGIN_ID = "dsh-remote-web";
 const PLUGIN_LEGACY_IDS = ["dsh-remote-ui"];
 const PLUGIN_ALL_IDS = [PLUGIN_ID, ...PLUGIN_LEGACY_IDS];
 /** 插件自身发布版本（与 dsh-remote 根包同步递增）。 */
-const PLUGIN_VERSION = "0.6.0-beta.9";
+const PLUGIN_VERSION = "0.6.0-beta.10";
 const UPDATE_LOG = ".dsh-update.log";
 const UPDATE_MARKER = ".dsh-update-running";
 
@@ -1388,6 +1388,27 @@ function registerRoutes(ctx, relayDir) {
           method: "POST", headers: { "content-type": "application/json" },
           body: JSON.stringify({ phone, ...(body.captcha_id !== undefined ? { captcha_id: String(body.captcha_id), captcha_answer: String(body.captcha_answer ?? "") } : {}) }),
         });
+        sendJson(res, r.status || 502, { ok: r.ok, status: r.status, body: r.body });
+      },
+    },
+    {
+      method: "POST",
+      path: "/dsh-remote/password/reset",
+      handler: async (req, res) => {
+        // 公开 POST /api/password/reset（无需 Bearer）：短信验证码重置密码。
+        // 成功 → 企业端使该账号全部授权设备/会话失效（含 E2EE 派生口令）。
+        const body = await readJsonBody(req);
+        if (body.__parseError) return sendJson(res, 400, { ok: false, error: "JSON 解析失败" });
+        const phone = String(body.phone ?? "").trim();
+        const smsCode = String(body.sms_code ?? "").trim();
+        const newPassword = String(body.new_password ?? body.password ?? "");
+        if (!phone || !smsCode || !newPassword) return sendJson(res, 400, { ok: false, error: "手机号、短信验证码与新密码必填" });
+        const r = await relayFetch(relayDir, "/api/password/reset", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ phone, sms_code: smsCode, new_password: newPassword }),
+        });
+        // 透传企业端 ok/error（成功 200 {ok:true}；失败保留 status 与错误体）
         sendJson(res, r.status || 502, { ok: r.ok, status: r.status, body: r.body });
       },
     },
