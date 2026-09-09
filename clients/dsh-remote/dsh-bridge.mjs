@@ -494,6 +494,10 @@ export async function handleHttpFrame(dchOrSend, frame) {
   const send = toSender(dchOrSend);
   const { id, method = "GET", path = "/", headers = {}, body, bodyBase64: isB64 } = frame;
   const t0 = Date.now();
+  // 桌面授权引导(方案A):POST /_e2ee/intro(device/channel 形态归一)—— 本地应答,不连上游
+  if (method === "POST" && path === "/_e2ee/intro") {
+    return answerIntro(send, id);
+  }
   // E2EE 信封标记即信号(§4.3):有标记=加密,无标记=明文 v1。
   // 解封失败绝不静默降级 → 明文错误 + x-dsh-e2ee-error 头 + 日志。
   if (hasEnvelopeMarker(headers)) {
@@ -546,6 +550,32 @@ export async function handleHttpFrame(dchOrSend, frame) {
     console.log(`[bridge] ${method} ${path} 上游错误: ${e.message}`);
     send({ id, type: "http", status: 502, headers: { "content-type": "application/json" }, body: Buffer.from(JSON.stringify({ error: String(e.message || e) })).toString("base64"), bodyBase64: true });
   }
+}
+
+/** 桌面授权引导(方案A):POST /_e2ee/intro —— 桥端本地应答,不连上游。
+ *  路由层已按 dsh_token cookie 完成同账号授权(device/channel 形态都只到本设备);
+ *  这里仅当桥端 E2EE 启用时一次性下发派生 MK(内存转发,不落盘不写日志)。 */
+function answerIntro(send, id) {
+  let ok = false;
+  let body;
+  try {
+    const g = e2ee.introGrant();
+    body = { ok: true, v: 2, grant: "desktop-intro", mk: g.mk, profile: g.profile, epoch: g.epoch, ts: Date.now() };
+    ok = true;
+    console.log("[bridge] e2ee intro → 手机(同一账号,已授权;MK 仅内存一次性下发)");
+  } catch (e) {
+    const code = e instanceof E2eeError ? e.code : "e2ee_disabled";
+    body = { ok: false, v: 2, error: { code, message: e?.message || "电脑端未启用端到端加密,无法授权引导" } };
+    console.log(`[bridge] e2ee intro 被拒(${code}): ${e?.message || ""}`);
+  }
+  send({
+    id,
+    type: "http",
+    status: ok ? 200 : 409,
+    headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
+    body: Buffer.from(JSON.stringify(body)).toString("base64"),
+    bodyBase64: true
+  });
 }
 
 /** E2EE 失败回包:明文(无信封标记)+ x-dsh-e2ee-error,绝不把无法解密的密文当正文转发。 */

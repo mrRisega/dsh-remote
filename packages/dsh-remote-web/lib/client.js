@@ -5,8 +5,10 @@
 // factory 内只能 require shell 种子模块（react / react/jsx-runtime 等）。
 //
 // 功能：
-//   - 入口＝官方「设置」页内的 settings.section「远程访问」栏目（位于「Agent 预设」下方，
-//     官方扩展点）；不向官方侧边栏注入任何按钮，官方「设置」按钮原样、不被遮挡
+//   - 双入口（2026-09 恢复侧栏注入，与官方共存不遮挡）：
+//       ① 官方「设置」→「远程访问」栏目（settings.section，位于「Agent 预设」下方，官方扩展点）；
+//       ② 左侧官方「设置」按钮旁注入独立「📱 远程访问」快捷按钮（id=dru-nav-remote，非 clone，
+//          插在其前方、同布局不覆盖官方按钮；点击直达该栏目，首次带引导红点）
 //   - 栏目内联渲染配置面板（浅色高对比 UI，遵循主流登录体验）
 //     · 登录态：已登录显示账号 + 退出登录；未登录显示 登录/注册 tabs
 //     · 🔒 修改密码（账号卡）：已登录账号经 图形验证码+短信验证码 重置（/dsh-remote/password/reset 代理）；
@@ -156,6 +158,11 @@ window.__ModuleLoader__.load({
       // Phase-5:端到端加密(E2EE)状态行 —— 启用=绿字绿点,未启用=灰字(纯文字状态行,不打扰)
       ".dru-e2ee-line{display:flex;align-items:center;gap:7px;margin-top:6px;font-size:12px;line-height:1.5;color:#57606a}",
       ".dru-e2ee-line.ok{color:#1a7f37}",
+      // 侧栏「远程访问」快捷按钮(2026-09 恢复注入,与官方「设置」按钮共存不遮挡):
+      // 独立 button(非 clone),插在官方「设置」按钮之前,同源同布局不覆盖官方热区。
+      ".dru-nav-remote{display:inline-flex;align-items:center;gap:6px;height:30px;margin:0 0 2px;padding:0 10px;border:1px solid #d0d7de;border-radius:8px;background:#ffffff;color:#0969da;font:500 12.5px/1 inherit;cursor:pointer;white-space:nowrap;user-select:none}",
+      ".dru-nav-remote:hover:not(:disabled){background:#f0f6ff;border-color:#0969da}",
+      ".dru-nav-remote-dot{position:absolute;top:-2px;right:-2px;width:8px;height:8px;border-radius:50%;background:#e5484d;box-shadow:0 0 0 2px #fff;pointer-events:none}",
     ].join("\n");
     document.head.appendChild(styleEl);
 
@@ -222,6 +229,104 @@ window.__ModuleLoader__.load({
       dotScan();
     }
 
+    // ── 侧栏「远程访问」快捷按钮（2026-09 恢复注入：与官方「设置」按钮共存、不遮挡） ──
+    // 用户要求：左侧官方「设置」按钮旁保留「远程访问」入口。实现为独立 <button id=dru-nav-remote>
+    // （绝不 clone 官方按钮 → 不继承官方事件委托/点击热区），插在官方「设置」按钮之前；
+    // 点击 → 打开官方设置页「远程访问」栏目。全程不点工作区会话内容：
+    //   - 候选一律限定为官方导航（class 含 navCell / 位于导航容器内）+ 短文本/aria 精确匹配；
+    //   - 命中排除自身与“菜单/更多”语义节点；
+    //   - 栏目未开时先点官方「设置」，再轮询(≤3s)补点「远程访问」栏目项。
+    var NAV_ENTRY_ID = "dru-nav-remote";
+    var NAV_TEXT_MAX = 10;
+    var NAV_POLL_MAX = 20;
+    var NAV_BAD_RE = /(^|[^a-z0-9])(menu|context|more|kebab|dropdown|popover|toolbar)($|[^a-z0-9])/i;
+    function navCleanText(el) { try { return (el.textContent || "").replace(/\s+/g, " ").trim(); } catch (e) { return ""; } }
+    function navAttrOf(el) {
+      try { return String(el.getAttribute("aria-label") || el.getAttribute("title") || "").trim(); } catch (e) { return ""; }
+    }
+    function navCellLike(el) {
+      try {
+        var cls = String(el.className || "");
+        if (cls.indexOf("navCell") !== -1) return true;
+        return !!el.closest('[role="navigation"], nav, [class*="sidebar" i], [class*="sidenav" i], [class*="appnav" i], [class*="navRail" i]');
+      } catch (e) { return false; }
+    }
+    function pickNavByToken(token) {
+      try {
+        var els = document.querySelectorAll("button, [role='tab'], [role='menuitem'], [role='button'], a, [aria-label]");
+        for (var i = 0; i < els.length; i++) {
+          var el = els[i];
+          if (!el || el.id === NAV_ENTRY_ID) continue; // 排除注入按钮自身(防递归)
+          if (!navCellLike(el)) continue;
+          if (NAV_BAD_RE.test(String(el.className || ""))) continue;
+          var t = navCleanText(el);
+          if (t && !/\r|\n/.test(t) && t.length <= NAV_TEXT_MAX &&
+              (t === token || t.indexOf(token) === 0 || t.indexOf(token) !== -1)) return el;
+          var at = navAttrOf(el);
+          if (at && (at === token || at.indexOf(token) === 0)) return el;
+        }
+      } catch (e) { /* 忽略 */ }
+      return null;
+    }
+    /** 打开「远程访问」设置栏目：栏目已渲染直接点；否则先点官方「设置」再 ≤3s 轮询补点。 */
+    function openRemoteSettings() {
+      try {
+        var cell = pickNavByToken("远程访问");
+        if (cell) { cell.click(); return; }
+        var st = pickNavByToken("设置");
+        if (!st) return;
+        st.click();
+        var tries = 0;
+        var iv = setInterval(function () {
+          tries++;
+          var c2 = pickNavByToken("远程访问");
+          if (c2) { clearInterval(iv); c2.click(); }
+          else if (tries >= NAV_POLL_MAX) clearInterval(iv);
+        }, 150);
+      } catch (e) { /* 忽略 */ }
+    }
+    /** 注入侧栏按钮到官方「设置」按钮之前（独立 button；首次未见过引导红点）。 */
+    function mountNavEntry(host) {
+      try {
+        if (document.getElementById(NAV_ENTRY_ID)) return;
+        var wrap = host && host.parentNode;
+        if (!wrap || !wrap.insertBefore || !wrap.contains) return;
+        var btn = document.createElement("button");
+        btn.type = "button";
+        btn.id = NAV_ENTRY_ID;
+        btn.className = "dru-nav-remote";
+        btn.setAttribute("data-dru-remote", "1");
+        btn.title = "打开「远程访问」设置(快捷入口)";
+        btn.style.position = "relative";
+        btn.textContent = "📱 远程访问";
+        btn.addEventListener("click", function (e) {
+          try { e.stopPropagation(); e.preventDefault(); } catch (err) {}
+          dotMarkSeen(); // 用过快捷入口=已了解入口位置 → 关闭首次红点(含官方栏目红点)
+          openRemoteSettings();
+        });
+        wrap.insertBefore(btn, host);
+        if (!dotSeen()) {
+          var d = document.createElement("span");
+          d.className = "dru-nav-remote-dot";
+          btn.appendChild(d);
+        }
+      } catch (e) { /* 忽略 */ }
+    }
+    /** 常驻确保：官方「设置」按钮出现后在它前面挂一次入口(去重；2s 心跳，成本极低)。 */
+    function navEnsureStart() {
+      if (window.__dshRemoteNavStarted) return;
+      window.__dshRemoteNavStarted = true;
+      try { window.__dshRemoteNav = { open: openRemoteSettings }; } catch (e) {}
+      var iv = setInterval(function () {
+        try {
+          if (document.getElementById(NAV_ENTRY_ID)) return; // 已注入
+          var host = pickNavByToken("设置");
+          if (host) mountNavEntry(host);
+        } catch (e) { /* 忽略 */ }
+      }, 2000);
+      try { if (iv && typeof iv.unref === "function") iv.unref(); } catch (e) {} // node 测试环境不阻塞退出
+    }
+
     // ── 宿主 API ────────────────────────────────────────────────────────────
     function api(path, options) {
       return fetch(path, options).then(function (res) {
@@ -260,6 +365,10 @@ window.__ModuleLoader__.load({
     var FB_THREADS_KEY = "dsh-feedback-threads";
     var FB_POPUP_KEY = "dsh-feedback-popup";
     var FB_POPUP_DELAY_MS = 60 * 60 * 1000;   // 安装/体验后至少 1 小时才弹窗(只弹一次)
+    // 评价去重(2026-09):弹窗状态按「账号(掩码手机号)或设备」分作用域 —— 换账号/换机不重复打扰;
+    // 服务端另有 user_id/device_id 409 already_rated 兜底(同一账号/设备只收集一次 rating)。
+    var fbPopScope = "anon";
+    function setFbPopScope(scope) { fbPopScope = String(scope || "anon"); }
     var FB_CATEGORIES = [
       { value: "feature", label: "功能类" },
       { value: "bug", label: "Bug 类" },
@@ -286,10 +395,17 @@ window.__ModuleLoader__.load({
       try { localStorage.removeItem(FB_THREADS_KEY); } catch (e) {}
     }
     function fbPopState() {
-      try { return JSON.parse(localStorage.getItem(FB_POPUP_KEY) || "null"); } catch (e) { return null; }
+      try { return JSON.parse(localStorage.getItem(FB_POPUP_KEY + ":" + fbPopScope) || "null"); } catch (e) { return null; }
     }
     function fbSavePopState(s) {
-      try { localStorage.setItem(FB_POPUP_KEY, JSON.stringify(s)); } catch (e) {}
+      try { localStorage.setItem(FB_POPUP_KEY + ":" + fbPopScope, JSON.stringify(s)); } catch (e) {}
+    }
+    /** 作用域清理:旧版无作用域键也一并视为已完成,避免老用户再次被打扰。 */
+    function fbClearPopScope(scopes) {
+      try {
+        localStorage.removeItem(FB_POPUP_KEY); // 兼容旧键(无后缀)
+        if (Array.isArray(scopes)) scopes.forEach(function (sc) { localStorage.removeItem(FB_POPUP_KEY + ":" + sc); });
+      } catch (e) {}
     }
 
     /** 同源反馈代理调用（浏览器 → /dsh-remote/feedback/* → 独立反馈服务）。 */
@@ -415,7 +531,7 @@ window.__ModuleLoader__.load({
           category: cat,
           title: fbTitle.trim(),
           content: fbContent.trim(),
-          contact: contact.trim() || (cfg && cfg.phone ? cfg.phone : ""),
+          contact: contact.trim() || ((cfg && cfg.phone && cfg.phone.indexOf("*") === -1) ? cfg.phone : ""),
         };
         fbApi("/feedback", { method: "POST", body: JSON.stringify(payload) })
           .then(function (b) {
@@ -670,6 +786,7 @@ window.__ModuleLoader__.load({
           .catch(function (e) {
             var errBody = e.body && e.body.error;
             if (errBody && errBody.code === "rate_limited") { fbPopupLater(); setMessage({ kind: "err", text: "今日提交已达上限，明天再来吧" }); }
+            else if (errBody && errBody.code === "already_rated") { fbPopupDone(); setMessage({ kind: "ok", text: "你已评价过，感谢支持（同一账号/设备只收集一次）" }); }
             else setMessage({ kind: "err", text: "提交失败：" + ((errBody && errBody.message) || e.message) + "（可稍后再试）" });
           })
           .finally(function () { setBusy(""); });
@@ -1027,10 +1144,11 @@ window.__ModuleLoader__.load({
 
       // ── 📱 远程访问卡：常量 / 轮询 / 一次性访问密钥 / 已授权设备 ─────────────────
       var KEY_AUTO_REFRESH_MS = 25000;  // 停留栏目时约每 25s 自动轮换一把新的一次性密钥（防已用/过期）
-      var STATUS_POLL_MS = 5000;        // 连接状态行轮询间隔
+      var STATUS_POLL_MS = 30000;       // 连接状态行轮询间隔(审计降频:原 5s→30s;页面隐藏时暂停)
 
       /** 轻量状态轮询：只更新 st，不改 mode（mode 由用户 Tab 选择决定，避免轮询把自建/云端来回切）。 */
       function pollStatus() {
+        if (document.hidden) return; // 页面隐藏时不空转(审计:降低请求频率)
         api("/dsh-remote/status").then(function (body) {
           if (!body || !body.ok) return;
           setSt(body);
@@ -1212,14 +1330,17 @@ window.__ModuleLoader__.load({
         }).finally(function () { setBusy(""); });
       };
 
-      // 停留主视图（home）时：每 5s 轻量轮询连接状态 + 每秒刷新倒计时
+      // 停留主视图（home）时：轮询连接状态(15s,审计降频) + 每秒刷新倒计时;隐藏暂停、回前台立即刷新
       useEffect(function () {
         if (view !== "home") return;
         var pollIv = setInterval(function () { pollStatus(); }, STATUS_POLL_MS);
         var tickIv = setInterval(function () { setNowTick(Date.now()); }, 1000);
+        var visFn = function () { if (!document.hidden) pollStatus(); };
+        document.addEventListener("visibilitychange", visFn);
         return function () {
           clearInterval(pollIv);
           clearInterval(tickIv);
+          document.removeEventListener("visibilitychange", visFn);
         };
       }, [view]);
 
@@ -1360,7 +1481,8 @@ window.__ModuleLoader__.load({
        * 账号卡=当前登录手机号；登录卡「忘记密码」=表单输入手机号。 */
       var sendPwdSms = function (ph) {
         ph = String(ph || "").trim();
-        if (!/^1\d{10}$/.test(ph)) { setMsg("err", "请输入正确的手机号"); return; }
+        // 账号卡改密(隐私契约):phone 为空 = 由服务端取本机账号真号发码;仅当显式填了非法号才报错
+        if (ph && !/^1\d{10}$/.test(ph)) { setMsg("err", "请输入正确的手机号"); return; }
         if (!pwdCap || !pwdCap.id || !pwdCapTxt.trim()) { setMsg("err", "请输入图中验证码（点击图片可刷新）"); return; }
         setBusy("pwd-sms");
         post("/dsh-remote/sms-code", { phone: ph, captcha_id: pwdCap.id, captcha_answer: pwdCapTxt.trim() })
@@ -1388,7 +1510,8 @@ window.__ModuleLoader__.load({
        */
       var doResetPwd = function (ph, fromLogin) {
         ph = String(ph || "").trim();
-        if (!/^1\d{10}$/.test(ph)) { setMsg("err", fromLogin ? "请输入正确的手机号" : "请先登录手机号账号（修改密码以当前账号为准）"); return; }
+        if (ph && !/^1\d{10}$/.test(ph)) { setMsg("err", "请输入正确的手机号"); return; }
+        if (!ph && fromLogin) { setMsg("err", "请输入正确的手机号"); return; } // 登录卡忘记密码必须显式填号
         if (!pwdSms.trim()) { setMsg("err", "请填写短信验证码"); return; }
         if (pwdNew.length < 8) { setMsg("err", "新密码至少 8 位"); return; }
         setBusy("pwd-reset");
@@ -1521,7 +1644,10 @@ window.__ModuleLoader__.load({
       // fromLogin=false：账号卡「修改密码」手机号以当前登录账号为准（只读）；
       // fromLogin=true：登录卡「忘记密码」手机号预填登录输入、可改（成功后返回登录表单请用新密码登录）。
       function renderResetPwdForm(fromLogin) {
-        var ph = fromLogin ? phone : ((st && st.config && st.config.phone) || "");
+        // 隐私审计(2026-09):账号卡「修改密码」手机号只展示掩码;发送/重置时由服务端取本机账号真实号,
+        // 浏览器端不再出现明文手机号。登录卡「忘记密码」为用户自行输入,原样使用。
+        var curPhone = ((st && st.config && st.config.phone) || "");
+        var ph = fromLogin ? phone : "";
         return h("div", { className: "dru-card", style: { marginTop: 10, border: "1px dashed #d0d7de" } },
           h("h3", null, fromLogin ? "忘记密码（短信重置）" : "🔒 修改密码（短信验证）"),
           h("div", { className: "dru-hint", style: { marginBottom: 8 } },
@@ -1530,7 +1656,7 @@ window.__ModuleLoader__.load({
               : PWD_RESET_WARN + "（E2EE 用新密码重新派生）。"),
           field("手机号", fromLogin
             ? input({ type: "tel", value: ph, placeholder: "11 位手机号", autoComplete: "tel", onChange: function (e) { setPhone(e.target.value); } })
-            : h("input", { className: "dru-input", type: "tel", value: ph, disabled: true, readOnly: true, title: "以当前登录账号为准" })),
+            : h("input", { className: "dru-input", type: "tel", value: curPhone, disabled: true, readOnly: true, title: "以当前登录账号为准" })),
           field("图形验证码", h("div", { className: "dru-captcha" },
             input({ value: pwdCapTxt, placeholder: "图中数字", autoComplete: "off", inputMode: "numeric", maxLength: 6, onChange: function (e) { setPwdCapTxt(e.target.value); } }),
             h("div", { className: "dru-captcha-box", title: "看不清？点击刷新", onClick: function () { pwdLoadCaptcha(); }, dangerouslySetInnerHTML: pwdCap && pwdCap.svg && pwdCap.svg.indexOf("<svg") === 0 ? { __html: pwdCap.svg } : void 0 },
@@ -1911,10 +2037,18 @@ window.__ModuleLoader__.load({
 
       // 首次安装引导小红点（localStorage dsh-remote-seen-dot；点击后不再显示）
       dotWatch();
+      // 侧栏「远程访问」快捷入口（2026-09 恢复注入：与官方「设置」按钮共存不遮挡）
+      navEnsureStart();
 
       // 满意度弹窗调度：首次观察到 bridge 运行（即“安装完成并体验”）后约 10 分钟弹出；
       // 每 60 秒复查一次，避免 dsh web 启动晚于到点时间。
+      // 弹窗状态按「账号/设备」分作用域(见 fbPopScope);旧版无后缀键视为已完成并迁移,不再打扰老用户。
+      var legacyPopState = null;
+      try { legacyPopState = JSON.parse(localStorage.getItem(FB_POPUP_KEY) || "null"); } catch (e) { legacyPopState = null; }
+      try { localStorage.removeItem(FB_POPUP_KEY); } catch (e) {}
       api("/dsh-remote/status").then(function (body) {
+        if (body && body.config) setFbPopScope(body.config.phone || body.config.deviceId || "anon");
+        if (legacyPopState && legacyPopState.state === "done") fbSavePopState({ state: "done", firstSeen: legacyPopState.firstSeen || Date.now(), nextAt: 0 });
         if (body && body.service && body.service.running) {
           fbEnsureFirstSeen();
           fbMaybeOpenPopup();
@@ -1925,6 +2059,7 @@ window.__ModuleLoader__.load({
         if (!s || s.state !== "pending") { clearInterval(popupTimer); return; }
         if (!fbFirstSeenAt) {
           api("/dsh-remote/status").then(function (body) {
+            if (body && body.config) setFbPopScope(body.config.phone || body.config.deviceId || "anon");
             if (body && body.service && body.service.running) {
               fbEnsureFirstSeen();
               fbMaybeOpenPopup();

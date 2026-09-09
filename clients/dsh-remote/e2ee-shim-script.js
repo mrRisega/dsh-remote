@@ -598,6 +598,19 @@
   }
 
   /* ---- 状态徽标 ---- */
+  var _badgeCollapseTimer = null; // 自动收缩(仅 ok 态):展示几秒后缩成仅 🔒,不挡界面
+  function _badgeClearCollapse() {
+    try { if (_badgeCollapseTimer) { clearTimeout(_badgeCollapseTimer); _badgeCollapseTimer = null; } } catch (e) {}
+  }
+  function _badgeArmCollapse(el) {
+    _badgeClearCollapse();
+    _badgeCollapseTimer = setTimeout(function () {
+      try {
+        if (!el.classList.contains("expanded") && el.classList.contains("ok")) el.classList.add("collapsed");
+      } catch (e) {}
+      _badgeCollapseTimer = null;
+    }, 5000);
+  }
   function _badgeEl() {
     var el = document.getElementById("dsh-e2ee-badge");
     if (el) return el;
@@ -613,7 +626,18 @@
     var note = document.createElement("div");
     note.className = "dsh-e2ee-badge-note";
     el.appendChild(ico); el.appendChild(txt); el.appendChild(note);
-    el.addEventListener("click", function () { el.classList.toggle("expanded"); });
+    el.addEventListener("click", function () {
+      if (el.classList.contains("collapsed")) {
+        // 从仅🔒芯片展开:展示完整文案(文本),不再自动收缩
+        el.classList.remove("collapsed");
+        el.classList.add("expanded");
+        _badgeClearCollapse();
+      } else {
+        el.classList.toggle("expanded");
+        _badgeClearCollapse();
+      }
+    });
+    el.addEventListener("pointerenter", function () { _badgeClearCollapse(); el.classList.remove("collapsed"); });
     host.appendChild(el);
     return el;
   }
@@ -624,7 +648,7 @@
       if (mode !== "ok" && window.innerWidth > 820) return;
       var el = _badgeEl();
       if (!el) return;
-      el.className = mode; // ok | warn | err
+      el.className = mode; // ok | warn | err(重置 expanded/collapsed 由下方状态机管理)
       el.querySelector(".dsh-e2ee-badge-ico").textContent = mode === "ok" ? "🔒" : "⚠";
       el.querySelector(".dsh-e2ee-badge-txt").textContent = text;
       var noteEl = el.querySelector(".dsh-e2ee-badge-note");
@@ -639,6 +663,8 @@
         }
       }
       el.title = text;
+      // 自动收缩:仅加密态(ok)几秒后缩成纯 🔒 芯片(warn/err 属安全提示保持文本,不静默)
+      if (mode === "ok") _badgeArmCollapse(el);
     } catch (e) { /* 徽标失败不阻断页面 */ }
   }
   function _appUrl() {
@@ -669,6 +695,7 @@
     } catch (e) { /* ignore */ }
   }
 
+  /* (刷新恢复见 _boot:优先 localStorage 持久交接单,2026-09) */
   /* ---- 启动 ---- */
   function _boot() {
     try {
@@ -678,7 +705,20 @@
       }
       var raw = _readHandover();
       if (!raw) {
-        _badge("warn", "未加密:未解锁(明文)", "本次为明文连接。密钥只存内存,刷新/离开后即丢失;请返回设备列表重新点选设备并输入密码解锁后,镜像页的数据请求与 WebSocket 将自动加密。");
+        // 刷新/重开:sessionStorage 一次性交接单已被读走 → 尝试 localStorage「记住本机」持久交接单
+        // (2026-09 用户决策;同一解锁会话的 SHK,刷新镜像页后仍能恢复加密)。
+        var lsRaw = null;
+        try { lsRaw = localStorage.getItem(DSH_E2EE_HANDOVER_KEY); } catch (e) { lsRaw = null; }
+        if (lsRaw) {
+          var lsSess = null;
+          try { lsSess = seSessionOfHandover(lsRaw); } catch (e) { lsSess = null; }
+          if (lsSess) {
+            _install(lsSess);
+            _badge("ok", "端到端加密已开启", "刷新后已自动恢复端到端加密(记住本机);密钥仅存内存。");
+            return;
+          }
+        }
+        _badge("warn", "未加密:未解锁(明文)", "本次为明文连接。密钥只存内存;请返回设备列表重新点选设备解锁后,镜像页的数据请求与 WebSocket 将自动加密。");
         return;
       }
       var sess = null;

@@ -17,7 +17,7 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync, accessSync, chmodSync, openSync, closeSync, rmSync, constants as fsConstants } from "node:fs";
 import { join, dirname, sep } from "node:path";
 import { execSync, spawn } from "node:child_process";
-import { homedir, hostname, platform } from "node:os";
+import { homedir, platform } from "node:os";
 import { fileURLToPath } from "node:url";
 
 /** 本插件在 host 侧的服务依赖。 */
@@ -653,7 +653,7 @@ async function relayAccount(relayDir) {
   if (!r.ok || !r.body || !r.body.user) return null;
   const u = r.body.user;
   return {
-    phone: u.phone || "",
+    phone: maskPhone(u.phone || ""),
     plan: u.plan || "free",
     plan_source: u.plan_source || "plan",
     plan_ends_at: u.plan_ends_at ?? null,
@@ -875,6 +875,15 @@ export function readE2eeStateFile(relayDir) {
   }
 }
 
+/**
+ * 手机号脱敏(隐私审计 2026-09):面板/镜像 UI 一律不下发明文手机号。
+ * 明文只在 bridge 本机 config / 服务端账号体系内流转,浏览器侧仅见掩码。
+ */
+function maskPhone(p) {
+  const s = String(p || "");
+  return s.length >= 7 ? s.slice(0, 3) + "****" + s.slice(-4) : (s ? s.slice(0, 1) + "****" : "");
+}
+
 async function composeStatus(relayDir) {
   const cfg = loadConfig(relayDir);
   const launchd = launchdStatus();
@@ -893,7 +902,8 @@ async function composeStatus(relayDir) {
   return {
     ok: true,
     config: {
-      phone: cfg.phone || "",
+      phone: maskPhone(cfg.phone || ""),
+      hasPhone: Boolean(cfg.phone),
       hasPassword: Boolean(cfg.password),
       deviceId: cfg.device_id || "",
       apiUrl,
@@ -913,7 +923,7 @@ async function composeStatus(relayDir) {
       // {enabled, reason, profile, epoch, caps}，供面板「📱 远程访问」卡展示加密状态。
       e2ee: readE2eeStateFile(relayDir),
     },
-    host: hostname(),
+    // 隐私审计(2026-09):不再下发真实 hostname(移除 host 字段)——设备标识统一走 deviceId/服务端登记名
   };
 }
 
@@ -1020,7 +1030,7 @@ const PLUGIN_ID = "dsh-remote-web";
 const PLUGIN_LEGACY_IDS = ["dsh-remote-ui"];
 const PLUGIN_ALL_IDS = [PLUGIN_ID, ...PLUGIN_LEGACY_IDS];
 /** 插件自身发布版本（与 dsh-remote 根包同步递增）。 */
-const PLUGIN_VERSION = "0.6.0-beta.11";
+const PLUGIN_VERSION = "0.6.0";
 const UPDATE_LOG = ".dsh-update.log";
 const UPDATE_MARKER = ".dsh-update-running";
 
@@ -1382,7 +1392,11 @@ function registerRoutes(ctx, relayDir) {
       handler: async (req, res) => {
         const body = await readJsonBody(req);
         if (body.__parseError) return sendJson(res, 400, { ok: false, error: "JSON 解析失败" });
-        const phone = String(body.phone ?? "").trim();
+        let phone = String(body.phone ?? "").trim();
+        if (!phone) {
+          // 隐私审计(2026-09):账号卡修改密码不再下发明文手机号——服务端以本机账号为准
+          phone = String((loadConfig(relayDir).phone) || "").trim();
+        }
         if (!phone) return sendJson(res, 400, { ok: false, error: "手机号必填" });
         const r = await relayFetch(relayDir, "/api/sms-code", {
           method: "POST", headers: { "content-type": "application/json" },
@@ -1399,7 +1413,11 @@ function registerRoutes(ctx, relayDir) {
         // 成功 → 企业端使该账号全部授权设备/会话失效（含 E2EE 派生口令）。
         const body = await readJsonBody(req);
         if (body.__parseError) return sendJson(res, 400, { ok: false, error: "JSON 解析失败" });
-        const phone = String(body.phone ?? "").trim();
+        let phone = String(body.phone ?? "").trim();
+        if (!phone) {
+          // 隐私审计(2026-09):同上,账号卡改密不传明文手机号,服务端回填本机账号
+          phone = String((loadConfig(relayDir).phone) || "").trim();
+        }
         const smsCode = String(body.sms_code ?? "").trim();
         const newPassword = String(body.new_password ?? body.password ?? "");
         if (!phone || !smsCode || !newPassword) return sendJson(res, 400, { ok: false, error: "手机号、短信验证码与新密码必填" });
@@ -1504,7 +1522,7 @@ function registerRoutes(ctx, relayDir) {
           feedbackUrl: api,
           reachable,
           deviceId: cfg.device_id || "",
-          phone: cfg.phone || "",
+          phone: maskPhone(cfg.phone || ""), // 隐私:浏览器端只见掩码(代理提交时服务端另附真号)
           // 登录态（已配置账号或自建密钥）→ 节点半自动附加 JWT，免图形验证码
           auth: cfg.local_key || (cfg.phone && cfg.password) ? "account" : "anonymous"
         });
