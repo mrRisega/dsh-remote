@@ -77,7 +77,7 @@ async function plantInstallation(tempHome, opts = {}) {
   return { relayDir, profile };
 }
 
-test("彻底卸载：配置目录整目录清空（含账号/密钥/固化运行时），不误伤 profile 其它条目与家目录其它数据", async () => {
+test("彻底卸载：配置目录整目录清空（含账号/密钥/固化运行时），不误伤 profile 其它条目与家目录其它数据", { skip: process.platform !== "darwin" }, async () => {
   const tempHome = await mkdtemp(path.join(os.tmpdir(), "dsh-ui-rt-"));
   const prevHome = process.env.HOME;
   process.env.HOME = tempHome;
@@ -220,7 +220,7 @@ test("DSH_RELAY_SKIP_SERVICE 开关：置位时即便存在自启动 plist 也�
   }
 });
 
-test("自然跳过（无开关）：HOME 有 plist 但服务未运行 → 删除 plist 但不发 launchctl bootout（PATH 假命令接管）", async () => {
+test("自然跳过（无开关）：HOME 有 plist 但服务未运行 → 删除 plist 但不发 launchctl bootout（PATH 假命令接管）", { skip: process.platform !== "darwin" }, async () => {
   const tempHome = await mkdtemp(path.join(os.tmpdir(), "dsh-ui-rt-natural-"));
   const prevHome = process.env.HOME;
   const prevPath = process.env.PATH;
