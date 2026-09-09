@@ -157,13 +157,15 @@ window.__ModuleLoader__.load({
     // 不用 fixed 悬浮层（会遮挡官方按钮）；改为在左侧主菜单的「设置」按钮上方克隆一行同款导航项：
     // 点击 = 打开 设置页 → 「远程访问」栏目；首次点击前该入口右上角带小红点（localStorage 一次）。
     var NAV_SEEN_KEY = "dsh-remote-nav-seen";
-    function clickTextNav(text) {
+    function clickTextNav(text, excludeId) {
       try {
         var nodes = document.querySelectorAll('button, [role="tab"], [role="menuitem"], [class*="navCell"], [class*="nav"], [class*="sidebar"] a, a');
         for (var i = 0; i < nodes.length; i++) {
           var el = nodes[i];
+          if (excludeId && el.id === excludeId) continue;
           var t = (el.textContent || "").trim();
-          if (t === text || t.indexOf(text) === 0) {
+          // 含匹配(标签常带 emoji 前缀,如“📱 远程访问”);排除自身入口防递归
+          if (t.indexOf(text) !== -1) {
             try { el.click(); return true; } catch (e) { /* 尝试下一个 */ }
           }
         }
@@ -171,11 +173,11 @@ window.__ModuleLoader__.load({
       return false;
     }
     function openRemoteSettings() {
-      if (clickTextNav("远程访问")) return; // 已在栏目内/可直接点到
+      if (clickTextNav("远程访问", "dru-nav-remote")) return; // 已在栏目内/直接点到(排除自身)
       if (clickTextNav("设置")) { /* 进入设置页后再轮询远程访问栏目 */ }
       var tries = 0;
       var iv = setInterval(function () {
-        if (clickTextNav("远程访问")) { clearInterval(iv); return; }
+        if (clickTextNav("远程访问", "dru-nav-remote")) { clearInterval(iv); return; }
         if (++tries > 40) clearInterval(iv);
       }, 150);
       if (typeof iv.unref === "function") iv.unref();
