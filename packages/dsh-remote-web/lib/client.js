@@ -335,6 +335,8 @@ window.__ModuleLoader__.load({
     }
 
     // ── 用户反馈模块：本地状态（thread 令牌 / 弹窗节流） ───────────────────
+    // 「我的反馈」双数据源：本地 dsh-feedback-threads(thread_token 凭据,匿名/本机未同步行)
+    // + 服务端 /api/feedback/mine(登录态账号历史,见 FeedbackCard loadMine/fbRows,合并去重展示)。
     var FB_THREADS_KEY = "dsh-feedback-threads";
     var FB_POPUP_KEY = "dsh-feedback-popup";
     var FB_POPUP_DELAY_MS = 60 * 60 * 1000;   // 安装/体验后至少 1 小时才弹窗(只弹一次)
@@ -400,8 +402,16 @@ window.__ModuleLoader__.load({
       var threadDataArr = useState(null); var threadData = threadDataArr[0]; var setThreadData = threadDataArr[1];
       var busyArr = useState(""); var busy = busyArr[0]; var setBusy = busyArr[1];
       var msgArr = useState(null); var fbMsg = msgArr[0]; var setFbMsg = msgArr[1];
+      // 账号历史（服务端 /feedback/mine 聚合列表）：null=未加载；登录态(SaaS 账号已配)打开「我的反馈」时拉取
+      var mineListArr = useState(null); var mineList = mineListArr[0]; var setMineList = mineListArr[1];
+      var mineErrArr = useState(false); var mineErr = mineErrArr[0]; var setMineErr = mineErrArr[1];
+      var mineBusyArr = useState(false); var mineBusy = mineBusyArr[0]; var setMineBusy = mineBusyArr[1];
 
       function setMsg(kind, text) { setFbMsg({ kind: kind, text: text }); }
+
+      // 登录态(SaaS 且账号已配)→ 打开「我的反馈」拉账号历史(/mine 需要 JWT,节点半在登录态自动附加);
+      // 自建/未登录(cfg.phone 为空)→ 仍走本地 thread_token,不发 /mine。
+      var fbAccount = !!(cfg && cfg.phone && fbAuth === "account");
 
       var loadCfg = useCallback(function () {
         api("/dsh-remote/feedback-config").then(function (b) {
@@ -413,18 +423,68 @@ window.__ModuleLoader__.load({
         }).catch(function (e) { setCfg({ reachable: false }); setMsg("warn", "反馈服务未连接：" + e.message); });
       }, []);
 
+      /** 服务端账号历史行（mine 列表含该 id）→ 单条打开/回复走服务端(节点半自动附 JWT),无需本地 thread_token。 */
+      function fbRowIsAccount(id) {
+        return !!(mineList && mineList.some(function (x) { return x.id === id; }));
+      }
+
       function loadThread(id) {
         var t = threads.filter(function (x) { return x.id === id; })[0];
-        if (!t) return;
+        // 账号历史行:不带 thread_token(登录态由节点半自动附账号 JWT,服务端按账号归属放行);
+        // 匿名/纯本地行:仍按原 thread_token 逻辑(带本地凭据访问)。
+        var accountRow = fbRowIsAccount(id);
+        if (!accountRow && !t) return;
         setBusy("thread:" + id);
-        fbApi("/feedback/" + id, { token: t.token }).then(function (b) {
+        fbApi("/feedback/" + id, accountRow ? {} : { token: t.token }).then(function (b) {
           setThreadData(b.feedback);
         }).catch(function (e) {
-          setMsg("err", "加载反馈详情失败：" + e.message);
+          if (e && e.status === 401) setMsg("err", "登录已过期，请退出后重新登录后再查看该反馈");
+          else setMsg("err", "加载反馈详情失败：" + (e && e.message));
         }).finally(function () { setBusy(""); });
       }
 
+      /** 登录态拉取账号历史(/feedback/mine,翻页参数可用;节点半在登录态自动附 JWT)。 */
+      function loadMine() {
+        if (!fbAccount) return;
+        setMineBusy(true); setMineErr(false);
+        fbApi("/feedback/mine?page=1&page_size=20").then(function (b) {
+          setMineList((b && b.items) || []);
+        }).catch(function (e) {
+          setMineErr(true);
+          var eb = e && e.body && e.body.error;
+          setMsg("err", e && e.status === 401
+            ? "账号登录已过期，请退出后重新登录，再查看账号全部历史"
+            : "账号历史拉取失败：" + ((eb && eb.message) || (e && e.message)) + "（本机记录仍可查看）");
+        }).finally(function () { setMineBusy(false); });
+      }
+
+      /** 合并展示列表：账号历史(服务端 mine,新→旧)在前；本机 thread_token 行去重后保留
+       *  （匿名/本机新增但服务端未聚合的行仍可见,打开继续走本地凭据）。 */
+      function fbRows() {
+        var out = [];
+        var seen = {};
+        (mineList || []).forEach(function (it) {
+          seen[it.id] = true;
+          out.push({
+            id: it.id, acct: true,
+            status: it.status || "", category: it.category || "", title: it.title || "",
+            created_at: it.created_at || 0, reply_count: it.reply_count || 0,
+          });
+        });
+        threads.slice().reverse().forEach(function (t) {
+          if (seen[t.id]) return;
+          seen[t.id] = true;
+          out.push({ id: t.id, acct: false, status: "", category: "", title: "", created_at: 0, reply_count: 0 });
+        });
+        return out;
+      }
+
       useEffect(function () { loadCfg(); }, [loadCfg]);
+      // 登录态打开「我的反馈」→ 拉账号历史;仅在未加载且非错误态自动触发(失败后点 tab 重试,不无限重试)
+      useEffect(function () {
+        if (tab === "mine" && fbAccount && mineList === null && !mineErr && !mineBusy) loadMine();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [tab, fbAccount, mineList === null, mineErr, mineBusy]);
 
       var doSubmit = function () {
         if (!fbContent.trim()) { setMsg("err", "请填写反馈内容"); return; }
@@ -441,6 +501,7 @@ window.__ModuleLoader__.load({
           .then(function (b) {
             fbRememberThread(b.feedback.id, b.thread_token);
             setThreads(fbLoadThreads());
+            if (fbAccount) setMineList(null); // 账号态提交成功 → 回「我的反馈」时重新拉取(含本条)
             setFbTitle(""); setFbContent(""); setContact("");
             setMsg("ok", "✅ 反馈已提交，可在「我的反馈」查看回复");
             setTab("mine");
@@ -458,9 +519,15 @@ window.__ModuleLoader__.load({
         var text = input ? input.value.trim() : "";
         if (!text) { setMsg("err", "请填写回复内容"); return; }
         var t = threads.filter(function (x) { return x.id === id; })[0];
-        if (!t) return;
+        var accountRow = fbRowIsAccount(id);
+        // 账号历史行:服务端回复(节点半自动附 JWT,无需本地 thread_token);本地/匿名行:带 thread_token 回复
+        var replyOpts = { method: "POST", body: JSON.stringify({ content: text }) };
+        if (!accountRow) {
+          if (!t) return;
+          replyOpts.token = t.token;
+        }
         setBusy("reply:" + id);
-        fbApi("/feedback/" + id + "/replies", { method: "POST", body: JSON.stringify({ content: text }), token: t.token })
+        fbApi("/feedback/" + id + "/replies", replyOpts)
           .then(function () {
             if (input) input.value = "";
             loadThread(id);
@@ -468,7 +535,8 @@ window.__ModuleLoader__.load({
           })
           .catch(function (e) {
             var errBody = e.body && e.body.error;
-            if (errBody && errBody.code === "rate_limited") setMsg("err", "今天回复次数已达上限，请明天再试");
+            if (e && e.status === 401) setMsg("err", "登录已过期，请重新登录后再回复");
+            else if (errBody && errBody.code === "rate_limited") setMsg("err", "今天回复次数已达上限，请明天再试");
             else setMsg("err", "回复失败：" + (errBody && errBody.message ? errBody.message : e.message));
           })
           .finally(function () { setBusy(""); });
@@ -480,11 +548,83 @@ window.__ModuleLoader__.load({
         if (id !== openId) loadThread(id);
       };
 
+      /** 「我的反馈」tab 内容：账号历史行直接用服务端字段渲染(状态/类别/标题/时间/回复数)，
+       *  并保留本机未同步的 thread_token 行；单条展开/回复由 loadThread/doReply 分流。 */
+      function renderMine() {
+        var rows = fbRows();
+        if (rows.length === 0) {
+          var emptyText = fbAccount
+            ? (mineBusy ? "正在加载账号历史…" : (mineErr ? "账号历史加载失败，点上方「我的反馈」tab 重试" : "暂无反馈，提交第一条？"))
+            : "还没有提交过反馈。" + (cfg && cfg.reachable === false ? "（反馈服务未连接）" : "登录手机号账号后，可在任意设备查看账号全部历史。");
+          return h("div", null,
+            h("div", { className: "dru-fb-empty" }, emptyText),
+            fbMsg && h("div", { className: "dru-msg dru-msg-" + fbMsg.kind }, fbMsg.text)
+          );
+        }
+        return h("div", null,
+          rows.map(function (r) {
+            var open = openId === r.id;
+            var td = open ? threadData : null;
+            var st = td ? td.status : r.status;
+            var cat = td ? td.category : r.category;
+            var titleTxt = td ? (td.title || "") : r.title;
+            var ts = td ? td.created_at : r.created_at;
+            var catLbl = (function () {
+              var c = FB_CATEGORIES.filter(function (x) { return x.value === cat; })[0];
+              return c ? c.label : (cat || "反馈");
+            })();
+            return h("div", { key: r.id, className: "dru-fb-item" },
+              h("div", { className: "dru-fb-item-head" },
+                fbStatusBadge(st || "open"),
+                h("span", { className: "dru-fb-cat" }, catLbl),
+                h("span", { className: "dru-fb-item-title" }, titleTxt || ("反馈 #" + r.id.slice(-6))),
+                h("span", { className: "dru-fb-item-time" },
+                  (ts ? new Date(ts).toLocaleString() : "") +
+                  (r.acct && !open && r.reply_count > 0 ? " · " + r.reply_count + " 条回复" : ""))
+              ),
+              open && td
+                ? h("div", null,
+                    h("div", { className: "dru-fb-item-content" }, td.content),
+                    td.replies.map(function (reply) {
+                      return h("div", { key: reply.id, className: "dru-fb-reply" },
+                        h("div", { className: "dru-fb-reply-row" },
+                          h("span", { className: "dru-fb-reply-who" + (reply.author === "user" ? " user" : "") }, reply.author === "admin" ? "管理员回复" : "我"),
+                          h("span", { className: "dru-fb-reply-text" }, reply.content)
+                        ),
+                        h("div", { className: "dru-fb-item-time" }, new Date(reply.created_at).toLocaleString())
+                      );
+                    }),
+                    h("div", { className: "dru-fb-reply" },
+                      h("textarea", { id: "dru-fb-reply-" + r.id, className: "dru-fb-reply-input", placeholder: "回复管理员…", maxLength: 2000 }),
+                      h("div", { style: { textAlign: "right", marginTop: 6 } },
+                        h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "", onClick: function () { doReply(r.id); } }, busy === "reply:" + r.id ? "发送中…" : "回复")
+                      )
+                    ),
+                    h("div", { className: "dru-fb-item-time", style: { textAlign: "right", marginTop: 8 } },
+                      h("button", { type: "button", className: "dru-btn dru-btn-ghost", style: { padding: "2px 10px", fontSize: 12 }, disabled: busy !== "", onClick: function () { loadThread(r.id); } }, "↻ 刷新"),
+                      " ",
+                      h("button", { type: "button", className: "dru-btn dru-btn-ghost", style: { padding: "2px 10px", fontSize: 12 }, onClick: function () { setOpenId(""); setThreadData(null); } }, "收起")
+                    )
+                  )
+                : h("div", { className: "dru-fb-item-time", style: { textAlign: "right" } },
+                    h("button", { type: "button", className: "dru-btn dru-btn-ghost", style: { padding: "2px 10px", fontSize: 12 }, disabled: busy !== "", onClick: function () { openThread(r.id); } }, open ? "收起" : "查看 / 回复"))
+            );
+          }),
+          mineBusy ? h("div", { className: "dru-hint", style: { marginTop: 6 } }, "账号历史同步中…") : null,
+          fbMsg && h("div", { className: "dru-msg dru-msg-" + fbMsg.kind }, fbMsg.text)
+        );
+      }
+
+      var mineRows = fbRows(); // 「我的反馈」展示行数：账号历史 + 本机未同步线程（合并去重后）
       return h("div", { className: "dru-card" },
         h("h3", null, "💬 用户反馈"),
         h("div", { className: "dru-fb-tabs" },
           h("div", { className: "dru-fb-tab" + (tab === "submit" ? " active" : ""), onClick: function () { setTab("submit"); setFbMsg(null); } }, "提交反馈"),
-          h("div", { className: "dru-fb-tab" + (tab === "mine" ? " active" : ""), onClick: function () { setTab("mine"); setFbMsg(null); setThreads(fbLoadThreads()); } }, "我的反馈" + (threads.length ? "(" + threads.length + ")" : ""))
+          h("div", { className: "dru-fb-tab" + (tab === "mine" ? " active" : ""), onClick: function () {
+            setTab("mine"); setFbMsg(null); setThreads(fbLoadThreads());
+            // 登录态(账号已配)打开「我的反馈」→ 拉取账号历史(合并展示,换设备/重装也能看到)
+            if (fbAccount && mineList === null) loadMine();
+          } }, "我的反馈" + (mineRows.length ? "(" + mineRows.length + ")" : ""))
         ),
         tab === "submit"
           ? h("div", null,
@@ -512,52 +652,7 @@ window.__ModuleLoader__.load({
               h("button", { type: "button", className: "dru-btn dru-btn-primary", style: { width: "100%" }, disabled: busy !== "", onClick: doSubmit }, busy === "submit" ? "提交中…" : "提交反馈"),
               fbMsg && h("div", { className: "dru-msg dru-msg-" + fbMsg.kind }, fbMsg.text)
             )
-          : h("div", null,
-              threads.length === 0
-                ? h("div", { className: "dru-fb-empty" }, "还没有提交过反馈。" + (cfg && cfg.reachable === false ? "（反馈服务未连接）" : ""))
-                : threads.slice().reverse().map(function (t) {
-                    var open = openId === t.id;
-                    var td = open ? threadData : null;
-                    return h("div", { key: t.id, className: "dru-fb-item" },
-                      h("div", { className: "dru-fb-item-head" },
-                        fbStatusBadge(td ? td.status : "open"),
-                        h("span", { className: "dru-fb-cat" }, (function () {
-                          var c = FB_CATEGORIES.filter(function (x) { return x.value === (td ? td.category : ""); })[0];
-                          return c ? c.label : (td ? td.category : "反馈");
-                        })()),
-                        h("span", { className: "dru-fb-item-title" }, td ? (td.title || "反馈") : "反馈 #" + t.id.slice(-6)),
-                        h("span", { className: "dru-fb-item-time" }, td ? new Date(td.created_at).toLocaleString() : "")
-                      ),
-                      open && td
-                        ? h("div", null,
-                            h("div", { className: "dru-fb-item-content" }, td.content),
-                            td.replies.map(function (r) {
-                              return h("div", { key: r.id, className: "dru-fb-reply" },
-                                h("div", { className: "dru-fb-reply-row" },
-                                  h("span", { className: "dru-fb-reply-who" + (r.author === "user" ? " user" : "") }, r.author === "admin" ? "管理员回复" : "我"),
-                                  h("span", { className: "dru-fb-reply-text" }, r.content)
-                                ),
-                                h("div", { className: "dru-fb-item-time" }, new Date(r.created_at).toLocaleString())
-                              );
-                            }),
-                            h("div", { className: "dru-fb-reply" },
-                              h("textarea", { id: "dru-fb-reply-" + t.id, className: "dru-fb-reply-input", placeholder: "回复管理员…", maxLength: 2000 }),
-                              h("div", { style: { textAlign: "right", marginTop: 6 } },
-                                h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "", onClick: function () { doReply(t.id); } }, busy === "reply:" + t.id ? "发送中…" : "回复")
-                              )
-                            ),
-                            h("div", { className: "dru-fb-item-time", style: { textAlign: "right", marginTop: 8 } },
-                              h("button", { type: "button", className: "dru-btn dru-btn-ghost", style: { padding: "2px 10px", fontSize: 12 }, disabled: busy !== "", onClick: function () { loadThread(t.id); } }, "↻ 刷新"),
-                              " ",
-                              h("button", { type: "button", className: "dru-btn dru-btn-ghost", style: { padding: "2px 10px", fontSize: 12 }, onClick: function () { setOpenId(""); setThreadData(null); } }, "收起")
-                            )
-                          )
-                        : h("div", { className: "dru-fb-item-time", style: { textAlign: "right" } },
-                            h("button", { type: "button", className: "dru-btn dru-btn-ghost", style: { padding: "2px 10px", fontSize: 12 }, disabled: busy !== "", onClick: function () { openThread(t.id); } }, open ? "收起" : "查看 / 回复"))
-                    );
-                  }),
-              fbMsg && h("div", { className: "dru-msg dru-msg-" + fbMsg.kind }, fbMsg.text)
-            )
+          : renderMine()
       );
     }
 
