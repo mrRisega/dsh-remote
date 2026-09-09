@@ -29,6 +29,19 @@ export function extractNativeWcCore(html = readNativeHtml()) {
   return html.slice(bodyStart, e).replace(/\n\s*$/, "");
 }
 
+// ---------- Phase-4 一次性交接单(DH-CORE)抽取 ----------
+export const HANDOVER_START = "/* ===DSH-E2EE-HANDOVER-CORE-START===";
+export const HANDOVER_END = "/* ===DSH-E2EE-HANDOVER-CORE-END===";
+
+/** 从 native.html 抽出交接单纯函数区间(文本;依赖 wcBytesToB64,需与 WC-CORE 同模块)。 */
+export function extractNativeHandoverCore(html = readNativeHtml()) {
+  const s = html.indexOf(HANDOVER_START);
+  const e = html.indexOf(HANDOVER_END);
+  if (s === -1 || e === -1 || e <= s) throw new Error("native.html 缺少 DSH-E2EE-HANDOVER-CORE 区间");
+  const bodyStart = html.indexOf("\n", s) + 1;
+  return html.slice(bodyStart, e).replace(/\n\s*$/, "");
+}
+
 export function readNativeHtml() {
   return readFileSync(NATIVE_HTML_PATH, "utf8");
 }
@@ -56,5 +69,24 @@ export async function loadNativeWcCore(html) {
   const b64 = Buffer.from(src, "utf8").toString("base64");
   const mod = await import("data:text/javascript;base64," + b64);
   cached = mod;
+  return mod;
+}
+
+export const HANDOVER_EXPORTS = [
+  "DSH_E2EE_HANDOVER_KEY",
+  "dshE2eeHandoverEncode",
+  "dshE2eeHandoverWrite",
+  "dshE2eeHandoverClear"
+];
+
+/** 抽取 native 交接单纯函数 + import(与 WC-CORE 同模块以复用 wcBytesToB64;幂等缓存)。 */
+export async function loadNativeHandoverCore(html) {
+  const core = extractNativeWcCore(html);
+  const handover = extractNativeHandoverCore(html);
+  const src =
+    core + "\n" + handover +
+    "\nexport { wcBytesToB64, " + HANDOVER_EXPORTS.join(", ") + " };\n";
+  const b64 = Buffer.from(src, "utf8").toString("base64");
+  const mod = await import("data:text/javascript;base64," + b64);
   return mod;
 }

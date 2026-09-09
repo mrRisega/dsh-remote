@@ -42,7 +42,8 @@ import {
   randomB64,
   randomHex
 } from "../e2ee-client.mjs";
-import { loadNativeWcCore } from "./lib-native-e2ee.mjs";
+import { loadNativeWcCore, loadNativeHandoverCore } from "./lib-native-e2ee.mjs";
+import { loadShimCore } from "./lib-e2ee-shim.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(HERE, "..", "..", "..");
@@ -95,11 +96,24 @@ const spawnProc = (name, args, env) => {
   return p;
 };
 
-// ---------- 本地上游:HTTP echo + /ws-echo ----------
+// ---------- 本地上游:HTTP echo + /ws-echo + 官方 html(/api/official 供 Phase-4 注入验证) ----------
+const OFFICIAL_BODY = `<!doctype html>
+<html lang="en">
+<head><base href="/"><script>window.__ModuleLoader__ = { mode: "queue" }</script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DeepSeek Harness</title></head>
+<body><div id="root"></div></body></html>`;
+
 const upstream = http.createServer((req, res) => {
   let body = "";
   req.on("data", (c) => { body += c; });
   req.on("end", () => {
+    // 官方 dsh web 特征 html(Phase-4:验证 e2ee 启用的桥端注入镜像 shim)
+    if (req.url === "/official" || req.url.startsWith("/api/official")) {
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      res.end(OFFICIAL_BODY);
+      return;
+    }
     res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
     res.end(JSON.stringify({ method: req.method, url: req.url, ct: req.headers["content-type"] || "", auth: req.headers["x-dsh-test-auth"] || "", body }));
   });
@@ -135,8 +149,19 @@ before(async () => {
   const [upPort, apiPort, routerPort] = [await freePort(), await freePort(), await freePort()];
   await new Promise((r) => mockApi.listen(apiPort, "127.0.0.1", r));
   await new Promise((r) => upstream.listen(upPort, "127.0.0.1", r));
-  upstreamWss = new WebSocketServer({ server: upstream, path: "/ws-echo" });
+  // 单一 noServer WSS + 按 pathname 手工路由(ws 库同一 http server 挂多个 WSS 会互相抢占同一 socket):
+  //   /ws-echo(既有 echo)、/api/events.mux(Phase-4 受保护前缀下的数据 WS echo)
+  upstreamWss = new WebSocketServer({ noServer: true });
   upstreamWss.on("connection", (ws) => ws.on("message", (d, isBinary) => ws.send(d, { binary: isBinary })));
+  upstream.on("upgrade", (req, socket, head) => {
+    let pathname = "";
+    try { pathname = new URL(req.url || "/", "http://x").pathname; } catch { /* keep "" */ }
+    if (pathname === "/ws-echo" || pathname === "/api/events.mux") {
+      upstreamWss.handleUpgrade(req, socket, head, (ws) => upstreamWss.emit("connection", ws, req));
+    } else {
+      try { socket.destroy(); } catch { /* ignore */ }
+    }
+  });
 
   spawnProc("router", [ROUTER_SRC], {
     DSH_ENTERPRISE_JWT_SECRET: SECRET,
@@ -518,3 +543,88 @@ test("Phase-3 手机 WebCrypto(native.html 抽取)解锁+HTTP+WS 与桥端互通
   }
 });
 
+
+// ============================================================
+// Phase-4 镜像页 shim:交接单重建会话 → 真实本地 router+bridge 互通端到端
+// (注入开关 / 灰度关闭零注入 / HTTP 信封 / WS 数据流,全部走真实进程)
+// ============================================================
+
+/**
+ * 把 'ws' 包实例适配成浏览器式 WebSocket 表面(供镜像 shim 的 SeE2eeWs 内层使用)。
+ * 浏览器中 Cookie 由同源自动携带;node 测试无 cookie jar → 适配器显式带 COOKIE 头。
+ */
+class WsPkgAdapter {
+  constructor(url) {
+    this.url = url;
+    this.readyState = 0;
+    this._ws = new WebSocket(url, { headers: { cookie: COOKIE } });
+    this.protocol = ""; this.extensions = ""; this.bufferedAmount = 0; this.binaryType = "blob";
+    const self = this;
+    this._ws.on("open", () => { self.readyState = 1; if (self.onopen) self.onopen({ type: "open", target: self }); });
+    this._ws.on("message", (d, isBinary) => { if (self.onmessage) self.onmessage({ type: "message", data: isBinary ? d : String(d), target: self }); });
+    this._ws.on("close", (code, reason) => {
+      self.readyState = 3;
+      if (self.onclose) self.onclose({ type: "close", code, reason: String(reason || ""), target: self });
+    });
+    this._ws.on("error", (e) => { if (self.onerror) self.onerror({ type: "error", message: e && e.message, target: self }); });
+  }
+  send(data) { this._ws.send(data); }
+  close(code, reason) { try { this._ws.close(code, reason); } catch (e) { /* ignore */ } }
+  addEventListener() {}
+  removeEventListener() {}
+}
+
+test("Phase-4 镜像页 shim:注入+交接单重建+HTTP 信封/WS 真实互通;灰度关闭零注入", async () => {
+  const [wcMod, shimMod, nativeHo] = await Promise.all([loadNativeWcCore(), loadShimCore(), loadNativeHandoverCore()]);
+  const params = await fetchE2eeParams(apiBase, signJwt({ sub: "42", phone: "13811110001", plan: "free" }));
+  assert.equal(params.enabled, true);
+  const mk = new Uint8Array(deriveMasterKey(PASSWORD, params.salt, params.kdf));
+  // 手机端(浏览器 WebCrypto)解锁 → 已与桥端探针互认的会话
+  const { client, sessId } = await wcUnlock(`${routerBase}/remote/${DEV_ON}/_e2ee/ctrl`, { mkBytes: mk, params });
+  assert.equal(sessId.length, 32);
+
+  // 1) 交接单:native.html 写入函数(抽取真实代码)→ 镜像 shim 读取函数重建会话(字节一致)
+  const handoverRaw = nativeHo.dshE2eeHandoverEncode(client);
+  assert.ok(handoverRaw, "native 应能编码交接单");
+  const sess = shimMod.seSessionOfHandover(handoverRaw);
+  assert.ok(sess, "镜像 shim 应能解码交接单重建会话");
+  assert.equal(sess.sessId, sessId);
+  assert.equal(Buffer.from(sess.shk).toString("hex"), Buffer.from(client.shk).toString("hex"));
+
+  // 2) 注入:e2ee 启用的桥端 → 官方 html 响应含 shim;e2ee 关闭桥端(灰度默认关)→ 零注入
+  const docRes = await fetch(`${routerBase}/remote/${DEV_ON}/official`, { headers: { cookie: COOKIE } });
+  assert.equal(docRes.status, 200);
+  const docHtml = await docRes.text();
+  assert.ok(docHtml.includes("data-dsh-e2ee-shim"), "e2ee 启用的桥端应注入镜像 shim");
+  assert.ok(docHtml.includes("dsh-e2ee-badge"));
+  assert.ok(docHtml.includes("data-dsh-mobile-adapter"), "mobile-adapter 照常注入");
+  const offHtml = await (await fetch(`${routerBase}/remote/${DEV_OFF}/official`, { headers: { cookie: COOKIE } })).text();
+  assert.ok(!offHtml.includes("data-dsh-e2ee-shim"), "e2ee 关闭(灰度关)桥端不注入 shim");
+  assert.ok(offHtml.includes("data-dsh-mobile-adapter"));
+
+  // 3) HTTP 信封:镜像 shim 的 fetch 包装 → 真实 router+bridge → 上游 html(桥内先注入后加密)
+  const ctx = { sess, origin: routerBase };
+  const wrappedRes = await shimMod.seFetchWrapper(
+    fetch.bind(globalThis), ctx,
+    `${routerBase}/remote/${DEV_ON}/api/official?phase4=1`,
+    { method: "GET", headers: { accept: "text/html", cookie: COOKIE } }
+  );
+  assert.equal(wrappedRes.status, 200);
+  const encBody = await wrappedRes.text();
+  assert.ok(encBody.includes("data-dsh-e2ee-shim"), "信封解密出的 html 应含注入 shim(mobile-adapter 同理)");
+  assert.ok(encBody.includes("data-dsh-mobile-adapter"));
+
+  // 4) 数据 WS:镜像 shim 的 SeE2eeWs 代理 → 真实 router+bridge → 上游 /api/events.mux 回显
+  const patchedWs = shimMod.seMakeWsCtor(WsPkgAdapter, { sess, origin: routerBase });
+  const dataWs = patchedWs(`${routerBase.replace(/^http/, "ws")}/remote/${DEV_ON}/api/events.mux?x=1`);
+  assert.ok(dataWs instanceof shimMod.SeE2eeWs, "受保护 /api 数据 WS 应套加密代理");
+  const echoed = await new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error("shim ws echo 超时")), 12000);
+    dataWs.onerror = (e) => { clearTimeout(t); reject(new Error("shim ws error: " + ((e && e.message) || ""))); };
+    dataWs.onmessage = (ev) => { clearTimeout(t); resolve(ev.data); };
+    dataWs.onopen = () => dataWs.send("ping-shim-phase4-你好");
+    dataWs.onclose = (ev) => { if (!ev || ev.code !== 1000) { clearTimeout(t); reject(new Error("shim ws 提前关闭 code=" + (ev && ev.code) + " reason=" + (ev && ev.reason))); } };
+  });
+  assert.equal(echoed, "ping-shim-phase4-你好");
+  try { dataWs.close(1000); } catch { /* ignore */ }
+});
