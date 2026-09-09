@@ -100,3 +100,25 @@ test("maybeInjectMobileAdapter:非 html / 空 body / 非 UTF-8 原样", () => {
 test("适配层文本不含口令类敏感标记(仅结构提示)", () => {
   assert.ok(!/password|secret|token\s*=/i.test(mod.ADAPTER_TAG + "")); // ADAPTER_TAG 只是 id 常量
 });
+
+test("fix2:设置区用精确类+小字号,浮层不再持久 will-change,鲸鱼协同 JS 载荷存在", () => {
+  const r = injectMobileAdapter(OFFICIAL_HTML);
+  const css = r.html.slice(r.html.indexOf('<style id="dsh-mobile-adapter-css"'), r.html.indexOf("</style>"));
+  const js = r.html.slice(r.html.indexOf('<script id="dsh-mobile-adapter-js"'));
+  // 设置面板:全屏/精确类/顶部 tab 字号 ≤13px/内容拉满
+  assert.match(css, /\[class~="VOzbGW_overlay"\]/);
+  assert.match(css, /\[class~="VOzbGW_panel"\]/);
+  assert.match(css, /\[class~="VOzbGW_navCell"\]/);
+  assert.match(css, /font-size:\s*13px\s*!important/);
+  assert.match(css, /\[class~="VOzbGW_options"\]/);
+  // 浮层规则不应再携带会被 fixed 弹层当作 containing block 的持久 will-change(见文件注释)
+  assert.ok(!/(^|})\s*will-change:\s*transform\s*;/m.test(css), "CSS 规则不应再有 will-change: transform 声明(注释里的字样不算)");
+  // 鲸鱼挂件(dsh-whale-widget)窄屏协同载荷:锚点清理 + touch 拖动护栏 + 卡左上兜底
+  assert.match(js, /dshw-pos/);
+  assert.match(js, /\.dshwv-root/);
+  assert.match(js, /touchstart/);
+  assert.match(js, /whaleUnstickIfStuck|whaleNativeDragToBottomRight/);
+  // 上述 CSS/JS 都只能落在 ≤820px 运行时:CSS 规则整体在 media 内;JS 执行由 NARROW() 把关
+  assert.ok(css.indexOf("@media (max-width: 820px)") !== -1);
+  assert.match(js, /NARROW\s*=\s*\(\)\s*=>\s*window\.innerWidth\s*<=\s*820/);
+});

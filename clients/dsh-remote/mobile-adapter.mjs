@@ -15,11 +15,27 @@
  *     1) ≤820px 强制三列轨宽为 0 / 1fr / 0,内容区全宽;侧栏/详情改造成离屏浮层(off-canvas),
  *        顶部放一个小鲸鱼/菜单按钮,点击 = 程序化点击官方 toggle(aria-label 打开/关闭侧边栏),
  *        不复制官方状态,数据属性仍是唯一真源;
- *     2) 设置面板(实测 .VOzbGW_overlay 是 z-index:1000 的 fixed 全屏,panel 内 nav 188px +
- *        content 154px 左右并排)→ 手机改为上下堆叠:顶部固定 tab 行(横向滚动),下面全高滚动内容;
+ *     2) 设置面板(实测挂载在侧栏 .hHd-Xa_settingsArea 子树里的 fixed 弹层;panel 内
+ *        nav 188px + content 154px 左右并排)→ 手机改为上下堆叠:顶部 tab 行(横向滚动)置顶,
+ *        下方内容区全高滚动。fix2:官方模块 CSS 运行期才注入 head(晚于本 <style>),普通规则
+ *        被官方同特异性后加载规则覆盖(nav 是 <nav>,圆1 的 div.VOzbGW_nav 从未命中;overlay
+ *        被官方 min(800px,84vw) 钉成左靠 328px 抽屉感)→ 本版设置区全部用 [class~=...] 精确类
+ *        + 几何 !important;并把侧栏/详情浮层的 will-change:transform 去掉(transform 祖先会让
+ *        侧栏子树里的 fixed 设置弹层以侧栏为 containing block,被压到 84vw——fix2 设置窄的根因);
+ *        顶部 tab 字号 ≤13px、行宽拉满可横向滚动,当前项自动滚入可视;
  *     3) 输入控件字号 ≥16px 防 iOS 聚焦缩放;hero 的工作区/模式座位行允许换行,防 212px 座位
  *        右缘伸出视口(实测 cubgiG_seat right=409 > 390);
- *     4) html/body overflow-x 防护、safe-area inset、触控目标友好;配色只用官方 CSS 变量。
+ *     4) html/body overflow-x 防护、safe-area inset、触控目标友好;配色只用官方 CSS 变量;
+ *     5) 鲸鱼余额挂件(用户另装的第三方 dsh-whale-widget,浮动 .dshwv-root,z-index:9999):
+ *        fix2 实测它的窄屏“卡左上角盖标题”与“拖不动”均为其自身缺陷的放大:
+ *        - 拖不动:触屏上 pointer 拖拽被页面滚动抢占(pointercancel,坐标归 0 → 挂件被“瞬移”),
+ *          鼠标路径正常 → 适配层在鲸鱼实体像素的 touchstart 上 preventDefault(仅 ≤820),
+ *          让浏览器不抢滚动,挂件原生拖拽在手机上恢复;
+ *        - 默认位置:它把锚点记忆存 localStorage(dshw-pos),一旦曾落在「左+上」就每次载入
+ *          盖住左上会话标题 → 适配层在页面解析期(挂件 widget.js 是 defer,晚于本脚本)清掉
+ *          left+top 陈旧锚点,默认回到右下;再兜底一次“卡左上角”检测(合成鼠标事件走它自己
+ *          的拖拽收尾,state/localStorage 由它自洽)。
+ *        仅对 ≤820 且锚点命中 left+top 干预;透明区点击/滚动仍穿透,与桌面语义一致。
  *
  * 宿主特征门(防误注入其它 html):
  *   - 注入前:content-type 必须 text/html 且含 </head> 且原文含官方标记
@@ -55,7 +71,10 @@ const STYLE = `
   /* 侧栏/详情已移出 grid 流(fixed),唯一在流的中心列须显式落到 1fr 轨道,否则自动放置会被塞进 0px 轨 */
   div.pI_x6G_centerCol, div.dsh-ma-center { grid-column: 2; min-width: 0; width: auto; }
 
-  /* --- 侧栏 / 详情:离屏浮层(off-canvas),展开态滑入 --- */
+  /* --- 侧栏 / 详情:离屏浮层(off-canvas),展开态滑入 ---
+     注意:不能给浮层设 will-change:transform / 持久 transform —— 官方把设置面板等
+     fixed 弹层的 DOM 挂在侧栏子树里,transform 祖先会成为 fixed 的 containing block,
+     导致弹层被限制在 84vw 侧栏宽内(实测 328px“抽屉感”,fix2 根因之一)。 */
   div.pI_x6G_sidebarCol, div.dsh-ma-sidebar {
     position: fixed; left: 0; top: 0; bottom: 0; margin: 0;
     width: min(84vw, 340px); max-width: 92vw;
@@ -64,7 +83,6 @@ const STYLE = `
     box-shadow: 0 10px 44px rgba(0,0,0,.26);
     transform: translateX(-103%);
     transition: transform .22s var(--ds-ease-in-out, ease);
-    will-change: transform;
   }
   html.dsh-ma-sidebar-open div.pI_x6G_sidebarCol,
   html.dsh-ma-sidebar-open div.dsh-ma-sidebar { transform: none; }
@@ -77,7 +95,6 @@ const STYLE = `
     box-shadow: 0 10px 44px rgba(0,0,0,.26);
     transform: translateX(103%);
     transition: transform .22s var(--ds-ease-in-out, ease);
-    will-change: transform;
   }
   html.dsh-ma-details-open div.pI_x6G_detailsCol,
   html.dsh-ma-details-open div.dsh-ma-details { transform: none; }
@@ -121,38 +138,81 @@ const STYLE = `
   div.wSkVaW_heroWorkspaceRow > * { max-width: calc(100vw - 32px); }
   div.wSkVaW_composerStack, div.wSkVaW_composerHero, div.uV2eYG_card { min-width: 0; }
 
-  /* --- 设置面板(实测 .VOzbGW_overlay fixed z-index:1000,panel 内 nav 188 + content 154 并排)
-        手机改为上下堆叠:顶部 tab 行固定/横向滚动,下方内容区最大化滚动 --- */
-  div.VOzbGW_overlay { justify-content: center; align-items: stretch; }
-  div.VOzbGW_panel {
-    width: 100%; max-width: 100%;
-    height: 100%; max-height: 100%;
-    border-radius: 0;
-    flex-direction: column;
-  }
-  div.VOzbGW_nav {
+  /* --- 设置面板(fix2 硬化版;实测 390×844:官方模块 CSS 运行期注入在适配层之后,
+        普通规则会被官方后加载样式覆盖——nav 是 <nav> 而非 div,圆1 的 div.VOzbGW_nav
+        从未命中;overlay 被官方宽度 min(800px,84vw) 钉在左侧 328px,呈“抽屉感”。
+        故本版全部用 [class~=...] 精确类 + 几何 !important,官方前缀变化则整段静默失效) --- */
+  [class~="VOzbGW_overlay"] {
+    position: fixed !important;
+    inset: 0 !important;
+    width: auto !important; max-width: none !important;
+    height: auto !important; max-height: none !important;
+    margin: 0 !important; padding: 0 !important;
+    border-radius: 0 !important;
     box-sizing: border-box;
-    width: 100% !important; height: auto; flex: none;
-    flex-direction: row; align-items: center;
-    gap: 8px; padding: 8px 10px 4px;
-    overflow-x: auto; overflow-y: hidden;
+    justify-content: center; align-items: stretch;
   }
-  div.VOzbGW_navTitle { flex: none; }
-  div.VOzbGW_navList {
+  [class~="VOzbGW_panel"] {
+    box-sizing: border-box;
+    width: 100% !important; max-width: 100% !important;
+    height: 100% !important; max-height: 100% !important;
+    margin: 0 !important; border-radius: 0 !important;
+    flex-direction: column !important;
+  }
+  /* 顶部 tab 行:整行铺满,字号调小(≤13px),横向可滚动 */
+  [class~="VOzbGW_nav"] {
+    box-sizing: border-box;
+    flex: none;
+    width: 100% !important;
+    flex-direction: row !important;
+    align-items: center;
+    gap: 4px;
+    padding: max(4px, env(safe-area-inset-top)) 4px 0;
+    overflow: visible;
+  }
+  [class~="VOzbGW_navTitle"] {
+    flex: none;
+    font-size: 13px !important; line-height: 1.2;
+    padding: 0 4px 0 8px;
+    white-space: nowrap;
+  }
+  [class~="VOzbGW_navList"] {
     box-sizing: border-box;
     flex: 1 1 auto; min-width: 0;
     flex-direction: row !important;
-    gap: 6px; overflow-x: auto; overflow-y: hidden;
-    padding-bottom: 2px;
+    gap: 4px;
+    overflow-x: auto; overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    padding: 0 0 6px;
   }
-  div.VOzbGW_navList > button, button.VOzbGW_navCell {
-    flex: none; min-width: max-content; padding: 10px 14px;
+  [class~="VOzbGW_navList"]::-webkit-scrollbar { display: none; }
+  [class~="VOzbGW_navCell"] {
+    flex: none; min-width: max-content;
+    box-sizing: border-box;
+    font-size: 13px !important;
+    height: 32px !important;
+    padding: 0 12px !important;
   }
-  div.VOzbGW_content { width: 100% !important; min-width: 0; flex: 1 1 auto; min-height: 0; }
-  div.VOzbGW_options {
+  /* 内容区:全宽拉满,收敛内边距,最大化有效宽度 */
+  [class~="VOzbGW_content"] {
+    box-sizing: border-box;
+    width: 100% !important; max-width: none !important;
+    flex: 1 1 auto; min-width: 0; min-height: 0;
+  }
+  [class~="VOzbGW_header"] {
+    box-sizing: border-box;
+    flex: none;
+    min-height: 40px;
+    padding: 6px 8px 4px 14px !important;
+    align-items: center;
+  }
+  [class~="VOzbGW_close"] { width: 32px; height: 32px; }
+  [class~="VOzbGW_options"] {
+    box-sizing: border-box;
     flex: 1 1 auto; min-height: 0; overflow-y: auto;
     -webkit-overflow-scrolling: touch;
-    padding-bottom: env(safe-area-inset-bottom);
+    padding: 2px 14px calc(14px + env(safe-area-inset-bottom)) !important;
   }
 }
 
@@ -167,6 +227,192 @@ const SCRIPT = `(() => {
     const HOSTISH = () =>
       HOST_RE.test(document.documentElement.outerHTML.slice(0, 200000)) ||
       !!document.querySelector("[data-shell-overlay], [data-sidebar-collapsed], [data-details-collapsed]");
+
+    /* —— 鲸鱼余额挂件(dsh-whale-widget,第三方插件的浮动组件)窄屏协同 ——
+       若挂件记忆的锚点是「左+上」(实测会盖住左上角会话标题/左上菜单按钮),在页面解析期
+       (鲸鱼 widget.js 是 defer 脚本,一定晚于本脚本执行)清掉该陈旧锚点 → 挂件回到自身
+       默认右下角。仅窄屏 & 仅命中 left+top 组合,不影响其它自定义位置。 */
+    try {
+      if (window.innerWidth <= 820 && window.localStorage) {
+        const rawPos = window.localStorage.getItem("dshw-pos");
+        if (rawPos) {
+          const pos = JSON.parse(rawPos);
+          if (pos && pos.hAnchor === "left" && pos.vAnchor === "top") {
+            window.localStorage.removeItem("dshw-pos");
+          }
+        }
+      }
+    } catch (e3) { /* 私有模式/配额等:忽略 */ }
+
+    /* ================= 鲸鱼挂件手机辅助(仅 ≤820 生效;挂件类名 .dshwv-* 稳定) ========= */
+    let whaleGuardsOn = false;
+    let whaleHitMap = null;
+    let whaleUnstuckDone = false;
+
+    const WHALE_IMG = () => document.querySelector(".dshwv-img");
+    const WHALE_ROOT = () => document.querySelector(".dshwv-root");
+
+    /* 命中测试与挂件自身一致:鲸鱼图按 610×610 采样 alpha>10;贴左(镜像)时水平翻转。 */
+    function whaleBodyAt(x, y) {
+      const img = WHALE_IMG();
+      const root = WHALE_ROOT();
+      if (!img || !root) return false;
+      const flip = root.classList.contains("dshwv-left");
+      const r = img.getBoundingClientRect();
+      if (!r || r.width <= 0 || r.height <= 0) return false;
+      const lx0 = ((x - r.left) / r.width) * 610;
+      const ly0 = ((y - r.top) / r.height) * 610;
+      if (lx0 < 0 || ly0 < 0 || lx0 >= 610 || ly0 >= 610) return false;
+      const key = img.currentSrc || img.src || "";
+      if (!whaleHitMap || whaleHitMap.key !== key) {
+        if (!img.complete || !img.naturalWidth || img.naturalWidth === 0) return false; /* 图未就绪→不挡 */
+        try {
+          const cv = document.createElement("canvas");
+          cv.width = 610; cv.height = 610;
+          const ctx = cv.getContext("2d");
+          if (!ctx) return false;
+          ctx.drawImage(img, 0, 0, 610, 610);
+          whaleHitMap = { key: key, data: ctx.getImageData(0, 0, 610, 610).data };
+        } catch (e4) { whaleHitMap = null; return false; }
+      }
+      const lx = flip ? 610 - lx0 : lx0;
+      const ix = Math.min(609, Math.max(0, Math.floor(lx)));
+      const iy = Math.min(609, Math.max(0, Math.floor(ly0)));
+      return whaleHitMap.data[(iy * 610 + ix) * 4 + 3] > 10;
+    }
+
+    /* 手机上挂件自身拖拽被滚动抢占:触摸点在鲸鱼实体上时浏览器默认滚动 → pointercancel,
+       挂件 pointermove 收不到且把它“瞬移”到取消点(实测拖到左上角)。鼠标路径无此问题。
+       在 document capture 阶段对鲸鱼实体像素的 touchstart preventDefault → 浏览器不抢滚动,
+       挂件原生的 pointer 拖拽在触屏上随之恢复;透明区仍穿透(与桌面一致)。仅窄屏注册。 */
+    function onWhaleTouchStart(ev) {
+      try {
+        if (!NARROW()) return;
+        const t = ev.touches && ev.touches[0];
+        if (!t) return;
+        const tg = ev.target;
+        if (tg && tg.closest && tg.closest(".dshwv-menu, .dshwv-menu-btn, .dshwv-bubble")) return;
+        if (whaleBodyAt(t.clientX, t.clientY)) ev.preventDefault();
+      } catch (e5) { /* 忽略 */ }
+    }
+
+    function whaleHookInit() {
+      if (whaleGuardsOn || !NARROW() || !WHALE_ROOT()) return;
+      whaleGuardsOn = true;
+      try { document.addEventListener("touchstart", onWhaleTouchStart, { capture: true, passive: false }); } catch (e6) {}
+      /* 兜底:极端时序下挂件若仍以 (0,0) 卡在左上(如解析期清锚点被竞态错过),settle 完再扶正一次 */
+      [1000, 3500].forEach(function (ms) {
+        setTimeout(function () { try { whaleUnstickIfStuck(); } catch (e7) {} }, ms);
+      });
+    }
+
+    function safeInsetSides() {
+      const ins = { right: 0, bottom: 0 };
+      try {
+        const p = document.createElement("div");
+        p.style.cssText = "position:fixed;top:0;left:0;width:10px;height:10px;visibility:hidden;pointer-events:none";
+        document.body.appendChild(p);
+        p.style.bottom = "env(safe-area-inset-bottom, 0px)";
+        p.style.top = "auto"; p.style.left = "0px"; p.style.right = "auto";
+        let r = p.getBoundingClientRect();
+        ins.bottom = Math.max(0, Math.round(window.innerHeight - r.top - 10));
+        p.style.bottom = "auto"; p.style.top = "0px";
+        p.style.right = "env(safe-area-inset-right, 0px)"; p.style.left = "auto";
+        r = p.getBoundingClientRect();
+        ins.right = Math.max(0, Math.round(window.innerWidth - r.left - 10));
+        p.remove();
+      } catch (e8) { /* 忽略 */ }
+      return ins;
+    }
+
+    function whaleBodyPoint() {
+      const img = WHALE_IMG();
+      if (!img) return null;
+      const r = img.getBoundingClientRect();
+      if (!r || r.width <= 0 || r.height <= 0) return null;
+      const cands = [[0.5, 0.5], [0.62, 0.64], [0.5, 0.72], [0.72, 0.6], [0.35, 0.58], [0.8, 0.68]];
+      for (let i = 0; i < cands.length; i++) {
+        const x = r.left + cands[i][0] * r.width;
+        const y = r.top + cands[i][1] * r.height;
+        if (whaleBodyAt(x, y)) return { x: Math.round(x), y: Math.round(y) };
+      }
+      return { x: Math.round(r.left + r.width * 0.62), y: Math.round(r.top + r.height * 0.66) };
+    }
+
+    function dispatchWhalePointer(type, x, y) {
+      try {
+        document.dispatchEvent(new PointerEvent(type, {
+          bubbles: true, cancelable: true, composed: true, pointerType: "mouse",
+          pointerId: 61001, isPrimary: true,
+          button: type === "pointerup" ? -1 : 0,
+          buttons: type === "pointerup" ? 0 : 1,
+          clientX: x, clientY: y
+        }));
+      } catch (e9) { /* 不支持 PointerEvent 的环境:跳过 */ }
+    }
+
+    /* 走挂件自己(鼠标路径)的拖拽把它送回右下:state/localStorage 全部由挂件收尾,我们只发合成事件。 */
+    function whaleNativeDragToBottomRight() {
+      const root = WHALE_ROOT();
+      if (!root || root.classList.contains("dshwv-dragging")) return false;
+      const start = whaleBodyPoint();
+      if (!start) return false;
+      const rect = root.getBoundingClientRect();
+      const w = rect.width || 122;
+      const h = rect.height || 122;
+      const ins = safeInsetSides();
+      const cx = window.innerWidth - w / 2 - Math.max(ins.right, 10);
+      const cy = window.innerHeight - h / 2 - Math.max(ins.bottom, 10);
+      if (cx < 0 || cy < 0 || cx < window.innerWidth * 0.5 || cy < window.innerHeight * 0.5) return false;
+      dispatchWhalePointer("pointerdown", start.x, start.y);
+      let started = false;
+      try { started = root.classList.contains("dshwv-dragging"); } catch (e10) {}
+      if (!started) { try { dispatchWhalePointer("pointerup", start.x, start.y); } catch (e11) {} return false; }
+      const N = 14;
+      for (let i = 1; i <= N; i++) {
+        const x = Math.round(start.x + ((cx - start.x) * i) / N);
+        const y = Math.round(start.y + ((cy - start.y) * i) / N);
+        dispatchWhalePointer("pointermove", x, y);
+      }
+      dispatchWhalePointer("pointerup", cx, cy);
+      return true;
+    }
+
+    function whaleUnstickIfStuck() {
+      if (!NARROW() || whaleUnstuckDone) return;
+      const root = WHALE_ROOT();
+      if (!root || root.classList.contains("dshwv-dragging")) return;
+      const rect = root.getBoundingClientRect();
+      if (rect.top > 20 || rect.left > 20) return; /* 只扶“真卡左上角”的,用户自己放的位置不动 */
+      whaleUnstuckDone = true;
+      try { if (window.localStorage) window.localStorage.removeItem("dshw-pos"); } catch (e12) {}
+      whaleNativeDragToBottomRight();
+    }
+
+    /* 设置面板打开时,把当前 tab 滚进横向可视区(顶部 tab 行手机横向滚动) */
+    let settingsWatchOn = false;
+    let settingsTick = 0;
+    function scrollActiveSettingsTab() {
+      const act = document.querySelector(
+        '[class~="VOzbGW_navCell"].VOzbGW_active, [class~="VOzbGW_navCell"][aria-current="true"]'
+      );
+      if (act && act.scrollIntoView) {
+        try { act.scrollIntoView({ block: "nearest", inline: "nearest" }); } catch (e13) {
+          try { act.scrollIntoView(); } catch (e14) {}
+        }
+      }
+    }
+    function watchSettings() {
+      if (settingsWatchOn || !NARROW()) return;
+      settingsWatchOn = true;
+      try {
+        const ob = new MutationObserver(function () {
+          clearTimeout(settingsTick);
+          settingsTick = setTimeout(function () { if (NARROW()) scrollActiveSettingsTab(); }, 140);
+        });
+        ob.observe(document.body, { childList: true, subtree: true });
+      } catch (e15) {}
+    }
 
     let done = false;
     const boot = () => {
@@ -231,11 +477,15 @@ const SCRIPT = `(() => {
         new MutationObserver(sync).observe(frame, { attributes: true, attributeFilter: ["data-sidebar-collapsed", "data-details-collapsed"] });
       } catch (e2) { /* 退化:仅在下次 boot 同步 */ }
       sync();
+      whaleHookInit();
+      watchSettings();
     };
 
     if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot); else boot();
-    /* 官方模块系统异步挂载 UI,晚一点再补几次(幂等,done 守卫) */
-    [700, 1600, 3200, 7000, 12000].forEach((ms) => setTimeout(boot, ms));
+    /* 官方模块系统异步挂载 UI,晚一点再补几次(幂等,done 守卫);同时等鲸鱼/设置弹层就位 */
+    [700, 1600, 3200, 7000, 12000].forEach((ms) =>
+      setTimeout(() => { try { boot(); whaleHookInit(); watchSettings(); } catch (e) { /* 幂等重试 */ } }, ms)
+    );
   } catch (e) { if (window.console) console.warn("[dsh-mobile-adapter]", e && e.message); }
 })();`;
 
