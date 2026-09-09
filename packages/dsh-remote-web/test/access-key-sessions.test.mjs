@@ -1,5 +1,7 @@
 // 插件 node 半新增代理回归：/dsh-remote/access-key | mobile-sessions | mobile-sessions/revoke
-// （企业端 E1 契约：POST /api/auth-key、POST /api/mobile-sessions、POST /api/mobile-sessions/:id/revoke，Bearer device-login JWT）
+// | mobile-sessions/delete | mobile-sessions/purge
+// （企业端 E1 契约：POST /api/auth-key、GET /api/mobile-sessions、POST /api/mobile-sessions/:id/revoke、
+//  DELETE /api/mobile-sessions/:id、POST /api/mobile-sessions/purge，Bearer device-login JWT）
 // 覆盖：Bearer 透传、字段扁平化、未登录 401、qr 缺失容错、上游错误透传。
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -41,6 +43,9 @@ function startFakeRelay(opts = {}) {
     }
     if (req.method === "POST" && url.pathname === "/api/mobile-sessions/ms_1/revoke") return send(200, { ok: true });
     if (req.method === "POST" && url.pathname === "/api/mobile-sessions/ghost/revoke") return send(404, { error: { message: "not_found" } });
+    if (req.method === "DELETE" && url.pathname === "/api/mobile-sessions/ms_1") return send(200, { ok: true });
+    if (req.method === "DELETE" && url.pathname === "/api/mobile-sessions/ghost") return send(404, { error: { message: "not_found" } });
+    if (req.method === "POST" && url.pathname === "/api/mobile-sessions/purge") return send(200, { ok: true, removed: 2 });
     send(404, { error: { code: "not_found" } });
   });
   return new Promise((resolve) => srv.listen(0, "127.0.0.1", () => resolve({ srv, seen, port: srv.address().port })));
@@ -155,7 +160,66 @@ test("mobile-sessions/revoke 路由：body {id} 转发到 /api/mobile-sessions/:
   }
 });
 
-test("未登录（无账号配置）→ 三条路由统一 401 提示登录，不请求企业端", async () => {
+test("mobile-sessions/delete 路由：DELETE body {id} 转发到企业端 DELETE /api/mobile-sessions/:id（拉黑 jti）", async () => {
+  const relay = await startFakeRelay();
+  const { host, base, tempDir } = await bootRelay(relay.port);
+  try {
+    const r = await (await fetch(`${base}/dsh-remote/mobile-sessions/delete`, {
+      method: "DELETE",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id: "ms_1" }),
+    })).json();
+    assert.equal(r.ok, true);
+    const up = relay.seen.find((s) => s.path === "/api/mobile-sessions/ms_1" && s.method === "DELETE");
+    assert.ok(up, "应转发到企业端 DELETE /api/mobile-sessions/ms_1");
+    assert.equal(up.authorization, "Bearer jwt-abc");
+
+    // 缺 id → 400；不存在的会话 → 透传 404 文案
+    const bad = await (await fetch(`${base}/dsh-remote/mobile-sessions/delete`, {
+      method: "DELETE",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    })).json();
+    assert.equal(bad.ok, false);
+    assert.match(String(bad.error), /id/);
+
+    const ghost = await (await fetch(`${base}/dsh-remote/mobile-sessions/delete`, {
+      method: "DELETE",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id: "ghost" }),
+    })).json();
+    assert.equal(ghost.ok, false);
+    assert.match(String(ghost.error), /not_found/);
+  } finally {
+    host.close();
+    relay.srv.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("mobile-sessions/purge 路由：POST → 企业端 POST /api/mobile-sessions/purge，removed 透传", async () => {
+  const relay = await startFakeRelay();
+  const { host, base, tempDir } = await bootRelay(relay.port);
+  try {
+    const r = await (await fetch(`${base}/dsh-remote/mobile-sessions/purge`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    })).json();
+    assert.equal(r.ok, true);
+    assert.equal(r.removed, 2, "企业端返回的 removed 清理条数应透传");
+    const up = relay.seen.find((s) => s.path === "/api/mobile-sessions/purge");
+    assert.ok(up, "应转发到 /api/mobile-sessions/purge");
+    assert.equal(up.method, "POST");
+    assert.equal(up.authorization, "Bearer jwt-abc");
+  } finally {
+    host.close();
+    relay.srv.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("未登录（无账号配置）→ 五条路由统一 401 提示登录，不请求企业端", async () => {
   const relay = await startFakeRelay();
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "dsh-aks-401-"));
   await writeFile(path.join(tempDir, ".dsh-config.json"), JSON.stringify({ api_url: `http://127.0.0.1:${relay.port}` }));
@@ -179,13 +243,19 @@ test("未登录（无账号配置）→ 三条路由统一 401 提示登录，�
       assert.equal((await (await fetch(`${base}${p}`, { method }))).status, 401, `${p} 应返回 401`);
       assert.match(String(r.error), /尚未登录/);
     }
-    const rev = await (await fetch(`${base}/dsh-remote/mobile-sessions/revoke`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ id: "ms_1" }),
-    })).json();
-    assert.equal(rev.ok, false);
-    assert.match(String(rev.error), /尚未登录/);
+    for (const [method, p] of [
+      ["POST", "/dsh-remote/mobile-sessions/revoke"],
+      ["DELETE", "/dsh-remote/mobile-sessions/delete"],
+      ["POST", "/dsh-remote/mobile-sessions/purge"],
+    ]) {
+      const r = await (await fetch(`${base}${p}`, {
+        method,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ id: "ms_1" }),
+      })).json();
+      assert.equal(r.ok, false);
+      assert.match(String(r.error), /尚未登录/);
+    }
     assert.ok(!relay.seen.some((s) => s.path.startsWith("/api/auth-key") || s.path.startsWith("/api/mobile-sessions")), "未登录不应请求企业端");
   } finally {
     host.close();

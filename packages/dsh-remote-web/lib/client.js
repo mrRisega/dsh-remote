@@ -159,55 +159,131 @@ window.__ModuleLoader__.load({
     // ── 侧边栏「远程访问」快捷入口（挂到官方设置按钮上方一行，用 dsh 自身的挂载位） ──
     // 不用 fixed 悬浮层（会遮挡官方按钮）；改为在左侧主菜单的「设置」按钮上方克隆一行同款导航项：
     // 点击 = 打开 设置页 → 「远程访问」栏目；首次点击前该入口右上角带小红点（localStorage 一次）。
+    // 导航命中策略（兼容宿主差异）：候选 = [class*=navCell] / [role=tab] / [role=menuitem] /
+    // [aria-label]（纯图标项常只有 aria-label 可读）；文本优先取 aria-label，再取 textContent，
+    // 因此 emoji/图标前缀（如 🖥/📱）不影响子串命中。命中「远程访问」栏目项后打 data-dru-remote
+    // 标记（同一设置页生命周期内二次命中直接走标记，无需重扫）。始终排除本插件注入的侧栏项
+    // （id=dru-nav-remote），避免点到自己造成递归。
     var NAV_SEEN_KEY = "dsh-remote-nav-seen";
-    function clickTextNav(text, excludeId) {
+    var NAV_ENTRY_ID = "dru-nav-remote";
+    var NAV_MARK = "data-dru-remote";
+    var NAV_CAND_SEL = '[class*="navCell"], [role="tab"], [role="menuitem"], [aria-label]';
+    var NAV_ANY_SEL = 'button, a, [role="button"], [class*="nav"] button, [class*="sidebar"] a';
+
+    /** 元素导航文本：优先 aria-label（纯图标导航常见），再拼 textContent；去空白差异。 */
+    function navTextOf(el) {
+      var t = "";
       try {
-        var nodes = document.querySelectorAll('button, [role="tab"], [role="menuitem"], [class*="navCell"], [class*="nav"], [class*="sidebar"] a, a');
+        var al = el.getAttribute && el.getAttribute("aria-label");
+        if (al) t += " " + al;
+      } catch (e) {}
+      try { if (el.textContent) t += " " + el.textContent; } catch (e2) {}
+      return t.replace(/\s+/g, " ").trim();
+    }
+    /** 候选是否“可点导航项”：按钮/链接/tab/menuitem/navCell（排除无交互的装饰容器）。 */
+    function isNavClickable(el) {
+      try {
+        var tag = String(el.tagName || "").toLowerCase();
+        if (tag === "button" || tag === "a") return true;
+        var role = el.getAttribute && el.getAttribute("role") || "";
+        if (role === "tab" || role === "menuitem" || role === "button" || role === "link") return true;
+        return String(el.className || "").indexOf("navCell") !== -1;
+      } catch (e) { return false; }
+    }
+    /** 在候选列表里找文本含 token 的导航项并返回（命中「远程访问」时打标记）。 */
+    function pickNavHit(nodes, token, excludeId, preferMarked) {
+      try {
         for (var i = 0; i < nodes.length; i++) {
           var el = nodes[i];
-          if (excludeId && el.id === excludeId) continue;
-          var t = (el.textContent || "").trim();
-          // 含匹配(标签常带 emoji 前缀,如“📱 远程访问”);排除自身入口防递归
-          if (t.indexOf(text) !== -1) {
-            try { el.click(); return true; } catch (e) { /* 尝试下一个 */ }
-          }
+          if (excludeId && el.id === excludeId) continue; // 排除注入项自身，防递归
+          if (!isNavClickable(el)) continue;
+          var marked = !!el.getAttribute && el.getAttribute(NAV_MARK) === "1";
+          if (preferMarked && !marked) continue;
+          if (!preferMarked && marked) continue;
+          if (navTextOf(el).indexOf(token) === -1) continue;
+          if (token === "远程访问") { try { el.setAttribute(NAV_MARK, "1"); } catch (e) {} }
+          return el;
         }
+      } catch (e) { /* 忽略 */ }
+      return null;
+    }
+    /**
+     * 点击“文本含 token”的导航项：① 已打 data-dru-remote 标记的（远程栏目）优先；
+     * ② [class*=navCell]/[role=tab]/[role=menuitem]/[aria-label] 语义候选；
+     * ③ 任意按钮/链接兜底。全部失败返回 false（调用方决定是否退化进「设置」）。
+     */
+    function clickNavToken(token, excludeId) {
+      try {
+        if (token === "远程访问") {
+          var all = document.querySelectorAll(NAV_CAND_SEL + ", " + NAV_ANY_SEL);
+          var hit = pickNavHit(all, token, excludeId, true);
+          if (hit) { try { hit.click(); } catch (e) {} return true; }
+        }
+        var sem = document.querySelectorAll(NAV_CAND_SEL);
+        var hit2 = pickNavHit(sem, token, excludeId, false);
+        if (hit2) { try { hit2.click(); } catch (e) {} return true; }
+        var any = document.querySelectorAll(NAV_ANY_SEL);
+        var hit3 = pickNavHit(any, token, excludeId, false);
+        if (hit3) { try { hit3.click(); } catch (e) {} return true; }
       } catch (e) { /* 忽略 */ }
       return false;
     }
+    /** 「远程访问」栏目内容区是否已在 DOM（设置页已选中该栏目）。 */
+    function remoteSectionVisible() {
+      try {
+        var el = document.querySelector(".dru-settings-section");
+        return !!el && (!document.body || document.body.contains(el));
+      } catch (e) { return false; }
+    }
+    /**
+     * 打开设置页「远程访问」栏目（侧栏注入项/面板内“去设置”等共用入口）：
+     * 已在栏目内容区 → 不动；否则先找栏目项直接点；点不到 → 点「设置」进设置页，
+     * 再轮询（栏目项异步挂载）补点「远程访问」。全程排除注入项自身防递归。
+     */
     function openRemoteSettings() {
-      if (clickTextNav("远程访问", "dru-nav-remote")) return; // 已在栏目内/直接点到(排除自身)
-      if (clickTextNav("设置")) { /* 进入设置页后再轮询远程访问栏目 */ }
+      if (remoteSectionVisible()) return;
+      if (clickNavToken("远程访问", NAV_ENTRY_ID)) return;
+      clickNavToken("设置", NAV_ENTRY_ID); // 进设置页（导航文字可能不同名/纯图标，交给命中器）
       var tries = 0;
       var iv = setInterval(function () {
-        if (clickTextNav("远程访问", "dru-nav-remote")) { clearInterval(iv); return; }
+        if (remoteSectionVisible() || clickNavToken("远程访问", NAV_ENTRY_ID)) { clearInterval(iv); return; }
         if (++tries > 40) clearInterval(iv);
       }, 150);
       if (typeof iv.unref === "function") iv.unref();
     }
+    // 暴露给宿主/自动化（同一入口，避免重复实现；测试沙箱经此驱动点击流）
+    try { window.__dshRemoteNav = { open: openRemoteSettings }; } catch (e) {}
+
     function injectSidebarRemoteEntry() {
       try {
-        if (document.getElementById("dru-nav-remote")) return;
+        if (document.getElementById(NAV_ENTRY_ID)) return;
         if (!document.body) { setTimeout(injectSidebarRemoteEntry, 300); return; }
         var tries = 0;
         var iv = setInterval(function () {
           try {
-            if (document.getElementById("dru-nav-remote")) { clearInterval(iv); return; }
-            // 只在「设置页已打开/未打开都能出现」的左侧主导航找「设置」按钮；
-            // 取文本以“设置”开头且最可能是菜单项(避免命中标题/弹层里的“设置”文字)
-            var nodes = document.querySelectorAll('button, [role="menuitem"], a, [class*="navCell"]');
+            if (document.getElementById(NAV_ENTRY_ID)) { clearInterval(iv); return; }
+            // 在左侧主导航找「设置」按钮：语义候选优先，文本开头为“设置”或 aria-label 恰为“设置”
+            // （兼容文字不同名/带 emoji 图标的情况：能读到的标识仍是“设置”）。
+            var nodes = document.querySelectorAll(NAV_CAND_SEL + ", " + NAV_ANY_SEL);
             var settingsBtn = null;
             for (var i = 0; i < nodes.length; i++) {
               var el = nodes[i];
+              if (el.id === NAV_ENTRY_ID) continue;
+              if (!isNavClickable(el)) continue;
+              var label = (el.getAttribute && el.getAttribute("aria-label")) || "";
               var t = (el.textContent || "").trim();
-              if (t.indexOf("设置") === 0 || t.indexOf("设置 ") === 0 || t === "设置") { settingsBtn = el; break; }
+              var hit = label === "设置" || label.indexOf("设置") === 0 ||
+                t === "设置" || t.indexOf("设置") === 0 || t.indexOf("设置 ") === 0;
+              if (!hit) continue;
+              settingsBtn = el;
+              break;
             }
             if (!settingsBtn || !settingsBtn.parentNode) {
               if (++tries > 80) clearInterval(iv);
               return;
             }
             var entry = settingsBtn.cloneNode(false);
-            entry.id = "dru-nav-remote";
+            entry.id = NAV_ENTRY_ID;
             entry.removeAttribute("data-view");
             entry.removeAttribute("href");
             entry.textContent = "";
@@ -983,7 +1059,7 @@ window.__ModuleLoader__.load({
         selfMsg ? h("div", { className: "dru-msg dru-msg-" + selfMsg.kind }, selfMsg.text) : null,
         h("div", { className: "dru-hint", style: { marginTop: 8 } },
           armed ? "⚠ 再次点击后即开始彻底卸载：① 移除 dsh web 配置中的插件引用与本地文件；② 停止并移除 bridge 自启动服务（macOS com.dshremote.bridge / Linux dsh-bridge）并结束残留进程；③ 清空本地配置目录（~/.dsh-remote：账号、设备密钥、固化运行时等）。此操作不可撤销，如需再次使用请在插件市场重新安装。" :
-            "插件市场没有更新/卸载按钮（dsh 官方市场暂不提供），本卡片即官方管理入口：检测新版、一键在线更新、彻底卸载都在这里完成。")
+            "检测新版、一键在线更新、彻底卸载都在本卡片完成。")
       );
     }
 
@@ -1054,7 +1130,9 @@ window.__ModuleLoader__.load({
       var devOpenArr = useState(false); var devOpen = devOpenArr[0]; var setDevOpen = devOpenArr[1];
       var devBusyArr = useState(""); var devBusy = devBusyArr[0]; var setDevBusy = devBusyArr[1];
       var devMsgArr = useState(null); var devMsg = devMsgArr[0]; var setDevMsg = devMsgArr[1];
-      var armedDevArr = useState(null); var armedDev = armedDevArr[0]; var setArmedDev = armedDevArr[1]; // 待二次确认的 session id
+      var armedDevArr = useState(null); var armedDev = armedDevArr[0]; var setArmedDev = armedDevArr[1]; // 待二次确认的 session id（取消配对）
+      var armedDelArr = useState(null); var armedDel = armedDelArr[0]; var setArmedDel = armedDelArr[1]; // 待二次确认的 session id（删除记录）
+      var purgeArmedArr = useState(false); var purgeArmed = purgeArmedArr[0]; var setPurgeArmed = purgeArmedArr[1]; // 清理已解绑二次确认
 
       var refresh = useCallback(function () {
         setBusy("status");
@@ -1198,30 +1276,76 @@ window.__ModuleLoader__.load({
           setDevMsg({ kind: "err", text: "加载已授权设备失败：" + e.message });
         }).finally(function () { setDevBusy(""); });
       }
+      /** 操作（取消配对/删除记录/清理已解绑）成功后静默重拉列表，覆盖行内状态。 */
+      function refreshDeviceList() {
+        api("/dsh-remote/mobile-sessions").then(function (b) {
+          if (b && b.ok) setDevSessions(Array.isArray(b.sessions) ? b.sessions : []);
+        }).catch(function () {});
+      }
 
       var toggleDevices = function () {
         var next = !devOpen;
         setDevOpen(next);
         if (next && devSessions === null && devBusy === "") loadDevices();
-        if (!next) setArmedDev(null);
+        if (!next) { setArmedDev(null); setArmedDel(null); setPurgeArmed(false); }
       };
 
       /** 取消配对：先点一次进入确认态，再点一次才 POST revoke（同 SelfManageCard 二次确认风格）。 */
       var doRevokeDevice = function (id) {
         if (!id) return;
-        if (armedDev !== id) { setArmedDev(id); return; }
+        if (armedDev !== id) { setArmedDev(id); setArmedDel(null); setPurgeArmed(false); return; }
         setDevBusy("revoke:" + id);
         post("/dsh-remote/mobile-sessions/revoke", { id: id }).then(function (b) {
           if (!b || !b.ok) throw new Error((b && (b.error || (b.body && b.body.error))) || "取消失败");
           setArmedDev(null);
           setDevMsg({ kind: "ok", text: "已取消，对方需重新扫码/登录" });
-          // 刷新列表（成功即重拉，行内状态随后由列表覆盖）
-          api("/dsh-remote/mobile-sessions").then(function (lb) {
-            if (lb && lb.ok) setDevSessions(Array.isArray(lb.sessions) ? lb.sessions : []);
-          }).catch(function () {});
+          refreshDeviceList();
         }).catch(function (e) {
           setArmedDev(null);
           setDevMsg({ kind: "err", text: "取消配对失败：" + e.message });
+        }).finally(function () { setDevBusy(""); });
+      };
+
+      /**
+       * 删除设备记录：任意行（含已取消/历史）都可用，整行删除并拉黑 jti——
+       * DELETE /dsh-remote/mobile-sessions/delete（body {id} → 企业端 DELETE /api/mobile-sessions/:id）。
+       * 先点一次进入确认态，再点一次才发请求。
+       */
+      var doDeleteDevice = function (id) {
+        if (!id) return;
+        if (armedDel !== id) { setArmedDel(id); setArmedDev(null); setPurgeArmed(false); return; }
+        setDevBusy("delete:" + id);
+        api("/dsh-remote/mobile-sessions/delete", {
+          method: "DELETE",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ id: id })
+        }).then(function (b) {
+          if (!b || !b.ok) throw new Error((b && (b.error || (b.body && b.body.error))) || "删除失败");
+          setArmedDel(null);
+          setDevMsg({ kind: "ok", text: "已删除该设备的记录" });
+          refreshDeviceList();
+        }).catch(function (e) {
+          setArmedDel(null);
+          setDevMsg({ kind: "err", text: "删除记录失败：" + e.message });
+        }).finally(function () { setDevBusy(""); });
+      };
+
+      /**
+       * 清理已解绑：删除本人全部 revoked 行——POST /dsh-remote/mobile-sessions/purge（企业端 purge）。
+       * 先点一次进入确认态，再点一次才发请求；成功后刷新列表并提示清理条数。
+       */
+      var doPurgeDevices = function () {
+        if (!purgeArmed) { setPurgeArmed(true); setArmedDev(null); setArmedDel(null); return; }
+        setDevBusy("purge");
+        post("/dsh-remote/mobile-sessions/purge", {}).then(function (b) {
+          if (!b || !b.ok) throw new Error((b && (b.error || (b.body && b.body.error))) || "清理失败");
+          setPurgeArmed(false);
+          var n = b.removed != null ? Number(b.removed) : 0;
+          setDevMsg({ kind: "ok", text: n > 0 ? ("已清理 " + n + " 条已解绑记录") : "已清理全部已解绑记录" });
+          refreshDeviceList();
+        }).catch(function (e) {
+          setPurgeArmed(false);
+          setDevMsg({ kind: "err", text: "清理失败：" + e.message });
         }).finally(function () { setDevBusy(""); });
       };
 
@@ -1501,8 +1625,8 @@ window.__ModuleLoader__.load({
             : serviceRunning ? "已连接（可远程访问）" : "等待设备连接";
         var dotCls = "dru-dot " + (loggedInSaaS && serviceRunning ? "dru-dot-on" : "dru-dot-off");
         // Phase-5:端到端加密(E2EE)状态行 —— 未登录/旧 host 未下发 e2ee 一律不渲染
-        // （桌面宽屏与手机镜像共用同一面板：纯文字状态行、不弹层不打扰）；启用=绿点绿字，
-        // 未启用=灰字 + 原因映射（server_disabled 等待灰度开启 / 其余回退普通 HTTPS）。
+        // （桌面宽屏与手机镜像共用同一面板：纯文字状态行、不弹层不打扰）；启用=绿点绿字（🔒已启用），
+        // 未启用=灰字 + 中性原因文案（回退普通 HTTPS 连接，不宣称“灰度等待”）。
         function renderE2eeBadge() {
           if (!loggedInSaaS) return null;
           var e = describeE2ee(st && st.service && st.service.e2ee);
@@ -1533,15 +1657,15 @@ window.__ModuleLoader__.load({
               ),
               h("div", { className: "dru-access-col" },
                 h("div", { className: "dru-key-note" },
-                  "扫码即进入远程访问；每次生成的链接 30 分钟有效、访问一次后失效，停留栏目期间会自动更新。"),
+                  "扫码即进入，30 分钟有效、用一次即失效。"),
                 h("div", { className: "dru-actions", style: { marginTop: 2 } },
                   h("button", { type: "button", className: "dru-btn dru-btn-primary", disabled: akeyBusy, onClick: openKeyUrl }, "直接打开"),
                   h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: akeyBusy, onClick: loadAccessKey }, akeyBusy ? "生成中…" : "刷新二维码/访问链接")
                 ),
                 h("div", { className: "dru-hint", style: { marginTop: 4 } },
                   !serviceRunning
-                    ? "本机 bridge 未运行：请先在下方「🖥 Bridge 服务」卡片启动，手机/另一台电脑才能连入本机。"
-                    : "手机上打开链接点「进入」即可像在本机一样使用 dsh web。")
+                    ? "本机 bridge 未运行：先在下方「🖥 Bridge 服务」卡启动。"
+                    : "打开链接/扫码进入即登录态；同设备重复扫码只更新授权，不新增设备。")
               )
             )
           ]) : h("div", null, [
@@ -1557,7 +1681,7 @@ window.__ModuleLoader__.load({
         ]);
       }
 
-      // ---------- 📲 已授权设备卡（展开列表 + 二次确认取消配对） ----------
+      // ---------- 📲 已授权设备卡（展开列表 + 行内 取消配对/删除记录 + 底部 清理已解绑） ----------
       function deviceLabel(s) {
         if (s && s.label) return String(s.label);
         var parts = [];
@@ -1578,10 +1702,12 @@ window.__ModuleLoader__.load({
         if (devSessions.length === 0) {
           return h("div", { className: "dru-fb-empty" }, "暂无已授权设备（手机扫码后出现）");
         }
+        var revokedCount = devSessions.filter(function (s) { return !!(s && s.revoked_at); }).length;
         return h("div", null, [
           devSessions.map(function (s) {
+            var id = s && s.id;
             var revoked = !!(s && s.revoked_at);
-            return h("div", { key: s && s.id, className: "dru-dev" },
+            return h("div", { key: id, className: "dru-dev" },
               h("div", { className: "dru-dev-top" },
                 h("span", { className: "dru-dev-name" }, deviceLabel(s)),
                 deviceMeta(s) ? h("span", { className: "dru-dev-meta" }, deviceMeta(s)) : null,
@@ -1592,18 +1718,34 @@ window.__ModuleLoader__.load({
                 (s && s.last_seen_at ? " · 最近活跃 " + fmtDT(s.last_seen_at) : "") +
                 (revoked ? " · 取消于 " + fmtDT(s.revoked_at) : "")
               ),
-              revoked ? null : h("div", { className: "dru-actions", style: { marginTop: 8 } },
-                h("button", {
+              h("div", { className: "dru-actions", style: { marginTop: 8 } },
+                revoked ? null : h("button", {
                   type: "button",
                   className: "dru-btn dru-btn-danger",
                   disabled: devBusy !== "",
-                  onClick: function () { doRevokeDevice(s && s.id); }
-                }, devBusy === "revoke:" + (s && s.id) ? "取消中…" : armedDev === (s && s.id) ? "⚠ 再点一次确认取消配对" : "取消配对")
+                  onClick: function () { doRevokeDevice(id); }
+                }, devBusy === "revoke:" + id ? "取消中…" : armedDev === id ? "⚠ 再点一次确认取消配对" : "取消配对"),
+                h("button", {
+                  type: "button",
+                  className: "dru-btn dru-btn-ghost",
+                  style: { color: "#cf222e", borderColor: "#cf222e" },
+                  disabled: devBusy !== "",
+                  onClick: function () { doDeleteDevice(id); }
+                }, devBusy === "delete:" + id ? "删除中…" : armedDel === id ? "⚠ 再点一次确认删除记录" : "删除记录")
               )
             );
           }),
           h("div", { className: "dru-hint", style: { marginTop: 4 } },
-            "取消配对后，对方需重新扫码/登录才能再次远程访问本机。")
+            "取消配对后，对方需重新扫码/登录才能再次远程访问本机。"),
+          h("div", { className: "dru-actions", style: { marginTop: 8, borderTop: "1px dashed #eaeef2", paddingTop: 8 } },
+            h("button", {
+              type: "button",
+              className: "dru-btn dru-btn-ghost",
+              disabled: devBusy !== "" || revokedCount === 0,
+              onClick: doPurgeDevices,
+              title: revokedCount > 0 ? ("清理 " + revokedCount + " 条已解绑记录") : "没有已解绑记录"
+            }, devBusy === "purge" ? "清理中…" : purgeArmed ? "⚠ 再点一次确认清理已解绑" : "清理已解绑" + (revokedCount > 0 ? "（" + revokedCount + "）" : ""))
+          )
         ]);
       }
       function renderDevicesCard() {
@@ -1727,7 +1869,7 @@ window.__ModuleLoader__.load({
             h("div", { className: "dru-hint", style: { marginBottom: 6 } }, "📱 远程访问：用手机或另一台电脑的浏览器，随时随地使用同一份 dsh web——人在哪都能用（免公网 IP、免内网穿透）；官方托管中继，4G/5G 即用，也可自建服务。"),
             h("div", { className: "dru-hint", style: { marginBottom: 6 } }, "🛠 电脑端一键安装：bridge 与「远程访问」面板一次到位——云端/自建切换、账号登录、bridge 启停、一次性扫码访问、已授权设备管理、意见反馈都在这里。"),
             h("div", { className: "dru-hint", style: { marginBottom: 6 } }, "🔒 安全与通道：HTTP / WebSocket 全量透传，一次性访问密钥认证，面板实时显示设备与已授权设备列表；服务端可配置流量配额。"),
-            h("div", { className: "dru-hint" }, "🛡 端到端加密（灰度开启中）：服务端开启后，手机↔电脑之间的消息内容用「你的账号密码派生密钥」端到端加密——密钥与密码不落服务端（仅存校验值），中继只可见路径/大小/时间（详见 README「安全与隐私」）。")
+            h("div", { className: "dru-hint" }, "🛡 端到端加密：手机↔电脑之间的消息内容用「你的账号密码派生密钥」端到端加密——密钥与密码不落服务端（仅存校验值），中继只可见路径/大小/时间（详见 README「安全与隐私」）。")
           ]),
           // 版本与更新（自管理：检测新版 / 一键在线更新 / 彻底卸载）
           h(SelfManageCard, null),
