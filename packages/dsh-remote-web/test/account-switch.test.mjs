@@ -6,7 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { apply } from "../lib/index.js";
 
-test("切换账号时轮换设备身份并重启 bridge", async () => {
+test("切换账号时轮换设备身份并重启 bridge", { skip: process.platform !== "darwin" }, async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "dsh-account-switch-"));
   const fakeHome = path.join(tempDir, "home");
   const fakeBin = path.join(tempDir, "bin");
