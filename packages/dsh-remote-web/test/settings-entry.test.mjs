@@ -284,7 +284,7 @@ test("红点已看过（localStorage 有 key）时不注入，重启 DSH Web 不
   assert.equal(navCell.children.length, 0, "已看过时不应再注入红点");
 });
 
-// ---------- 侧栏入口「远程访问」点击流（openRemoteSettings） ----------
+// ---------- 侧栏入口「远程访问」点击流（openRemoteSettings，Bug A：容器限定 + 短文本 + 独立按钮） ----------
 
 /** 简易导航节点：带 aria-label/text/class/role 的“按钮”，记录点击并支持 data-dru-remote 标记。 */
 function navNode({ id = "", text = "", aria = "", cls = "", role = "", tag = "button" } = {}) {
@@ -304,12 +304,25 @@ function navNode({ id = "", text = "", aria = "", cls = "", role = "", tag = "bu
   return node;
 }
 
-test("侧栏入口点击流：远程栏目项已存在（navCell/aria-label，含 emoji 前缀）→ 直接命中栏目，不点注入项自身", () => {
+/** 简易“导航容器”：候选查询（NAV_CAND_SEL）一律返回给定候选列表（容器内行为仿真）。 */
+function navContainer(candidates) {
+  return { querySelectorAll() { return candidates; } };
+}
+/** 容器定位选择器（NAV_CONTAINER_SEL）特征：client 只在语义容器选择器上全文档扫描。 */
+const isContainerSel = (sel) => /navigation|sidebar|navRail|navPanel|sidenav|appnav/.test(sel);
+/** 建一个“侧栏容器已存在”的沙箱导航环境：document 语义容器查询 → [container]，其余 → []。 */
+function navHarness(candidates) {
+  const container = navContainer(candidates);
+  return { container, navQuery: (sel) => (isContainerSel(sel) ? [container] : []) };
+}
+
+test("侧栏入口点击流：远程栏目项已存在（navCell/aria-label，含 emoji 前缀）→ 容器内直接命中栏目，不点注入项自身", () => {
   const injected = navNode({ id: "dru-nav-remote", text: "📱 远程访问", cls: "navCell-clone" }); // 注入的侧栏项
   const settingsNav = navNode({ text: "设置", cls: "navCell-set" });
   const remoteCell = navNode({ aria: "远程访问", cls: "VOzbGW_navCell", tag: "button" }); // 纯图标+aria-label 的栏目项
-  const nodes = [injected, settingsNav, remoteCell];
-  const plugin = loadPlugin({ navQuery: () => nodes });
+  const candidates = [injected, settingsNav, remoteCell];
+  const env = navHarness(candidates);
+  const plugin = loadPlugin({ navQuery: env.navQuery });
   plugin.navWindow.__dshRemoteNav.open();
   assert.equal(remoteCell._clicked, 1, "应命中「远程访问」栏目项（aria-label 亦可读）");
   assert.equal(remoteCell.getAttribute("data-dru-remote"), "1", "命中后应打 data-dru-remote 标记（加速二次命中）");
@@ -318,12 +331,13 @@ test("侧栏入口点击流：远程栏目项已存在（navCell/aria-label，�
   assert.equal(plugin.intervals.filter((x) => x.ms === 150).length, 0, "直接命中后不应启动轮询");
 });
 
-test("侧栏入口点击流：栏目项尚未挂载 → 先点「设置」，轮询到点后再补点「远程访问」（全程不点注入项）", () => {
+test("侧栏入口点击流：栏目项尚未挂载 → 容器内先点「设置」，轮询（≤3s 上限）到点后再补点「远程访问」（全程不点注入项）", () => {
   const injected = navNode({ id: "dru-nav-remote", text: "📱 远程访问", cls: "navCell-clone" });
   const settingsNav = navNode({ text: "设置", cls: "navCell-set" });
   const remoteCell = navNode({ text: "📱 远程访问", cls: "VOzbGW_navCell" }); // 设置页打开后才挂载
-  const nodes = [injected, settingsNav]; // 初始只有注入项 + 「设置」
-  const plugin = loadPlugin({ navQuery: () => nodes });
+  const candidates = [injected, settingsNav]; // 初始只有注入项 + 「设置」
+  const env = navHarness(candidates);
+  const plugin = loadPlugin({ navQuery: env.navQuery });
   plugin.navWindow.__dshRemoteNav.open();
 
   assert.equal(settingsNav._clicked, 1, "栏目不可达时应点「设置」进入设置页");
@@ -331,12 +345,55 @@ test("侧栏入口点击流：栏目项尚未挂载 → 先点「设置」，轮
   const poll = plugin.intervals.find((x) => x.ms === 150);
   assert.ok(poll, "应启动 150ms 轮询等待栏目挂载");
 
-  nodes.push(remoteCell); // 设置页已打开，栏目项挂载
+  candidates.push(remoteCell); // 设置页已打开，栏目项挂载
   poll.cb();
   assert.equal(remoteCell._clicked, 1, "轮询到点后应补点「远程访问」栏目");
   assert.equal(remoteCell.getAttribute("data-dru-remote"), "1", "栏目命中后应打标记");
   assert.equal(settingsNav._clicked, 1, "「设置」只应点一次");
   assert.equal(injected._clicked, 0, "轮询过程也不得点注入项自身");
+});
+
+test("Bug A：会话标题式长文本（含「远程访问」12+ 字）不被命中，也不点击「设置」以外内容", () => {
+  // 会话标题被误当导航项是 Bug A 根因之一：长文本必须被短文本规则拒绝
+  const injected = navNode({ id: "dru-nav-remote", text: "📱 远程访问", cls: "navCell-clone" });
+  const settingsNav = navNode({ text: "设置", cls: "navCell-set" });
+  const sessionLike = navNode({ text: "分析竞品远程访问功能完整报告", cls: "chat-session-title", tag: "button" }); // 13 字会话标题（可点 button，考验文本长度规则）
+  const candidates = [injected, settingsNav, sessionLike];
+  const env = navHarness(candidates);
+  const plugin = loadPlugin({ navQuery: env.navQuery });
+  plugin.navWindow.__dshRemoteNav.open();
+
+  assert.equal(sessionLike._clicked, 0, "长文本（会话标题）候选绝不能被点击");
+  assert.equal(settingsNav._clicked, 1, "只能退化到容器内「设置」");
+  const poll = plugin.intervals.find((x) => x.ms === 150);
+  assert.ok(poll, "进「设置」后应轮询等待远程栏目");
+  // 轮询上限（20 次 × 150ms = 3s）：跑满上限后不再产生任何点击
+  for (let i = 0; i < 20; i++) poll.cb();
+  assert.equal(sessionLike._clicked, 0, "长文本候选在轮询全程都不应被点击");
+  assert.equal(injected._clicked, 0, "注入项全程不应被点击");
+  assert.equal(settingsNav._clicked, 1, "「设置」只点一次（轮询只找「远程访问」，不重复点设置）");
+});
+
+test("Bug A（源码约束）：容器限定选择器存在、无 document 级全量点击/克隆注入项、open 流程含轮询上限", () => {
+  // 1) 容器定位选择器与容器内候选查询必须存在（不应再出现 document 级全量导航点击）
+  assert.match(SOURCE, /NAV_CONTAINER_SEL/);
+  assert.match(SOURCE, /\[role="navigation"\]/);
+  assert.match(SOURCE, /sidebar\|navRail\|navPanel/);
+  assert.match(SOURCE, /containers\[c\]\.querySelectorAll\(NAV_CAND_SEL\)/);
+  assert.doesNotMatch(SOURCE, /NAV_ANY_SEL/, "旧的 document 全量兜底选择器应移除");
+  // 2) 短文本上限与命中收紧（长会话标题被拒）
+  assert.match(SOURCE, /NAV_TEXT_MAX = 10/);
+  assert.match(SOURCE, /\.length > NAV_TEXT_MAX/);
+  assert.match(SOURCE, /menu\|context\|more\|kebab/);
+  // 3) 注入项为自有独立 button，不 cloneNode 官方按钮
+  assert.doesNotMatch(SOURCE, /cloneNode/, "不得再 clone 官方按钮（避免继承官方委托/热区）");
+  assert.match(SOURCE, /createElement\("button"\)/);
+  assert.match(SOURCE, /NAV_ENTRY_ID/);
+  // 4) openRemoteSettings：容器内点击 + 轮询上限（20 × 150ms = 3s）
+  assert.match(SOURCE, /function openRemoteSettings\(\)/);
+  assert.match(SOURCE, /NAV_POLL_MAX = 20/);
+  assert.match(SOURCE, /tries >= NAV_POLL_MAX/);
+  assert.match(SOURCE, /__dshRemoteNav/);
 });
 
 test("源码约束：无侧边栏入口/浮动面板/切换账号；命名统一为「远程访问」；新增访问密钥/设备路由", () => {
