@@ -239,6 +239,48 @@
     .retain-btns { display: flex; gap: 10px; }
     .retain-btns .auth-btn { flex: 1; margin: 0; }
     #retain-modal { z-index: 950; }
+
+    /* ---------- E2EE(端到端加密)Phase-3:状态徽标 / 能力标记 / 解锁层 ----------
+     * 视觉风格与全页一致(浅色卡片 + 胶囊徽标)。徽标与解锁层文案见
+     * docs/e2ee-protocol.md §2.3(信任文案)。密钥仅驻内存,见 JS 端注释。 */
+    #dsh-e2ee-badge {
+      display: inline-flex; align-items: center; gap: 5px;
+      font-size: 11px; padding: 2px 10px; height: 24px; border-radius: 999px;
+      white-space: nowrap; border: 1px solid var(--border); background: var(--bg);
+      color: var(--muted); margin-left: 4px; flex: none;
+    }
+    #dsh-e2ee-badge.ok { color: var(--ok); border-color: rgba(26,127,55,.45); background: rgba(26,127,55,.08); }
+    #dsh-e2ee-badge.warn { color: var(--warn); border-color: rgba(154,103,0,.4); background: rgba(154,103,0,.07); }
+    #dsh-e2ee-badge.err { color: var(--err); border-color: rgba(207,34,46,.4); background: rgba(207,34,46,.06); }
+    .e2ee-chip {
+      display: inline-block; font-size: 11px; padding: 1px 8px; border-radius: 999px;
+      color: var(--ok); background: rgba(26,127,55,.1); border: 1px solid rgba(26,127,55,.35);
+      margin-left: 6px; vertical-align: 1px; white-space: nowrap;
+    }
+    .device .e2ee-cap { margin-left: 8px; font-size: 15px; }
+    #unlock-modal .modal-card { max-width: 400px; text-align: left; }
+    #unlock-modal h3 { margin-bottom: 6px; }
+    .e2ee-unlock-who { font-size: 13px; color: var(--text); margin-bottom: 4px; }
+    .e2ee-unlock-who b { font-weight: 600; }
+    .e2ee-unlock-copy {
+      font-size: 12.5px; color: var(--muted); line-height: 1.85; text-align: left;
+      background: var(--bg); border: 1px dashed var(--border); border-radius: 10px;
+      padding: 10px 12px; margin: 8px 0 4px;
+    }
+    .e2ee-unlock-copy b { color: var(--text); }
+    .e2ee-unlock-msg { font-size: 13px; margin-top: 8px; min-height: 16px; }
+    .e2ee-unlock-msg.err { color: var(--err); }
+    .e2ee-unlock-msg.ok { color: var(--ok); }
+    #unlock-modal .auth-btn { margin-top: 12px; }
+    .e2ee-unlock-row { display: flex; gap: 10px; margin-top: 12px; }
+    .e2ee-unlock-row .auth-btn { flex: 1; margin: 0; }
+    .e2ee-unlock-note { font-size: 11.5px; color: var(--muted); margin-top: 10px; line-height: 1.7; }
+    .e2ee-statusline {
+      margin: 2px 0 10px; padding: 8px 12px; font-size: 12px; line-height: 1.7;
+      background: var(--bg); border: 1px solid var(--border); border-left: 3px solid var(--ok);
+      border-radius: 8px; color: var(--text);
+    }
+    .e2ee-statusline.warn { border-left-color: var(--warn); }
   </style>
 <script>
 /* 百度统计(仅官方 SaaS 域名生效):
@@ -261,6 +303,7 @@ var _hmt = _hmt || [];
     <div class="sub" id="conn-status">未连接</div>
   </div>
   <button id="btn-logout" class="hidden">退出</button>
+  <span id="dsh-e2ee-badge" class="hidden" title="端到端加密状态"></span>
   <div class="spacer"></div>
   <a class="nav-link" href="https://n.risegao.cn:8085/" target="_blank" rel="noopener">官网</a>
   <a class="nav-btn accent hidden" id="nav-upgrade" href="/app/promo">🚀 升级方案</a>
@@ -429,6 +472,23 @@ var _hmt = _hmt || [];
       <button type="button" class="auth-btn ghost" id="retain-stay">我再想想</button>
       <button type="button" class="auth-btn danger" id="retain-leave">残忍离开</button>
     </div>
+  </div>
+</div>
+
+<!-- E2EE(Phase-3)解锁层:仅在「账号启用 e2ee ∧ 设备声明 e2ee-v2」时出现。
+     密钥/MK 仅存本页内存;输入即触发 WebCrypto 派生 + /_e2ee/ctrl 握手(见 JS)。 -->
+<div class="modal-overlay hidden" id="unlock-modal">
+  <div class="modal-card">
+    <h3>🔒 端到端加密解锁</h3>
+    <div class="e2ee-unlock-who">设备:<b id="unlock-device-name">-</b></div>
+    <div class="e2ee-unlock-copy" id="unlock-copy">请输入账号密码以开启 🔒 端到端加密。密码仅在本页内存中参与密钥派生,不会发送给中继,也不被保存;刷新或重开页面需再次输入。</div>
+    <div class="auth-field"><label for="unlock-pass">账号密码</label><input class="auth-input" id="unlock-pass" type="password" placeholder="登录密码(≥8 位)" autocomplete="current-password" /></div>
+    <div class="e2ee-unlock-msg" id="unlock-msg"></div>
+    <div class="e2ee-unlock-row">
+      <button type="button" class="auth-btn ghost" id="btn-unlock-skip">暂不加密(明文)</button>
+      <button type="button" class="auth-btn" id="btn-unlock-go">解锁并建立加密会话</button>
+    </div>
+    <div class="e2ee-unlock-note">忘记/重置密码后,旧的加密会话无法恢复(服务端不保存你的内容,无法代为解密)。</div>
   </div>
 </div>
 
@@ -881,7 +941,8 @@ async function doRegister() {
   }
 }
 
-/** 统一退出:清 localStorage + dsh_token/dsh_device Cookie,并注销服务端 JWT。 */
+/** 统一退出:清 localStorage + dsh_token/dsh_device Cookie,并注销服务端 JWT。
+ *  同时清空 E2EE 内存会话与参数缓存(密钥随登录态离开;绝不留驻)。 */
 function logout(clearForm = false) {
   const token = state.token;
   state.token = ""; state.user = null;
@@ -889,6 +950,10 @@ function logout(clearForm = false) {
   document.cookie = "dsh_token=; path=/; max-age=0; SameSite=Lax; Secure";
   document.cookie = "dsh_device=; path=/; max-age=0; SameSite=Lax; Secure";
   if (token) fetch(API_BASE + "/api/logout", { method: "POST", headers: { authorization: `Bearer ${token}` } }).catch(() => {});
+  // E2EE:清空内存会话/参数(协议 §5.1:密钥只存内存,退出即失效)
+  try { if (typeof e2eeClient !== "undefined") { e2eeClient.sessions.clear(); e2eeClient.params = null; e2eeClient.paramsT = 0; } } catch {}
+  try { if (typeof e2eeUpdateBadge === "function") e2eeUpdateBadge(); } catch {}
+  try { if (typeof e2eeCloseUnlock === "function") e2eeCloseUnlock(); } catch {}
   setConn("未连接");
   if (clearForm) {
     ["login-phone", "login-pass", "login-captcha", "login-sms-code", "login-sms-captcha", "reg-phone", "reg-sms-code", "reg-sms-captcha", "reg-pass", "reg-pass2"].forEach(id => { const el = $(id); if (el) el.value = ""; });
@@ -1055,14 +1120,19 @@ async function fetchAccountDevices() {
     }));
 }
 
-/** 单台设备行 HTML:在线 → 绿色徽标,可点进入;离线 → 置灰并标注「离线 · 电脑端未连接」。 */
+/** 单台设备行 HTML:在线 → 绿色徽标,可点进入;离线 → 置灰并标注「离线 · 电脑端未连接」。
+ *  Router /_devices 已透传 caps(Phase-2 §6.2):含 e2ee-v2 且在线 → 显示 🔒 可加密。
+ *  data-caps/data-name 供点选时的 E2EE 门控(e2eeMaybeGateThenEnter)读取。 */
 function deviceRowHTML(d) {
+  const caps = Array.isArray(d.caps) ? d.caps : [];
   if (d.online) {
+    const capChip = caps.includes("e2ee-v2")
+      ? `<span class="e2ee-chip" title="电脑端声明支持端到端加密">🔒 可加密</span>` : "";
     return `
-      <div class="device" data-device="${esc(d.id)}">
+      <div class="device" data-device="${esc(d.id)}" data-name="${esc(d.name || d.id)}" data-caps="${esc(caps.join(","))}">
         <div class="icon">🟢</div>
         <div>
-          <div class="name">${esc(d.name || d.id)}</div>
+          <div class="name">${esc(d.name || d.id)}${capChip}</div>
           <div class="meta">${esc(d.id)}</div>
         </div>
         <div class="status on">在线</div>
@@ -1099,7 +1169,7 @@ async function refreshDevices() {
     const d = await r.json().catch(() => ({}));
     routerDevices = (Array.isArray(d.devices) ? d.devices : [])
       .filter(x => x && x.id)
-      .map(x => ({ id: String(x.id), name: String(x.name || x.id) }));
+      .map(x => ({ id: String(x.id), name: String(x.name || x.id), caps: Array.isArray(x.caps) ? x.caps.map(String) : [] }));
     routerOk = true;
   } catch (e) { routerErr = e.message; }
 
@@ -1115,11 +1185,11 @@ async function refreshDevices() {
   // 3) 合并渲染:已绑定设备铺底 + Router 实时在线设备并入(并集,不漏可进入设备);
   //    能否进入以 Router 实时连接为准 → 在线标记 = 是否出现在 Router /_devices 列表。
   const byId = new Map();
-  for (const b of boundDevices) byId.set(b.id, { id: b.id, name: b.name || b.id, online: false });
+  for (const b of boundDevices) byId.set(b.id, { id: b.id, name: b.name || b.id, online: false, caps: [] });
   for (const rd of routerDevices) {
     const ex = byId.get(rd.id);
-    if (ex) { ex.online = true; if (ex.name === ex.id) ex.name = rd.name; }
-    else byId.set(rd.id, { id: rd.id, name: rd.name || rd.id, online: true });
+    if (ex) { ex.online = true; if (ex.name === ex.id) ex.name = rd.name; ex.caps = rd.caps; }
+    else byId.set(rd.id, { id: rd.id, name: rd.name || rd.id, online: true, caps: rd.caps });
   }
   const all = [...byId.values()];
   const online = all.filter(d => d.online);
@@ -1160,13 +1230,18 @@ async function refreshDevices() {
   $("dot-signal").classList.toggle("on", online.length > 0);
   if (online.length) void applyQuotaHint();
 
-  // 行点击:在线 → 进入设备(原流程不变);离线 → 轻提示引导
+  // 行点击:在线 → E2EE 门控后进入(未启用/无能力 → 原明文流程,零行为变化);离线 → 轻提示引导
   list.querySelectorAll(".device").forEach(el => {
     el.onclick = () => {
       if (el.classList.contains("off")) toast("该设备当前无法进入:请在电脑上确认 bridge 运行中后,点「刷新设备列表」重试", 3500);
-      else enterDevice(el.dataset.device);
+      else {
+        const caps = (el.dataset.caps || "").split(",").filter(Boolean);
+        void e2eeMaybeGateThenEnter(el.dataset.device, el.dataset.name || el.dataset.device, caps);
+      }
     };
   });
+  // 进入设备列表时顺带拉取一次账号级 e2ee 参数并刷新徽标(失败静默)
+  void e2eeGetParams(false).then(e2eeUpdateBadge).catch(() => {});
 }
 
 // ---------- v2 推广页(产品介绍/月付年付/价格对比/购买/安装引导/邀请) ----------
@@ -1350,7 +1425,810 @@ function showPromo() {
   reportUpgradeIntent("promo_open"); // 第一层:进入推广页即上报购买意愿
 }
 
-// ---------- 事件绑定 ----------
+/* ============================================================
+ * E2EE 手机端客户端(Phase-3)——浏览器 WebCrypto 实现
+ *
+ * 依据:
+ *   docs/e2ee-protocol.md §3/§4/§5/§9 与 clients/dsh-remote/e2ee-client.mjs
+ *   文件头「规范化决定 1–6」(桥端 Phase-2 实现,已由 e2ee-bridge.test.mjs 验证)。
+ * 本段 = 手机端与桥端必须**逐字节一致**的部分;测试通过「从本文件抽取
+ * ==DSH-E2EE-WC-CORE== 区间 → 在 node 里与 e2ee-client.mjs 对拍」保证。
+ *
+ * 规范化对照(与桥端 e2ee-client.mjs 相同,不得各自发挥):
+ *   1. 域/info 分隔符 \x00;info 形如 "dsh-e2ee/v1\0<用途>"。
+ *   2. SHK   = HKDF-SHA256(ikm=MK, salt=sha256(a‖b), info="dsh-e2ee/v1\0shk", 32)
+ *      子密钥 = HKDF-SHA256(ikm=SHK, salt=sha256(a‖b), info=域串, 32)
+ *      (WebCrypto deriveBits 与 node hkdfSync 同算法,输出一致。)
+ *   3. 子密钥 info:
+ *        http 请求   "dsh-e2ee/v1\0http\0<reqNonceB64>\0p2b"  (reqNonce=请求信封 n)
+ *        http 响应   "…\0http\0<reqNonceB64>\0b2p"            (响应信封 n 回显请求 n)
+ *        ws 流       "…\0ws\0<wsLabel>\0p2b|b2p"
+ *        ctrl 探针   "…\0ctrl\0p2b|b2p"
+ *   4. AAD = UTF8("dsh-e2ee/v1\0<kind>\0<sessId>\0<dir>\0<counter>")。
+ *   5. 信封 {v:2,k,s,c,n,t,d}:n=base64url(12B nonce),d=base64url(AES-256-GCM 密文‖16B tag)。
+ *   6. ctrl 通道(/_e2ee/ctrl):hello/hello-ack/e2ee-error 为明文 JSON;probe 为 k:"ctrl" AEAD 信封。
+ *
+ * WebCrypto 与 node:crypto 差异说明(唯一语义差异处,均已对齐):
+ *   - PBKDF2/HKDF/AES-GCM 在 subtle 中全部为异步;同步路径(如直接 fetch 组装)改 async。
+ *   - importKey 需要明确用途;deriveBits 返回 ArrayBuffer(以 Uint8Array 承接,32B)。
+ *   - 无 sync randomBytes → crypto.getRandomValues(同强度)。
+ *   - 无 Buffer → Uint8Array;base64url 编解码用 atob/btoa 自实现(wcBytesToB64/wcB64ToBytes)。
+ *   - gzip 解压用 DecompressionStream('gzip')(async,现代浏览器/Node 均可用)。
+ *
+ * 密钥纪律(协议 §5.1/§8 风险 5):MK/SHK/子密钥只存本页内存(e2eeClient.sessions/
+ * WcE2eeSession 字段),绝不写 localStorage/sessionStorage/IndexedDB;刷新/重开需重新解锁。
+ * ============================================================ */
+
+/* ===DSH-E2EE-WC-CORE-START===  (纯原语区间:无 DOM 依赖,node 抽取对拍用) */
+const WC_E2EE_DOMAIN = "dsh-e2ee/v1";
+const WC_MK_LABEL = "dsh-e2ee/v1/mk\x00";
+const WC_SALT_BYTES = 16;
+const WC_MK_BYTES = 32;
+const WC_NONCE_BYTES = 12;
+const WC_TAG_BYTES = 16;
+const WC_SESS_ID_RE = /^[0-9a-f]{32}$/i;
+const WC_E2EE_VERSION = 2;
+const WC_ENVELOPE_CONTENT_TYPE = "application/vnd.dsh.e2ee-v2";
+const WC_ENVELOPE_HEADER = "x-dsh-e2ee";
+const WC_E2EE_CAP = "e2ee-v2";
+const WC_DIR_P2B = "p2b";
+const WC_DIR_B2P = "b2p";
+
+function wcNormalizePassword(pw) { return String(pw ?? "").normalize("NFKC"); }
+function wcUtf8(s) { return new TextEncoder().encode(String(s ?? "")); }
+function wcUtf8Decode(u8) { return new TextDecoder().decode(u8); }
+
+/** base64url(无 padding)解码 → Uint8Array;非法抛错。 */
+function wcB64ToBytes(b64) {
+  if (typeof b64 !== "string" || b64 === "") throw new Error("e2ee: base64url 非法");
+  let s = b64.replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+function wcBytesToB64(bytes) {
+  const u = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  let bin = "";
+  const CH = 0x8000;
+  for (let i = 0; i < u.length; i += CH) bin += String.fromCharCode.apply(null, u.subarray(i, i + CH));
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function wcConcat(...parts) {
+  let total = 0;
+  for (const p of parts) total += p.length;
+  const out = new Uint8Array(total);
+  let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+}
+function wcRandomBytes(n) {
+  const u = new Uint8Array(n);
+  crypto.getRandomValues(u);
+  return u;
+}
+function wcRandomB64(n) { return wcBytesToB64(wcRandomBytes(n)); }
+function wcRandomHex(n) {
+  let s = "";
+  const u = wcRandomBytes(n);
+  for (let i = 0; i < u.length; i++) s += u[i].toString(16).padStart(2, "0");
+  return s;
+}
+function wcNewSessId() { return wcRandomHex(16); } // 128-bit hex,32 字符
+async function wcSha256Bytes(...parts) {
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", wcConcat(...parts)));
+}
+/** decodeSalt:16B base64url → Uint8Array;非法返回 null(协议 §3.1)。 */
+function wcDecodeSalt(saltB64) {
+  if (typeof saltB64 !== "string" || saltB64 === "") return null;
+  let b;
+  try { b = wcB64ToBytes(saltB64); } catch { return null; }
+  return b.length === WC_SALT_BYTES ? b : null;
+}
+/** sha256|sha384|sha512 → WebCrypto 标准 "SHA-256" 风格名(subtle 只认连字符形式)。 */
+function wcHashName(hash) {
+  const m = /^sha(256|384|512)$/i.exec(String(hash || ""));
+  return m ? "SHA-" + m[1] : "SHA-256";
+}
+/** 容错归一 kdf(兼容 iter/iterations 两种下发写法;与 node normalizeKdf 同构)。 */
+function wcNormalizeKdf(kdf) {
+  const D = { alg: "pbkdf2-sha256", iter: 600000, dkLen: WC_MK_BYTES, hash: "sha256" };
+  if (!kdf || typeof kdf !== "object") return D;
+  const iter = Number(kdf.iter ?? kdf.iterations);
+  const dkLen = Number(kdf.dkLen ?? kdf.keyLen ?? kdf.length ?? WC_MK_BYTES);
+  const hash = typeof kdf.hash === "string" && kdf.hash ? kdf.hash : "sha256";
+  if (!Number.isInteger(iter) || iter < 1) throw new Error("e2ee: kdf.iter 非法");
+  if (!Number.isInteger(dkLen) || dkLen < 1 || dkLen > 64) throw new Error("e2ee: kdf.dkLen 非法");
+  if (!/^sha(256|384|512)$/.test(hash)) throw new Error("e2ee: kdf.hash 不受支持: " + hash);
+  return { alg: typeof kdf.alg === "string" && kdf.alg ? kdf.alg : "pbkdf2-sha256", iter, dkLen, hash };
+}
+/**
+ * 派生客户端主密钥 MK(协议 §3.3;node 侧见 deriveMasterKey):
+ *   kdfInput = UTF8("dsh-e2ee/v1/mk\0") ‖ rawSalt(16B)
+ *   MK(32B)  = PBKDF2-HMAC-SHA256(NFKC(password), salt=kdfInput, iter, dkLen)
+ * 参数按服务端下发执行,绝不写死。
+ * @returns {Promise<Uint8Array>} 32B
+ */
+async function wcDeriveMasterKey(password, saltB64, kdf) {
+  const salt = wcDecodeSalt(saltB64);
+  if (!salt) throw new Error("e2ee: salt 非法(须为 16B base64url)");
+  const { iter, dkLen, hash } = wcNormalizeKdf(kdf);
+  const kdfInput = wcConcat(wcUtf8(WC_MK_LABEL), salt);
+  const key = await crypto.subtle.importKey("raw", wcUtf8(wcNormalizePassword(password)), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: wcHashName(hash), salt: kdfInput, iterations: iter }, key, dkLen * 8);
+  return new Uint8Array(bits);
+}
+/** HKDF-SHA256(info 为字符串,内部 UTF8;与 node hkdfSync(ikm,salt,info,len) 同构)。 */
+async function wcHkdf(ikm, salt, infoStr, len) {
+  const key = await crypto.subtle.importKey("raw", ikm, "HKDF", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt, info: wcUtf8(infoStr) }, key, len * 8);
+  return new Uint8Array(bits);
+}
+/**
+ * 由 MK 与握手随机数 a/b 派生 SHK(文件头决定 2;node 侧 deriveShk):
+ *   saltH = sha256(a‖b)(32B); SHK = HKDF-SHA256(ikm=MK, salt=saltH, info="dsh-e2ee/v1\0shk", 32)
+ * @returns {Promise<{shk:Uint8Array, saltH:Uint8Array}>}
+ */
+async function wcDeriveShk(mkBytes, aB64, bB64) {
+  if (!mkBytes || mkBytes.length !== WC_MK_BYTES) throw new Error("e2ee: MK 非法");
+  const a = wcB64ToBytes(aB64);
+  const b = wcB64ToBytes(bB64);
+  if (a.length !== WC_MK_BYTES || b.length !== WC_MK_BYTES) throw new Error("e2ee: 握手随机数须为 32B");
+  const saltH = await wcSha256Bytes(a, b);
+  const shk = await wcHkdf(mkBytes, saltH, `${WC_E2EE_DOMAIN}\x00shk`, WC_MK_BYTES);
+  return { shk, saltH };
+}
+
+/** 会话级错误(带稳定 code;不得携带密钥材料)。 */
+function wcErr(code, message) {
+  const e = new Error(message || code);
+  e.code = code;
+  e.wcE2ee = true;
+  return e;
+}
+
+/**
+ * 一个解锁会话(浏览器版 E2eeSession;密钥仅内存)。
+ * 提供子密钥派生 + 信封加解密原语;不持有密码/MK 明文以外的任何落盘材料。
+ */
+class WcE2eeSession {
+  constructor({ sessId, shk, saltH, profile = "", epoch = 0 }) {
+    if (typeof sessId !== "string" || !WC_SESS_ID_RE.test(sessId)) throw wcErr("bad_session", "e2ee: sessId 非法");
+    if (!shk || shk.length !== WC_MK_BYTES) throw wcErr("bad_session", "e2ee: SHK 非法");
+    if (!saltH || saltH.length !== WC_MK_BYTES) throw wcErr("bad_session", "e2ee: saltH 非法");
+    this.sessId = sessId;
+    this.shk = shk;
+    this.saltH = saltH;
+    this.profile = profile;
+    this.epoch = epoch;
+    this.verified = false;
+  }
+  /** 子密钥(文件头决定 3);kind∈http|http-resp|w|ctrl。 */
+  async keyBytesFor({ kind, dir, reqNonceB64 = "", wsLabel = "" }) {
+    let use;
+    if (kind === "http" || kind === "http-resp") {
+      if (!reqNonceB64) throw wcErr("bad_keyinfo", "e2ee: http 子密钥需要 reqNonceB64");
+      use = `http\x00${reqNonceB64}\x00${dir}`;
+    } else if (kind === "w") {
+      if (!wsLabel) throw wcErr("bad_keyinfo", "e2ee: ws 子密钥需要 wsLabel");
+      use = `ws\x00${wsLabel}\x00${dir}`;
+    } else if (kind === "ctrl") {
+      use = `ctrl\x00${dir}`;
+    } else {
+      throw wcErr("bad_keyinfo", "e2ee: 未知信封 kind: " + kind);
+    }
+    if (dir !== WC_DIR_P2B && dir !== WC_DIR_B2P) throw wcErr("bad_keyinfo", "e2ee: 未知方向: " + dir);
+    return wcHkdf(this.shk, this.saltH, `${WC_E2EE_DOMAIN}\x00${use}`, WC_MK_BYTES);
+  }
+  /** AAD(文件头决定 4)。 */
+  aadBytesOf({ kind, dir, counter }) {
+    return wcUtf8(`${WC_E2EE_DOMAIN}\x00${kind}\x00${this.sessId}\x00${dir}\x00${String(counter ?? 0)}`);
+  }
+  /**
+   * 密封一条消息 → 信封对象(node 侧 seal 的浏览器异步版)。
+   * @returns {Promise<{v:number,k:string,s:string,c:number,n:string,t:number,d:string}>}
+   */
+  async seal({ kind, dir, counter = 0, data, t, reqNonceB64 = "", wsLabel = "", nonceBytes }) {
+    const isText = typeof data === "string";
+    const pt = isText ? wcUtf8(data) : (data instanceof Uint8Array ? data : new Uint8Array(data));
+    const tOut = t !== undefined ? (t === 0 ? 0 : 1) : kind === "w" ? (isText ? 0 : 1) : 0;
+    const n = nonceBytes || wcRandomBytes(WC_NONCE_BYTES);
+    if (!n || n.length !== WC_NONCE_BYTES) throw wcErr("bad_nonce", "e2ee: nonce 须为 12B");
+    // 规范(决定 3):http 请求信封 key-info reqNonce 默认 = 本信封 n(自描述);
+    // http-resp 的 key-info reqNonce 必须为对应请求 n(由调用方显式传入)。
+    const keyNonce = kind === "http-resp" ? reqNonceB64 : reqNonceB64 || wcBytesToB64(n);
+    const keyBytes = await this.keyBytesFor({ kind, dir, reqNonceB64: keyNonce, wsLabel });
+    const key = await crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["encrypt"]);
+    const enc = await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv: n, additionalData: this.aadBytesOf({ kind, dir, counter }), tagLength: 128 },
+      key,
+      pt
+    );
+    return {
+      v: WC_E2EE_VERSION,
+      k: kind,
+      s: this.sessId,
+      c: counter,
+      n: wcBytesToB64(n),
+      t: tOut,
+      d: wcBytesToB64(new Uint8Array(enc)) // AES-GCM 输出 = 密文‖tag
+    };
+  }
+  /**
+   * 打开(解密+认证)一条消息。认证失败/字段不符抛 code=… 的 Error。
+   * @returns {Promise<{data:Uint8Array, t:number}>}
+   */
+  async open({ kind, dir, env, counter, reqNonceB64 = "", wsLabel = "" }) {
+    if (!env || typeof env !== "object") throw wcErr("bad_envelope", "e2ee: 信封缺失");
+    if (env.v !== WC_E2EE_VERSION) throw wcErr("bad_version", "e2ee: 信封版本不受支持: " + env.v);
+    if (env.k !== kind) throw wcErr("bad_kind", "e2ee: 信封 kind 不符");
+    if (env.s !== this.sessId) throw wcErr("bad_session", "e2ee: 信封会话不符");
+    let raw;
+    try { raw = wcB64ToBytes(env.d); } catch { raw = null; }
+    if (!raw || raw.length < WC_TAG_BYTES + 1) throw wcErr("bad_cipher", "e2ee: 密文非法");
+    let n;
+    try { n = wcB64ToBytes(env.n); } catch { n = null; }
+    if (!n || n.length !== WC_NONCE_BYTES) throw wcErr("bad_nonce", "e2ee: nonce 非法");
+    const keyNonce = kind === "http-resp" ? reqNonceB64 : reqNonceB64 || String(env.n || "");
+    const keyBytes = await this.keyBytesFor({ kind, dir, reqNonceB64: keyNonce, wsLabel });
+    const key = await crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["decrypt"]);
+    let out;
+    try {
+      out = new Uint8Array(await crypto.subtle.decrypt(
+        { name: "AES-GCM", iv: n, additionalData: this.aadBytesOf({ kind, dir, counter }), tagLength: 128 },
+        key,
+        raw
+      ));
+    } catch {
+      throw wcErr("auth_failed", "e2ee: AEAD 打开失败(密文被篡改或密钥不一致)");
+    }
+    return { data: out, t: env.t === 1 ? 1 : 0 };
+  }
+}
+
+// ---------- http/ws 明文载荷编解码(node 侧 decode/encodeHttp*Plain 的浏览器版) ----------
+
+function wcParseJsonBytes(u8) {
+  try { return JSON.parse(u8 instanceof Uint8Array ? wcUtf8Decode(u8) : String(u8)); }
+  catch { throw wcErr("bad_plain", "e2ee: 明文不是 JSON"); }
+}
+/** 请求信封明文 {m,p,h,b}(§4.3)。 */
+function wcDecodeHttpRequestPlain(buf) {
+  const pt = wcParseJsonBytes(buf);
+  if (!pt || typeof pt !== "object") throw wcErr("bad_plain", "e2ee: http 请求明文缺失");
+  const method = typeof pt.m === "string" && pt.m ? pt.m.toUpperCase() : "GET";
+  const path = typeof pt.p === "string" && pt.p ? pt.p : "/";
+  const headers = pt.h && typeof pt.h === "object" ? pt.h : {};
+  const b = typeof pt.b === "string" ? pt.b : "";
+  return { method, path, headers, bodyB64: b, hasBody: b !== "" };
+}
+function wcEncodeHttpRequestPlain({ method = "GET", path = "/", headers = {}, bodyB64 = "" } = {}) {
+  return wcUtf8(JSON.stringify({ m: String(method).toUpperCase(), p: path, h: headers, b: String(bodyB64 ?? "") }));
+}
+/** 响应信封明文 {st,h,enc,b}(§4.3)。 */
+function wcDecodeHttpResponsePlain(buf) {
+  const pt = wcParseJsonBytes(buf);
+  if (!pt || typeof pt !== "object") throw wcErr("bad_plain", "e2ee: http 响应明文缺失");
+  return {
+    status: Number(pt.st) || 502,
+    headers: pt.h && typeof pt.h === "object" ? pt.h : {},
+    enc: typeof pt.enc === "string" ? pt.enc : "",
+    bodyB64: typeof pt.b === "string" ? pt.b : ""
+  };
+}
+function wcEncodeHttpResponsePlain({ status = 200, headers = {}, bodyB64 = "", enc } = {}) {
+  const h = {};
+  let encOut = enc || "";
+  for (const [k, v] of Object.entries(headers || {})) {
+    const lk = String(k).toLowerCase();
+    if (["content-length", "content-encoding", "transfer-encoding", "connection", "keep-alive"].includes(lk)) {
+      if (lk === "content-encoding" && !enc) encOut = String(v);
+      continue;
+    }
+    h[k] = Array.isArray(v) ? v.join(", ") : String(v);
+  }
+  return wcUtf8(JSON.stringify({ st: Number(status) || 200, h, enc: encOut, b: String(bodyB64 ?? "") }));
+}
+/** enc=gzip 时解压响应正文(async)。 */
+async function wcGunzip(u8) {
+  try {
+    const ds = new DecompressionStream("gzip");
+    const stream = new Blob([u8]).stream().pipeThrough(ds);
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+  } catch { return null; }
+}
+
+/**
+ * 解析数据 WS 打开路径的 e2ee 标记(node 侧 parseWsE2eeParams 同构):
+ *   upstreamPath: 去掉 e2ee 与 w 两参后的干净上游路径;
+ *   wsLabel:      仅去掉 e2ee 的重组 query(path+query,内含 w → 每流唯一)。
+ */
+function wcParseWsE2eeParams(fullPath) {
+  if (typeof fullPath !== "string" || !fullPath.startsWith("/")) return null;
+  const qIdx = fullPath.indexOf("?");
+  const path = qIdx === -1 ? fullPath : fullPath.slice(0, qIdx);
+  if (qIdx === -1) return null;
+  const params = new URLSearchParams(fullPath.slice(qIdx + 1));
+  const sessId = params.get("e2ee") || "";
+  const w = params.get("w") || "";
+  if (!sessId || !w || !WC_SESS_ID_RE.test(sessId)) return null;
+  params.delete("e2ee");
+  const qsLabel = params.size ? `?${params.toString()}` : "";
+  const labelWithW = `${path}${qsLabel}`; // w 保留其中
+  params.delete("w");
+  const qsUp = params.size ? `?${params.toString()}` : "";
+  return { sessId, w, wsLabel: labelWithW, upstreamPath: `${path}${qsUp}` };
+}
+
+/** 信封标记头(§4.3 头即信号;node 侧 envelopeRequestHeaders)。 */
+function wcEnvelopeHeaders(sessId, kind = "http") {
+  return { "content-type": WC_ENVELOPE_CONTENT_TYPE, [WC_ENVELOPE_HEADER]: `v=${WC_E2EE_VERSION};s=${sessId};k=${kind}` };
+}
+function wcHeaderValueOf(headers, name) {
+  const lk = String(name).toLowerCase();
+  for (const [k, v] of Object.entries(headers || {})) {
+    if (String(k).toLowerCase() === lk) return Array.isArray(v) ? v.join(", ") : String(v);
+  }
+  return "";
+}
+function wcParseEnvelopeMarker(headers = {}) {
+  const val = wcHeaderValueOf(headers, WC_ENVELOPE_HEADER);
+  if (!val) return null;
+  const m = /^v=(\d+);s=([0-9a-f]{32});k=([a-z-]+)$/i.exec(val.trim());
+  return m ? { v: Number(m[1]), s: m[2], k: m[3] } : null;
+}
+function wcHasEnvelopeMarker(headers = {}) {
+  const ct = wcHeaderValueOf(headers, "content-type").split(";")[0].trim().toLowerCase();
+  if (ct === WC_ENVELOPE_CONTENT_TYPE) return true;
+  return wcParseEnvelopeMarker(headers) !== null;
+}
+/* ===DSH-E2EE-WC-CORE-END=== */
+
+// ---------- E2EE 客户端状态(仅内存;密钥不落 localStorage) ----------
+const E2EE_ERR_TEXT = {
+  bad_key: "电脑端保存的账号密码与本次输入不一致。请在电脑端面板重新登录该账号后重试。",
+  auth_failed: "解密校验失败:密码与电脑端不一致或传输被篡改,请重试。",
+  params: "加密参数与电脑端不一致(密码或服务端参数可能已更换),请重新登录账号后重试。",
+  disabled: "电脑端当前未启用端到端加密,已按明文路径继续。",
+  e2ee_disabled: "电脑端未启用端到端加密(请检查账号密码/服务端开关),已按明文路径继续。",
+  no_cap: "电脑端版本过旧或不支持端到端加密,已按明文路径继续。",
+  busy: "电脑端正忙,请稍后重试。",
+  unknown_session: "会话不存在或已过期,请重新解锁。",
+  not_verified: "会话尚未完成探针校验,请重新解锁。",
+  replay: "检测到重放,请重新解锁。",
+  ws_closed: "与电脑端的加密握手连接提前关闭,请检查网络后重试。",
+  ws_timeout: "加密握手超时,请检查网络后重试。",
+  derive_failed: "密钥派生失败,请确认密码后重试。"
+};
+
+const e2eeClient = {
+  params: null,          // {enabled, reason, profile, salt, kdf, epoch, status}
+  paramsT: 0,
+  sessions: new Map(),   // deviceId → { params, sess: WcE2eeSession, unlockedAt }(仅内存)
+  deviceName: new Map()  // deviceId → name(解锁层展示)
+};
+
+/** 拉取并容错解析 GET {apiBase}/api/e2ee-params(Bearer;协议 §3.4/§6.1)。
+ *  任何失败 → {enabled:false, reason}(明文回退,不抛)。缓存 30s,force 时重取。 */
+async function e2eeGetParams(force = false) {
+  const cached = e2eeClient.params;
+  if (cached && !force && Date.now() - e2eeClient.paramsT < 30000) return cached;
+  const miss = (reason, status = 0) => {
+    if (cached && !force) return cached;
+    return { enabled: false, reason, status };
+  };
+  if (!state.token || deploymentMode === "self") return miss("no_token");
+  let r;
+  try {
+    r = await fetch(API_BASE + "/api/e2ee-params", {
+      headers: { authorization: `Bearer ${state.token}`, accept: "application/json" },
+      signal: AbortSignal.timeout(8000)
+    });
+  } catch { return miss("params_unreachable"); }
+  if (r.status !== 200) return miss(r.status === 401 ? "server_unauthorized" : r.status === 404 ? "server_no_params" : "http_" + r.status, r.status);
+  let data;
+  try { data = await r.json(); } catch { return miss("bad_params", 200); }
+  const e2 = data && typeof data === "object" ? data.e2ee : null;
+  if (!e2 || typeof e2 !== "object") return miss("server_no_params", 200);
+  if (e2.enabled !== true) return miss("server_disabled", 200);
+  if (typeof e2.salt !== "string" || !wcDecodeSalt(e2.salt)) return miss("bad_params", 200);
+  let kdf;
+  try { kdf = wcNormalizeKdf(e2.kdf); } catch { return miss("bad_params", 200); }
+  const p = {
+    enabled: true, reason: "ok", status: 200,
+    profile: typeof e2.profile === "string" && e2.profile ? e2.profile : "pbkdf2-sha256-600k",
+    salt: e2.salt,
+    epoch: Number(e2.epoch) || 0,
+    kdf
+  };
+  e2eeClient.params = p;
+  e2eeClient.paramsT = Date.now();
+  return p;
+}
+
+/** 设备是否具备 E2EE 能力(账号 enabled ∧ 设备声明 e2ee-v2 ∧ 非自建)。 */
+function e2eeCapable(params, caps) {
+  return !!(params && params.enabled === true && Array.isArray(caps) && caps.includes(WC_E2EE_CAP));
+}
+
+/** WebCrypto 可用性(subtle 需要安全上下文 https/wss;不可用 → 明文回退 + 提示)。 */
+function e2eeSubtleAvailable() {
+  return !!(globalThis.crypto && globalThis.crypto.subtle && globalThis.crypto.getRandomValues);
+}
+
+/** 控制 WS 地址:device 形态 {origin}/remote/<deviceId>/_e2ee/ctrl(§5.2)。 */
+function e2eeCtrlWsUrl(deviceId) {
+  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${proto}//${window.location.host}/remote/${encodeURIComponent(deviceId)}/_e2ee/ctrl`;
+}
+
+/**
+ * §5.2 手机侧全握手:hello → hello-ack → deriveShk → 探针(ctrl AEAD)→ probe-ok。
+ * @param {string} deviceId
+ * @param {object} o { password, params }
+ * @returns {Promise<{sessId:string, sess:WcE2eeSession}>} verified 后返回
+ */
+function e2eeUnlockHandshake(deviceId, { password, params }) {
+  return new Promise((resolve, reject) => {
+    const sessId = wcNewSessId();
+    const aB64 = wcRandomB64(32);
+    let ws;
+    let timer = null;
+    let settled = false;
+    const done = (v) => { if (settled) return; settled = true; clearTimeout(timer); try { ws.close(1000); } catch {} resolve(v); };
+    const fail = (e) => { if (settled) return; settled = true; clearTimeout(timer); try { ws.close(); } catch {} reject(e); };
+    try {
+      ws = new WebSocket(e2eeCtrlWsUrl(deviceId));
+    } catch (e) { fail(wcErr("ws_closed", E2EE_ERR_TEXT.ws_closed)); return; }
+    timer = setTimeout(() => fail(wcErr("ws_timeout", E2EE_ERR_TEXT.ws_timeout)), 20000);
+    ws.onerror = () => { /* onclose 统一收尾 */ };
+    ws.onclose = (ev) => {
+      if (!settled) fail(wcErr("ws_closed", E2EE_ERR_TEXT.ws_closed + (ev.reason ? `(${ev.reason})` : "")));
+    };
+    ws.onopen = () => {
+      ws.send(JSON.stringify({
+        v: 2, type: "e2ee-hello", role: "phone", s: sessId,
+        a: aB64, salt: params.salt, profile: params.profile, ts: Date.now()
+      }));
+    };
+    let session = null;
+    ws.onmessage = async (ev) => {
+      let msg;
+      try { msg = JSON.parse(String(ev.data)); } catch { return; }
+      if (!msg || typeof msg !== "object") return;
+      if (msg.type === "e2ee-error") {
+        const code = String(msg.code || "e2ee_failed");
+        const text = E2EE_ERR_TEXT[code] || (msg.message ? String(msg.message) : ("电脑端握手失败(" + code + ")"));
+        fail(wcErr(code, text));
+        return;
+      }
+      if (msg.type === "e2ee-hello-ack") {
+        try {
+          const mk = await wcDeriveMasterKey(password, params.salt, params.kdf);
+          const { shk, saltH } = await wcDeriveShk(mk, aB64, String(msg.b || ""));
+          session = new WcE2eeSession({ sessId, shk, saltH, profile: params.profile, epoch: params.epoch });
+          const probe = await session.seal({
+            kind: "ctrl", dir: WC_DIR_P2B, counter: 0,
+            data: JSON.stringify({ p: "dsh-e2ee-probe-v1", t: Date.now(), c: 0 })
+          });
+          ws.send(JSON.stringify(probe));
+        } catch (e) {
+          fail(e && e.wcE2ee ? e : wcErr("derive_failed", E2EE_ERR_TEXT.derive_failed));
+        }
+        return;
+      }
+      if (session && msg.v === 2 && msg.k === "ctrl") {
+        // probe-ok:开包通过 = 双方 MK 一致;会话 verified
+        try {
+          const opened = await session.open({ kind: "ctrl", dir: WC_DIR_B2P, env: msg, counter: msg.c ?? 0 });
+          const pt = JSON.parse(wcUtf8Decode(opened.data));
+          if (pt && pt.p === "dsh-e2ee-probe-ok") {
+            session.verified = true;
+            done({ sessId, sess: session });
+          } else {
+            fail(wcErr("bad_key", E2EE_ERR_TEXT.bad_key));
+          }
+        } catch (e) {
+          fail(e && e.wcE2ee ? e : wcErr("bad_key", E2EE_ERR_TEXT.bad_key));
+        }
+      }
+    };
+  });
+}
+
+/** 解锁设备:密码 → 派生 MK → ctrl 握手(探针通过即「双方 MK 一致」)。会话仅存内存。 */
+async function e2eeUnlockDevice(deviceId, password) {
+  if (!e2eeSubtleAvailable()) return { ok: false, code: "no_webcrypto", text: "当前浏览器不支持端到端加密所需的安全环境,请用系统浏览器(HTTPS)重试;已按明文路径继续。" };
+  const params = await e2eeGetParams(true);
+  if (!params.enabled) return { ok: false, code: params.reason, text: E2EE_ERR_TEXT[params.reason] || "服务端未启用端到端加密,已按明文路径继续。" };
+  if (typeof password !== "string" || password.length < 1) return { ok: false, code: "no_password", text: "请输入账号密码" };
+  let r;
+  try {
+    r = await e2eeUnlockHandshake(deviceId, { password, params });
+  } catch (e) {
+    return { ok: false, code: e && e.code ? e.code : "e2ee_failed", text: (e && e.message) || "解锁失败,请重试" };
+  }
+  e2eeClient.sessions.set(deviceId, { params, sess: r.sess, unlockedAt: Date.now() });
+  e2eeClient.deviceName.set(deviceId, e2eeClient.deviceName.get(deviceId) || deviceId);
+  e2eeUpdateBadge();
+  return { ok: true, code: "ok", sessId: r.sessId };
+}
+
+/** 会话状态查询(供 Phase-4 插件/徽标读取;字段名即对外约定)。 */
+function e2eeStateFor(deviceId) {
+  const params = e2eeClient.params;
+  const s = deviceId ? e2eeClient.sessions.get(deviceId) : null;
+  return {
+    supported: !!(params && params.enabled === true),
+    enabled: !!(params && params.enabled === true),
+    serverReason: params ? params.reason : "not_checked",
+    unlocked: !!s,
+    deviceId: deviceId || "",
+    sessId: s ? s.sess.sessId : "",
+    profile: s ? s.sess.profile : (params ? params.profile : ""),
+    epoch: s ? s.sess.epoch : (params ? params.epoch : 0)
+  };
+}
+
+/** 更新 header 加密状态徽标(已解锁=绿/仅账号支持=黄/不支持隐藏)。 */
+function e2eeUpdateBadge() {
+  const el = $("dsh-e2ee-badge");
+  if (!el) return;
+  const sessions = [...e2eeClient.sessions.values()];
+  if (sessions.length > 0) {
+    el.className = "ok";
+    el.title = "本页已建立端到端加密会话(密钥仅存内存)";
+    el.textContent = "🔒 已解锁";
+    return;
+  }
+  const p = e2eeClient.params;
+  if (p && p.enabled === true) {
+    el.className = "warn";
+    el.textContent = "🔒 可加密";
+    el.title = "账号已启用端到端加密:点选支持加密的设备时需先解锁";
+  } else {
+    el.className = "hidden";
+    el.textContent = "";
+    el.title = "";
+  }
+}
+
+// ---------- E2EE 解锁层 UI(仅 E2EE 能力设备出现;密钥/口令绝不落盘) ----------
+let unlockCtx = null; // { deviceId, name, after }
+
+function e2eeOpenUnlock(deviceId, name, after) {
+  unlockCtx = { deviceId, name: name || deviceId, after: after || null };
+  $("unlock-device-name").textContent = unlockCtx.name;
+  $("unlock-msg").className = "e2ee-unlock-msg";
+  $("unlock-msg").textContent = "";
+  $("unlock-pass").value = "";
+  $("unlock-modal").classList.remove("hidden");
+  $("unlock-modal").querySelector("#btn-unlock-go").disabled = false;
+  setTimeout(() => { try { $("unlock-pass").focus(); } catch {} }, 60);
+}
+
+function e2eeCloseUnlock() {
+  $("unlock-modal").classList.add("hidden");
+  unlockCtx = null;
+}
+
+async function e2eeDoUnlock() {
+  const go = $("btn-unlock-go");
+  const msg = $("unlock-msg");
+  if (!unlockCtx) return;
+  const deviceId = unlockCtx.deviceId;
+  const pw = $("unlock-pass").value;
+  if (!pw) { msg.className = "e2ee-unlock-msg err"; msg.textContent = "请输入账号密码"; return; }
+  go.disabled = true;
+  msg.className = "e2ee-unlock-msg";
+  msg.innerHTML = '<span class="loading"></span> 正在派生密钥并与电脑端握手…(约 1–2 秒)';
+  const r = await e2eeUnlockDevice(deviceId, pw);
+  $("unlock-pass").value = ""; // 口令用完即清,不留在 DOM
+  if (r.ok) {
+    msg.className = "e2ee-unlock-msg ok";
+    msg.textContent = "✅ 已与电脑端确认密码一致,加密会话就绪(密钥仅存本页内存)。";
+    const after = unlockCtx.after;
+    const name = unlockCtx.name;
+    go.disabled = false;
+    go.textContent = "进入设备";
+    unlockCtx.after = null;
+    setTimeout(() => { e2eeCloseUnlock(); if (after) after(); }, 900);
+    toast(`🔒 ${name} 端到端加密会话已建立`, 2600);
+  } else {
+    msg.className = "e2ee-unlock-msg err";
+    msg.textContent = "解锁失败:" + (r.text || "未知错误");
+    go.disabled = false;
+  }
+}
+
+/** 「暂不加密(明文)」:协议 §7.3 明确二次确认 → 明文进入 + 徽标明示。 */
+function e2eeSkipUnlock() {
+  if (!unlockCtx) return;
+  const id = unlockCtx.deviceId;
+  const name = unlockCtx.name;
+  e2eeCloseUnlock();
+  toast(`⚠ ${name}:本次连接未加密(明文)。点选设备将直接进入镜像页。`, 4200);
+  enterDevice(id);
+}
+
+/** e2eeGetParams 的限时版:超时(默认 1200ms)按「未启用」处理 —— 门控绝不让明文进入被拖慢。 */
+async function e2eeParamsWithin(ms = 1200, force = false) {
+  return Promise.race([
+    e2eeGetParams(force),
+    new Promise((r) => setTimeout(() => r({ enabled: false, reason: "params_slow" }), ms))
+  ]);
+}
+
+/**
+ * 设备点选入口(E2EE 门控):账号启用 e2ee ∧ 设备声明 e2ee-v2 → 弹解锁层;
+ * 否则完全走原明文进入流程(行为零变化,回归保护)。 */
+async function e2eeMaybeGateThenEnter(deviceId, name, caps) {
+  const params = await e2eeParamsWithin(1200, false);
+  e2eeUpdateBadge();
+  if (!e2eeCapable(params, caps)) {
+    enterDevice(deviceId); // 未启用/无能力:与旧版完全一致
+    return;
+  }
+  if (!e2eeSubtleAvailable()) {
+    // 浏览器无 WebCrypto(非安全上下文等):不弹层,明文进入 + 原因提示(协议 §7.1 不回退静默)
+    toast("⚠ 当前环境不支持端到端加密(需 HTTPS 安全上下文),本次连接为明文", 5000);
+    enterDevice(deviceId);
+    return;
+  }
+  e2eeClient.deviceName.set(deviceId, name || deviceId);
+  // 已解锁过(同页内存会话)→ 直接进入(镜像页;Phase-4 起在镜像页内复用加密传输)
+  if (e2eeClient.sessions.has(deviceId)) {
+    enterDevice(deviceId);
+    return;
+  }
+  e2eeOpenUnlock(deviceId, name, () => enterDevice(deviceId));
+}
+
+// ---------- E2EE 信封 HTTP/WS 传输原语(浏览器侧;Phase-4 镜像页/插件接线用) ----------
+// 语义对照桥端/路由:
+//   - HTTP 信封明文 p =「上游路径」= router resolveRoute 的转发路径(剥 /remote/<deviceId|channel>
+//     前缀、channel 形态剥 device 参数;§6.2)——桥端按该路径 fetch 127.0.0.1:3080;
+//   - 数据 WS 的 wsLabel = 桥端 parseWsE2eeParams 看到的上游 path+query(剥 e2ee、保留 w)。
+
+/** 上游路径(镜像 router resolveRoute:剥 /remote/ 前缀;channel 形态保留首段标记;剥 device 参数)。 */
+function wcUpstreamPathOf(fullPath) {
+  let p = String(fullPath || "");
+  let query = "";
+  const qIdx = p.indexOf("?");
+  if (qIdx !== -1) { query = p.slice(qIdx + 1); p = p.slice(0, qIdx); }
+  const params = new URLSearchParams(query);
+  params.delete("device"); // router 对 channel 形态剥 device 参数(§6.2)
+  let path = p;
+  if (p.startsWith("/remote/")) {
+    const rest = p.slice("/remote/".length);
+    const slash = rest.indexOf("/");
+    const head = slash === -1 ? rest : rest.slice(0, slash);
+    const tail = slash === -1 ? "" : rest.slice(slash);
+    const marker = ["api", "sidebar", "git", "pet", "_e2ee"].includes(head);
+    path = marker ? "/" + head + tail : (tail || "/");
+  }
+  const qs = params.size ? "?" + params.toString() : "";
+  return path + qs;
+}
+
+/** 数据 WS 流标签(e2ee 标记去掉后保留 w 的 path+query;与桥端 parseWsE2eeParams 同构)。 */
+function wcWsLabelOf(fullPath) {
+  const up = wcUpstreamPathOf(fullPath); // 保持 e2ee/w 参数,剥 device
+  const qIdx = up.indexOf("?");
+  const path = qIdx === -1 ? up : up.slice(0, qIdx);
+  const params = new URLSearchParams(qIdx === -1 ? "" : up.slice(qIdx + 1));
+  const sessId = params.get("e2ee") || "";
+  const w = params.get("w") || "";
+  if (!sessId || !WC_SESS_ID_RE.test(sessId)) return null;
+  params.delete("e2ee");
+  return { sessId, w, wsLabel: path + (params.size ? "?" + params.toString() : ""), upstreamPath: path };
+}
+
+/**
+ * 用已解锁会话封装一个 HTTP 请求并解密响应(§4.3)。
+ * 请求:外头 content-type: application/vnd.dsh.e2ee-v2 + x-dsh-e2ee;
+ *       信封明文 {m,p,h,b}(p = 上游路径);响应信封(k=http-resp)解密 → {st,h,enc,b}(enc=gzip 解压)。
+ * 无信封标记的响应(502/x-dsh-e2ee-error、router 402/403/502/504)→ 原样透传(调用方展示)。
+ * @param {string} deviceId 已解锁设备
+ * @param {string} routerUrl 手机侧 URL(如 `${origin}/remote/<deviceId>/api/...` 或 channel 形态)
+ * @param {object} o { method, path?(显式上游路径,缺省按 routerUrl 推导), headers, body }
+ */
+async function e2eeFetchEnveloped(deviceId, routerUrl, { method = "GET", path, headers = {}, body } = {}) {
+  const ent = e2eeClient.sessions.get(deviceId);
+  if (!ent || !ent.sess) throw new Error("e2ee: 会话未解锁(deviceId=" + deviceId + ")");
+  const sess = ent.sess;
+  const url = new URL(routerUrl, window.location.href);
+  const upstreamPath = path || wcUpstreamPathOf(url.pathname + url.search);
+  const n = wcRandomBytes(WC_NONCE_BYTES);
+  const nonceB64 = wcBytesToB64(n);
+  const reqPlain = wcEncodeHttpRequestPlain({
+    method,
+    path: upstreamPath,
+    headers,
+    bodyB64: body ? wcBytesToB64(typeof body === "string" ? wcUtf8(body) : body) : ""
+  });
+  const envReq = await sess.seal({ kind: "http", dir: WC_DIR_P2B, counter: 0, data: reqPlain, nonceBytes: n });
+  const res = await fetch(url.href, {
+    method: "POST",
+    headers: { ...wcEnvelopeHeaders(sess.sessId, "http"), cookie: document.cookie },
+    body: JSON.stringify(envReq)
+  });
+  const ct = String(res.headers.get("content-type") || "");
+  if (ct.startsWith(WC_ENVELOPE_CONTENT_TYPE) && res.headers.get(WC_ENVELOPE_HEADER)) {
+    const envResp = await res.json();
+    const opened = await sess.open({ kind: "http-resp", dir: WC_DIR_B2P, env: envResp, counter: envResp.c ?? 0, reqNonceB64: nonceB64 });
+    const rp = wcDecodeHttpResponsePlain(opened.data);
+    let bodyBytes = rp.bodyB64 ? wcB64ToBytes(rp.bodyB64) : new Uint8Array(0);
+    if (rp.enc === "gzip" && bodyBytes.length) {
+      const un = await wcGunzip(bodyBytes);
+      if (un) bodyBytes = un;
+    }
+    return { status: rp.status, headers: rp.headers, body: bodyBytes, plain: false };
+  }
+  // 无信封标记:router/bridge 错误页等 → 原样透传(调用方展示 502/402/403/504 语义)
+  const text = await res.text();
+  return { status: res.status, headers: Object.fromEntries([...res.headers.entries()]), body: text, plain: true, raw: text };
+}
+
+/**
+ * 建一条 E2EE 数据 WS(§4.6):在手机侧 ws URL 上追加 &e2ee=<sessId>&w=<8B hex(=16 hex 字符)>;
+ * 每条消息为 k:"w" 信封;p2b 方向计数自 0 单调;b2p 收到后按信封 c 校验单调。
+ * 事件:{ onOpen({ws, wsLabel}), onEnvelope({data:Uint8Array, t}), onPlain(raw), onError(e), onClose(ev) }。
+ * @param {string} deviceId
+ * @param {string} wsUrl 手机侧 ws 地址(允许相对;device 或 channel 形态)
+ */
+function e2eeOpenDataWs(deviceId, wsUrl, { onOpen, onEnvelope, onPlain, onClose, onError } = {}) {
+  const ent = e2eeClient.sessions.get(deviceId);
+  if (!ent || !ent.sess) throw new Error("e2ee: 会话未解锁(deviceId=" + deviceId + ")");
+  const sess = ent.sess;
+  const u = new URL(wsUrl, window.location.href);
+  u.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const params = new URLSearchParams(u.search);
+  if (!params.get("w")) params.set("w", wcRandomHex(8)); // 8B 随机 = 16 hex
+  params.set("e2ee", sess.sessId);
+  const sentPath = u.pathname + (params.size ? "?" + params.toString() : "");
+  const label = wcWsLabelOf(sentPath);
+  if (!label) throw new Error("e2ee: 数据 WS 缺少 e2ee/w 标记(内部错误)");
+  const wsLabel = label.wsLabel; // 与桥端一致的流标签(含 w)
+  const ws = new WebSocket(u.origin + sentPath);
+  let p2b = 0;
+  let b2pLast = -1;
+  ws.onopen = () => { if (onOpen) onOpen({ ws, wsLabel }); };
+  ws.onmessage = (ev) => {
+    const raw = String(ev.data);
+    void (async () => {
+      let env = null;
+      try { env = JSON.parse(raw); } catch { /* 非 JSON 明文帧 */ }
+      if (env && typeof env === "object" && env.k === "w") {
+        try {
+          if (!Number.isInteger(env.c) || env.c <= b2pLast) throw wcErr("replay", "e2ee: b2p 计数重放/乱序");
+          const opened = await sess.open({ kind: "w", dir: WC_DIR_B2P, env, counter: env.c ?? 0, wsLabel });
+          b2pLast = env.c;
+          if (onEnvelope) onEnvelope({ data: opened.data, t: opened.t, env });
+        } catch (e) {
+          if (onError) onError(e); else try { ws.close(1008, "⚠ e2ee 消息无法解密"); } catch {}
+        }
+        return;
+      }
+      if (onPlain) onPlain(raw);
+    })();
+  };
+  ws.onerror = (e) => { if (onError) onError(e); };
+  ws.onclose = (ev) => { if (onClose) onClose(ev); };
+  return {
+    ws,
+    send(data, { binary = false } = {}) {
+      return (async () => {
+        const env = await sess.seal({ kind: "w", dir: WC_DIR_P2B, counter: p2b++, data, t: binary ? 1 : 0, wsLabel });
+        ws.send(JSON.stringify(env));
+      })();
+    },
+    close(code, reason) { try { ws.close(code, reason); } catch {} }
+  };
+}
+
+
 $("btn-login").onclick = () => doLogin();
 $("btn-register").onclick = () => doRegister();
 $("btn-logout").onclick = () => logout();
@@ -1383,6 +2261,10 @@ $("btn-promo-back").onclick = () => {
 };
 $("login-pass").addEventListener("keydown", (e) => { if (e.key === "Enter") $("btn-login").onclick(); });
 $("reg-pass2").addEventListener("keydown", (e) => { if (e.key === "Enter") $("btn-register").onclick(); });
+// E2EE 解锁层(Phase-3):解锁 / 明文跳过 / Enter 提交;遮罩点击不误关(输入中)
+$("btn-unlock-go").onclick = () => void e2eeDoUnlock();
+$("btn-unlock-skip").onclick = () => e2eeSkipUnlock();
+$("unlock-pass").addEventListener("keydown", (e) => { if (e.key === "Enter" && !$("btn-unlock-go").disabled) void e2eeDoUnlock(); });
 
 // ---------- 启动 ----------
 function tokenExpired(token) {

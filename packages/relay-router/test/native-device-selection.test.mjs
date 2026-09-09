@@ -34,8 +34,9 @@ test("0/1/多设备统一进设备选择页:不按台数自动跳转,由用户�
   assert.match(APP, /devices\.length === 0/);
   // 单台不再写 dsh_device 自动进入:enterMirror 内不允许出现 devices[0] 直跳
   assert.doesNotMatch(APP, /enterDevice\(devices\[0\]\.id\)/);
-  // 点选设备(行级 onclick,读取 data-device)才是唯一进入途径;离线行不会触发 enter
-  assert.match(APP, /enterDevice\(el\.dataset\.device\)/);
+  // 点选设备(行级 onclick,读取 data-device)才是唯一进入途径;离线行不会触发 enter。
+  // 在线行先经 E2EE 门控(e2eeMaybeGateThenEnter):未启用/无能力时内部照旧 enterDevice。
+  assert.match(APP, /e2eeMaybeGateThenEnter\(el\.dataset\.device/);
 });
 
 test("仅用户点选设备才写 dsh_device 并跳根路径(enterDevice)", () => {
@@ -78,4 +79,79 @@ test("登录卡片已登录区移除「切换账号」按钮,保留「退出登�
 
 test("Router 错误页「返回登录」带显式退出意图 /app/?logout=1", () => {
   assert.match(ROUTER, /\/app\/\?logout=1/);
+});
+
+// ============================================================
+// E2EE Phase-3 源码级契约(native.html 手机端客户端;docs/e2ee-protocol.md §2.3/§3.4/§5/§6.4)
+// ============================================================
+
+test("E2EE 信任文案:解锁层文案按 §2.3-2,强调密码=密钥/仅内存/不发给中继/刷新重输", () => {
+  assert.match(APP, /请输入账号密码以开启/);
+  assert.match(APP, /端到端加密/);
+  assert.match(APP, /密码仅在本页内存中参与密钥派生/);
+  assert.match(APP, /不会发送给中继/);
+  assert.match(APP, /不(被|会)保存/);
+  assert.match(APP, /刷新或重开页面需再次输入/);
+  // 明文跳过必须明确二次确认(§7.3「本次连接不加密(明文)」)
+  assert.match(APP, /暂不加密/);
+  assert.match(APP, /明文/);
+  // 密钥不落 localStorage:不得把 e2ee 材料写入本地存储(协议 §5.1/§8 风险 5)
+  assert.doesNotMatch(APP, /localStorage\.(set|get|remove)Item\(\s*["'][^"']*e2ee/i);
+});
+
+test("E2EE 接入点字段:params 端点 / 控制通道 / 信封标记 / 握手消息齐备", () => {
+  // §3.4 参数端点(拉取:服务端 enabled=false → 明文回退)
+  assert.match(APP, /api\/e2ee-params/);
+  assert.match(APP, /server_disabled/);
+  // §5.2 控制通道 device 形态 {origin}/remote/<deviceId>/_e2ee/ctrl
+  assert.match(APP, /\/remote\/.*_e2ee\/ctrl/);
+  assert.match(APP, /e2ee-hello/);
+  assert.match(APP, /dsh-e2ee-probe-v1/);
+  assert.match(APP, /dsh-e2ee-probe-ok/);
+  // §4.3 信封即信号:content-type 与 x-dsh-e2ee 标记
+  assert.match(APP, /application\/vnd\.dsh\.e2ee-v2/);
+  assert.match(APP, /x-dsh-e2ee/);
+  // 可读错误码文案映射(bad_key 等)
+  assert.match(APP, /bad_key/);
+  assert.match(APP, /电脑端保存的账号密码与本次输入不一致/);
+});
+
+test("E2EE 门控:仅「账号 enabled ∧ 设备 caps=e2ee-v2」才走解锁流程;否则原明文进入不变", () => {
+  assert.match(APP, /e2eeCapable\(/);
+  assert.match(APP, /e2eeMaybeGateThenEnter/);
+  // 能力判定必须同时看服务端开关与 /_devices 透传的 caps(Phase-2 §6.2)
+  assert.match(APP, /caps\.includes/);
+  assert.match(APP, /WC_E2EE_CAP|["']e2ee-v2["']/);
+  // 门控不满足 → 直接原进入路径(明文回退,回归保护)
+  assert.match(APP, /if \(!e2eeCapable\(params, caps\)\)/);
+  assert.match(APP, /enterDevice\(deviceId\)/);
+  // 设备行渲染须携带 caps(供门控读取;离线行不可进入)
+  assert.match(APP, /data-caps=/);
+  assert.match(APP, /class="device off"/);
+  // 内存会话(同页已解锁 → 直接进入,不重复弹层)
+  assert.match(APP, /e2eeClient\.sessions\.has\(deviceId\)/);
+});
+
+test("E2EE 状态字段(Phase-4 约定):徽标/状态取自 e2eeStateFor 命名", () => {
+  assert.match(APP, /function e2eeStateFor/);
+  assert.match(APP, /supported:/);
+  assert.match(APP, /enabled:/);
+  assert.match(APP, /unlocked:/);
+  assert.match(APP, /deviceId:/);
+  assert.match(APP, /sessId:/);
+  assert.match(APP, /profile:/);
+  assert.match(APP, /epoch:/);
+  // header 徽标 id(dsh-e2ee-badge)+ 状态文案
+  assert.match(APP, /dsh-e2ee-badge/);
+  assert.match(APP, /🔒 已解锁/);
+});
+
+test("E2EE WebCrypto 核心与纯浏览器 API 对齐(供 node 抽取对拍的原语区间)", () => {
+  assert.match(APP, /DSH-E2EE-WC-CORE-START/);
+  assert.match(APP, /crypto\.subtle/);
+  assert.match(APP, /importKey/);
+  assert.match(APP, /deriveBits/);
+  assert.match(APP, /AES-GCM/);
+  assert.match(APP, /PBKDF2/);
+  assert.match(APP, /HKDF/);
 });
