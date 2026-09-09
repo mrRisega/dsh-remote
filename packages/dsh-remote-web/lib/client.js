@@ -5,15 +5,18 @@
 // factory 内只能 require shell 种子模块（react / react/jsx-runtime 等）。
 //
 // 功能：
-//   - settings.section：设置页「远程访问」栏目（位于「Agent 预设」下方，官方扩展点）
+//   - 入口＝官方「设置」页内的 settings.section「远程访问」栏目（位于「Agent 预设」下方，
+//     官方扩展点）；不向官方侧边栏注入任何按钮，官方「设置」按钮原样、不被遮挡
 //   - 栏目内联渲染配置面板（浅色高对比 UI，遵循主流登录体验）
 //     · 登录态：已登录显示账号 + 退出登录；未登录显示 登录/注册 tabs
-//     · 🔒 修改密码：已登录账号经 图形验证码+短信验证码 重置（/dsh-remote/password/reset 代理）；
+//     · 🔒 修改密码（账号卡）：已登录账号经 图形验证码+短信验证码 重置（/dsh-remote/password/reset 代理）；
 //       成功后全部已授权设备/会话失效 → 本地登出并提示用新密码重新登录（覆盖本机 config 密码）
+//     · 忘记密码（登录卡）：未登录时登录表单内「忘记密码？」→ 同一套
+//       图形验证码+短信验证码 表单（手机号预填当前输入、可改），成功后本地登出并提示「请用新密码登录」
 //     · 登录要求图形验证码；注册要求两次密码 + 图形验证码
 //     · 📱 远程访问卡：一次性访问密钥（扫码/直接打开/复制 + 到期倒计时自动刷新）与已授权设备管理
 //     · bridge 状态与启停开关 + 关于 dsh-remote 说明卡片
-//   - 首次安装引导：设置页栏目旁小红点（localStorage dsh-remote-seen-dot 控制）
+//   - 首次安装引导：设置页「远程访问」栏目（官方导航 navCell）旁小红点（localStorage dsh-remote-seen-dot 控制）
 //   - shell.overlay：满意度弹窗（安装体验至少 1 小时后弹出，只弹一次）
 // 所有数据经同源 /dsh-remote/* 宿主路由读写（node 半提供）。
 window.__ModuleLoader__.load({
@@ -63,6 +66,8 @@ window.__ModuleLoader__.load({
       ".dru-btn-ghost:hover:not(:disabled){background:#f6f8fa}",
       ".dru-btn-danger{background:#ffffff;color:#cf222e;border-color:#cf222e}",
       ".dru-btn-danger:hover:not(:disabled){background:#fff0f1}",
+      ".dru-linkbtn{display:inline-block;padding:0;border:none;background:none;color:#0969da;font-size:12.5px;line-height:1.6;cursor:pointer;font-family:inherit;text-decoration:none}",
+      ".dru-linkbtn:hover{text-decoration:underline}",
       ".dru-tabs{display:flex;gap:8px;margin-bottom:12px}",
       ".dru-tab{flex:1;padding:7px 0;text-align:center;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600;color:#57606a;background:#f6f8fa;border:1px solid #d0d7de;user-select:none}",
       ".dru-tab.active{color:#0969da;background:#ffffff;border-color:#0969da}",
@@ -151,305 +156,8 @@ window.__ModuleLoader__.load({
       // Phase-5:端到端加密(E2EE)状态行 —— 启用=绿字绿点,未启用=灰字(纯文字状态行,不打扰)
       ".dru-e2ee-line{display:flex;align-items:center;gap:7px;margin-top:6px;font-size:12px;line-height:1.5;color:#57606a}",
       ".dru-e2ee-line.ok{color:#1a7f37}",
-      // 左下角「远程访问」快捷小手机图标（安装后常驻；首次点击前带红点）
-      ".dru-fab{position:fixed;left:18px;bottom:18px;z-index:2147482100;width:46px;height:46px;border-radius:50%;background:#0969da;color:#fff;border:none;display:flex;align-items:center;justify-content:center;font-size:22px;line-height:1;box-shadow:0 6px 18px rgba(0,0,0,.28);cursor:pointer;font-family:inherit;padding:0}",
-      ".dru-fab:hover{background:#0860bd}",
-      ".dru-fab-dot{position:absolute;top:2px;right:2px;width:9px;height:9px;border-radius:50%;background:#e5484d;box-shadow:0 0 0 2px #fff;pointer-events:none}",
     ].join("\n");
     document.head.appendChild(styleEl);
-
-    // ── 侧边栏「远程访问」快捷入口（独立按钮，挂在官方「设置」上方；Bug A 修复） ──
-    // 用户实测 Bug A：入口视觉在左侧（官方「设置」上方），点击却落在工作区会话行——
-    // 会话标题含「远程访问」（如“分析竞品远程访问功能”）被旧逻辑当成导航项点中。
-    // 根因：旧实现用 document 级 querySelectorAll + textContent「包含匹配」扫全文档，
-    // 会话标题也命中；且注入项 clone 官方按钮可能继承官方事件委托/点击热区。
-    // 修复（本段全部导航点击逻辑）：
-    //   1) 候选扫描一律限定在「侧栏/主导航容器」内（[role=navigation]/<nav>/class 含
-    //      sidebar|navRail|navPanel|navigation|sidenav|appnav 等；兜底：含「设置」导航项或
-    //      navCell 的元素向上找最近容器）。绝不 document 全量扫可点元素去点击。
-    //   2) 命中收紧：aria-label/title 等于或 startsWith(token)；textContent 仅当短文本
-    //      （trim ≤ NAV_TEXT_MAX=10 且不含换行——长会话标题天然被拒）且 等于/以 token 开头/
-    //      含 token 但短；同时排除 class 带 menu/context/more/kebab 等“菜单/更多”语义的节点。
-    //   3) 注入项改为自有独立 <button id=dru-nav-remote>（不再复制官方按钮元素，避免继承
-    //      官方委托与热区），自带 click → openRemoteSettings()。
-    //   4) openRemoteSettings：栏目已在 DOM 直接返回 → 各容器内点「远程访问」栏目项 →
-    //      容器内点「设置」→ 轮询 ≤3s（20×150ms）容器内补点「远程访问」；绝不点工作区内容。
-    var NAV_SEEN_KEY = "dsh-remote-nav-seen";
-    var NAV_ENTRY_ID = "dru-nav-remote";
-    var NAV_MARK = "data-dru-remote";
-    /** 导航候选（仅在导航容器内查询）：navCell（shell hashed 类）/tab/menuitem/button/a/aria-label。 */
-    var NAV_CAND_SEL = '[class*="navCell"], [role="tab"], [role="menuitem"], [role="button"], button, a, [aria-label]';
-    /** 侧栏/主导航容器定位选择器（先定位容器，再在容器内做候选查询）。 */
-    var NAV_CONTAINER_SEL = '[role="navigation"], nav, [class*="sidebar"], [class*="navRail"], [class*="navPanel"], [class*="sidenav"], [class*="appnav"], [class*="navigation"]';
-    /** 候选节点 class 命中这些语义（菜单/更多/下拉…）→ 视为会话行“⋯”等，绝不点击。 */
-    var NAV_BAD_CLS_RE = /(^|[^a-z0-9])(menu|context|more|kebab|dropdown|popover|toolbar)($|[^a-z0-9])/i;
-    /** textContent 短文本上限：超过即视为长文本（会话标题等），textContent 命中一律拒绝。 */
-    var NAV_TEXT_MAX = 10;
-    /** openRemoteSettings 轮询上限：150ms × 20 = 3s（≤3s），到时放弃，不再无限轮询。 */
-    var NAV_POLL_MAX = 20;
-    /** 向上找“最近容器”的最大步数（防误上到整页）。 */
-    var NAV_UP_MAX = 8;
-
-    /** 候选是否“可点导航项”：按钮/链接/tab/menuitem/navCell（排除无交互的装饰容器）。 */
-    function isNavClickable(el) {
-      try {
-        var tag = String(el.tagName || "").toLowerCase();
-        if (tag === "button" || tag === "a") return true;
-        var role = el.getAttribute && el.getAttribute("role") || "";
-        if (role === "tab" || role === "menuitem" || role === "button" || role === "link") return true;
-        return String(el.className || "").indexOf("navCell") !== -1;
-      } catch (e) { return false; }
-    }
-    /** 节点 class 是否带“菜单/更多”语义（会话行的 ⋯/右键菜单等）→ 不可作为导航候选。 */
-    function isBadNavClass(el) {
-      try { return NAV_BAD_CLS_RE.test(String(el.className || "")); } catch (e) { return false; }
-    }
-    /** 是否语义化导航容器：role=navigation/menu 或 class 含 sidebar/navRail/navPanel 等。 */
-    function isNavContainerEl(el) {
-      try {
-        var role = el.getAttribute && el.getAttribute("role") || "";
-        if (role === "navigation" || role === "menu") return true;
-        return NAV_CONTAINER_RE.test(String(el.className || ""));
-      } catch (e) { return false; }
-    }
-    var NAV_CONTAINER_RE = /sidebar|navRail|navPanel|sidenav|appnav|navigation/i;
-    /** 候选可用性：可点 + 非“菜单/更多”语义 class。 */
-    function isUsableNavCandidate(el) {
-      try {
-        if (!isNavClickable(el)) return false;
-        if (isBadNavClass(el)) return false;
-        return true;
-      } catch (e) { return false; }
-    }
-    /**
-     * 收紧后的命中规则（aria/title 与可见短文本任一命中即可，语义更贴近官方按钮：
-     * 官方按钮可能带 aria-label/title，也可能只有可见文字）：
-     *  - aria-label/title：等于 token 或以 token 开头（长度不限，纯图标导航常见）；
-     *  - textContent：仅短文本（trim ≤10 且不含换行——长会话标题被拒）且
-     *    等于 / 以 token 开头 / 含 token 但文本短。
-     */
-    function navTextHits(el, token) {
-      try {
-        var al = el.getAttribute && el.getAttribute("aria-label");
-        var attr = al && String(al).trim() ? String(al).trim() : "";
-        if (!attr) { var tt = el.getAttribute && el.getAttribute("title"); if (tt && String(tt).trim()) attr = String(tt).trim(); }
-        if (attr && (attr === token || attr.indexOf(token) === 0)) return true;
-      } catch (e) {}
-      var t = "";
-      try { t = (el.textContent || "").replace(/\s+/g, " ").trim(); } catch (e2) {}
-      if (!t || /\r|\n/.test(t) || t.length > NAV_TEXT_MAX) return false; // 长文本/多行 → 拒绝
-      return t === token || t.indexOf(token) === 0 || t.indexOf(token) !== -1;
-    }
-    /**
-     * 在候选列表里找命中 token 的导航项（命中「远程访问」时打 data-dru-remote 标记，
-     * 二次命中直接走标记，无需重扫）。始终排除注入项自身（id=dru-nav-remote）防递归。
-     */
-    function pickNavHit(nodes, token, excludeId, preferMarked) {
-      try {
-        for (var i = 0; i < nodes.length; i++) {
-          var el = nodes[i];
-          if (excludeId && el.id === excludeId) continue; // 排除注入项自身，防递归
-          if (!isUsableNavCandidate(el)) continue;
-          var marked = !!el.getAttribute && el.getAttribute(NAV_MARK) === "1";
-          if (preferMarked && !marked) continue;
-          if (!preferMarked && marked) continue;
-          if (!navTextHits(el, token)) continue;
-          if (token === "远程访问") { try { el.setAttribute(NAV_MARK, "1"); } catch (e) {} }
-          return el;
-        }
-      } catch (e) { /* 忽略 */ }
-      return null;
-    }
-    /** 统计容器内可用导航候选数量（用于向上定位“最近容器”）。 */
-    function navLikeCount(container) {
-      try {
-        var nodes = container.querySelectorAll(NAV_CAND_SEL) || [];
-        var n = 0;
-        for (var i = 0; i < nodes.length; i++) { if (isUsableNavCandidate(nodes[i])) n++; }
-        return n;
-      } catch (e) { return 0; }
-    }
-    /** 从某导航叶子向上找“最近容器”（语义容器或 ≥2 个可用候选的层）。 */
-    function navContainerAbove(leaf) {
-      var p = leaf && leaf.parentNode ? leaf.parentNode : null;
-      var steps = 0;
-      while (p && p !== document.documentElement && steps < NAV_UP_MAX) {
-        if (isNavContainerEl(p)) return p;
-        if (navLikeCount(p) >= 2) return p;
-        p = p.parentNode;
-        steps++;
-      }
-      return null;
-    }
-    /** 全文档找一个命中 token 的短导航叶子（仅用于“定位容器”，不点击）。 */
-    function navLeafByToken(token) {
-      try {
-        var all = document.querySelectorAll(NAV_CAND_SEL) || [];
-        for (var i = 0; i < all.length; i++) {
-          var el = all[i];
-          if (el.id === NAV_ENTRY_ID) continue;
-          if (!isUsableNavCandidate(el)) continue;
-          if (!navTextHits(el, token)) continue;
-          return el;
-        }
-      } catch (e) {}
-      return null;
-    }
-    /** 全文档找一个 navCell 叶子（shell 设置页导航按钮；用于兜底定位容器）。 */
-    function navCellLeaf() {
-      try {
-        var all = document.querySelectorAll('[class*="navCell"]') || [];
-        for (var i = 0; i < all.length; i++) {
-          var el = all[i];
-          if (el.id === NAV_ENTRY_ID) continue;
-          if (!isUsableNavCandidate(el)) continue;
-          return el;
-        }
-      } catch (e) {}
-      return null;
-    }
-    /**
-     * 定位侧栏/主导航容器（此后所有候选命中都在这些容器内进行，绝不扫 main/内容区/会话列表）：
-     *   ① 语义容器：[role=navigation]/<nav>/class 含 sidebar|navRail|navPanel|sidenav|appnav|navigation；
-     *   ② 兜底：从全文档命中「设置」的短导航叶子向上找最近容器；
-     *   ③ 再兜底：从任意 navCell 叶子向上找最近容器（设置页栏目导航）。
-     * 返回去嵌套后的容器数组（保持调用次序，document 不在容器内）。
-     */
-    function navContainers() {
-      var out = [];
-      var push = function (el) {
-        if (!el || typeof el.querySelectorAll !== "function") return;
-        if (out.indexOf(el) !== -1) return;
-        var nested = false;
-        for (var j = 0; j < out.length; j++) {
-          try { if (out[j].contains && out[j].contains(el)) { nested = true; break; } } catch (e) {}
-        }
-        if (!nested) out.push(el);
-      };
-      try {
-        var sem = document.querySelectorAll(NAV_CONTAINER_SEL) || [];
-        for (var i = 0; i < sem.length; i++) push(sem[i]);
-      } catch (e) {}
-      var seed = navLeafByToken("设置");
-      if (seed) push(navContainerAbove(seed));
-      var cell = navCellLeaf();
-      if (cell) push(navContainerAbove(cell));
-      return out;
-    }
-    /**
-     * 在全部侧栏/导航容器内点击“命中 token”的导航项（②：导航文字可能不同名/纯图标，
-     * 交给命中器）。只查容器内候选，绝不 document 全量点击。全部失败返回 false。
-     */
-    function clickNavToken(token, excludeId) {
-      var containers = navContainers();
-      for (var c = 0; c < containers.length; c++) {
-        var nodes = null;
-        try { nodes = containers[c].querySelectorAll(NAV_CAND_SEL); } catch (e) { nodes = null; }
-        if (!nodes) continue;
-        if (token === "远程访问") {
-          var hitMarked = pickNavHit(nodes, token, excludeId, true);
-          if (hitMarked) { try { hitMarked.click(); } catch (e2) {} return true; }
-        }
-        var hit = pickNavHit(nodes, token, excludeId, false);
-        if (hit) { try { hit.click(); } catch (e3) {} return true; }
-      }
-      return false;
-    }
-    /** 「远程访问」栏目内容区是否已在 DOM（设置页已选中该栏目）。 */
-    function remoteSectionVisible() {
-      try {
-        var el = document.querySelector(".dru-settings-section");
-        if (!el) return false;
-        if (document.body && !document.body.contains(el)) return false;
-        if (el.getAttribute && (el.getAttribute("aria-hidden") === "true" || el.getAttribute("hidden") !== null)) return false;
-        return true;
-      } catch (e) { return false; }
-    }
-    /**
-     * 打开设置页「远程访问」栏目（侧栏注入项/面板内“去设置”等共用入口）：
-     * 栏目已在 DOM → 直接返回；否则容器内点「远程访问」栏目项 → 容器内点「设置」进设置页，
-     * 再轮询（≤3s：20×150ms，NAV_POLL_MAX）容器内补点「远程访问」。全程不点工作区内容。
-     */
-    function openRemoteSettings() {
-      if (remoteSectionVisible()) return;
-      if (clickNavToken("远程访问", NAV_ENTRY_ID)) return;
-      clickNavToken("设置", NAV_ENTRY_ID); // 进设置页（导航文字可能不同名/纯图标，交给命中器）
-      var tries = 0;
-      var iv = setInterval(function () {
-        if (remoteSectionVisible() || clickNavToken("远程访问", NAV_ENTRY_ID)) { clearInterval(iv); return; }
-        if (++tries >= NAV_POLL_MAX) clearInterval(iv); // ≤3s 轮询上限
-      }, 150);
-      if (typeof iv.unref === "function") iv.unref();
-    }
-    // 暴露给宿主/自动化（同一入口，避免重复实现；测试沙箱经此驱动点击流）
-    try { window.__dshRemoteNav = { open: openRemoteSettings }; } catch (e) {}
-
-    function injectSidebarRemoteEntry() {
-      try {
-        if (document.getElementById(NAV_ENTRY_ID)) return;
-        if (!document.body) { setTimeout(injectSidebarRemoteEntry, 300); return; }
-        var tries = 0;
-        var iv = setInterval(function () {
-          try {
-            if (document.getElementById(NAV_ENTRY_ID)) { clearInterval(iv); return; }
-            // 只在导航容器内找「设置」按钮（可点 + 短文本/aria 命中），绝不 document 全量找。
-            var containers = navContainers();
-            var settingsBtn = null;
-            for (var c = 0; c < containers.length; c++) {
-              var nodes = null;
-              try { nodes = containers[c].querySelectorAll(NAV_CAND_SEL); } catch (e) { nodes = null; }
-              if (!nodes) continue;
-              var hit = pickNavHit(nodes, "设置", NAV_ENTRY_ID, false);
-              if (hit) { settingsBtn = hit; break; }
-            }
-            if (!settingsBtn || !settingsBtn.parentNode) {
-              if (++tries > 80) clearInterval(iv);
-              return;
-            }
-            // 独立按钮：不复用官方按钮元素（避免继承官方事件委托/点击热区 → Bug A 误点会话行）。
-            var entry = document.createElement("button");
-            entry.id = NAV_ENTRY_ID;
-            entry.setAttribute("type", "button");
-            entry.setAttribute("role", "button");
-            entry.setAttribute("tabindex", "0");
-            entry.setAttribute("aria-label", "远程访问");
-            entry.textContent = "📱 远程访问";
-            entry.style.cssText = "display:flex;align-items:center;gap:6px;box-sizing:border-box;width:100%;" +
-              "padding:8px 10px;margin:2px 0;border:1px solid transparent;background:transparent;" +
-              "border-radius:8px;color:inherit;font-family:inherit;font-size:13px;line-height:1.4;" +
-              "cursor:pointer;text-align:left;position:relative";
-            var seen = false;
-            try { seen = !!localStorage.getItem(NAV_SEEN_KEY); } catch (e) {}
-            if (!seen) {
-              var dot = document.createElement("span");
-              dot.setAttribute("aria-hidden", "true");
-              dot.style.cssText = "position:absolute;top:4px;right:10px;width:8px;height:8px;border-radius:50%;background:#e5484d;pointer-events:none";
-              entry.appendChild(dot);
-            }
-            entry.addEventListener("click", function () {
-              try { localStorage.setItem(NAV_SEEN_KEY, "1"); } catch (e) {}
-              var dots = entry.children || [];
-              for (var i = 0; i < dots.length; i++) {
-                var d = dots[i];
-                if (d.getAttribute && d.getAttribute("aria-hidden") === "true" && /background:#e5484d/.test(d.style && d.style.cssText || "")) {
-                  try { entry.removeChild(d); } catch (e2) {}
-                  break;
-                }
-              }
-              openRemoteSettings();
-            });
-            settingsBtn.parentNode.insertBefore(entry, settingsBtn); // 官方「设置」在入口下方
-            clearInterval(iv);
-          } catch (e) { /* 忽略单次失败,继续重试 */ }
-        }, 300);
-        if (typeof iv.unref === "function") iv.unref();
-      } catch (e) { /* 非关键 */ }
-    }
-    if (document.readyState === "loading") {
-      document.addEventListener("DOMContentLoaded", injectSidebarRemoteEntry);
-    } else {
-      setTimeout(injectSidebarRemoteEntry, 600);
-    }
 
     // ── 首次安装引导小红点（设置页「远程访问」栏目，localStorage 控制） ────
     // 无 dsh-remote-seen-dot key 视为首次：在设置页导航栏目右上角显示 CSS 圆点；
@@ -1313,8 +1021,9 @@ window.__ModuleLoader__.load({
 
       useEffect(function () { refresh(); }, [refresh]);
       useEffect(function () {
-        if (st !== null && !loggedIn && mode === "saas" && authTab === "login" && !lcap) loadCaptcha("login");
-      }, [st, loggedIn, mode, authTab, lcap]);
+        // 展开「忘记密码」重置表单时不用预载登录表单验证码（收起的 reset 表单用独立 pwdCap）
+        if (st !== null && !loggedIn && mode === "saas" && authTab === "login" && !pwdOpen && !lcap) loadCaptcha("login");
+      }, [st, loggedIn, mode, authTab, pwdOpen, lcap]);
 
       // ── 📱 远程访问卡：常量 / 轮询 / 一次性访问密钥 / 已授权设备 ─────────────────
       var KEY_AUTO_REFRESH_MS = 25000;  // 停留栏目时约每 25s 自动轮换一把新的一次性密钥（防已用/过期）
@@ -1538,6 +1247,7 @@ window.__ModuleLoader__.load({
               return post("/dsh-remote/config", { phone: phone.trim(), password: pass }).then(function (cfg) {
                 // 切换连接账号（手机号与之前不同）：清除旧账号留下的反馈线程凭据
                 if (prevPhone !== phone.trim()) fbClearThreads();
+                setPwdOpen(false); // 登录成功（可能从「忘记密码」返回）→ 收起重置表单
                 setSt(cfg); setPass(""); setLcapTxt(""); setLcap(null);
                 setMsg("ok", "✅ 登录成功，账号已保存");
               });
@@ -1588,6 +1298,7 @@ window.__ModuleLoader__.load({
           .then(function (body) {
             if (body.ok || body.status === 201 || (body.body && body.body.token)) {
               return post("/dsh-remote/config", { phone: rphone.trim(), password: rpass }).then(function (cfg) {
+                setPwdOpen(false);
                 setSt(cfg);
                 setRphone(""); setRpass(""); setRpass2(""); setRsms(""); setRcap(null); setRcapTxt(""); setRInvite("");
                 setMsg("ok", "✅ 注册成功，已自动登录");
@@ -1609,17 +1320,23 @@ window.__ModuleLoader__.load({
           // 退出登录：清除本机保存的用户反馈线程凭据（thread_token 见 FB_THREADS_KEY），
           // 反馈历史保留在服务端（按账号校验），账号身份变化后本机不再可见旧线程。
           fbClearThreads();
+          setPwdOpen(false); // 退出登录后回到登录卡，收起重置/修改密码表单
           if (clearForm) { setPhone(""); setPass(""); setLcapTxt(""); setLcap(null); setRphone(""); setRpass(""); setRpass2(""); setRsms(""); setRsmsBtn("获取验证码"); setRcapTxt(""); setRcap(null); }
           setMessage(null);
         }).catch(function (e) { setMsg("err", "退出失败: " + e.message); })
           .finally(function () { setBusy(""); });
       };
 
-      // ---------- 🔒 修改密码（已登录 SaaS，短信重置；企业端公开 POST /api/password/reset） ----------
+      // ---------- 🔒 修改密码 / 忘记密码（共用：短信验证码重置；企业端公开 POST /api/password/reset） ----------
       // 图形验证码 + 短信验证码复用既有 /dsh-remote/captcha、/dsh-remote/sms-code 防刷路径；
-      // 新密码 ≥8 位。成功后企业端使全部授权设备/会话失效（含 E2EE 派生口令），
-      // 且桌面端配置 config.phone/password 里的旧口令已不可用 → 本地登出（清 threads/会话），
+      // 新密码 ≥8 位。成功后企业端使全部授权设备/会话失效（含 E2EE 派生口令）→ 本地登出，
       // 提示用新密码重新登录（登录成功会把新密码写回本地 config，覆盖旧口令并重建 E2EE 派生）。
+      // 两处入口共用同一组字段/函数（pwdOpen/pwdCap/pwdCapTxt/pwdSms/pwdSmsBtn/pwdNew 与
+      // togglePwdForm/sendPwdSms/doResetPwd/renderResetPwdForm，避免重复实现）：
+      //   - 账号卡「🔒 修改密码」：fromLogin=false，手机号以当前登录账号为准（只读）；
+      //   - 登录卡「忘记密码？」：fromLogin=true，手机号预填登录输入、可改；成功后请用新密码登录。
+      var PWD_RESET_WARN = "修改后所有已授权设备/会话将失效，需重新登录与解锁";
+
       function pwdLoadCaptcha() {
         setPwdCap({ id: null, svg: '<span class="dru-hint">加载中</span>' });
         fetch("/dsh-remote/captcha").then(function (r) {
@@ -1632,10 +1349,18 @@ window.__ModuleLoader__.load({
           });
         }).catch(function () { setPwdCap({ id: null, svg: null }); });
       }
-      /** 发送修改密码用的短信验证码（图形验证码防刷；captcha_invalid → 重载验证码提示重试）。 */
-      var sendPwdSms = function () {
-        var ph = (st && st.config && st.config.phone) || "";
-        if (!/^1\d{10}$/.test(ph)) { setMsg("err", "请先登录手机号账号再修改密码（以当前账号为准）"); return; }
+      /** 展开/收起重置密码表单（账号卡「修改密码」与登录卡「忘记密码」共用开关）。 */
+      var togglePwdForm = function () {
+        var next = !pwdOpen;
+        setPwdOpen(next);
+        setMessage(null);
+        if (next && !pwdCap) pwdLoadCaptcha();
+      };
+      /** 发送短信验证码（图形验证码防刷；captcha_invalid → 重载验证码提示重试）。ph 由调用方给出：
+       * 账号卡=当前登录手机号；登录卡「忘记密码」=表单输入手机号。 */
+      var sendPwdSms = function (ph) {
+        ph = String(ph || "").trim();
+        if (!/^1\d{10}$/.test(ph)) { setMsg("err", "请输入正确的手机号"); return; }
         if (!pwdCap || !pwdCap.id || !pwdCapTxt.trim()) { setMsg("err", "请输入图中验证码（点击图片可刷新）"); return; }
         setBusy("pwd-sms");
         post("/dsh-remote/sms-code", { phone: ph, captcha_id: pwdCap.id, captcha_answer: pwdCapTxt.trim() })
@@ -1656,10 +1381,14 @@ window.__ModuleLoader__.load({
           })
           .finally(function () { setBusy(""); });
       };
-      /** 确认修改密码：POST /dsh-remote/password/reset → 成功后本地登出，提示用新密码登录。 */
-      var doChangePwd = function () {
-        var ph = (st && st.config && st.config.phone) || "";
-        if (!/^1\d{10}$/.test(ph)) { setMsg("err", "请先登录手机号账号（修改密码以当前账号为准）"); return; }
+      /**
+       * 确认重置密码：POST /dsh-remote/password/reset → 成功后本地登出，提示用新密码登录。
+       * @param {string} ph - 手机号（账号卡=当前登录账号；登录卡「忘记密码」=表单输入）。
+       * @param {boolean} fromLogin - true=登录卡「忘记密码」；false=账号卡「修改密码」。
+       */
+      var doResetPwd = function (ph, fromLogin) {
+        ph = String(ph || "").trim();
+        if (!/^1\d{10}$/.test(ph)) { setMsg("err", fromLogin ? "请输入正确的手机号" : "请先登录手机号账号（修改密码以当前账号为准）"); return; }
         if (!pwdSms.trim()) { setMsg("err", "请填写短信验证码"); return; }
         if (pwdNew.length < 8) { setMsg("err", "新密码至少 8 位"); return; }
         setBusy("pwd-reset");
@@ -1670,7 +1399,7 @@ window.__ModuleLoader__.load({
               var relayBody = (body && body.body) || body || {};
               var errText = (relayBody.error && (relayBody.error.message || relayBody.error))
                 || relayBody.detail || ("修改失败(" + ((body && body.status) || "?") + ")");
-              setMsg("err", "修改失败：" + String(errText));
+              setMsg("err", (fromLogin ? "重置失败：" : "修改失败：") + String(errText));
               setPwdSms(""); // 短信验证码一次性：失败后需重新获取
               return undefined;
             }
@@ -1682,13 +1411,19 @@ window.__ModuleLoader__.load({
               setAkey(null); setAkeyMsg(null);
               fbClearThreads();
               setPwdOpen(false); setPwdSms(""); setPwdNew(""); setPwdCap(null); setPwdCapTxt(""); setPwdSmsBtn("获取验证码");
-              setMsg("ok", "✅ 密码已修改成功：所有已授权设备与会话已失效，本机已退出登录。" +
-                "请在下方账号卡用「新密码」重新登录——登录会更新本机保存的密码并重新启用端到端加密（E2EE）。");
+              if (fromLogin) {
+                // 「忘记密码」成功：本机登出完成 → 回到登录表单提示用新密码登录（手机号保留，便于直接重登）
+                setPass(""); setLcapTxt(""); setLcap(null); loadCaptcha("login");
+                setMsg("ok", "✅ 密码已重置成功：" + PWD_RESET_WARN + "，本机已退出登录。请用新密码登录。");
+              } else {
+                setMsg("ok", "✅ 密码已修改成功：所有已授权设备与会话已失效，本机已退出登录。" +
+                  "请在下方账号卡用「新密码」重新登录——登录会更新本机保存的密码并重新启用端到端加密（E2EE）。");
+              }
             }).catch(function (e) {
-              setMsg("err", "密码已修改成功，但本机退出登录失败：" + e.message + "（建议手动「退出登录」后用新密码重新登录，以更新本机配置密码）");
+              setMsg("err", "密码已" + (fromLogin ? "重置" : "修改") + "成功，但本机退出登录失败：" + e.message + "（建议手动「退出登录」后用新密码重新登录，以更新本机配置密码）");
             });
           })
-          .catch(function (e) { setMsg("err", "修改失败: " + e.message); })
+          .catch(function (e) { setMsg("err", (fromLogin ? "重置失败: " : "修改失败: ") + e.message); })
           .finally(function () { setBusy(""); });
       };
 
@@ -1710,6 +1445,7 @@ window.__ModuleLoader__.load({
           .then(function (body) {
             // 切换到自建服务（连接账号上下文变为本地无账号）：清除 SaaS 账号的反馈线程凭据
             fbClearThreads();
+            setPwdOpen(false);
             setSt(body); setSelfHost(""); setLocalKey("");
             setMsg(body.ok ? "ok" : "err", body.ok ? "✅ 已切换到自建服务，bridge 已重启" : (body.error || (body.body && body.body.error) || "保存失败"));
           })
@@ -1771,29 +1507,30 @@ window.__ModuleLoader__.load({
               busy === "upgrade" ? "生成链接中…" : (!isMember ? "🚀 升级 PRO" : source === "trial" ? "🚀 转正式 PRO" : "🔄 续费会员")),
             h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "", onClick: function () { setView("invite"); loadInvite(); } }, "🎯 邀请好友赚会员"),
             h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "", onClick: function () { setView("feedback"); } }, "💬 用户反馈"),
-            h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "", onClick: function () {
-              var next = !pwdOpen;
-              setPwdOpen(next);
-              setMessage(null);
-              if (next && !pwdCap) pwdLoadCaptcha();
-            } }, pwdOpen ? "收起修改密码" : "🔒 修改密码"),
+            h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "", onClick: togglePwdForm }, pwdOpen ? "收起修改密码" : "🔒 修改密码"),
             h("button", { type: "button", className: "dru-btn dru-btn-danger", disabled: busy !== "", onClick: function () { doLogout(false); } }, "退出登录")
           ),
           h("div", { className: "dru-hint", style: { marginTop: 8 } },
             "升级/续费以带登录态方式打开：点击后生成一次性访问链接并直接跳转，无需重新登录。" +
             (endsAt && isMember ? "到期后如需继续使用会员权益，请在到期前续费。" : "")),
-          pwdOpen ? renderChangePwdForm() : null
+          pwdOpen ? renderResetPwdForm(false) : null
         );
       }
 
-      // ---------- 🔒 修改密码小表单（登录态账号卡内展开；短信验证码重置） ----------
-      function renderChangePwdForm() {
-        var ph = (st && st.config && st.config.phone) || "";
+      // ---------- 🔒 修改密码 / 忘记密码 共用重置表单（图形验证码 + 短信验证码 + 新密码≥8） ----------
+      // fromLogin=false：账号卡「修改密码」手机号以当前登录账号为准（只读）；
+      // fromLogin=true：登录卡「忘记密码」手机号预填登录输入、可改（成功后返回登录表单请用新密码登录）。
+      function renderResetPwdForm(fromLogin) {
+        var ph = fromLogin ? phone : ((st && st.config && st.config.phone) || "");
         return h("div", { className: "dru-card", style: { marginTop: 10, border: "1px dashed #d0d7de" } },
-          h("h3", null, "🔒 修改密码（短信验证）"),
+          h("h3", null, fromLogin ? "忘记密码（短信重置）" : "🔒 修改密码（短信验证）"),
           h("div", { className: "dru-hint", style: { marginBottom: 8 } },
-            "修改后所有已授权设备与会话将失效，需重新登录与解锁（E2EE 用新密码重新派生）。"),
-          field("手机号", h("input", { className: "dru-input", type: "tel", value: ph, disabled: true, readOnly: true, title: "以当前登录账号为准" })),
+            fromLogin
+              ? "手机号预填当前输入，可改为其它账号；" + PWD_RESET_WARN + "。"
+              : PWD_RESET_WARN + "（E2EE 用新密码重新派生）。"),
+          field("手机号", fromLogin
+            ? input({ type: "tel", value: ph, placeholder: "11 位手机号", autoComplete: "tel", onChange: function (e) { setPhone(e.target.value); } })
+            : h("input", { className: "dru-input", type: "tel", value: ph, disabled: true, readOnly: true, title: "以当前登录账号为准" })),
           field("图形验证码", h("div", { className: "dru-captcha" },
             input({ value: pwdCapTxt, placeholder: "图中数字", autoComplete: "off", inputMode: "numeric", maxLength: 6, onChange: function (e) { setPwdCapTxt(e.target.value); } }),
             h("div", { className: "dru-captcha-box", title: "看不清？点击刷新", onClick: function () { pwdLoadCaptcha(); }, dangerouslySetInnerHTML: pwdCap && pwdCap.svg && pwdCap.svg.indexOf("<svg") === 0 ? { __html: pwdCap.svg } : void 0 },
@@ -1801,13 +1538,19 @@ window.__ModuleLoader__.load({
           )),
           field("短信验证码", h("div", { className: "dru-captcha" },
             input({ value: pwdSms, placeholder: "6 位验证码", autoComplete: "off", inputMode: "numeric", maxLength: 6, onChange: function (e) { setPwdSms(e.target.value); } }),
-            h("button", { type: "button", className: "dru-btn dru-btn-ghost", style: { flex: "none", padding: "0 14px" }, disabled: busy !== "", onClick: sendPwdSms }, pwdSmsBtn)
+            h("button", { type: "button", className: "dru-btn dru-btn-ghost", style: { flex: "none", padding: "0 14px" }, disabled: busy !== "", onClick: function () { sendPwdSms(ph); } }, pwdSmsBtn)
           )),
           field("新密码（至少 8 位）", input({ type: "password", value: pwdNew, minLength: 8, autoComplete: "new-password", placeholder: "至少 8 位", onChange: function (e) { setPwdNew(e.target.value); } })),
           h("div", { className: "dru-hint", style: { marginBottom: 8 } },
-            "修改成功后，本机保存的旧密码会被清除并退出登录；请用新密码重新登录（登录会更新本机配置密码并重新启用远程访问与端到端加密）。"),
-          h("button", { type: "button", className: "dru-btn dru-btn-danger", style: { width: "100%" }, disabled: busy !== "", onClick: doChangePwd },
-            busy === "pwd-reset" ? "提交中…" : busy === "pwd-logout" ? "已修改，正在退出本地登录…" : "确认修改密码")
+            fromLogin
+              ? "重置成功后本机会退出登录（如有已保存的旧账号），请用新密码登录。"
+              : "修改成功后，本机保存的旧密码会被清除并退出登录；请用新密码重新登录（登录会更新本机配置密码并重新启用远程访问与端到端加密）。"),
+          h("button", { type: "button", className: "dru-btn dru-btn-danger", style: { width: "100%" }, disabled: busy !== "", onClick: function () { doResetPwd(ph, fromLogin); } },
+            busy === "pwd-reset" ? "提交中…" : busy === "pwd-logout" ? "已重置，正在退出本地登录…" : (fromLogin ? "确认重置密码" : "确认修改密码")),
+          fromLogin
+            ? h("div", { style: { textAlign: "right", marginTop: 6 } },
+                h("button", { type: "button", className: "dru-linkbtn", onClick: function () { togglePwdForm(); } }, "← 返回登录"))
+            : null
         );
       }
 
@@ -2039,19 +1782,26 @@ window.__ModuleLoader__.load({
                   ? renderAccount()
                   : h("div", null,
                       h("div", { className: "dru-tabs" },
-                        h("div", { className: "dru-tab" + (authTab === "login" ? " active" : ""), onClick: function () { setAuthTab("login"); setMessage(null); } }, "登录"),
-                        h("div", { className: "dru-tab" + (authTab === "register" ? " active" : ""), onClick: function () { setAuthTab("register"); setMessage(null); } }, "注册")
+                        h("div", { className: "dru-tab" + (authTab === "login" ? " active" : ""), onClick: function () { setAuthTab("login"); setPwdOpen(false); setMessage(null); } }, "登录"),
+                        h("div", { className: "dru-tab" + (authTab === "register" ? " active" : ""), onClick: function () { setAuthTab("register"); setPwdOpen(false); setMessage(null); } }, "注册")
                       ),
                       authTab === "login"
-                        ? h("div", null,
-                            field("手机号", input({ type: "tel", value: phone, placeholder: "11 位手机号", autoComplete: "tel", onChange: function (e) { setPhone(e.target.value); } })),
-                            field("密码", input({ type: "password", value: pass, placeholder: "密码", autoComplete: "current-password", onChange: function (e) { setPass(e.target.value); } })),
-                            field("验证码", h("div", { className: "dru-captcha" },
-                              input({ value: lcapTxt, placeholder: "图中数字", autoComplete: "off", inputMode: "numeric", maxLength: 6, onChange: function (e) { setLcapTxt(e.target.value); } }),
-                              h("div", { className: "dru-captcha-box", title: "看不清？点击刷新", onClick: function () { loadCaptcha("login"); }, dangerouslySetInnerHTML: lcap && lcap.svg && lcap.svg.indexOf("<svg") === 0 ? { __html: lcap.svg } : void 0 },
-                                lcap && lcap.svg && lcap.svg.indexOf("<svg") !== 0 ? lcap.svg : null)
-                            )),
-                            h("button", { type: "button", className: "dru-btn dru-btn-primary", style: { width: "100%" }, disabled: busy !== "", onClick: doLogin }, busy === "login" ? "登录中…" : "登录")
+                        ? (pwdOpen
+                            // 「忘记密码」展开：与账号卡「修改密码」共用同一重置表单（手机号可编辑、预填登录输入）
+                            ? renderResetPwdForm(true)
+                            : h("div", null,
+                                field("手机号", input({ type: "tel", value: phone, placeholder: "11 位手机号", autoComplete: "tel", onChange: function (e) { setPhone(e.target.value); } })),
+                                field("密码", input({ type: "password", value: pass, placeholder: "密码", autoComplete: "current-password", onChange: function (e) { setPass(e.target.value); } })),
+                                field("验证码", h("div", { className: "dru-captcha" },
+                                  input({ value: lcapTxt, placeholder: "图中数字", autoComplete: "off", inputMode: "numeric", maxLength: 6, onChange: function (e) { setLcapTxt(e.target.value); } }),
+                                  h("div", { className: "dru-captcha-box", title: "看不清？点击刷新", onClick: function () { loadCaptcha("login"); }, dangerouslySetInnerHTML: lcap && lcap.svg && lcap.svg.indexOf("<svg") === 0 ? { __html: lcap.svg } : void 0 },
+                                    lcap && lcap.svg && lcap.svg.indexOf("<svg") !== 0 ? lcap.svg : null)
+                                )),
+                                h("button", { type: "button", className: "dru-btn dru-btn-primary", style: { width: "100%" }, disabled: busy !== "", onClick: doLogin }, busy === "login" ? "登录中…" : "登录"),
+                                // 忘记密码：小字入口，点击展开短信验证码重置表单（不抢占任何官方按钮）
+                                h("div", { style: { display: "flex", justifyContent: "flex-end", marginTop: 8 } },
+                                  h("button", { type: "button", className: "dru-linkbtn", disabled: busy !== "", onClick: togglePwdForm }, "忘记密码？"))
+                              )
                           )
                         : h("div", null,
                             field("手机号", input({ type: "tel", value: rphone, placeholder: "11 位手机号", autoComplete: "tel", onChange: function (e) { setRphone(e.target.value); } })),
