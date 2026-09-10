@@ -151,6 +151,14 @@ npx @mrrisega/dsh-remote setup --server wss://<你的域名>:端口 --key <访�
 
 测试：`npm test`（router 契约 + 插件 + bridge 全部单测与回归）。
 
+## 企微交流群
+
+扫码加入 **企微交流群**：安装/使用答疑、问题反馈、版本更新都会在群里同步，欢迎来聊。
+
+<img src="image/企微交流群.jpg" alt="企微交流群" width="240">
+
+> 也可以在仓库提 [Issue](https://github.com/mrRisega/dsh-remote/issues)；安全相关问题请按 [SECURITY.md](SECURITY.md) 私下反馈。
+
 ## 文档
 
 - [docs/self-hosting.md](docs/self-hosting.md) — 开源自建完整指南（含安全提示）
