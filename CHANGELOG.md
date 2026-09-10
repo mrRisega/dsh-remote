@@ -3,7 +3,9 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.6.1] - 2026-09-10
+
+> 稳定版（`latest`）。内容 = 预发版 `0.6.1-beta.1`（首次安装登录体验修复）+ 交流群二维码。
 
 ### Added
 
@@ -13,11 +15,6 @@ All notable changes to dsh-remote are documented here. This project follows
   图片加载失败也自动隐藏（不留空壳）。配置经公开配置 `community.qrcode` 下发，插件侧由
   `/dsh-remote/community` 转发并把相对路径拼成企业端绝对地址。
 - README 增加「企微交流群」章节（含二维码图片），方便用户扫码入群。
-
-## [0.6.1-beta.1] - 2026-09-10
-
-> 预发版（`beta` 通道，`latest` 仍为 0.6.0）。修「首次安装后立即登录，二维码/设备列表报红字」
-> 的首次使用体验问题，并让面板在中继未就绪时自愈，不再需要手动刷新页面。
 
 ### Fixed
 
@@ -46,6 +43,8 @@ All notable changes to dsh-remote are documented here. This project follows
   5xx 与网络失败重试、密钥轮换、503+retryable 语义、账号密码失效、自建模式不取设备密钥）。
 - 新增 `packages/dsh-remote-web/test/login-selfheal-ui.test.mjs`（浏览器半：真实 `useEffect` +
   假定时器驱动登录 → 首次失败 → 退避自动重试 → 二维码与设备列表恢复，无需刷新页面）。
+- 新增 `packages/dsh-remote-web/test/community-qr-ui.test.mjs`（node 半拼址 + 设置面板按钮/弹窗渲染 +
+  未配置不展示 + 反馈页展示）与付费页交流群卡片源码级契约。
 
 ## [0.6.0] - 2026-09-09
 

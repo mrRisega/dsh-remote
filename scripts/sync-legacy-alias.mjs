@@ -2,7 +2,7 @@
 /**
  * 灰度兼容：把 packages/dsh-remote-web（正式包）同步生成一份旧名别名包
  * packages/dsh-remote-ui，使插件市场里“旧条目”（url 指向 packages/dsh-remote-ui）
- * 在新名审核通过前依旧可安装，且用户装到的是同一份最新代码（当前 0.6.0）。
+ * 在新名审核通过前依旧可安装，且用户装到的是同一份最新代码（当前 0.6.1）。
  *
  * 用法:
  *   node scripts/sync-legacy-alias.mjs           # 生成/刷新别名包

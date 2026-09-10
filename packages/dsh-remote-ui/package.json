@@ -1,6 +1,6 @@
 {
   "name": "dsh-remote-ui",
-  "version": "0.6.1-beta.1",
+  "version": "0.6.1",
   "description": "【兼容别名包】dsh-remote 旧名 dsh-remote-ui 的别名，功能与 dsh-remote-web 完全一致（同一份代码同步生成）。 Legacy alias of dsh-remote-web — identical build, kept installable while the renamed entry is pending review. 公网远程控制 DeepSeek Harness（dsh web）：安装即得专属加密地址，人在外面也能用手机访问电脑上的 dsh——无需同一局域网/WiFi、无需公网 IP 与内网穿透，全程加密；手机端 100% 还原电脑体验（对话/工具/审批/设置）。技术用户可选自建服务，流量走自己的服务器。Remote control DeepSeek Harness (dsh web) from anywhere over the public internet — install, get an encrypted URL, use it from your phone on any network (dual-half cordis plugin: Settings panel + same-origin /dsh-remote routes). (2026-09 由 dsh-remote-ui 更名 / renamed from dsh-remote-ui; dsh-remote 的 dsh web 插件半，不是纯 UI/皮肤插件)",
   "type": "module",
   "main": "lib/index.js",
