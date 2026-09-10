@@ -859,6 +859,35 @@ async function relayInviteRecords(relayDir) {
   return { records: r.body.records || [], rewards: r.body.rewards || [] };
 }
 
+// ---------- 交流群二维码（运营配置，公开读取） ----------
+
+/**
+ * 交流群二维码/客服微信：企业端配置经公开配置 /api/public-config 的 community 字段下发
+ * （community.qrcode 形如 "/qr/group-qr.png"）。面板与反馈页展示「加入交流群」用。
+ *
+ * 面板跑在电脑本机 dsh web（http://127.0.0.1:3080），相对路径无法直接当 <img src>，
+ * 故这里按企业端公开约定拼成绝对地址：<api_url><qrcode>（与手机端 PWA 的 API_BASE + qr 一致）。
+ * 30s 内存缓存：面板与反馈卡都会取，避免重复打公开配置。
+ */
+const COMMUNITY_TTL_MS = 30_000;
+let communityCache = { dir: "", at: 0, data: null };
+
+async function communityInfo(relayDir) {
+  if (communityCache.data && communityCache.dir === relayDir && Date.now() - communityCache.at < COMMUNITY_TTL_MS) {
+    return communityCache.data;
+  }
+  const cfg = loadConfig(relayDir);
+  const api = (cfg.api_url || DEFAULT_API).replace(/\/+$/, "");
+  const r = await relayFetch(relayDir, "/api/public-config");
+  const b = r.ok && r.body && typeof r.body === "object" ? r.body : {};
+  const c = b.community && typeof b.community === "object" ? b.community : {};
+  const raw = String(c.qrcode || "").trim();
+  const qrcode = raw && !/^https?:/i.test(raw) ? api + (raw.startsWith("/") ? raw : `/${raw}`) : raw;
+  const data = { qrcode, wechat: String(c.wechat || "") };
+  communityCache = { dir: relayDir, at: Date.now(), data };
+  return data;
+}
+
 // ---------- 一次性访问密钥 / 已授权设备代理（E1 企业端新增 auth-key / mobile-sessions） ----------
 
 /** 从 relay 响应里尽量提取人类可读错误信息（兼容 {error:{message}} / {error:".."} / {message} / 纯文本）。 */
@@ -1490,6 +1519,14 @@ function registerRoutes(ctx, relayDir) {
           relayReachable: pub.ok,
           publicConfig: body
         });
+      },
+    },
+    // 交流群二维码（设置面板「加入交流群」按钮 + 用户反馈页展示；未配置返回空串，UI 不展示入口）
+    {
+      method: "GET",
+      path: "/dsh-remote/community",
+      handler: async (_req, res) => {
+        sendJson(res, 200, { ok: true, ...(await communityInfo(relayDir)) });
       },
     },
     // 一次性访问密钥（📱 远程访问卡）：GET 即创建新 key，企业端 POST /api/auth-key（Bearer）

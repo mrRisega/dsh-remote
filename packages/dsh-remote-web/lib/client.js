@@ -134,6 +134,9 @@ window.__ModuleLoader__.load({
       ".dru-popup-foot button{border:none;background:none;color:#57606a;cursor:pointer;font-size:12px;font-family:inherit;padding:4px 6px}",
       ".dru-popup-foot button:hover{color:#0969da}",
       ".dru-popup .dru-msg{text-align:left}",
+      ".dru-community-qr{display:block;width:220px;max-width:62vw;margin:0 auto;background:#ffffff;padding:10px;border-radius:10px;border:1px solid #d0d7de;box-sizing:content-box}",
+      ".dru-fb-community{margin-top:16px;padding-top:14px;border-top:1px dashed #d0d7de;text-align:center}",
+      ".dru-fb-community .dru-community-qr{width:180px;max-width:56vw}",
       // ── 自管理：版本与更新（插件面板内提供在线更新/彻底卸载，市场无更新按钮） ──
       ".dru-ver-badge{display:inline-block;font-size:11px;border-radius:999px;padding:1px 8px;margin-left:6px;vertical-align:1px}",
       ".dru-ver-badge-new{color:#9a6700;background:#fff8c5;border:1px solid #eed888}",
@@ -347,6 +350,24 @@ window.__ModuleLoader__.load({
       return api(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(data || {}) });
     };
 
+    // ── 交流群（运营二维码;管理后台统一上传,node 半经公开配置下发） ─────────
+    // 设置面板「加入交流群」按钮与用户反馈页都展示同一张码;未配置(qrcode 为空)→ 不展示任何入口。
+    var COMMUNITY_TTL_MS = 5 * 60 * 1000; // 面板/反馈卡共用缓存:5 分钟内不重复请求
+    var communityCache = { at: 0, data: null };
+    /** 取交流群信息(模块级缓存;失败视为未配置,不打扰用户)。 */
+    function loadCommunity(force) {
+      if (!force && communityCache.data && Date.now() - communityCache.at < COMMUNITY_TTL_MS) {
+        return Promise.resolve(communityCache.data);
+      }
+      return api("/dsh-remote/community").then(function (b) {
+        communityCache = { at: Date.now(), data: { qrcode: (b && b.qrcode) || "", wechat: (b && b.wechat) || "" } };
+        return communityCache.data;
+      }).catch(function () {
+        communityCache = { at: Date.now(), data: { qrcode: "", wechat: "" } };
+        return communityCache.data;
+      });
+    }
+
     // ── 登录后首次加载的自愈（0.6.1-beta.1） ───────────────────────────────
     // 现象（首次安装后立即登录）：面板在 loggedIn 翻真的瞬间就请求 /dsh-remote/access-key 与
     // /dsh-remote/mobile-sessions；此时中继握手可能尚未就绪（bridge 刚被重启、device-login 共享密钥
@@ -478,12 +499,20 @@ window.__ModuleLoader__.load({
       var mineListArr = useState(null); var mineList = mineListArr[0]; var setMineList = mineListArr[1];
       var mineErrArr = useState(false); var mineErr = mineErrArr[0]; var setMineErr = mineErrArr[1];
       var mineBusyArr = useState(false); var mineBusy = mineBusyArr[0]; var setMineBusy = mineBusyArr[1];
+      // 💬 交流群:反馈页底部展示「加入交流群」二维码(与设置面板共用同一份缓存)
+      var commArr = useState(communityCache.data); var comm = commArr[0]; var setComm = commArr[1];
 
       function setMsg(kind, text) { setFbMsg({ kind: kind, text: text }); }
 
       // 登录态(SaaS 且账号已配)→ 打开「我的反馈」拉账号历史(/mine 需要 JWT,节点半在登录态自动附加);
       // 自建/未登录(cfg.phone 为空)→ 仍走本地 thread_token,不发 /mine。
       var fbAccount = !!(cfg && cfg.phone && fbAuth === "account");
+
+      useEffect(function () {
+        var alive = true;
+        loadCommunity().then(function (d) { if (alive) setComm(d); });
+        return function () { alive = false; };
+      }, []);
 
       var loadCfg = useCallback(function () {
         api("/dsh-remote/feedback-config").then(function (b) {
@@ -724,7 +753,15 @@ window.__ModuleLoader__.load({
               h("button", { type: "button", className: "dru-btn dru-btn-primary", style: { width: "100%" }, disabled: busy !== "", onClick: doSubmit }, busy === "submit" ? "提交中…" : "提交反馈"),
               fbMsg && h("div", { className: "dru-msg dru-msg-" + fbMsg.kind }, fbMsg.text)
             )
-          : renderMine()
+          : renderMine(),
+        // 反馈页底部:企微交流群二维码(后台上传后出现;未配置不展示)
+        comm && comm.qrcode
+          ? h("div", { className: "dru-fb-community" },
+              h("div", { className: "dru-fb-community-title" }, "💬 加入企微交流群"),
+              h("div", { className: "dru-hint", style: { marginBottom: 8 } }, "扫码入群：安装答疑 / 使用技巧 / 版本更新 / 问题反馈"),
+              h("img", { className: "dru-community-qr", src: comm.qrcode, alt: "企微交流群二维码" }),
+              comm.wechat ? h("div", { className: "dru-hint", style: { marginTop: 8 } }, "二维码失效或群满，可加客服微信：" + comm.wechat) : null)
+          : null
       );
     }
 
@@ -1135,6 +1172,9 @@ window.__ModuleLoader__.load({
       var pwdSmsArr = useState(""); var pwdSms = pwdSmsArr[0]; var setPwdSms = pwdSmsArr[1];
       var pwdSmsBtnArr = useState("获取验证码"); var pwdSmsBtn = pwdSmsBtnArr[0]; var setPwdSmsBtn = pwdSmsBtnArr[1];
       var pwdNewArr = useState(""); var pwdNew = pwdNewArr[0]; var setPwdNew = pwdNewArr[1];            // 新密码（≥8）
+      // ── 💬 交流群（「加入交流群」按钮 + 弹窗）：同样放在全部既有字段之后 ──
+      var communityArr = useState(null); var community = communityArr[0]; var setCommunity = communityArr[1]; // {qrcode,wechat}；null=未加载
+      var commOpenArr = useState(false); var commOpen = commOpenArr[0]; var setCommOpen = commOpenArr[1];
 
       var refresh = useCallback(function () {
         setBusy("status");
@@ -1175,6 +1215,13 @@ window.__ModuleLoader__.load({
       }, [st && st.config && st.config.phone]);
 
       useEffect(function () { refresh(); }, [refresh]);
+
+      // 交流群二维码(后台上传即可展示;未配置 → community.qrcode 为空,入口不出现)
+      useEffect(function () {
+        var alive = true;
+        loadCommunity().then(function (d) { if (alive) setCommunity(d); });
+        return function () { alive = false; };
+      }, []);
       useEffect(function () {
         // 展开「忘记密码」重置表单时不用预载登录表单验证码（收起的 reset 表单用独立 pwdCap）
         if (st !== null && !loggedIn && mode === "saas" && authTab === "login" && !pwdOpen && !lcap) loadCaptcha("login");
@@ -2117,11 +2164,44 @@ window.__ModuleLoader__.load({
             h("div", { className: "dru-hint", style: { marginBottom: 6 } }, "📱 远程访问：用手机或另一台电脑的浏览器，随时随地使用同一份 dsh web——人在哪都能用（免公网 IP、免内网穿透）；官方托管中继，4G/5G 即用，也可自建服务。"),
             h("div", { className: "dru-hint", style: { marginBottom: 6 } }, "🛠 电脑端一键安装：bridge 与「远程访问」面板一次到位——云端/自建切换、账号登录、bridge 启停、一次性扫码访问、已授权设备管理、意见反馈都在这里。"),
             h("div", { className: "dru-hint", style: { marginBottom: 6 } }, "🔒 安全与通道：HTTP / WebSocket 全量透传，一次性访问密钥认证，面板实时显示设备与已授权设备列表；服务端可配置流量配额。"),
-            h("div", { className: "dru-hint" }, "🛡 端到端加密：手机↔电脑之间的消息内容用「你的账号密码派生密钥」端到端加密——密钥与密码不落服务端（仅存校验值），中继只可见路径/大小/时间（详见 README「安全与隐私」）。")
+            h("div", { className: "dru-hint" }, "🛡 端到端加密：手机↔电脑之间的消息内容用「你的账号密码派生密钥」端到端加密——密钥与密码不落服务端（仅存校验值），中继只可见路径/大小/时间（详见 README「安全与隐私」）。"),
+            // 加入交流群（后台上传二维码后出现；点击弹出二维码大图便于扫码）
+            community && community.qrcode
+              ? h("div", { className: "dru-actions", style: { marginTop: 10 } },
+                  h("button", {
+                    type: "button",
+                    className: "dru-btn dru-btn-ghost",
+                    style: { width: "100%" },
+                    onClick: function () { setCommOpen(true); }
+                  }, "💬 加入交流群"))
+              : null
           ]),
           // 版本与更新（自管理：检测新版 / 一键在线更新 / 彻底卸载）
           h(SelfManageCard, null),
           message && h("div", { className: "dru-msg dru-msg-" + message.kind }, message.text)
+        );
+      }
+
+      /** 交流群弹窗（复用满意度弹窗的 dru-popup 视觉；点遮罩/关闭即收起）。 */
+      function renderCommunityModal() {
+        if (!commOpen || !(community && community.qrcode)) return null;
+        var close = function () { setCommOpen(false); };
+        return h("div", { className: "dru-popup", onMouseDown: function (e) { if (e.target === e.currentTarget) close(); } },
+          h("div", { className: "dru-popup-card", role: "dialog", "aria-label": "加入企微交流群" },
+            h("div", { className: "dru-popup-body" },
+              h("div", { className: "dru-popup-icon" }, "💬"),
+              h("div", { className: "dru-popup-title" }, "加入企微交流群"),
+              h("div", { className: "dru-popup-sub" }, "扫码入群：安装答疑 / 使用技巧 / 版本更新 / 问题反馈"),
+              h("img", { className: "dru-community-qr", src: community.qrcode, alt: "企微交流群二维码" }),
+              community.wechat
+                ? h("div", { className: "dru-hint", style: { marginTop: 10 } }, "二维码失效或群满，可加客服微信：" + community.wechat)
+                : h("div", { className: "dru-hint", style: { marginTop: 10 } }, "二维码失效或群满，可到 GitHub 提 Issue 联系作者")
+            ),
+            h("div", { className: "dru-popup-foot" },
+              h("span", null, "手机微信/企业微信扫码即可入群"),
+              h("button", { type: "button", onClick: close }, "关闭")
+            )
+          )
         );
       }
 
@@ -2135,7 +2215,8 @@ window.__ModuleLoader__.load({
         ),
         h("div", { className: "dru-settings-body" },
           view === "feedback" ? renderFeedback() : view === "invite" ? renderInvite() : renderHome()
-        )
+        ),
+        renderCommunityModal()
       );
     }
 
