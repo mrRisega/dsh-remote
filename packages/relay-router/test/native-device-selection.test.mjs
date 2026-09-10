@@ -202,3 +202,19 @@ test("E2EE WebCrypto 核心与纯浏览器 API 对齐(供 node 抽取对拍的�
   assert.match(APP, /PBKDF2/);
   assert.match(APP, /HKDF/);
 });
+
+// 交流群二维码(运营配置;源码级契约):付费页底部展示、数据取自 public-config.community.qrcode,
+// 未配置/图片加载失败时整块隐藏(不留空壳卡片)。
+test("付费页底部「加入交流群」卡片:取 public-config.community.qrcode,相对路径拼 API_BASE,未配置/失败即隐藏", () => {
+  assert.match(APP, /id="promo-community-card"/, "推广页应有交流群卡片容器");
+  assert.match(APP, /id="promo-community-qr"/, "推广页应有交流群二维码容器");
+  assert.match(APP, /function renderPromoCommunity\(\)/, "应有独立的交流群渲染函数");
+  // 数据源与拼址约定(与收款码一致):/^https?:/ 直用,否则 API_BASE + qr
+  assert.match(APP, /\(\(pubConfig && pubConfig\.community\) \|\| \{\}\)\.qrcode/);
+  assert.match(APP, /const src = \/\^https\?:\/i\.test\(qr\) \? qr : API_BASE \+ qr;/);
+  // 未配置 → 隐藏;图片 onerror → 隐藏
+  assert.match(APP, /if \(!qr\) \{ card\.classList\.add\("hidden"\);/);
+  assert.match(APP, /img\.onerror = \(\) => \{ card\.classList\.add\("hidden"\); \}/);
+  // 每次刷新配置都会重新评估(renderPromoPlans 末尾调用)
+  assert.match(APP, /  renderPromoCommunity\(\);\n\}/);
+});

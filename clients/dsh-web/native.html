@@ -478,6 +478,12 @@ var _hmt = _hmt || [];
       <h2>🎯 邀请好友,双方得奖励</h2>
       <div id="promo-invite-body"></div>
     </div>
+    <!-- 交流群(管理后台上传二维码后经 public-config 下发;未配置时整块隐藏) -->
+    <div class="card hidden" id="promo-community-card">
+      <h2>💬 加入交流群</h2>
+      <div style="font-size:13px;color:#57606a;margin:6px 0 2px;">扫码加入企微交流群:安装答疑、使用技巧、版本更新与问题反馈都在群里同步。</div>
+      <div class="qr-img-wrap" id="promo-community-qr"></div>
+    </div>
     <button id="btn-promo-back" class="secondary">← 返回</button>
   </div>
 </main>
@@ -1460,6 +1466,25 @@ function renderPromoPlans() {
       openQrModal(btn.dataset.plan);
     };
   });
+  renderPromoCommunity();
+}
+
+/** 推广页底部交流群二维码(public-config.community.qrcode;未配置 → 整块隐藏)。 */
+function renderPromoCommunity() {
+  const card = $("promo-community-card");
+  const wrap = $("promo-community-qr");
+  if (!card || !wrap) return;
+  const qr = ((pubConfig && pubConfig.community) || {}).qrcode || "";
+  if (!qr) { card.classList.add("hidden"); wrap.innerHTML = ""; return; }
+  const src = /^https?:/i.test(qr) ? qr : API_BASE + qr;
+  card.classList.remove("hidden");
+  wrap.innerHTML = "";
+  const img = document.createElement("img");
+  img.src = src;
+  img.alt = "企微交流群二维码";
+  img.style.cssText = "width:200px;max-width:56vw;background:#fff;padding:10px;border-radius:8px;display:block;margin:0 auto;";
+  img.onerror = () => { card.classList.add("hidden"); }; // 图挂了不显示空壳
+  wrap.appendChild(img);
 }
 
 /** 月付/年付 Tab 切换:更新 Tab 高亮并整体刷新价格展示。 */

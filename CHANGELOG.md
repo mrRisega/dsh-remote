@@ -3,6 +3,17 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **交流群二维码（后台可配，四处展示）**：管理后台「推广」页新增「交流群二维码」上传卡片，上传后即时生效于
+  ① 官网落地页、② 付费页（`/app/promo`）底部、③ 电脑端「设置 → 远程访问 → 关于 dsh-remote」的
+  **「💬 加入交流群」按钮**（点击弹出二维码大图）、④ 用户反馈页底部；未上传时这几处一律不展示入口，
+  图片加载失败也自动隐藏（不留空壳）。配置经公开配置 `community.qrcode` 下发，插件侧由
+  `/dsh-remote/community` 转发并把相对路径拼成企业端绝对地址。
+- README 增加「企微交流群」章节（含二维码图片），方便用户扫码入群。
+
 ## [0.6.1-beta.1] - 2026-09-10
 
 > 预发版（`beta` 通道，`latest` 仍为 0.6.0）。修「首次安装后立即登录，二维码/设备列表报红字」
