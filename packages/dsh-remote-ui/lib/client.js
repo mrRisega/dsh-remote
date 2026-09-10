@@ -347,6 +347,42 @@ window.__ModuleLoader__.load({
       return api(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(data || {}) });
     };
 
+    // ── 登录后首次加载的自愈（0.6.1-beta.1） ───────────────────────────────
+    // 现象（首次安装后立即登录）：面板在 loggedIn 翻真的瞬间就请求 /dsh-remote/access-key 与
+    // /dsh-remote/mobile-sessions；此时中继握手可能尚未就绪（bridge 刚被重启、device-login 共享密钥
+    // 刚补齐或正在轮换、中继冷启动/网络抖动），旧版只报一次红字且不重试——必须手动刷新页面才行。
+    // 现在：可重试类失败按退避自动重试（成功即自动清除红字），并给红字配「重试」按钮。
+    var LOGIN_LOAD_RETRY_MS = [1200, 3000, 6000];
+
+    /** node 半标记 retryable（中继未就绪）或网络/5xx → 值得自动重试；未登录/密码失效不重试。 */
+    function retryableFail(e) {
+      var body = e && e.body;
+      if (body && body.retryable === true) return true;
+      if (body && typeof body.hint === "string" && /^relay_/.test(body.hint)) return true;
+      var st = e && e.status;
+      if (typeof st !== "number") return true;       // fetch 本身失败（网络中断/被中止）
+      return st === 0 || st === 408 || st === 429 || st >= 500;
+    }
+
+    /** 定时器节流：tests/SSR 环境没有 setTimeout 时静默降级（不抛错、不阻塞面板）。 */
+    function later(fn, ms) {
+      try { return setTimeout(fn, ms); } catch (e) { return null; }
+    }
+    function clearLater(t) {
+      if (t == null) return;
+      try { clearTimeout(t); } catch (e) { /* 忽略 */ }
+    }
+
+    /** 一次性访问密钥 / 已授权设备列表的自动重试状态（放在组件外：不随渲染重建）。 */
+    var akeyRetry = { timer: null, attempt: 0 };
+    var devRetry = { timer: null, attempt: 0 };
+    // 请求在途标记同样放组件外：组件内 state 闭包会在定时器/轮询回调里过期，
+    // 导致 busy 护栏失效（重复请求）或误拦（该重试却跳过）。
+    var akeyInFlight = { v: false };
+    var devInFlight = { v: false };
+    function cancelAkeyRetry() { clearLater(akeyRetry.timer); akeyRetry.timer = null; }
+    function cancelDevRetry() { clearLater(devRetry.timer); devRetry.timer = null; }
+
     /** 一次性访问 url → 升级/续费页 url（带同一 auth，进入后即登录态到 /app/promo）。 */
     function promoUrlOf(u) {
       var s = String(u || "");
@@ -1126,6 +1162,8 @@ window.__ModuleLoader__.load({
 
       var loggedIn = !!(st && st.config && (st.config.phone || st.config.hasLocalKey));
       var serviceRunning = !!(st && st.service && st.service.running);
+      // 账号标识（掩码手机号）：登录成功/换账号时变化 → 触发上方的重取 effect（比布尔 loggedIn 更敏感）
+      var phoneKey = (st && st.config && st.config.phone) || "";
       var launchdPid = st && st.service && st.service.launchd && st.service.launchd.pid;
 
       // 已登录(SaaS)→ 拉我的信息/配额/公共配置
@@ -1184,20 +1222,26 @@ window.__ModuleLoader__.load({
         return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()) + " " + pad2(d.getHours()) + ":" + pad2(d.getMinutes());
       }
 
-      /** 创建（或刷新）一次性访问密钥：GET /dsh-remote/access-key（node 半转发企业端 /api/auth-key）。 */
+      /**
+       * 创建（或刷新）一次性访问密钥：GET /dsh-remote/access-key（node 半转发企业端 /api/auth-key）。
+       * 失败自愈：中继未就绪类失败（node 半 retryable / 网络 / 5xx）按退避自动重试，
+       * 见「登录后首次加载自愈」——首次安装立即登录时不再需要手动刷新页面。
+       */
       function loadAccessKey() {
-        if (akeyBusy) return;
+        if (akeyInFlight.v) return;
         // 登录前不请求企业端（避免 401/404 噪音）；由账号登录成功后触发
         if (!(st && st.config && st.config.phone)) {
           setAkeyMsg(null);
+          cancelAkeyRetry();
           return;
         }
+        akeyInFlight.v = true;
         setAkeyBusy(true);
         api("/dsh-remote/access-key").then(function (b) {
           if (!b || !b.ok) {
             var why = (b && (b.error || (b.body && b.body.error))) || "未知错误";
-            setAkeyMsg({ kind: "err", text: "获取一次性访问地址失败：" + why });
-            return;
+            var e = new Error(why); e.body = b || null;
+            throw e;
           }
           // 契约容错：url 必须有；qr_data_url 取不到时仍展示链接/复制/直接打开
           if (!b.url) {
@@ -1212,9 +1256,16 @@ window.__ModuleLoader__.load({
             qr_data_url: b.qr_data_url != null ? b.qr_data_url : null
           });
           setAkeyMsg(null);
+          akeyRetry.attempt = 0;
         }).catch(function (e) {
-          setAkeyMsg({ kind: "err", text: "获取一次性访问地址失败：" + e.message });
-        }).finally(function () { setAkeyBusy(false); });
+          var text = "获取一次性访问地址失败：" + e.message;
+          if (retryableFail(e) && akeyRetry.attempt < LOGIN_LOAD_RETRY_MS.length) {
+            scheduleAkeyRetry(text);
+            return;
+          }
+          // 自动重试额度用尽（或不该重试）→ 红字 + 「立即重试」入口，不让用户只能刷新页面
+          setAkeyMsg({ kind: "err", text: text, retry: retryAkeyManually });
+        }).finally(function () { akeyInFlight.v = false; setAkeyBusy(false); });
       }
 
       var copyKeyUrl = function () {
@@ -1232,17 +1283,67 @@ window.__ModuleLoader__.load({
         try { window.open(akey.url, "_blank", "noopener"); } catch (e) {}
       };
 
-      /** 加载已授权设备列表：GET /dsh-remote/mobile-sessions。 */
+      /** 加载已授权设备列表：GET /dsh-remote/mobile-sessions（失败同上：可重试类自动重试）。 */
       function loadDevices() {
-        if (devBusy !== "") return;
+        if (devInFlight.v || devBusy !== "") return;
+        devInFlight.v = true;
         setDevBusy("list");
         api("/dsh-remote/mobile-sessions").then(function (b) {
           if (!b || !b.ok) throw new Error((b && b.error) || "加载已授权设备失败");
           setDevSessions(Array.isArray(b.sessions) ? b.sessions : []);
           setDevMsg(null);
+          devRetry.attempt = 0;
         }).catch(function (e) {
-          setDevMsg({ kind: "err", text: "加载已授权设备失败：" + e.message });
-        }).finally(function () { setDevBusy(""); });
+          var text = "加载已授权设备失败：" + e.message;
+          if (retryableFail(e) && devRetry.attempt < LOGIN_LOAD_RETRY_MS.length) {
+            scheduleDevRetry(text);
+            return;
+          }
+          setDevMsg({ kind: "err", text: text, retry: retryDevicesManually });
+        }).finally(function () { devInFlight.v = false; setDevBusy(""); });
+      }
+      /** 手动重试（红字旁的「重试」按钮）：重置退避计数后立即重新拉取。 */
+      var retryAkeyManually = function () {
+        cancelAkeyRetry();
+        akeyRetry.attempt = 0;
+        setAkeyMsg(null);
+        loadAccessKey();
+      };
+      var retryDevicesManually = function () {
+        cancelDevRetry();
+        devRetry.attempt = 0;
+        setDevMsg(null);
+        loadDevices();
+      };
+      /** 定时重试一次性访问密钥（黄字提示 + 退避；成功时由 loadAccessKey 清掉提示）。 */
+      function scheduleAkeyRetry(why) {
+        cancelAkeyRetry();
+        var wait = LOGIN_LOAD_RETRY_MS[akeyRetry.attempt] || LOGIN_LOAD_RETRY_MS[LOGIN_LOAD_RETRY_MS.length - 1];
+        akeyRetry.attempt += 1;
+        setAkeyMsg({
+          kind: "warn",
+          text: "中继连接尚未就绪，" + Math.round(wait / 1000) + " 秒后自动重试（第 " + akeyRetry.attempt + "/" + LOGIN_LOAD_RETRY_MS.length + " 次）：" + why,
+          retry: retryAkeyManually
+        });
+        akeyRetry.timer = later(function () {
+          akeyRetry.timer = null;
+          loadAccessKey(); // 在途标记由上一个请求的 finally 释放，退避窗口内用户也可手动刷新
+        }, wait);
+      }
+      /** 定时重试已授权设备列表（同上）。 */
+      function scheduleDevRetry(why) {
+        cancelDevRetry();
+        var wait = LOGIN_LOAD_RETRY_MS[devRetry.attempt] || LOGIN_LOAD_RETRY_MS[LOGIN_LOAD_RETRY_MS.length - 1];
+        devRetry.attempt += 1;
+        setDevMsg({
+          kind: "warn",
+          text: "中继连接尚未就绪，" + Math.round(wait / 1000) + " 秒后自动重试（第 " + devRetry.attempt + "/" + LOGIN_LOAD_RETRY_MS.length + " 次）：" + why,
+          retry: retryDevicesManually
+        });
+        devRetry.timer = later(function () {
+          devRetry.timer = null;
+          loadDevices();
+        }, wait);
       }
       /** 操作（取消配对/删除记录/清理已解绑）成功后静默重拉列表，覆盖行内状态。 */
       function refreshDeviceList() {
@@ -1346,13 +1447,22 @@ window.__ModuleLoader__.load({
 
       // 已登录云端主视图停留期间：打开即取一把新 key + 已授权设备；之后每 ~25s 自动轮换
       // （未登录不轮询，避免 401 空转；离开栏目/切视图/退出登录即清理定时器）
+      //
+      // 依赖里带上「账号」与「bridge 运行态」：登录成功（含换账号）与 bridge 拉起/重启后立即重取，
+      // 首次安装后立即登录不再需要手动刷新页面；失败重试由 loadAccessKey/loadDevices 内部退避处理。
       useEffect(function () {
         if (view !== "home" || mode !== "saas" || !loggedIn) return undefined;
+        cancelAkeyRetry(); cancelDevRetry();
+        akeyRetry.attempt = 0; devRetry.attempt = 0;
         loadAccessKey();
         loadDevices();
         var rotateIv = setInterval(function () { loadAccessKey(); }, KEY_AUTO_REFRESH_MS);
-        return function () { clearInterval(rotateIv); };
-      }, [view, mode, loggedIn]);
+        return function () {
+          clearInterval(rotateIv);
+          cancelAkeyRetry();
+          cancelDevRetry();
+        };
+      }, [view, mode, loggedIn, phoneKey, serviceRunning]);
 
       function setMsg(kind, text) { setMessage({ kind: kind, text: text }); }
 
@@ -1760,7 +1870,13 @@ window.__ModuleLoader__.load({
             h("span", null, statusTxt)
           ),
           renderE2eeBadge(),
-          akeyMsg ? h("div", { className: "dru-msg dru-msg-" + akeyMsg.kind, style: { marginTop: 8 } }, akeyMsg.text) : null,
+          akeyMsg
+            ? h("div", { className: "dru-msg dru-msg-" + akeyMsg.kind, style: { marginTop: 8 } },
+                akeyMsg.text,
+                akeyMsg.retry
+                  ? h("button", { type: "button", className: "dru-linkbtn", style: { marginLeft: 8 }, disabled: akeyBusy, onClick: akeyMsg.retry }, akeyBusy ? "重试中…" : "立即重试")
+                  : null)
+            : null,
           hasKey ? h("div", null, [
             h("div", { className: "dru-url big", style: { marginTop: 8 } },
               h("span", null, akey.url),
@@ -1883,7 +1999,13 @@ window.__ModuleLoader__.load({
             }, devBusy === "list" ? "加载中…" : btnLabel)
           ),
           devOpen ? renderDeviceList() : null,
-          devMsg ? h("div", { className: "dru-msg dru-msg-" + devMsg.kind, style: { marginTop: 6 } }, devMsg.text) : null
+          devMsg
+            ? h("div", { className: "dru-msg dru-msg-" + devMsg.kind, style: { marginTop: 6 } },
+                devMsg.text,
+                devMsg.retry
+                  ? h("button", { type: "button", className: "dru-linkbtn", style: { marginLeft: 8 }, disabled: devBusy !== "", onClick: devMsg.retry }, devBusy === "list" ? "重试中…" : "立即重试")
+                  : null)
+            : null
         ]);
       }
 
