@@ -3,6 +3,39 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.1-beta.1] - 2026-09-10
+
+> 预发版（`beta` 通道，`latest` 仍为 0.6.0）。修「首次安装后立即登录，二维码/设备列表报红字」
+> 的首次使用体验问题，并让面板在中继未就绪时自愈，不再需要手动刷新页面。
+
+### Fixed
+
+- **首次安装后立即登录 → 二维码与已授权设备列表报「尚未登录」红字**（需要刷新页面才恢复）：
+  根因是企业端 `POST /api/device-login` 强制校验共享密钥 `x-dsh-bridge-secret`，而该字段原本
+  只有一键安装器（`npx @mrrisega/dsh-remote` → `dsh-setup.mjs`）会写入配置；**只装插件**的路径
+  （`dsh plugin add` / 插件市场安装）没有这一步，插件侧 `device-login` 便一直缺密钥 → 拿不到
+  token → 面板把「中继未就绪」误报成「尚未登录」。现在插件侧补上同一份自愈：缺密钥即向
+  `/api/public-config` 取一次、落盘并缓存（服务端轮换密钥时自动重取），bridge 若已在运行则后台
+  重启一次使其带上密钥。
+- **面板不再需要手动刷新页面**：登录成功（含换账号）与 bridge 拉起/重启都会立即重取二维码与设备
+  列表；中继握手未就绪类失败（可重试）按 1.2s / 3s / 6s 退避自动重试，成功即自动清除提示，
+  红字旁常驻「立即重试」入口。bridge 重启/中继短时抖动不再需要用户手动刷新。
+
+### Changed
+
+- 错误文案不再一律谎报「尚未登录」：区分「未登录（去登录）」、`relogin_required`（本机密码已失效，
+  提示用新密码重新登录）与 `relay_not_ready` / `relay_unreachable`（中继未就绪或不可达，可重试，
+  返回 HTTP 503 + `retryable: true`），并保留上游原因便于排查。
+- 服务端取 token 增加一次退避重试（网络抖动/5xx/连接被断）与共享密钥轮换重取，减少首次登录的
+  偶发失败面。
+
+### Tests
+
+- 新增 `packages/dsh-remote-web/test/first-login-selfheal.test.mjs`（node 半：缺密钥自愈/落盘、
+  5xx 与网络失败重试、密钥轮换、503+retryable 语义、账号密码失效、自建模式不取设备密钥）。
+- 新增 `packages/dsh-remote-web/test/login-selfheal-ui.test.mjs`（浏览器半：真实 `useEffect` +
+  假定时器驱动登录 → 首次失败 → 退避自动重试 → 二维码与设备列表恢复，无需刷新页面）。
+
 ## [0.6.0] - 2026-09-09
 
 > 本版只记录**面向用户**的变化（管理后台/服务端后台更新不在此列）。稳定通道仍为

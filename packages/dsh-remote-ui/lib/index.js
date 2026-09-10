@@ -612,15 +612,135 @@ async function relayFetch(relayDir, pathname, init) {
   }
 }
 
+// ---------- bridge_secret 自愈（device-login 共享密钥） ----------
+
+/**
+ * 企业端 POST /api/device-login 强制校验 `x-dsh-bridge-secret`（缺失/失效 → 401 "需要有效设备密钥"），
+ * 密钥由服务端公开配置 /api/public-config 下发、与 dsh-setup.mjs 的 `bridge_secret` 同源。
+ *
+ * 一键安装器（npx @mrrisega/dsh-remote → dsh-setup.mjs）会在安装时取一次并写入 .dsh-config.json；
+ * 但**只装插件**的路径（dsh plugin add / 插件市场安装）没有这一步，于是：
+ *   首次安装 → 打开设置面板立即登录 → 面板请求 /dsh-remote/access-key & mobile-sessions
+ *   → relayToken 拿不到 token（401 需要设备密钥）→ 面板显示「尚未登录」（其实是密钥缺失）
+ * 直到后台自愈（scheduleRuntime → ensureRuntime 跑一次 npx 安装器）把 bridge_secret 写回配置，
+ * 或用户手动刷新页面才恢复——这正是「首次安装后立即登录，二维码/设备列表报红字」的根因。
+ *
+ * 这里在插件侧补上同一份自愈：缺密钥就取一次、落盘并缓存；失败短退避后可再试，不阻塞面板。
+ */
+let bridgeSecretCache = { dir: "", secret: "", failedAt: 0 };
+const BRIDGE_SECRET_RETRY_MS = 15_000;
+
+/** 读取配置里已保存的 bridge_secret（无则空串）。 */
+function readBridgeSecret(relayDir) {
+  try {
+    return String(loadConfig(relayDir).bridge_secret || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * 取 device-login 共享密钥：配置已有 → 直接用；否则向企业端公开配置取一次并写回配置（内存缓存兜底）。
+ * @param {string} relayDir 配置目录
+ * @param {object} [cfgOverride] 尚未落盘的配置（登录请求刚写入 phone/password 时用），仅用于判断模式
+ * @param {{force?: boolean, timeoutMs?: number}} [opts] force=true 跳过本地文件/缓存强制重取；
+ *        timeoutMs 限制单次公开配置请求耗时（登录路径用更短的上限，避免拖慢登录响应）
+ * @returns {Promise<string>} 密钥（取不到为空串，调用方按“中继未就绪”降级，不抛错）
+ */
+async function bridgeSecretOf(relayDir, cfgOverride, opts) {
+  const force = !!(opts && opts.force);
+  if (!force) {
+    const local = readBridgeSecret(relayDir);
+    if (local) {
+      bridgeSecretCache = { dir: relayDir, secret: local, failedAt: 0 };
+      return local;
+    }
+    if (bridgeSecretCache.dir === relayDir && bridgeSecretCache.secret) return bridgeSecretCache.secret;
+    if (bridgeSecretCache.dir === relayDir && Date.now() - bridgeSecretCache.failedAt < BRIDGE_SECRET_RETRY_MS) return ""; // 负缓存：别把公开配置打爆
+  }
+  const cfg = cfgOverride && typeof cfgOverride === "object" ? { ...loadConfig(relayDir), ...cfgOverride } : loadConfig(relayDir);
+  if (cfg.local_key) return ""; // 自建模式走 /_login，不用设备密钥
+  const api = (cfg.api_url || DEFAULT_API).replace(/\/+$/, "");
+  const timeoutMs = Number((opts && opts.timeoutMs) || 0) > 0 ? Number(opts.timeoutMs) : 6000;
+  let secret = "";
+  try {
+    const r = await fetch(`${api}/api/public-config`, { signal: AbortSignal.timeout(timeoutMs) });
+    if (r.ok) {
+      const d = await r.json();
+      secret = String((d && d.bridge_secret) || "").trim();
+    }
+  } catch { /* 网络抖动：负缓存短退避后再试 */ }
+  if (!secret) {
+    bridgeSecretCache = { dir: relayDir, secret: "", failedAt: Date.now() };
+    return "";
+  }
+  bridgeSecretCache = { dir: relayDir, secret, failedAt: 0 };
+  // 落盘（与 dsh-setup.mjs 同一份配置）：即使本进程退出，下次启动也不再缺密钥/不再是旧密钥
+  let healed = false;
+  try {
+    const cur = loadConfig(relayDir);
+    if (!cur.bridge_secret || (force && cur.bridge_secret !== secret)) {
+      cur.bridge_secret = secret;
+      saveConfig(relayDir, cur);
+      healed = true;
+    }
+  } catch { /* 写盘失败不致命：内存缓存本次进程内仍生效 */ }
+  // 密钥是「从无到有」补上的：已经在跑的 bridge 是用空密钥起的，隧道认证同样会失败——
+  // 后台重启一次让它带上密钥（一次性事件，失败只记日志不打断面板请求）。
+  if (healed && !UNINSTALLED_DIRS.has(relayDir)) {
+    setTimeout(() => {
+      try {
+        const st = launchdStatus();
+        if (!st.running) return;
+        const r = startBridge(relayDir);
+        console.log(`[dsh-remote-web] 已补记 bridge_secret，后台重启 bridge 使其生效: ${r.status}`);
+      } catch (e) {
+        console.warn(`[dsh-remote-web] 补记 bridge_secret 后重启 bridge 失败: ${e.message}`);
+      }
+    }, 50).unref?.();
+  }
+  return secret;
+}
+
 // ---------- v2 账号/配额/邀请代理（我的信息 与 免费额度提示） ----------
 
-/** 获取短期 relay token:SaaS → device-login;本地模式 → /_login(从隧道地址推导同源)。 */
-async function relayToken(relayDir) {
-  const cfg = loadConfig(relayDir);
-  const api = (cfg.api_url || DEFAULT_API).replace(/\/+$/, "");
-  if (cfg.local_key) {
-    // 本地认证:POST {tunnel 同源}/_login
-    const u = new URL(cfg.tunnel_url || api.replace(/^https?/, "wss"));
+/** token 获取失败的原因（供 UI 区分“未登录”与“中继未就绪”，不再一律谎报“尚未登录”）。 */
+const AUTH_NO_CREDENTIALS = "no_credentials";       // 本机没存账号/自建密钥 → 该去登录
+const AUTH_BAD_CREDENTIALS = "bad_credentials";     // 账号密码被企业端拒绝 → 该重新登录
+const AUTH_RELAY_UNREACHABLE = "relay_unreachable"; // 网络/5xx/超时 → 稍后重试
+const AUTH_RELAY_NOT_READY = "relay_not_ready";     // 凭证齐全但企业端未接受（缺失/轮换中的设备密钥等）→ 稍后重试
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** 单次 device-login：返回 { ok, status, token, code, detail }（不抛错，便于按原因降级/重试）。 */
+async function deviceLoginOnce(api, cfg, secret) {
+  try {
+    const r = await fetch(`${api}/api/device-login`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(secret ? { "x-dsh-bridge-secret": secret } : {}) },
+      body: JSON.stringify({ phone: cfg.phone, email: cfg.phone, password: cfg.password }),
+      signal: AbortSignal.timeout(6000)
+    });
+    const text = await r.text();
+    let d = null;
+    try { d = JSON.parse(text); } catch { d = null; }
+    return {
+      ok: r.ok,
+      status: r.status,
+      token: (d && d.token) || "",
+      code: (d && d.error && d.error.code) || "",
+      detail: (d && d.error && (d.error.message || d.error.code)) || "",
+    };
+  } catch (e) {
+    return { ok: false, status: 0, token: "", code: "", detail: e.message };
+  }
+}
+
+/** 单次本地认证（自建模式）：POST {隧道同源}/_login。 */
+async function localLoginOnce(cfg, api) {
+  const fallbackApi = (api || cfg.api_url || DEFAULT_API).replace(/\/+$/, "");
+  try {
+    const u = new URL(cfg.tunnel_url || fallbackApi.replace(/^https?/, "wss"));
     u.protocol = u.protocol === "wss:" ? "https:" : "http:";
     u.pathname = "/_login";
     const r = await fetch(u.toString(), {
@@ -629,20 +749,59 @@ async function relayToken(relayDir) {
       body: JSON.stringify({ key: cfg.local_key }),
       signal: AbortSignal.timeout(6000)
     });
-    if (!r.ok) return "";
+    if (!r.ok) return { ok: false, status: r.status, token: "", code: "", detail: "" };
     const d = await r.json();
-    return d.token || "";
+    return { ok: true, status: 200, token: (d && d.token) || "", code: "", detail: "" };
+  } catch (e) {
+    return { ok: false, status: 0, token: "", code: "", detail: e.message };
   }
-  if (!cfg.phone || !cfg.password) return "";
-  const r = await fetch(`${api}/api/device-login`, {
-    method: "POST",
-    headers: { "content-type": "application/json", ...(cfg.bridge_secret ? { "x-dsh-bridge-secret": cfg.bridge_secret } : {}) },
-    body: JSON.stringify({ phone: cfg.phone, email: cfg.phone, password: cfg.password }),
-    signal: AbortSignal.timeout(6000)
-  });
-  if (!r.ok) return "";
-  const d = await r.json();
-  return d.token || "";
+}
+
+/**
+ * 获取短期 relay token:SaaS → device-login;本地模式 → /_login(从隧道地址推导同源)。
+ * 与旧版差异：① 缺 device-login 共享密钥时自愈补齐；② 服务端轮换密钥(401/403)自动重取重试；
+ * ③ 网络抖动/5xx 退避重试一次；④ 失败时给出**可判定原因**而非空串（消除“尚未登录”误报）。
+ * @returns {Promise<{token:string, reason:string, status:number, detail:string}>}
+ */
+async function relayTokenWithReason(relayDir, cfgOverride) {
+  const cfg = cfgOverride && typeof cfgOverride === "object" ? { ...loadConfig(relayDir), ...cfgOverride } : loadConfig(relayDir);
+  const api = (cfg.api_url || DEFAULT_API).replace(/\/+$/, "");
+  if (cfg.local_key) {
+    let r = await localLoginOnce(cfg, api);
+    if (!r.token && (r.status === 0 || r.status >= 500)) { await sleep(350); r = await localLoginOnce(cfg, api); }
+    if (r.token) return { token: r.token, reason: "", status: r.status, detail: "" };
+    return {
+      token: "",
+      reason: r.status === 401 || r.status === 403 ? AUTH_BAD_CREDENTIALS : AUTH_RELAY_UNREACHABLE,
+      status: r.status,
+      detail: r.detail,
+    };
+  }
+  if (!cfg.phone || !cfg.password) return { token: "", reason: AUTH_NO_CREDENTIALS, status: 0, detail: "" };
+
+  let secret = await bridgeSecretOf(relayDir, cfgOverride);
+  let r = await deviceLoginOnce(api, cfg, secret);
+  // 带了密钥仍被拒 → 可能是服务端轮换了共享密钥：丢弃缓存强制重取一次再试
+  if (!r.token && (r.status === 401 || r.status === 403) && secret) {
+    const fresh = await bridgeSecretOf(relayDir, cfgOverride, { force: true });
+    if (fresh && fresh !== secret) r = await deviceLoginOnce(api, cfg, fresh);
+  }
+  // 网络抖动/超时/5xx：短退避重试一次（首次安装后中继握手偶发失败很常见）
+  if (!r.token && (r.status === 0 || r.status >= 500)) {
+    await sleep(350);
+    r = await deviceLoginOnce(api, cfg, await bridgeSecretOf(relayDir, cfgOverride));
+  }
+  if (r.token) return { token: r.token, reason: "", status: r.status, detail: "" };
+  if (r.code === "bad_credentials") return { token: "", reason: AUTH_BAD_CREDENTIALS, status: r.status, detail: r.detail };
+  // 凭证齐全但企业端没给 token（设备密钥缺失/轮换中、限流、其它 4xx）→ 可重试，不谎报“未登录”
+  if (r.status === 0 || r.status >= 500) return { token: "", reason: AUTH_RELAY_UNREACHABLE, status: r.status, detail: r.detail };
+  return { token: "", reason: AUTH_RELAY_NOT_READY, status: r.status, detail: r.detail };
+}
+
+/** 兼容旧调用方（反馈/账号/配额等只需 token 字符串）。 */
+async function relayToken(relayDir) {
+  const r = await relayTokenWithReason(relayDir).catch(() => ({ token: "" }));
+  return r.token || "";
 }
 
 /** 我的信息:SaaS 账号的生效套餐/到期日/邀请码(经 /api/me)。 */
@@ -723,6 +882,57 @@ function notLoggedInJson() {
 }
 
 /**
+ * 凭证齐全但拿不到 relay token 时的统一返回：区分「密码失效需重新登录」与「中继暂未就绪可重试」。
+ * 关键：不再把中继未就绪/设备密钥缺失谎报成“尚未登录”（旧版 UI 因此显示误导性红字）。
+ */
+function relayAuthFailureJson(reason, detail) {
+  if (reason === AUTH_NO_CREDENTIALS) return { status: 401, body: notLoggedInJson() };
+  if (reason === AUTH_BAD_CREDENTIALS) {
+    return {
+      status: 401,
+      body: {
+        ok: false,
+        error: "本机保存的账号密码已被中继拒绝（可能已在别处修改过密码）：请用新密码重新登录「账号」卡片后重试",
+        hint: "relogin_required",
+        retryable: false,
+        detail: String(detail || ""),
+      },
+    };
+  }
+  const unreachable = reason === AUTH_RELAY_UNREACHABLE;
+  return {
+    status: 503,
+    body: {
+      ok: false,
+      error: unreachable
+        ? "中继服务暂时不可达（网络波动或中继正在重启），请稍后重试"
+        : "账号已登录，但中继连接尚未就绪（正在建立安全通道），请稍后重试",
+      hint: unreachable ? "relay_unreachable" : "relay_not_ready",
+      retryable: true,
+      detail: String(detail || ""),
+    },
+  };
+}
+
+/**
+ * 取 relay token 或直接回错误响应（面板代理统一入口）。
+ * @returns {Promise<string>} token；为空串表示已写出错误响应（调用方直接 return）
+ */
+async function relayTokenOrReject(relayDir, res, cfgOverride) {
+  const a = await relayTokenWithReason(relayDir, cfgOverride).catch((e) => ({
+    token: "",
+    reason: AUTH_RELAY_UNREACHABLE,
+    status: 0,
+    detail: e && e.message,
+  }));
+  if (a.token) return a.token;
+  const { status, body } = relayAuthFailureJson(a.reason, a.detail);
+  console.warn(`[dsh-remote-web] 取 relay token 失败(${a.reason}/${a.status}): ${a.detail || "无详情"}`);
+  sendJson(res, status, body);
+  return "";
+}
+
+/**
  * 透传企业端响应体：契约字段可能在顶层或 data 子对象里（容错）。
  * 返回扁平对象；数组字段只取首层数组。
  */
@@ -737,8 +947,8 @@ function flattenRelayBody(r) {
  * 契约容错：url 必须可用；qr_data_url 取不到时返回 null（UI 只展示链接并说明“二维码暂不可用”，不报错）。
  */
 async function proxyCreateAccessKey(relayDir, res) {
-  const token = await relayToken(relayDir).catch(() => "");
-  if (!token) return sendJson(res, 401, notLoggedInJson());
+  const token = await relayTokenOrReject(relayDir, res);
+  if (!token) return;
   const r = await relayFetch(relayDir, "/api/auth-key", {
     method: "POST",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
@@ -766,8 +976,8 @@ async function proxyCreateAccessKey(relayDir, res) {
  * GET /dsh-remote/mobile-sessions → 已授权设备列表（企业端 GET /api/mobile-sessions，Bearer）。
  */
 async function proxyMobileSessions(relayDir, res) {
-  const token = await relayToken(relayDir).catch(() => "");
-  if (!token) return sendJson(res, 401, notLoggedInJson());
+  const token = await relayTokenOrReject(relayDir, res);
+  if (!token) return;
   const r = await relayFetch(relayDir, "/api/mobile-sessions", {
     method: "GET",
     headers: { authorization: `Bearer ${token}` },
@@ -788,8 +998,8 @@ async function proxyRevokeMobileSession(relayDir, req, res) {
   if (body.__parseError) return sendJson(res, 400, { ok: false, error: "JSON 解析失败" });
   const id = String(body.id ?? "").trim();
   if (!id) return sendJson(res, 400, { ok: false, error: "缺少参数 id（会话 ID）" });
-  const token = await relayToken(relayDir).catch(() => "");
-  if (!token) return sendJson(res, 401, notLoggedInJson());
+  const token = await relayTokenOrReject(relayDir, res);
+  if (!token) return;
   const r = await relayFetch(relayDir, `/api/mobile-sessions/${encodeURIComponent(id)}/revoke`, {
     method: "POST",
     headers: { authorization: `Bearer ${token}` },
@@ -812,8 +1022,8 @@ async function proxyDeleteMobileSession(relayDir, req, res) {
   if (body.__parseError) return sendJson(res, 400, { ok: false, error: "JSON 解析失败" });
   const id = String(body.id ?? "").trim();
   if (!id) return sendJson(res, 400, { ok: false, error: "缺少参数 id（会话 ID）" });
-  const token = await relayToken(relayDir).catch(() => "");
-  if (!token) return sendJson(res, 401, notLoggedInJson());
+  const token = await relayTokenOrReject(relayDir, res);
+  if (!token) return;
   const r = await relayFetch(relayDir, `/api/mobile-sessions/${encodeURIComponent(id)}`, {
     method: "DELETE",
     headers: { authorization: `Bearer ${token}` },
@@ -831,8 +1041,8 @@ async function proxyDeleteMobileSession(relayDir, req, res) {
  * （企业端 POST /api/mobile-sessions/purge，Bearer）。
  */
 async function proxyPurgeMobileSessions(relayDir, res) {
-  const token = await relayToken(relayDir).catch(() => "");
-  if (!token) return sendJson(res, 401, notLoggedInJson());
+  const token = await relayTokenOrReject(relayDir, res);
+  if (!token) return;
   const r = await relayFetch(relayDir, "/api/mobile-sessions/purge", {
     method: "POST",
     headers: { authorization: `Bearer ${token}` },
@@ -1030,7 +1240,7 @@ const PLUGIN_ID = "dsh-remote-ui";
 const PLUGIN_LEGACY_IDS = ["dsh-remote-web"];
 const PLUGIN_ALL_IDS = [PLUGIN_ID, ...PLUGIN_LEGACY_IDS];
 /** 插件自身发布版本（与 dsh-remote 根包同步递增）。 */
-const PLUGIN_VERSION = "0.6.0";
+const PLUGIN_VERSION = "0.6.1-beta.1";
 const UPDATE_LOG = ".dsh-update.log";
 const UPDATE_MARKER = ".dsh-update-running";
 
@@ -1352,6 +1562,14 @@ function registerRoutes(ctx, relayDir) {
           }
           // SaaS 权威归一化：清除自建残留(local_key/假 tunnel_url)，api/tunnel 一律按云端重算
           applySaaSMode(cfg);
+          // device-login 共享密钥自愈：只装插件的路径没有安装器那一步，缺密钥会导致
+          // 「首次安装后立即登录」时面板拿不到二维码/设备列表（旧版要等后台自愈或手动刷新）。
+          // 这里在启动 bridge 之前补齐，bridge 首次启动即可带上密钥。
+          if (!cfg.bridge_secret) {
+            // 3s 上限：这次取密钥在登录响应路径上，宁可先放行（后续请求还会自愈）也不拖慢登录
+            const secret = await bridgeSecretOf(relayDir, cfg, { timeoutMs: 3000 });
+            if (secret) cfg.bridge_secret = secret;
+          }
         }
         saveConfig(relayDir, cfg);
         const bridgeRestart = startBridge(relayDir);
