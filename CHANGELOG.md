@@ -3,6 +3,43 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.2] - 2026-09-11
+
+> 稳定版（`latest`）。主题：**插件市场安装即可用**（补齐桌面运行环境 + 修复自愈停摆 + 首次安装重启引导）。
+
+### Fixed
+
+- **插件市场安装后 bridge 起不来、且永远不自愈**（本机实测复现并修复）。只装插件半（市场/`dsh plugin add`）
+  的用户，桌面运行环境 `~/.dsh-remote/dsh-setup.mjs` 从未被补齐，而登录/「启动 bridge」会直接写 plist 并
+  `launchctl bootstrap` → 指向不存在的脚本 → launchd KeepAlive 无限重拉（实测 `runs = 23`、
+  `last exit code = 1`、日志 20+ 次 `MODULE_NOT_FOUND`）。三处根因一并修掉：
+  1. **`startBridge()` 不再在运行环境缺失时 bootstrap**：改为拒绝启动并转入后台补装，不再生成指向空路径的
+     自启动项（这类 plist 是崩溃循环的唯一来源）。
+  2. **`launchdStatus()` 不再把崩溃循环谎报为「运行中」**：`launchctl print` 能打印时以它的 `state` 为准，
+     绝不回退 `launchctl list`——崩溃循环里 list 的 PID 列会闪现**已死**的 pid（实测 `40213 1` 而
+     `ps -p 40213` 为空），旧实现据此报 `running: true`，直接导致第 3 条的自愈停摆。
+  3. **自愈顺序修正**：`scheduleRuntime` 把「运行环境是否就绪」提到最前，先于「账号是否登录」与
+     「服务是否在跑」判断；并主动摘除指向不存在脚本的失效自启动（`bootout` + 删 plist），止住崩溃循环。
+  另：插件加载（`apply`）即开始后台补装运行环境，不再等用户先登录；自启动 plist 增加 `ThrottleInterval`，
+  崩溃时不再空转重拉。
+
+### Added
+
+- **首次安装/更新后引导重启 DeepSeek harness**：dsh web 的插件（宿主半 + 浏览器半）都在进程启动时装载，
+  市场安装只是把文件写进 profile，必须重启才生效。现在：
+  - 「设置 → 远程访问」**顶部醒目提示**「首次安装需要重启 DeepSeek harness」+「重启」按钮；
+  - 面板**最底部常驻**「🔄 重启 DeepSeek harness」按钮（随时可达）；
+  - 面板内一键重启：优先交回监管者（`launchctl kickstart -k` 精确匹配承载本插件的作业 / `systemctl --user
+    restart`），无监管者时用原命令行自拉起；重启期间页面自动轮询并在服务恢复后刷新，无需手动操作；
+  - 「待重启」状态持久化并跨进程结清：真重启后提示自动消失，同一进程内（仅刷新页面）不会误撤。
+- `GET /dsh-remote/status` 新增 `service.runtimeReady` 与 `restart`（`pending/kind/reason`），面板据此
+  区分「运行环境没装（自动补装中）」与「装了但没跑」，并把崩溃循环如实显示为「启动失败（已自动转入修复）」。
+
+### Changed
+
+- `npm run test:plugin` 默认置位 `DSH_RELAY_SKIP_SERVICE=1`（测试隔离）：插件加载不再在用例里触发真实
+  npx 补装 / launchctl / 重启 harness；需要真实分支的用例显式 unset。
+
 ## [0.6.1] - 2026-09-10
 
 > 稳定版（`latest`）。内容 = 预发版 `0.6.1-beta.1`（首次安装登录体验修复）+ 交流群二维码。

@@ -24,6 +24,9 @@ exit 0
     res.end(JSON.stringify({ app_url: "https://example.test/app/" }));
   });
   await new Promise((resolve) => relay.listen(0, "127.0.0.1", resolve));
+  // 0.6.2 契约：运行环境（固化运行时 dsh-setup.mjs）就绪才允许 bootstrap，
+  // 否则 startBridge 会拒绝并转为后台补装。本用例场景是「已安装环境切账号」→ 先放运行时占位。
+  await writeFile(path.join(tempDir, "dsh-setup.mjs"), "// runtime stub");
   await writeFile(path.join(tempDir, ".dsh-config.json"), JSON.stringify({
     phone: "new-account",
     email: "old-account",
@@ -38,6 +41,10 @@ exit 0
   process.env.HOME = fakeHome;
   process.env.PATH = `${fakeBin}:${oldEnv.PATH}`;
   process.env.DSH_TEST_LAUNCH_LOG = launchLog;
+  // 本用例专测「切账号 → 重启 bridge」的真实分支：launchctl 已由 fakeBin 接管，
+  // 故显式关闭全局测试隔离开关（npm run test:plugin 默认置位，见 package.json）。
+  const savedSkip = process.env.DSH_RELAY_SKIP_SERVICE;
+  delete process.env.DSH_RELAY_SKIP_SERVICE;
 
   const routes = new Map();
   apply({

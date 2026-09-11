@@ -91,6 +91,13 @@ window.__ModuleLoader__.load({
       ".dru-msg-err{color:#cf222e}",
       ".dru-msg-warn{color:#9a6700}",
       ".dru-hint{font-size:12px;color:#57606a;line-height:1.6}",
+      // ── 重启 DeepSeek harness（首次安装/更新后置顶提醒 + 底部常驻按钮） ──
+      ".dru-restart-alert{display:flex;gap:10px;align-items:flex-start;background:#fff8c5;border:1px solid #d4a72c;border-radius:10px;padding:12px 14px;margin-bottom:12px}",
+      ".dru-restart-alert-icon{font-size:18px;line-height:1.2}",
+      ".dru-restart-alert-title{font-size:13px;font-weight:700;color:#7d4e00}",
+      ".dru-restart-alert-sub{font-size:12px;color:#6b5900;margin-top:4px;line-height:1.6}",
+      ".dru-restart-foot{margin-top:14px;padding-top:12px;border-top:1px solid #eaeef2;display:flex;gap:10px;align-items:center;flex-wrap:wrap}",
+      ".dru-restart-foot .dru-hint{flex:1;min-width:180px;margin:0}",
       // ── 用户反馈模块 ──
       ".dru-fb-tabs{display:flex;gap:8px;margin-bottom:10px}",
       ".dru-fb-tab{flex:1;padding:6px 0;text-align:center;border-radius:8px;cursor:pointer;font-size:12.5px;font-weight:600;color:#57606a;background:#eaeef2;border:1px solid #d0d7de;user-select:none}",
@@ -1202,6 +1209,19 @@ window.__ModuleLoader__.load({
 
       var loggedIn = !!(st && st.config && (st.config.phone || st.config.hasLocalKey));
       var serviceRunning = !!(st && st.service && st.service.running);
+      // 0.6.2：运行环境是否就绪 + launchd 是否处于崩溃循环（入口脚本缺失导致的 KeepAlive 重拉）。
+      // 旧版把「作业在 launchd 里但进程秒退」显示成「运行中」，用户完全看不出问题在哪。
+      var serviceRuntimeReady = !(st && st.service && st.service.runtimeReady === false);
+      var serviceLaunchd = (st && st.service && st.service.launchd) || {};
+      var serviceCrashing = !!serviceLaunchd.crashing;
+      var serviceStateText = !st ? "查询中…"
+        : serviceRunning ? "运行中"
+        : serviceCrashing ? "启动失败（已自动转入修复）"
+        : !serviceRuntimeReady ? "运行环境安装中…"
+        : "已停止";
+      // 是否需要重启 DeepSeek harness（首次安装/在线更新后置顶提醒 + 底部常驻按钮）
+      var restartInfo = (st && st.restart) || {};
+      var restartPending = !!restartInfo.pending;
       // 账号标识（掩码手机号）：登录成功/换账号时变化 → 触发上方的重取 effect（比布尔 loggedIn 更敏感）
       var phoneKey = (st && st.config && st.config.phone) || "";
       var launchdPid = st && st.service && st.service.launchd && st.service.launchd.pid;
@@ -1718,6 +1738,39 @@ window.__ModuleLoader__.load({
           .finally(function () { setBusy(""); });
       };
 
+      /**
+       * 重启 DeepSeek harness：插件本体与浏览器半在进程启动时装载，首次安装/在线更新后
+       * 必须重启才生效。重启会短暂断开本页面 —— 这里轮询等它回来，然后自动刷新。
+       */
+      var restartHarness = function () {
+        setBusy("restart");
+        post("/dsh-remote/harness/restart")
+          .then(function (body) {
+            setSt(body);
+            setMsg("ok", "🔄 正在重启 DeepSeek harness" + (body && body.mode ? "（" + body.mode + "）" : "") +
+              "…约 2~10 秒，页面会自动刷新，无需手动操作。");
+            waitHarnessBack(0, false);
+          })
+          .catch(function (e) {
+            setMsg("err", "重启失败: " + e.message + " —— 请手动重启 DeepSeek harness（退出 dsh web 后重新启动）。");
+            setBusy("");
+          });
+      };
+
+      /** 轮询等待 harness 回来；观察到「断过又恢复」或等待足够久后自动刷新页面。 */
+      var waitHarnessBack = function (tries, sawDown) {
+        if (tries > 40) { setMsg("err", "重启后仍未就绪，请手动刷新页面或重启 DeepSeek harness。"); setBusy(""); return; }
+        setTimeout(function () {
+          fetch("/dsh-remote/status", { cache: "no-store" })
+            .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+            .then(function () {
+              if (sawDown || tries >= 8) { location.reload(); return; }
+              waitHarnessBack(tries + 1, sawDown);
+            })
+            .catch(function () { waitHarnessBack(tries + 1, true); });
+        }, 1500);
+      };
+
       var saveLocal = function () {
         if (!selfHost.trim() || !localKey.trim()) { setMsg("err", "请填写服务器地址与访问密钥"); return; }
         setBusy("local");
@@ -2139,7 +2192,7 @@ window.__ModuleLoader__.load({
           card("🖥 Bridge 服务",
             h("div", { className: "dru-status-line" },
               h("span", { className: "dru-dot " + (serviceRunning ? "dru-dot-on" : "dru-dot-off") }),
-              h("span", null, st ? (serviceRunning ? "运行中" : "已停止") : "查询中…"),
+              h("span", null, st ? serviceStateText : "查询中…"),
               launchdPid ? h("span", { className: "dru-meta", style: { marginTop: 0 } }, "(pid=" + launchdPid + ")") : null
             ),
             h("div", { className: "dru-actions", style: { marginTop: 10 } },
@@ -2149,6 +2202,14 @@ window.__ModuleLoader__.load({
             ),
             h("div", { className: "dru-meta" }, st && st.config && st.config.deviceId ? "设备 ID：" + st.config.deviceId : "设备 ID：生成中"),
             h("div", { className: "dru-meta" }, st ? (st.service && st.service.plistExists ? "自启动服务已安装" : "自启动服务未安装（启动时自动创建）") : ""),
+            // 0.6.2：把「运行环境缺失 / launchd 崩溃循环」如实告诉用户，而不是显示「运行中」
+            st && !serviceRuntimeReady
+              ? h("div", { className: "dru-hint", style: { marginTop: 8 } },
+                  "🛠 插件市场只装「面板插件」，桌面运行环境（bridge）需要额外补装——已自动在后台安装，装完会自动启动 bridge，不用做任何操作。若超过几分钟仍未变成「运行中」，点上方版本卡的「一键更新」手动补全。")
+              : serviceCrashing
+                ? h("div", { className: "dru-hint", style: { marginTop: 8 } },
+                    "⚠️ 上一次启动失败（自启动入口失效），已自动清理失效自启动项并重新补装运行环境。稍候会自动恢复；仍失败请点「一键更新」。")
+                : null,
             st && st.service && st.service.bindError
               ? h("div", { className: "dru-msg dru-msg-err", style: { marginTop: 8 } },
                   "⚠️ 设备注册失败：" + (st.service.bindError.message || "未说明原因"),
@@ -2214,7 +2275,36 @@ window.__ModuleLoader__.load({
           )
         ),
         h("div", { className: "dru-settings-body" },
+          restartPending
+            ? h("div", { className: "dru-restart-alert", role: "status" },
+                h("span", { className: "dru-restart-alert-icon" }, "🔔"),
+                h("div", { style: { flex: "1" } },
+                  h("div", { className: "dru-restart-alert-title" },
+                    restartInfo.kind === "update" ? "在线更新已完成，需要重启 DeepSeek harness" : "首次安装需要重启 DeepSeek harness"),
+                  h("div", { className: "dru-restart-alert-sub" },
+                    "插件本体与「远程访问」面板是在 DeepSeek harness 启动时装载的，重启之后即可正常使用（账号、二维码、bridge 全部生效）。"),
+                  h("div", { className: "dru-actions", style: { marginTop: 10 } },
+                    h("button", {
+                      type: "button",
+                      className: "dru-btn dru-btn-primary",
+                      disabled: busy !== "",
+                      onClick: function () { restartHarness(); }
+                    }, busy === "restart" ? "重启中…" : "重启 DeepSeek harness")
+                  )
+                )
+              )
+            : null,
           view === "feedback" ? renderFeedback() : view === "invite" ? renderInvite() : renderHome()
+        ),
+        // 常驻入口最底部：「重启 DeepSeek harness」按钮始终可达（首次安装/更新/排查都用它）
+        h("div", { className: "dru-restart-foot" },
+          h("div", { className: "dru-hint" }, "重启 DeepSeek harness：插件与面板在 harness 启动时装载，首次安装或在线更新后重启即可生效；仅重启 dsh web，不影响 bridge 与手机端连接。"),
+          h("button", {
+            type: "button",
+            className: "dru-btn " + (restartPending ? "dru-btn-primary" : "dru-btn-ghost"),
+            disabled: busy !== "",
+            onClick: function () { restartHarness(); }
+          }, busy === "restart" ? "重启中…" : "🔄 重启 DeepSeek harness")
         ),
         renderCommunityModal()
       );

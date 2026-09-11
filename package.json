@@ -1,6 +1,6 @@
 {
   "name": "@mrrisega/dsh-remote",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "手机远程控制 DeepSeek Harness · Remote control DeepSeek Harness (dsh web) from any phone browser — 100% 全功能 App 级体验：发消息、看工具执行、审批权限、改设置、管凭据，含特权操作，免内网穿透。一条命令安装 npx @mrrisega/dsh-remote。Mobile remote control for DSH, self-host or SaaS, no server needed on LAN.",
   "keywords": [
     "deepseek-harness",
@@ -50,7 +50,8 @@
   "scripts": {
     "test": "npm run test:router && npm run test:plugin && npm run test:bridge",
     "test:router": "node --test packages/relay-router/test/native-device-selection.test.mjs packages/relay-router/test/quotas.test.mjs",
-    "test:plugin": "node --test --test-concurrency=1 packages/dsh-remote-web/test/*.test.mjs",
+    "_comment:test:plugin": "DSH_RELAY_SKIP_SERVICE=1 = 测试隔离：插件加载时不做真实系统操作（npx 补装 / launchctl / 重启 harness）；需要真实分支的用例自行 unset（见 account-switch / runtime-provision / harness-restart 用例注释）",
+    "test:plugin": "DSH_RELAY_SKIP_SERVICE=1 node --test --test-concurrency=1 packages/dsh-remote-web/test/*.test.mjs",
     "test:bridge": "node --test clients/dsh-remote/test/*.test.mjs",
     "check": "node --check clients/dsh-remote/dsh-bridge.mjs && node --check clients/dsh-remote/e2ee-shim.mjs && node --check dsh-setup.mjs && node --check packages/dsh-remote-web/lib/index.js && node --check packages/dsh-remote-web/lib/client.js && bash -n deploy/install-open.sh && npm run check:alias",
     "sync:alias": "node scripts/sync-legacy-alias.mjs",

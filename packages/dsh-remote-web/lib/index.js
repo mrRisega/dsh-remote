@@ -14,7 +14,7 @@
 //   - 0.1.2+ ?token 浏览器鉴权会话代持（0.4.1 起）
 //
 // 不依赖任何第三方包：只使用 node 内置模块与 cordis 注入的 webServer 服务。
-import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync, accessSync, chmodSync, openSync, closeSync, rmSync, constants as fsConstants } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync, accessSync, chmodSync, openSync, closeSync, rmSync, statSync, constants as fsConstants } from "node:fs";
 import { join, dirname, sep } from "node:path";
 import { execSync, spawn } from "node:child_process";
 import { homedir, platform } from "node:os";
@@ -76,8 +76,8 @@ const NODE_BIN = preferredNode();
 function npxCommand() {
   const name = process.platform === "win32" ? "npx.cmd" : "npx";
   const dirs = [
+    process.env.DSH_SETUP_NPX_DIR || "",  // 显式覆盖优先（测试注入假 npx；生产通常不设）
     dirname(process.execPath),           // 与当前 node 同目录（homebrew/usr/local 均可覆盖）
-    process.env.DSH_SETUP_NPX_DIR || "",
     "/opt/homebrew/bin",
     "/usr/local/bin",
     "/opt/homebrew/opt/node@20/bin",
@@ -290,6 +290,25 @@ function scheduleHarnessMint(ctx, relayDir) {
   };
 }
 
+// ---------- 桌面运行环境就绪判定 / 系统级操作开关 ----------
+
+/**
+ * 桌面运行环境是否就绪：固化运行时 `<relayDir>/dsh-setup.mjs` 存在即视为就绪。
+ * 这是「bridge 能不能跑」的唯一权威判据，也是 launchd 自启动指向的入口脚本
+ * （见 writeAutostartFile）——插件市场只装「插件半」时该文件不存在，必须先补装。
+ */
+function runtimeReady(relayDir) {
+  return existsSync(join(relayDir, "dsh-setup.mjs"));
+}
+
+/**
+ * 系统级操作总开关（测试隔离）：置位后不做 launchctl / npx 安装 / 杀进程等一切真实系统操作。
+ * 生产环境绝不设置；测试与 CI 必须设置，否则用例会去碰本机真实的 bridge 自启动服务。
+ */
+function skipsSystemOps() {
+  return process.env.DSH_RELAY_SKIP_SERVICE === "1";
+}
+
 // ---------- bridge 服务状态 / 启停（launchctl，macOS） ----------
 
 function launchAgentPath() {
@@ -301,20 +320,46 @@ function launchTarget() {
   return `gui/${process.getuid()}/com.dshremote.bridge`;
 }
 
-/** 检查 launchd 服务状态（state=running + pid；兜底 launchctl list）。 */
+/**
+ * 检查 launchd 服务状态。
+ *
+ * 【0.6.2 关键修复】`launchctl print` 只要成功，它的 `state` 就是权威，**不得**再回退
+ * `launchctl list`。原因：plist 指向不存在的入口脚本时，KeepAlive 会让作业陷入
+ * 「秒退→立刻重拉」的崩溃循环，而在重拉的瞬间 `launchctl list` 的 PID 列会闪现一个
+ * **已经死掉**的 pid（本机实测 `launchctl list` = `40213 1 com.dshremote.bridge`，
+ * 同时 `ps -p 40213` 为空、`launchctl print` = `state = spawn scheduled`）。
+ * 旧实现据此谎报 running=true，后果有二：
+ *   1) 面板显示「运行中」，用户以为 bridge 在跑（实际从未注册成功）；
+ *   2) scheduleRuntime 判定「已在运行」→ 自愈 watcher 永久停摆，再也不补运行环境。
+ * 现在：print 的 state 为准 + 附带 runs/lastExitCode/crashing 供面板与自愈解释原因；
+ * 仅在 print 本身不可用时才回退 list，且回退路径要求 pid 真实存活。
+ */
 function launchdStatus() {
   const target = launchTarget();
   const pr = sh(`launchctl print ${target}`);
-  if (pr.ok && /state\s*=\s*running/.test(pr.stdout)) {
-    const m = pr.stdout.match(/pid\s*=\s*(\d+)/);
-    return { running: true, pid: m ? Number(m[1]) : null };
+  if (pr.ok) {
+    const stateMatch = pr.stdout.match(/state\s*=\s*([^\n]+)/);
+    const state = stateMatch ? stateMatch[1].trim() : "";
+    const pidMatch = pr.stdout.match(/(?:^|\n)\s*pid\s*=\s*(\d+)/);
+    const runsMatch = pr.stdout.match(/runs\s*=\s*(\d+)/);
+    const exitMatch = pr.stdout.match(/last exit code\s*=\s*(-?\d+)/);
+    const runs = runsMatch ? Number(runsMatch[1]) : null;
+    const lastExitCode = exitMatch ? Number(exitMatch[1]) : null;
+    const running = state === "running";
+    // 崩溃循环：作业在 launchd 里可见但没在跑，且上次退出码非 0（KeepAlive 会无限重拉）
+    const crashing = !running && runs !== null && runs > 0 && lastExitCode !== null && lastExitCode !== 0;
+    return { running, pid: running && pidMatch ? Number(pidMatch[1]) : null, state, runs, lastExitCode, crashing };
   }
-  const ls = sh(`launchctl list | grep com.dshremote.bridge`);
+  const ls = sh("launchctl list | grep com.dshremote.bridge");
   if (ls.ok) {
     const pidStr = ls.stdout.trim().split(/\s+/)[0];
-    if (pidStr && pidStr !== "-" && /^\d+$/.test(pidStr)) return { running: true, pid: Number(pidStr) };
+    if (pidStr && pidStr !== "-" && /^\d+$/.test(pidStr)) {
+      const pid = Number(pidStr);
+      // list 的 PID 列在崩溃循环中会出现已死进程 → 必须校验存活才敢报运行
+      if (pidAlive(pid) !== false) return { running: true, pid, state: "running", runs: null, lastExitCode: null, crashing: false };
+    }
   }
-  return { running: false, pid: null };
+  return { running: false, pid: null, state: "", runs: null, lastExitCode: null, crashing: false };
 }
 
 /** 检查手动运行的 watcher（dsh-setup.mjs run）与 bridge 子进程（排除 launchd 托管链）。 */
@@ -350,6 +395,14 @@ function manualStatus() {
 const PROVISION_MARKER = ".dsh-setup-installing";
 const AUTO_INSTALL_LOG = ".dsh-setup-install.log";
 const STALE_MARKER_MS = 30 * 60 * 1000; // 超过该时长视为上次进程残留，插件启动时清理
+/**
+ * 自愈 watcher 轮询间隔（默认 12s）。DSH_RELAY_SELFHEAL_MS 可覆盖——仅供测试把
+ * 崩溃循环自愈链路压到亚秒级验证，生产不必设置。调用时读取（而非模块加载时固定），
+ * 测试才能在 import 之后再改。
+ */
+function selfhealIntervalMs() {
+  return Math.max(200, Number(process.env.DSH_RELAY_SELFHEAL_MS) || 12_000);
+}
 
 /** 向日志追加一行（多个子进程写同一日志用 append 模式，互不覆盖）。 */
 function appendLogLine(relayDir, name, line) {
@@ -374,7 +427,8 @@ function appendLogLine(relayDir, name, line) {
  * 已被 0.4.5 移除的“用户 include”重新写回 profile（历史上造成 dsh web 重复 ID 崩溃）。 */
 function ensureRuntime(relayDir) {
   if (UNINSTALLED_DIRS.has(relayDir)) return false; // 已彻底卸载：不再自动安装运行环境
-  if (existsSync(join(relayDir, "dsh-setup.mjs"))) return true;
+  if (runtimeReady(relayDir)) return true;
+  if (skipsSystemOps()) return false; // 测试隔离：绝不在用例里 spawn 真实 npx 安装
   const marker = join(relayDir, PROVISION_MARKER);
   if (existsSync(marker)) return false; // 正在安装中
   try {
@@ -419,6 +473,7 @@ function writeAutostartFile(relayDir) {
   <array><string>${NODE_BIN}</string><string>${setupUrl}</string><string>run</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
   <key>StandardOutPath</key><string>${join(relayDir, ".dsh-bridge.log")}</string>
   <key>StandardErrorPath</key><string>${join(relayDir, ".dsh-bridge.log")}</string>
   <key>EnvironmentVariables</key><dict><key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string></dict>
@@ -428,7 +483,44 @@ function writeAutostartFile(relayDir) {
   return plistPath;
 }
 
-/** 启动 bridge：确保 plist 存在 → launchctl bootstrap（回退 load -w）。 */
+/**
+ * 自启动 plist 里的入口脚本是否已不存在（不存在 = launchd 必然陷入崩溃循环）。
+ * 只解析 ProgramArguments 里的第一个 .mjs 参数，不引入 plist 解析依赖。
+ */
+function plistEntryMissing() {
+  const plistPath = launchAgentPath();
+  if (!plistPath || !existsSync(plistPath)) return false;
+  let raw = "";
+  try { raw = readFileSync(plistPath, "utf8"); } catch { return false; }
+  const m = raw.match(/<string>([^<]*\.mjs)<\/string>/);
+  if (!m) return false;
+  return !existsSync(m[1]);
+}
+
+/**
+ * 摘掉「指向不存在入口脚本」的自启动项，止住 launchd 崩溃循环。
+ *
+ * 现场（0.6.1 及更早）：只装插件半的用户在面板点「启动 bridge」或首次登录时，
+ * startBridge 会无条件生成指向 `<relayDir>/dsh-setup.mjs` 的 plist 并 bootstrap，
+ * 而该文件并不存在 → launchd KeepAlive 无限重拉（日志 20+ 次 MODULE_NOT_FOUND、
+ * `runs = 23 / last exit code = 1`）。此时仅删 plist 文件没用：作业已加载在 launchd 里，
+ * 必须 bootout 才会停。判据严格限定为「入口脚本确实缺失」，绝不碰正常停止的服务。
+ * @returns {boolean} 是否执行了清理
+ */
+function reapBrokenAutostart(relayDir) {
+  if (skipsSystemOps()) return false;
+  if (!plistEntryMissing()) return false;
+  const st = launchdStatus();
+  if (!st.running && !st.crashing && !st.state) return false; // 作业未被 launchd 加载、无可摘的东西
+  sh(`launchctl bootout ${launchTarget()}`);
+  try { rmSync(launchAgentPath(), { force: true }); } catch { /* 非关键 */ }
+  appendLogLine(relayDir, AUTO_INSTALL_LOG,
+    `[dsh-remote-web] 已摘除失效自启动：plist 入口 ${join(relayDir, "dsh-setup.mjs")} 不存在`
+    + `（launchd state=${st.state || "?"}, runs=${st.runs ?? "?"}, lastExit=${st.lastExitCode ?? "?"}）→ 转入后台补装运行环境`);
+  return true;
+}
+
+/** 启动 bridge：确保运行环境就绪 + plist 存在 → launchctl bootstrap（回退 load -w）。 */
 function startBridge(relayDir) {
   if (UNINSTALLED_DIRS.has(relayDir)) {
     // 已彻底卸载：面板/自愈在重启前可能仍在内存中，禁止再把自启动与 plist 拉回来
@@ -436,6 +528,23 @@ function startBridge(relayDir) {
   }
   const plistPath = launchAgentPath();
   if (!plistPath) return { ok: false, status: "unsupported", detail: "仅支持 macOS" };
+  if (skipsSystemOps()) return { ok: false, status: "skipped", detail: "测试隔离（DSH_RELAY_SKIP_SERVICE=1）：跳过真实服务操作" };
+  // 【0.6.2 关键修复】运行环境缺失时绝不 bootstrap：写一个指向不存在脚本的 plist
+  // 只会让 launchd 进入 KeepAlive 崩溃循环——面板还可能因瞬时 pid 谎报「已启动」。
+  // 正确做法：先把运行环境补起来（后台 npx），就绪后由 scheduleRuntime / 面板再次启动。
+  if (!runtimeReady(relayDir)) {
+    ensureRuntime(relayDir);
+    return {
+      ok: false,
+      status: "provisioning",
+      runtimeMissing: true,
+      detail: "桌面运行环境（bridge）尚未安装，已在后台自动安装，完成后会自动启动 bridge——请稍候刷新面板（也可点下方「一键更新」查看进度）",
+    };
+  }
+  // plist 存在但入口不是当前运行环境（relayDir 变更/旧安装）→ 重写，避免又指到失效路径
+  if (existsSync(plistPath) && !readFileSync(plistPath, "utf8").includes(join(relayDir, "dsh-setup.mjs"))) {
+    writeAutostartFile(relayDir);
+  }
   if (!existsSync(plistPath)) writeAutostartFile(relayDir);
   if (!existsSync(plistPath)) return { ok: false, status: "not-installed", detail: "plist 生成失败" };
   const target = launchTarget();
@@ -451,27 +560,42 @@ function startBridge(relayDir) {
   return { ok: st.running, status: st.running ? "running" : "failed", pid: st.pid, detail: st.running ? void 0 : "服务未进入运行态" };
 }
 
-/** 运行时自愈 watcher:账号就绪后若环境缺失则自动安装;装好/重启后自动拉起 bridge。 */
+/**
+ * 运行时自愈 watcher：补齐桌面运行环境 + 环境就绪后自动拉起 bridge。
+ *
+ * 【0.6.2 顺序修复】运行环境检查提到最前，且必须先于「账号就绪」与「服务是否在跑」：
+ *   - 旧版先判 `st.running` 才判运行环境，而崩溃循环中的作业会被误判为 running
+ *     → watcher `done = true` 永久停摆，自动补装（ensureRuntime）再也不会执行，
+ *     这正是「市场装完插件、bridge 却起不来」且永不恢复的直接原因；
+ *   - 补装运行环境不该等用户先登录：市场安装只给到插件半，登录那一刻就会 startBridge。
+ */
 function scheduleRuntime(relayDir) {
   let done = false;
+  // 本进程启动时是否缺运行环境：缺 → 补齐完成后需要重启 DeepSeek harness 才算「安装完成」。
+  let awaitingRestartHint = !runtimeReady(relayDir);
   const iv = setInterval(() => {
     if (done) { clearInterval(iv); return; }
     if (UNINSTALLED_DIRS.has(relayDir)) { done = true; clearInterval(iv); return; } // 已彻底卸载：自愈 watcher 停摆
     try {
+      if (!runtimeReady(relayDir)) {
+        reapBrokenAutostart(relayDir); // 先摘掉指向不存在脚本的自启动，止住崩溃循环
+        ensureRuntime(relayDir);       // 后台 npx 补齐（marker 防重入）；就绪后下一轮自动拉起
+        return;
+      }
+      if (awaitingRestartHint) {
+        awaitingRestartHint = false;
+        // 首次安装：运行环境（bridge + 自启动）刚在本进程内补齐 → 提示重启，重启后即完全可用
+        markRestartPending(relayDir, "first-install", "首次安装需要重启 DeepSeek harness");
+      }
       const cfg = loadConfig(relayDir);
       const hasAcct = Boolean((cfg.phone || cfg.email) && cfg.password) || Boolean(cfg.local_key);
       if (!hasAcct) return;
-      // 先看服务是否已在运行（runtime 可能位于 npx 缓存/固化目录，不必重复安装）
+      // 运行环境已在，看服务是否已在运行（runtime 可能位于 npx 缓存/固化目录，不必重复安装）
       const st = launchdStatus();
       if (st.running) { done = true; clearInterval(iv); return; }
-      const setupUrl = join(relayDir, "dsh-setup.mjs");
-      if (!existsSync(setupUrl)) {
-        ensureRuntime(relayDir); // 什么环境都没有 → 后台 npx 安装一次
-        return;
-      }
       startBridge(relayDir); // 环境在但服务没起 → 拉起
     } catch { /* 下一轮再试 */ }
-  }, 12_000);
+  }, selfhealIntervalMs());
   iv.unref?.();
   return () => clearInterval(iv);
 }
@@ -533,7 +657,10 @@ function uninstallRuntime(relayDir, protectedPath) {
         // 只处理「plist 位于当前 HOME」的服务：本插件/dsh-setup.mjs 安装的服务一定在此
         const plistPath = launchAgentPath();
         if (plistPath && existsSync(plistPath)) {
-          if (launchdStatus().running) {
+          // crashing 也要 bootout：崩溃循环中的作业在 launchd 里仍是「已加载」，
+          // 只删 plist 文件它照样被 KeepAlive 反复重拉（见 launchdStatus 注释）。
+          const st = launchdStatus();
+          if (st.running || st.crashing) {
             const r = stopBridge(); // launchctl bootout → KeepAlive 一并失效
             out.stoppedService = r.ok;
           }
@@ -588,6 +715,181 @@ function uninstallRuntime(relayDir, protectedPath) {
     }
   } catch { /* 目录正被占用等：删除失败不致命（残留可由用户手动删除） */ }
   return out;
+}
+
+// ---------- DeepSeek harness 重启（0.6.2：首次安装/更新后必须重启才能加载插件本体） ----------
+//
+// 为什么需要：dsh web 的插件（宿主半 + 浏览器半）都是在**进程启动时**装载的。
+// 市场点击安装只把文件写进 profile，当前进程里既没有 /dsh-remote/* 路由、也没有面板入口，
+// 必须重启 DeepSeek harness 才生效（面板与 bridge 才能真正可用）。
+// 本段提供：① 持久化「待重启」状态（跨进程判定重启是否真的发生过）；
+//           ② 一条可靠的重启实现（优先交回监管者，其次自拉起）；③ 面板按钮用的路由。
+
+const RESTART_STATE_FILE = ".dsh-restart-state.json";
+const RESTART_SCRIPT_FILE = ".dsh-restart-harness.sh";
+const RESTART_LOG_FILE = ".dsh-restart.log";
+
+/**
+ * 当前 dsh web 进程身份（pid + 启动时刻）。模块加载时算一次并固定：
+ * 若每次调用重算，`Date.now() - uptime*1000` 的毫秒漂移会让同一个进程算出不同的 id，
+ * 结清逻辑就会误判「已经重启过」而错误撤下提示。
+ */
+const BOOT_ID = `${process.pid}-${Math.round(Date.now() - process.uptime() * 1000)}`;
+
+function bootId() {
+  return BOOT_ID;
+}
+
+/** 读取「待重启」状态；文件缺失/损坏一律视为无需重启。 */
+function readRestartState(relayDir) {
+  try {
+    const raw = JSON.parse(readFileSync(join(relayDir, RESTART_STATE_FILE), "utf8"));
+    if (raw && typeof raw === "object") return raw;
+  } catch { /* 无文件 / 损坏 */ }
+  return { pending: false };
+}
+
+function writeRestartState(relayDir, state) {
+  try {
+    mkdirSync(relayDir, { recursive: true });
+    writeFileSync(join(relayDir, RESTART_STATE_FILE), JSON.stringify({ ...state, updatedAt: Date.now() }, null, 2), { mode: 0o600 });
+  } catch { /* 写盘失败不致命：面板退化为不提示 */ }
+}
+
+/** 标记「需要重启 DeepSeek harness」。kind: first-install(首次安装) | update(在线更新)。 */
+function markRestartPending(relayDir, kind, reason) {
+  const cur = readRestartState(relayDir);
+  if (cur.pending && cur.kind === kind) return cur; // 幂等：同一原因不反复重写
+  const next = { pending: true, kind, reason, at: Date.now(), bootId: bootId(), installedBy: cur.installedBy || "" };
+  writeRestartState(relayDir, next);
+  return next;
+}
+
+/**
+ * 插件装载时调用：bootId 与记录中的不同 = 中间确实重启过一次 → 结清「待重启」状态。
+ * @returns {{cleared:boolean, state:object}}
+ */
+function settleRestartState(relayDir) {
+  const cur = readRestartState(relayDir);
+  if (!cur.pending) return { cleared: false, state: cur };
+  if (cur.bootId && cur.bootId === bootId()) return { cleared: false, state: cur }; // 同一进程：仍待重启
+  const state = { pending: false, kind: "", reason: "", at: cur.at || 0, bootId: bootId(), lastRestartedAt: Date.now() };
+  writeRestartState(relayDir, state);
+  return { cleared: true, state };
+}
+
+/**
+ * 插件文件是否**晚于本进程启动**才落盘（= 运行中被市场安装/在线更新改写过）。
+ * 依据：本插件自身 package.json 的 mtime 对比 dsh web 进程启动时刻（2s 容差）。
+ */
+function pluginInstalledAfterBoot() {
+  try {
+    const here = fileURLToPath(import.meta.url);            // <profile>/node_modules/<pkg>/lib/index.js
+    const pkgFile = join(dirname(dirname(here)), "package.json");
+    const mtimeMs = statSync(pkgFile).mtimeMs;
+    const bootMs = Date.now() - process.uptime() * 1000;
+    return mtimeMs > bootMs + 2000;
+  } catch { return false; }
+}
+
+/** 本进程的启动命令（重启时原样复用：node 路径 + dsh 参数 + 工作目录）。 */
+function selfCommand() {
+  return { node: process.execPath, args: process.argv.slice(1), cwd: process.cwd() };
+}
+
+/** macOS：从 `launchctl list` 里找出托管本进程（pid 精确匹配）的作业标签。 */
+function launchdLabelForPid(pid) {
+  const r = sh("launchctl list");
+  if (!r.ok) return "";
+  for (const line of r.stdout.split("\n")) {
+    const m = line.trim().match(/^(\d+)\s+(-?\d+)\s+(\S+)$/);
+    if (m && Number(m[1]) === pid) return m[3];
+  }
+  return "";
+}
+
+/** Linux：从 /proc/self/cgroup 里找出托管本进程的 systemd 单元。 */
+function systemdUnitForSelf() {
+  try {
+    const cg = readFileSync("/proc/self/cgroup", "utf8");
+    const m = cg.match(/\/([A-Za-z0-9_.@-]+\.service)/);
+    return m ? m[1] : "";
+  } catch { return ""; }
+}
+
+/**
+ * 生成重启脚本（延迟执行，先把 HTTP 响应让浏览器收完）。
+ * mode=launchd/systemd：交给监管者重启最干净（KeepAlive/Restart 会拉起新进程）；
+ * mode=relaunch：没有监管者时自行拉起同一条命令行（detached 新会话，脱离将被 kill 的旧进程）。
+ */
+function buildRestartScript(mode, target, cmd, relayDir) {
+  const log = join(relayDir, RESTART_LOG_FILE);
+  const head = `#!/bin/sh\n# dsh-remote 自动生成：重启 DeepSeek harness（mode=${mode}）\necho "[$(date '+%F %T')] restart mode=${mode} target=${target || "-"} pid=${process.pid}" >> '${log}'\nsleep 1\n`;
+  if (mode === "launchd") {
+    return `${head}exec launchctl kickstart -k '${target}' >> '${log}' 2>&1\n`;
+  }
+  if (mode === "systemd") {
+    return `${head}exec systemctl --user restart '${target}' >> '${log}' 2>&1\n`;
+  }
+  const quote = (s) => "'" + String(s).replace(/'/g, `'\\''`) + "'";
+  const argv = [cmd.node, ...cmd.args].map(quote).join(" ");
+  // 先优雅退出旧进程，超时再强杀；随后在新会话里拉起同一条命令
+  return `${head}kill -TERM ${process.pid} 2>/dev/null\n`
+    + `i=0\nwhile [ $i -lt 60 ]; do kill -0 ${process.pid} 2>/dev/null || break; i=$((i+1)); sleep 0.5; done\n`
+    + `kill -KILL ${process.pid} 2>/dev/null\n`
+    + `cd ${quote(cmd.cwd)} || exit 1\n`
+    + `exec ${argv} >> '${log}' 2>&1\n`;
+}
+
+/**
+ * 重启 DeepSeek harness（dsh web）。
+ * 只重启「承载本插件的那个进程」（pid 匹配到的监管者或自身），绝不触碰 bridge。
+ * @returns {{ok:boolean, status:string, mode?:string, detail?:string, script?:string, log?:string}}
+ */
+function restartHarness(relayDir, opts = {}) {
+  if (skipsSystemOps()) return { ok: false, status: "skipped", detail: "测试隔离（DSH_RELAY_SKIP_SERVICE=1）：跳过真实重启" };
+  const cmd = selfCommand();
+  let mode = "relaunch";
+  let target = "";
+  if (platform() === "darwin") {
+    const label = launchdLabelForPid(process.pid);
+    if (label) { mode = "launchd"; target = `gui/${process.getuid()}/${label}`; }
+  } else if (platform() === "linux") {
+    const unit = systemdUnitForSelf();
+    if (unit) { mode = "systemd"; target = unit; }
+  }
+  const script = buildRestartScript(mode, target, cmd, relayDir);
+  if (opts.dryRun || process.env.DSH_RELAY_RESTART_DRYRUN === "1") {
+    // 测试/诊断用：只返回将要执行的脚本，不做任何真实动作
+    return { ok: true, status: "dry-run", mode, target, script, log: join(relayDir, RESTART_LOG_FILE) };
+  }
+  const scriptPath = join(relayDir, RESTART_SCRIPT_FILE);
+  try {
+    mkdirSync(relayDir, { recursive: true });
+    writeFileSync(scriptPath, script, { mode: 0o700 });
+    const log = join(relayDir, RESTART_LOG_FILE);
+    const child = spawn("/bin/sh", [scriptPath], {
+      detached: true,
+      cwd: homedir(),
+      env: spawnEnv(),
+      stdio: ["ignore", openSync(log, "a"), openSync(log, "a")],
+    });
+    child.unref();
+    appendLogLine(relayDir, RESTART_LOG_FILE, `[restart] 已调度重启：mode=${mode}${target ? " target=" + target : ""} helper=${child.pid}`);
+    return {
+      ok: true,
+      status: "restarting",
+      mode,
+      target,
+      pid: child.pid,
+      log,
+      detail: mode === "launchd" ? "已交由 launchd 重启（约 2~5 秒）"
+        : mode === "systemd" ? "已交由 systemd 重启（约 2~5 秒）"
+        : "无监管者，已用同一条命令行自拉起（约 2~5 秒）",
+    };
+  } catch (e) {
+    return { ok: false, status: "failed", detail: `调度重启失败: ${e.message}` };
+  }
 }
 
 // ---------- relay API 代理（直连，不走系统代理；undici 默认忽略代理环境变量） ----------
@@ -1157,11 +1459,17 @@ async function composeStatus(relayDir) {
       launchd,
       manual,
       running: launchd.running || manual.bridge.length > 0,
+      // 桌面运行环境（固化运行时 dsh-setup.mjs）是否就绪：面板据此区分
+      // 「运行环境没装（正在自动补装）」与「装了但没跑」，不再把崩溃循环显示成「运行中」。
+      runtimeReady: runtimeReady(relayDir),
       bindError,
       // E2EE 开关状态（bridge 写 .e2ee-state.json；文件缺失 = 未启用明文）：
       // {enabled, reason, profile, epoch, caps}，供面板「📱 远程访问」卡展示加密状态。
       e2ee: readE2eeStateFile(relayDir),
     },
+    // 是否需要重启 DeepSeek harness（首次安装 / 在线更新后必须重启才加载插件本体）：
+    // {pending, kind: first-install|update, reason, at}，供面板顶部醒目提示 + 重启按钮。
+    restart: readRestartState(relayDir),
     // 隐私审计(2026-09):不再下发真实 hostname(移除 host 字段)——设备标识统一走 deviceId/服务端登记名
   };
 }
@@ -1269,7 +1577,7 @@ const PLUGIN_ID = "dsh-remote-web";
 const PLUGIN_LEGACY_IDS = ["dsh-remote-ui"];
 const PLUGIN_ALL_IDS = [PLUGIN_ID, ...PLUGIN_LEGACY_IDS];
 /** 插件自身发布版本（与 dsh-remote 根包同步递增）。 */
-const PLUGIN_VERSION = "0.6.1";
+const PLUGIN_VERSION = "0.6.2";
 const UPDATE_LOG = ".dsh-update.log";
 const UPDATE_MARKER = ".dsh-update-running";
 
@@ -1336,6 +1644,8 @@ function runOnlineUpdate(relayDir) {
         }
         appendLogLine(relayDir, UPDATE_LOG, `[update] npx 退出 code=${code ?? "?"}（${retried ? "默认源" : "官方源"}）`);
         clear();
+        // 在线更新改写了插件/运行环境文件 → 必须重启 DeepSeek harness 才装载新版本
+        if (code === 0) markRestartPending(relayDir, "update", "已在线更新，需要重启 DeepSeek harness 生效");
       });
       child.on("error", (e) => {
         appendLogLine(relayDir, UPDATE_LOG, `[update] 子进程启动失败: ${e.message}`);
@@ -1627,10 +1937,27 @@ function registerRoutes(ctx, relayDir) {
     },
     {
       method: "POST",
+      path: "/dsh-remote/harness/restart",
+      handler: async (_req, res) => {
+        // 首次安装/在线更新后重启 DeepSeek harness：插件本体与浏览器半在进程启动时装载，
+        // 不重启则面板入口与 /dsh-remote/* 路由都不会出现。只重启承载本插件的进程。
+        const r = restartHarness(relayDir);
+        const payload = { ...(await composeStatus(relayDir)), ...r };
+        if (!r.ok) payload.error = r.detail || r.status || "重启失败";
+        sendJson(res, r.ok ? 200 : 500, payload);
+      },
+    },
+    {
+      method: "POST",
       path: "/dsh-remote/start",
       handler: async (_req, res) => {
         const r = startBridge(relayDir);
-        sendJson(res, r.ok ? 200 : 500, { ok: r.ok, status: r.status, pid: r.pid, detail: r.detail, ...(await composeStatus(relayDir)) });
+        // 【0.6.2】composeStatus 自带 ok:true（那是「状态查询成功」），必须先展开再覆盖，
+        // 否则不管启动成没成功都回 ok:true → 面板一律弹「✅ bridge 已启动」。
+        // 失败时额外带上 error：浏览器半的 api() 优先用它做提示文案，避免只看到「HTTP 500」。
+        const payload = { ...(await composeStatus(relayDir)), ...r };
+        if (!r.ok) payload.error = r.detail || r.status || "启动失败";
+        sendJson(res, r.ok ? 200 : 500, payload);
       },
     },
     {
@@ -1638,7 +1965,9 @@ function registerRoutes(ctx, relayDir) {
       path: "/dsh-remote/stop",
       handler: async (_req, res) => {
         const r = stopBridge();
-        sendJson(res, r.ok ? 200 : 500, { ok: r.ok, status: r.status, detail: r.detail, ...(await composeStatus(relayDir)) });
+        const payload = { ...(await composeStatus(relayDir)), ...r };
+        if (!r.ok) payload.error = r.detail || r.status || "停止失败";
+        sendJson(res, r.ok ? 200 : 500, payload);
       },
     },
     {
@@ -1836,10 +2165,29 @@ export function apply(ctx, config = {}) {
   UNINSTALLED_DIRS.delete(relayDir);
   // 清理上次进程残留的安装/更新 marker（宿主被重启/强杀时子进程清理回调会丢失）
   sweepStaleMarkers(relayDir);
+  // 「待重启」状态结清 + 运行时安装检测：
+  //   - bootId 变了 = 这次装载发生在新进程里 → 重启已完成，撤下提示；
+  //   - 插件文件晚于本进程启动才落盘（市场安装/在线更新在运行中改写）→ 当前进程里
+  //     根本没有本插件的路由与面板，必须重启 DeepSeek harness 才能生效。
+  const settled = settleRestartState(relayDir);
+  if (settled.cleared) {
+    ctx.logger?.info?.("dsh-remote-web: 检测到 DeepSeek harness 已重启，撤下「需要重启」提示");
+  }
+  if (!readRestartState(relayDir).pending && pluginInstalledAfterBoot()) {
+    markRestartPending(relayDir, "first-install", "首次安装需要重启 DeepSeek harness");
+    ctx.logger?.info?.("dsh-remote-web: 插件文件晚于本次进程启动 → 需要重启 DeepSeek harness");
+  }
   ctx.effect(() => registerRoutes(ctx, relayDir), "dsh-remote-web: /dsh-remote routes");
   // 0.1.2-rc.1+ 浏览器会话代持：换取 Harness 会话 Cookie 供 bridge 上游携带（手机点设备不再 401 白页）
   ctx.effect(() => scheduleHarnessMint(ctx, relayDir), "dsh-remote-web: harness browser-session mint");
   // 插件市场一键全功能:缺桌面运行环境则自动安装,登录后自动拉起 bridge(不依赖用户跑 npx)
   ctx.effect(() => scheduleRuntime(relayDir), "dsh-remote-web: runtime self-provision");
+  // 【0.6.2】市场安装路径的「装到用户电脑上」第一步：插件加载即后台补装桌面运行环境
+  // （bridge + 自启动），不再等用户先登录、也不再依赖 launchd 状态判断是否「已在运行」。
+  // 已就绪时是零副作用 no-op；正在安装中/已卸载时 ensureRuntime 自身幂等挡下。
+  const provisioned = ensureRuntime(relayDir);
+  if (!provisioned && !runtimeReady(relayDir)) {
+    ctx.logger?.info?.(`dsh-remote-web: 桌面运行环境缺失，已在后台自动安装（relayDir=${relayDir}）`);
+  }
   ctx.logger?.info?.(`dsh-remote-web: /dsh-remote routes ready (relayDir=${relayDir})`);
 }
