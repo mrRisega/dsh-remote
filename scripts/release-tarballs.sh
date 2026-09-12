@@ -18,7 +18,7 @@ OUT="$(mktemp -d)"
 DRY=0
 [ "${1:-}" = "--dry-run" ] && DRY=1
 
-echo "版本: $VERSION  标签: $TAG"
+echo "版本: ${VERSION}  标签: ${TAG}"
 
 for pkg in dsh-remote-web dsh-remote-ui; do
   [ -d "$ROOT/packages/$pkg" ] || { echo "跳过（不存在）: packages/$pkg"; continue; }
@@ -31,7 +31,7 @@ for pkg in dsh-remote-web dsh-remote-ui; do
 done
 
 if [ "$DRY" = 1 ]; then
-  echo "dry-run：产物在 $OUT（未发布）"
+  echo "dry-run：产物在 ${OUT}（未发布）"
   ls -lh "$OUT"
   exit 0
 fi
