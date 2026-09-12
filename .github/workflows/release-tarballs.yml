@@ -1,0 +1,106 @@
+name: Release market tarballs
+
+# 插件市场条目用 releases/latest/download/<常量名>.tgz 指向我们的预构建包。
+# 只要某个版本的 Release 缺这两个同名资产，market 的一键安装就会 404 ——
+# 所以本工作流在「打 tag」或手动触发时自动出包并挂资产，保证 latest/download 始终有效。
+#
+# 规范文档：docs/release-and-market.md
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '要发布的版本号（留空则取仓库 package.json 的 version）'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  tarballs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Resolve version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          v="${INPUT_VERSION:-}"
+          if [ -z "$v" ]; then v=$(node -p "require('./package.json').version"); fi
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+          echo "TAG=v$v" >> "$GITHUB_ENV"
+          echo "版本: $v / 标签: v$v"
+
+      - name: Build version-free tarballs
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          for pkg in dsh-remote-web dsh-remote-ui; do
+            [ -d "packages/$pkg" ] || { echo "跳过（不存在）: packages/$pkg"; continue; }
+            (cd "packages/$pkg" && npm pack --pack-destination "$GITHUB_WORKSPACE/out" >/dev/null)
+            # 关键：资产名不带版本号，latest/download 才能长期复用同一 URL
+            mv "out/$pkg-$VERSION.tgz" "out/$pkg.tgz"
+          done
+          ls -lh out
+
+      - name: Verify inner version matches
+        run: |
+          set -euo pipefail
+          for f in out/*.tgz; do
+            got=$(tar -xzOf "$f" package/package.json | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).version")
+            echo "$f -> $got"
+            [ "$got" = "$VERSION" ] || { echo "::error::$f 包内版本 $got 与 $VERSION 不一致"; exit 1; }
+          done
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在 → 覆盖上传资产"
+            gh release upload "$TAG" out/*.tgz --clobber
+          else
+            echo "创建 Release $TAG"
+            gh release create "$TAG" \
+              --target "${GITHUB_REF_NAME:-main}" \
+              --title "dsh-remote $VERSION — 插件市场预构建包" \
+              --notes "预构建插件包（资产名不带版本号，供插件市场以 releases/latest/download 常量地址安装）：dsh-remote-web.tgz / dsh-remote-ui.tgz（均为 $VERSION）。" \
+              out/*.tgz
+          fi
+
+      - name: Verify latest/download resolves to this version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          sleep 8
+          tmp=$(mktemp)
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/dsh-remote-web.tgz?cb=$(date +%s)"
+          curl -sL --max-time 60 -o "$tmp" "$url"
+          got=$(tar -xzOf "$tmp" package/package.json | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).version")
+          echo "latest/download 现在返回: $got"
+          if [ "$got" != "$VERSION" ]; then
+            # CDN 有缓存：刚发布时可能仍返回旧内容，或另有更新的 release。提示而非失败。
+            echo "::warning::latest/download 目前是 $got（可能是 CDN 缓存或存在更新的 release），稍后复查"
+          fi
+
+      - name: Summary
+        run: |
+          {
+            echo "### 预构建包已发布"
+            echo ""
+            echo "- 标签：\`$TAG\`（版本 $VERSION）"
+            echo "- 常量地址：\`https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/dsh-remote-web.tgz\`"
+            echo "- 资产：$(ls out | tr '\n' ' ')"
+          } >> "$GITHUB_STEP_SUMMARY"
