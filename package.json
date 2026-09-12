@@ -55,7 +55,8 @@
     "test:bridge": "node --test clients/dsh-remote/test/*.test.mjs",
     "check": "node --check clients/dsh-remote/dsh-bridge.mjs && node --check clients/dsh-remote/e2ee-shim.mjs && node --check dsh-setup.mjs && node --check packages/dsh-remote-web/lib/index.js && node --check packages/dsh-remote-web/lib/client.js && bash -n deploy/install-open.sh && npm run check:alias",
     "sync:alias": "node scripts/sync-legacy-alias.mjs",
-    "check:alias": "node scripts/sync-legacy-alias.mjs --check"
+    "check:alias": "node scripts/sync-legacy-alias.mjs --check",
+    "release:tarballs": "bash scripts/release-tarballs.sh"
   },
   "dependencies": {
     "ws": "^8.18.0"
