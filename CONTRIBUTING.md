@@ -31,8 +31,30 @@ be tolerated.
 ```bash
 npm install
 npm test          # router contract tests + plugin tests + bridge tests
-npm run check     # syntax checks (node --check, bash -n)
+npm run check     # syntax checks + legacy-alias drift check
 ```
+
+## Releases & Plugin Marketplaces
+
+The full rules live in **[docs/release-and-market.md](docs/release-and-market.md)**. The
+non-negotiables, because each of them has already broken something in production:
+
+1. **Bump three versions together** — root `package.json`, `packages/dsh-remote-web/package.json`,
+   and `PLUGIN_VERSION` in `packages/dsh-remote-web/lib/index.js`.
+2. **Commit before you publish** — release code must never live only in a working tree.
+3. **Publish both npm packages**, always with `--registry=https://registry.npmjs.org`
+   (the machine default is a mirror).
+4. **Never pin a version in a marketplace `tarball:` URL.** Entries must use
+   `releases/latest/download/<name>.tgz` with a **version-free asset name**, and every release
+   must attach those assets — run `npm run release:tarballs` (or let
+   `.github/workflows/release-tarballs.yml` do it on a `v*` tag). A pinned URL silently keeps
+   shipping the old build to every storefront.
+5. **Keep the legacy alias until the renamed entry is merged.** `packages/dsh-remote-ui/` is
+   generated from `packages/dsh-remote-web/` by `npm run sync:alias` (`npm run check` fails
+   when it drifts). Deleting it while the renamed entry is still under review makes the
+   already-listed entry — and every install pointing at it — 404.
+6. **Market copy says "highlights", never "selling points".** Descriptions must stay factual
+   and checkable against the code, and must touch only our own entry.
 
 ## Architecture
 
