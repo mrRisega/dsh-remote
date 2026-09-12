@@ -20,6 +20,18 @@ DRY=0
 
 echo "版本: ${VERSION}  标签: ${TAG}"
 
+
+# 从 CHANGELOG.md 提取本版本小节作为 Release 正文（插件市场的「更新说明」直接读它）
+extract_notes() {
+  local ver="$1" out="$2"
+  awk -v ver="$ver" '
+    index($0, "## [" ver "]") == 1 { f = 1; next }
+    f && index($0, "## [") == 1 { exit }
+    f { print }
+  ' "$ROOT/CHANGELOG.md" | awk 'NF {p=1} p' | sed -e :a -e '/^\n*$/{$d;N;ba}' > "$out"
+  [ -s "$out" ] || printf '维护性发布：%s。详见仓库 CHANGELOG。\n' "$ver" > "$out"
+}
+
 for pkg in dsh-remote-web dsh-remote-ui; do
   [ -d "$ROOT/packages/$pkg" ] || { echo "跳过（不存在）: packages/$pkg"; continue; }
   (cd "$ROOT/packages/$pkg" && npm pack --pack-destination "$OUT" >/dev/null)
@@ -37,13 +49,17 @@ if [ "$DRY" = 1 ]; then
 fi
 
 if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-  echo "Release $TAG 已存在 → 覆盖上传资产"
+  echo "Release $TAG 已存在 → 覆盖上传资产并刷新说明"
   gh release upload "$TAG" "$OUT"/*.tgz --repo "$REPO" --clobber
+  NOTES=$(mktemp); extract_notes "$VERSION" "$NOTES"
+  gh release edit "$TAG" --repo "$REPO" --notes-file "$NOTES" >/dev/null
 else
   echo "创建 Release $TAG"
+  NOTES=$(mktemp)
+  extract_notes "$VERSION" "$NOTES"
   gh release create "$TAG" --repo "$REPO" --target main \
-    --title "dsh-remote $VERSION — 插件市场预构建包" \
-    --notes "预构建插件包（资产名不带版本号，供插件市场以 releases/latest/download 常量地址安装）：dsh-remote-web.tgz / dsh-remote-ui.tgz（均为 $VERSION）。" \
+    --title "dsh-remote $VERSION" \
+    --notes-file "$NOTES" \
     "$OUT"/*.tgz
 fi
 

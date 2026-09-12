@@ -3,6 +3,20 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.3] - 2026-09-12
+
+### Added
+
+- **插件清单声明宿主要求**（`engines.dsh: ">=0.1.0-rc.6 <0.2.0-0"`）：插件市场详情页不再提示
+  "未声明宿主要求"，并可据此按 DSH 版本筛选适配插件。
+- **发版说明自动化**：每个版本的 GitHub Release 正文由 CHANGELOG 对应小节自动生成，
+  插件市场的「更新说明」因此显示真实条目（此前为空/通用文案）。
+
+### Changed
+
+- 市场预构建包地址改为 `releases/latest/download/`（资产名不带版本号）——
+  一键安装始终跟随最新版本；此前钉在 v0.6.0，导致市场长期安装旧版。
+
 ## [0.6.2] - 2026-09-11
 
 > 稳定版（`latest`）。主题：**插件市场安装即可用**（补齐桌面运行环境 + 修复自愈停摆 + 首次安装重启引导）。
