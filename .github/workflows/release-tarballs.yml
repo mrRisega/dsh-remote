@@ -86,11 +86,13 @@ jobs:
             gh release edit "$TAG" --notes-file notes.md >/dev/null
           else
             echo "创建 Release $TAG"
-            gh release create "$TAG" \
-              --target "${GITHUB_REF_NAME:-main}" \
-              --title "dsh-remote $VERSION" \
-              --notes-file notes.md \
-              out/*.tgz
+            # tag 触发时 GITHUB_REF_NAME 是 tag 名，不能当 --target（会 422）；
+            # 只有手动/分支触发才显式指定目标分支。
+            if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+              gh release create "$TAG" --title "dsh-remote $VERSION" --notes-file notes.md out/*.tgz
+            else
+              gh release create "$TAG" --target "${GITHUB_REF_NAME:-main}" --title "dsh-remote $VERSION" --notes-file notes.md out/*.tgz
+            fi
           fi
 
       - name: Verify latest/download resolves to this version
