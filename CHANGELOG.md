@@ -3,6 +3,47 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.4-beta.1] - 2026-09-13
+
+> 预发版（`beta` 通道，`latest` 仍为 0.6.3）。主题：**首次安装不再卡**。
+> 生产诊断显示 11 个新注册用户里只有 3 个把设备连上来，本轮针对两类流失分别修复。
+
+### Fixed
+
+- **电脑端装好后 bridge 不自动启动 → 手机永远看不到设备**：面板在账号登录后自动
+  「补运行环境 → 拉起 bridge → 跟踪到中继注册成功」，并把过程做成**阶段化状态**：
+  `正在准备运行环境（首次约 1~2 分钟）… → 正在启动 Bridge… → 正在连接中继… → 已连接 ✅`；
+  非 `online` 阶段每 2.5 秒自动推进、`online` 后退避到 15 秒，页面隐藏时完全停发请求、回到前台立即补一次。
+  **用户全程零操作、零刷新**；进入「已连接」后二维码与「已授权设备」列表也会自动刷新。
+  严格区分 `starting`（bridge 进程在跑）与 `online`（设备已在中继注册成功、手机真的能用）。
+  失败时给可读原因 + 自动重试倒计时（2s/4s/8s/16s/30s/60s，用尽后继续按 60s 重试）+ 「重试」按钮 +
+  一键「复制诊断信息」（版本 / relayDir / 阶段 / 进程与 launchd 状态 / 日志路径），不留死胡同。
+- **手机端空设备列表只能干等**：现在是**自动等待**——轻量探测中继在线设备（不写账号库、不污染统计），
+  5 秒一次共 10 次后转 20 秒，页面隐藏暂停、回前台立即探测；电脑一上线设备自动出现，不用点「刷新」。
+- **安装引导只有终端命令**（非技术用户走不到）：空设备态改为「① 在电脑上打开 DeepSeek Harness →
+  ② 有插件市场入口就搜索 `dsh-remote` 安装；没有就复制那条命令 → ③ 登录后稍等，电脑会自己出现」，
+  折叠区只留排错与手动控制；付费推广页同步改为「市场 / 命令」二选一。
+- **阶段轮询放大认证请求**：新增 relay token 60 秒缓存（按账号/模式/服务端为键，并发合并，
+  401/403 立即失效），状态轮询不再每次都打 `device-login`。
+
+### Added
+
+- **首次安装来源与版本采集**（供运营定位"哪个版本在哪类机器上装不上"，不含任何隐私内容）：
+  面板注册上报 `reg_source=panel_register`、手机端网页注册上报 `remoteweb_register`；
+  bridge 设备登记与 `POST /api/install-report` 上报 `install_source`（`npx` / `plugin_market`）、
+  `install_version`、`host_os`、`host_arch`；一键安装器在 plist / systemd unit / 子进程三处注入安装来源与版本。
+- 面板新增 `GET /dsh-remote/bridge-status`（返回前先推进闭环）与 `POST /dsh-remote/connect/retry`（手动立即重试），
+  `/dsh-remote/status` 增加 `connect` 字段；bridge 新增本机状态文件 `.dsh-bridge-state.json`。
+- relay-router 新增**设备在线态权威上报**（注册→在线、断开→离线、每 60 秒心跳），
+  解决服务端「在线设备」长期失真的问题（该修复同时让管理后台的在线数与活跃设备数可信）。
+
+### Tests
+
+- 插件新增 `connect-loop.test.mjs`（14 例，node 半闭环/阶段判定/退避/诊断/埋点/认证缓存）与
+  `connect-ui.test.mjs`（6 例，浏览器半真实 `useEffect` + 假定时器：自动推进、hidden 暂停、error 可重试）；
+  relay-router 新增 `presence-report.test.mjs`（3 例，含真实 HTTP 上报形状与失败静默）。
+  合计 `test:router` 28 / `test:plugin` 112 / `test:bridge` 82 全绿。
+
 ## [0.6.3] - 2026-09-12
 
 ### Added
