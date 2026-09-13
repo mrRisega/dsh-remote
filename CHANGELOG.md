@@ -3,13 +3,17 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
-## [0.6.4-beta.4] - 2026-09-13
+## [0.6.4-beta.5] - 2026-09-13
 
 > 预发版。把**安装那一刻的输出**收拾干净：不再重复引导、不再把「dsh web 没开」说成失败；
 > 并告诉你匿名装机统计怎么彻底关掉。
 
 ### Fixed
 
+- **`--no-autostart`（或平台不支持自启动）时不再自相矛盾地显示「✅ 运行中」**：以前这一行会同时
+  打出「(当前平台不支持) — ✅ 运行中」，并继续承诺「打开 dsh web 后 bridge 会自动启动」——可自启动
+  服务根本没装，没有东西会去启动它。现在明确区分三态：**运行中** / **未运行（原因）** /
+  **未安装（本次显式跳过 或 当前平台不支持）**，未安装时改为提示用 `dsh-remote run` 手动运行。
 - **安装时 dsh web 没在运行，不再显示让人误解的「服务启动失败」**：bridge 依赖 dsh web 才能工作，
   dsh web 没开时 bridge 起来也会立刻退出——这是**正常状态**，不是安装出错。现在安装结束会如实说明
   「检测到 dsh web 当前没有运行，所以 bridge 还没接上（正常，不是安装出错）；打开 dsh web 后
