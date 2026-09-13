@@ -131,6 +131,13 @@ function preferredNode() {
 }
 const NODE_BIN = preferredNode();
 
+/**
+ * 自启动服务里注入的 PATH。
+ * 必须含 /usr/sbin 与 /sbin:bridge 会用 ioreg 之类系统命令探测本机信息,
+ * 缺少这两个目录时 launchd 服务日志里会刷 `ioreg: command not found`(用户反馈实测)。
+ */
+const SERVICE_PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+
 // ---------- 安装口径（随 bridge 环境变量注入；服务端存到设备行，供运营统计） ----------
 /**
  * install_source：本文件即「一键安装器」→ 默认 npx（用户自己跑 `npx @mrrisega/dsh-remote` 的那条路径）。
@@ -194,43 +201,181 @@ function hasFlag(argv, name) {
 }
 
 // ---------- 自启动服务生成与热启动 ----------
+/** 自启动服务 label（macOS LaunchAgent / Linux systemd 共用同一个名字）。 */
+const BRIDGE_LABEL = "com.dshremote.bridge";
+
 function autostartFilePath() {
   if (process.platform === "darwin")
-    return path.join(os.homedir(), "Library/LaunchAgents/com.dshremote.bridge.plist");
+    return path.join(os.homedir(), `Library/LaunchAgents/${BRIDGE_LABEL}.plist`);
   if (process.platform === "linux")
     return path.join(os.homedir(), ".config/systemd/user/dsh-bridge.service");
   return null;
+}
+
+/** 同步睡眠（生成 launchd 状态轮询用；不引第三方依赖）。 */
+function sleepSync(ms) {
+  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
+  catch { /* 极端环境不支持 → 退化为忙等一小会 */ const end = Date.now() + ms; while (Date.now() < end) { /* spin */ } }
 }
 
 function writeAutostartFile() {
   const runCmd = `"${NODE_BIN}" "${runtimeSetupPath()}" run`;
   if (process.platform === "darwin") {
     const plistPath = autostartFilePath();
+    // LimitLoadToSessionType 是**必需项**，不是可选优化：
+    //   · macOS 26 上 gui/<uid> 会进入 on-demand-only 模式，RunAtLoad/KeepAlive 全部失效
+    //     （只登记不派生，runs=0，日志报 "pending spawn, domain in on-demand-only mode"）；
+    //     迁到 user/<uid> domain 才能恢复派生与崩溃自愈。
+    //   · 而不带该键时 `launchctl bootstrap user/<uid>` 直接失败（实测 rc=5 Input/output error）。
+    //   · 带上 [Aqua, Background] 后 user/<uid> 与 gui/<uid> 都能正常装载（macOS 14/26 均实测）。
+    // 仍保留 RunAtLoad/KeepAlive：user domain 下它们是真生效的（实测 kill -9 后自动重建）。
     const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>Label</key><string>com.dshremote.bridge</string>
+  <key>Label</key><string>${BRIDGE_LABEL}</string>
   <key>ProgramArguments</key>
   <array><string>${NODE_BIN}</string><string>${runtimeSetupPath()}</string><string>run</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
+  <key>LimitLoadToSessionType</key><array><string>Aqua</string><string>Background</string></array>
   <key>StandardOutPath</key><string>${path.join(CONFIG_DIR, ".dsh-bridge.log")}</string>
   <key>StandardErrorPath</key><string>${path.join(CONFIG_DIR, ".dsh-bridge.log")}</string>
-  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string><key>DSH_BRIDGE_INSTALL_SOURCE</key><string>${INSTALL_SOURCE}</string><key>DSH_BRIDGE_INSTALL_VERSION</key><string>${INSTALL_VERSION}</string></dict>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>${SERVICE_PATH}</string><key>DSH_BRIDGE_INSTALL_SOURCE</key><string>${INSTALL_SOURCE}</string><key>DSH_BRIDGE_INSTALL_VERSION</key><string>${INSTALL_VERSION}</string></dict>
 </dict></plist>`;
-    fs.writeFileSync(plistPath, plist);
+    // ~/Library/LaunchAgents 在全新账户/精简系统上可能不存在,必须先建目录,
+    // 否则 writeFileSync 抛 ENOENT 直接把安装流程打断(用户反馈里也踩过类似的路径问题)。
+    try {
+      fs.mkdirSync(path.dirname(plistPath), { recursive: true });
+      fs.writeFileSync(plistPath, plist);
+    } catch (e) {
+      console.warn(`⚠️ 自启动服务写入失败: ${e.message}（可稍后用 \`dsh-remote install\` 重试）`);
+      return null;
+    }
     return plistPath; // 路径在最终汇总里统一展示(避免同一信息打印两遍)
   }
   if (process.platform === "linux") {
     const dir = path.join(os.homedir(), ".config/systemd/user");
     fs.mkdirSync(dir, { recursive: true });
-    const unit = `[Unit]\nDescription=dsh-remote bridge (auto-starts with dsh web)\n\n[Service]\nExecStart=${runCmd}\nRestart=on-failure\nRestartSec=5\nEnvironment=PATH=/usr/local/bin:/usr/bin:/bin\nEnvironment=DSH_BRIDGE_INSTALL_SOURCE=${INSTALL_SOURCE}\nEnvironment=DSH_BRIDGE_INSTALL_VERSION=${INSTALL_VERSION}\n\n[Install]\nWantedBy=default.target\n`;
+    const unit = `[Unit]\nDescription=dsh-remote bridge (auto-starts with dsh web)\n\n[Service]\nExecStart=${runCmd}\nRestart=on-failure\nRestartSec=5\nEnvironment=PATH=${SERVICE_PATH}\nEnvironment=DSH_BRIDGE_INSTALL_SOURCE=${INSTALL_SOURCE}\nEnvironment=DSH_BRIDGE_INSTALL_VERSION=${INSTALL_VERSION}\n\n[Install]\nWantedBy=default.target\n`;
     const unitPath = autostartFilePath();
     fs.writeFileSync(unitPath, unit);
     return unitPath; // 路径在最终汇总里统一展示
   }
   console.log("⚠️ 当前平台暂不支持自启动，请手动运行 `dsh-remote run`");
   return null;
+}
+
+/**
+ * 读取 launchd job 状态。
+ * deferred = launchd 登记了但**从未派生**（macOS 26 的 on-demand-only 特征）；
+ * 光看 "state = not running" 无法区分"被系统挂起"与"正常退出"，必须单独识别才能给出正确建议。
+ */
+function launchdState(target) {
+  const pr = sh(`launchctl print ${target}`);
+  if (!pr.ok) return { exists: false, running: false, pid: null, deferred: false, raw: "" };
+  const raw = pr.stdout;
+  const running = /state\s*=\s*running/.test(raw);
+  const m = raw.match(/pid\s*=\s*(\d+)/);
+  const runs = raw.match(/runs\s*=\s*(\d+)/);
+  return {
+    exists: true,
+    running,
+    pid: running && m ? Number(m[1]) : null,
+    runs: runs ? Number(runs[1]) : 0,
+    deferred: /pended nondemand spawn/.test(raw) || /on-demand-only/.test(raw),
+    raw
+  };
+}
+
+/**
+ * 轮询等待 job 起来。
+ * launchd 派生是异步的：bootstrap 成功后立刻 print 必然看到 not running（旧实现因此误报"启动失败"）。
+ * 明确"被挂起且没有派生"时提前放弃（等满也没用），否则给足 ~8 秒。
+ */
+function waitLaunchdRunning(target, tries = 20, gapMs = 400) {
+  let st = launchdState(target);
+  for (let i = 0; i < tries; i += 1) {
+    st = launchdState(target);
+    if (st.running) return st;
+    // 已登记、没在跑、又没被挂起（runs>0 说明派生过）→ 是启动后立刻退出，不必等满
+    if (st.exists && st.runs > 0 && !st.deferred) break;
+    if (i >= 2 && st.exists && !st.deferred && st.runs === 0) break; // 登记了却一次都没派生 → 被挂起
+    sleepSync(gapMs);
+  }
+  return st;
+}
+
+/** 终极兜底：脱离 launchd 直接后台拉起 bridge（至少"现在能用"，但没有开机自启/崩溃自愈）。 */
+function spawnDetachedBridge() {
+  try {
+    const logPath = path.join(CONFIG_DIR, ".dsh-bridge.log");
+    const out = fs.openSync(logPath, "a");
+    const child = spawn(NODE_BIN, [runtimeSetupPath(), "run"], {
+      detached: true,
+      stdio: ["ignore", out, out],
+      env: process.env
+    });
+    child.unref();
+    fs.closeSync(out);
+    return { ok: Boolean(child.pid), pid: child.pid || null };
+  } catch (e) {
+    return { ok: false, pid: null, error: e.message };
+  }
+}
+
+/**
+ * macOS：按「可自愈优先」的阶梯启动 bridge。
+ *   ① user/<uid>  ← 首选。macOS 26 上唯一支持 RunAtLoad/KeepAlive 的 domain（可崩溃自愈）
+ *   ② gui/<uid> + kickstart  ← 兼容兜底。bootstrap 只登记不派生时用 kickstart 强拉一次；
+ *      但实测 kickstart 只解决"这一次"，进程被杀后不会重建（KeepAlive 已被系统绕过）→ 如实告知
+ *   ③ 后台进程  ← 连 launchd 都托管不了时保证可用
+ */
+function startBridgeDarwin(plistPath) {
+  const uid = process.getuid();
+  const q = (s) => "'" + String(s).replace(/'/g, `'\\''`) + "'";
+  let lastDetail = "";
+  for (const domain of [`user/${uid}`, `gui/${uid}`]) {
+    const target = `${domain}/${BRIDGE_LABEL}`;
+    // 清掉另一个 domain 的历史注册，避免两处并存导致重复实例
+    for (const d of [`user/${uid}`, `gui/${uid}`]) {
+      if (d !== domain) sh(`launchctl bootout ${d}/${BRIDGE_LABEL}`);
+    }
+    sh(`launchctl bootout ${target}`);
+    let boot = sh(`launchctl bootstrap ${domain} ${q(plistPath)}`);
+    if (!boot.ok) {
+      // 老写法兜底（部分系统上 load -w 仍可用）
+      sh(`launchctl unload ${q(plistPath)}`);
+      boot = sh(`launchctl load -w ${q(plistPath)}`);
+    }
+    if (!boot.ok) {
+      lastDetail = (boot.stderr || boot.stdout).trim() || "launchctl bootstrap 失败";
+      continue;
+    }
+    // bootstrap 只是登记；立刻 kickstart 一次，确保"这一次"一定起来
+    // （on-demand-only 的 gui domain 下这是唯一能拉起的手段）
+    sh(`launchctl kickstart -k ${target}`);
+    const st = waitLaunchdRunning(target);
+    if (st.running) {
+      // 被挂起（deferred）过一次 = 本机 launchd 不保证崩溃自愈，必须如实报告，不能报成完全成功
+      const selfHealing = !st.deferred;
+      return { ok: true, status: "running", pid: st.pid, domain, selfHealing, detail: selfHealing ? "" : "本机 launchd 处于 on-demand-only，进程退出后不会自动重建" };
+    }
+    lastDetail = st.deferred
+      ? `launchd 拒绝派生（domain ${domain} 处于 on-demand-only 模式）`
+      : (st.exists ? `已登记但未运行（runs=${st.runs}）` : "已登记但查不到状态");
+  }
+  const d = spawnDetachedBridge();
+  if (d.ok) {
+    return {
+      ok: false,
+      status: "degraded-detached",
+      pid: d.pid,
+      domain: null,
+      selfHealing: false,
+      detail: "launchd 无法托管本机 bridge，已改为后台进程运行（现在可用，但不会开机自启、崩溃后不自动恢复）"
+    };
+  }
+  return { ok: false, status: "failed", detail: `launchd 与后台进程均启动失败：${lastDetail}` };
 }
 
 function restartBridgeService() {
@@ -241,29 +386,7 @@ function restartBridgeService() {
   if (process.platform === "darwin") {
     const plistPath = autostartFilePath();
     if (!fs.existsSync(plistPath)) return { ok: false, status: "not-installed", detail: "plist 不存在" };
-    const uid = process.getuid();
-    const domain = `gui/${uid}`;
-    const target = `${domain}/com.dshremote.bridge`;
-    const q = (s) => "'" + String(s).replace(/'/g, `'\\''`) + "'";
-    sh(`launchctl bootout ${target}`);
-    let boot = sh(`launchctl bootstrap ${domain} ${q(plistPath)}`);
-    if (!boot.ok) {
-      sh(`launchctl unload ${q(plistPath)}`);
-      boot = sh(`launchctl load -w ${q(plistPath)}`);
-    }
-    if (!boot.ok) return { ok: false, status: "failed", detail: (boot.stderr || boot.stdout).trim() || "launchctl 启动失败" };
-    const pr = sh(`launchctl print ${target}`);
-    if (pr.ok && /state\s*=\s*running/.test(pr.stdout)) {
-      const m = pr.stdout.match(/pid\s*=\s*(\d+)/);
-      return { ok: true, status: "running", pid: m ? Number(m[1]) : null };
-    }
-    const ls = sh(`launchctl list | grep com.dshremote.bridge`);
-    if (ls.ok) {
-      const pidStr = ls.stdout.trim().split(/\s+/)[0];
-      if (pidStr && pidStr !== "-" && /^\d+$/.test(pidStr))
-        return { ok: true, status: "running", pid: Number(pidStr) };
-    }
-    return { ok: false, status: "failed", detail: (pr.stderr || ls.stderr || "服务未在运行").trim() };
+    return startBridgeDarwin(plistPath);
   }
   if (process.platform === "linux") {
     const r = sh(`systemctl --user restart dsh-bridge`);
@@ -471,9 +594,15 @@ async function setup(argv) {
   // 三分支:running / 未运行(有原因) / 未安装(跳过或平台不支持)——最后一种既不能显示"运行中",
   // 也不能显示"未运行(原因)",它压根没装(此前会打出自相矛盾的"(当前平台不支持) — ✅ 运行中")。
   const svcSkipped = st.status === "skipped" || st.status === "unsupported" || !svc.path;
+  // 第三态:起来了、但本机 launchd 不保证崩溃自愈(on-demand-only 的 gui domain 只能靠 kickstart 拉起),
+  // 必须与"完全正常"分开说 —— 否则用户以为有自启,进程一崩就永久掉线且找不到原因。
+  const svcFragile = !svcSkipped && st.ok && st.selfHealing === false;
+  const svcDegraded = st.status === "degraded-detached";
   const svcState = svcSkipped
     ? (st.status === "skipped" ? "未安装（本次显式跳过）" : "未安装（当前平台不支持自启动）")
-    : (st.ok ? `✅ 运行中${st.pid ? ` (pid=${st.pid})` : ""}` : `未运行 (${st.detail || st.status})`);
+    : (st.ok
+        ? `✅ 运行中${st.pid ? ` (pid=${st.pid})` : ""}${svcFragile ? "，但本机不支持崩溃自愈" : ""}`
+        : (svcDegraded ? "⚠️ 未被系统托管（已用后台进程兜底）" : `未运行 (${st.detail || st.status})`));
   const L = [];
   L.push("✅ 安装完成");
   if (selfHosted) {
@@ -498,8 +627,21 @@ async function setup(argv) {
     L.push("   如果 dsh web 已经开着但看不到本机，先重启 dsh web 让插件生效。");
   } else if (!st.ok) {
     L.push("");
-    L.push(`⚠️ bridge 未能启动: ${st.detail || st.status}`);
-    L.push(`   可查看日志: ${CONFIG_DIR}/.dsh-bridge.log`);
+    if (svcDegraded) {
+      // launchd 托管失败但进程活着:能立刻用,只是没有自启/自愈。如实说明,别让用户以为有自启。
+      L.push(`⚠️ ${st.detail}`);
+      L.push(`   bridge 已在后台运行${st.pid ? `（pid=${st.pid}）` : ""}，现在就能用；`);
+      L.push("   但重启电脑或进程退出后不会自动恢复，需要时执行 `dsh-remote run`。");
+    } else {
+      L.push(`⚠️ bridge 未能启动: ${st.detail || st.status}`);
+      L.push(`   可查看日志: ${CONFIG_DIR}/.dsh-bridge.log`);
+    }
+  } else if (svcFragile) {
+    // 起来了但靠 kickstart 拉起的 → 明确告知"进程退出后不会自动重建"
+    L.push("");
+    L.push("ℹ 本机 launchd 处于 on-demand-only 模式（macOS 26 起会出现），系统不会自动派生自启动服务，");
+    L.push("   安装脚本已手动把它拉起来一次，现在可用；但**进程退出后不会自动重建**。");
+    L.push("   建议升级到最新版 dsh-remote（已针对该模式改用 user domain 启动，可恢复自动重建）。");
   }
   if (selfHosted) {
     L.push("");

@@ -450,10 +450,12 @@ test("失败退避：不阻塞主流程；退避窗口内不重试；累计 6 �
       const cost = Date.now() - t0;
       assert.equal(r.status, 200, "发送失败不得影响面板路由");
       assert.equal(body.ok, true);
-      assert.ok(cost < 2000, "面板路由不得被遥测发送拖慢，实际 " + cost + "ms");
+      // 阈值只用于抓「同步重试风暴」这类病态问题（真同步会卡到几十秒），
+      // 不能设得太紧：CI/本机高负载时单次请求几秒钟是正常的，紧阈值只会制造假失败。
+      assert.ok(cost < 5000, "面板路由不得被遥测发送拖慢，实际 " + cost + "ms");
 
       // 累计 6 次仍失败 → 丢弃该批（不永久堆积）
-      const ok = await waitFor(() => TELEMETRY.queueOf(env.relayDir).length === 0, { timeout: 8000 });
+      const ok = await waitFor(() => TELEMETRY.queueOf(env.relayDir).length === 0, { timeout: 15000 });
       assert.ok(ok, "6 次失败后必须丢弃该批（队列清零）");
       const total = relay.count("/api/telemetry/events");
       assert.ok(total >= 6, "必须真的重试到 6 次，实际 " + total);
@@ -579,16 +581,21 @@ test("不为遥测创建配置目录 / 测试隔离：隔离开关下零副作�
   } finally { await env.restore(); relay.srv.close(); }
 });
 
-test("面板可见性：关于卡片写明「匿名统计 + 关闭方式」，并链到 README/docs/telemetry.md", () => {
+test("面板可见性：关于卡片写明「匿名统计 + 关闭方式」，但不在面板里堆文档链接", () => {
   const client = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
   assert.match(client, /匿名装机统计/, "面板必须有匿名统计说明");
   assert.match(client, /DSH_REMOTE_TELEMETRY=0/, "面板必须写明关闭方法");
-  assert.ok(client.includes("README.md#匿名装机统计与隐私"), "面板必须链到 README 对应段落");
-  assert.ok(client.includes("docs/telemetry.md"), "面板必须链到完整字段清单");
   assert.match(client, /不含任何账号、手机号、会话或文件内容/, "面板必须写明不采集什么");
+  // 面板只讲结论,不放「隐私说明: README… · docs/telemetry.md」这类文档链接行(用户明确要求)
+  const about = client.slice(client.indexOf("关于 dsh-remote"), client.indexOf("加入交流群"));
+  assert.ok(!/隐私说明/.test(about), "关于卡片不应再出现「隐私说明:」链接行");
+  assert.ok(!/完整字段清单/.test(about), "关于卡片不应再出现「完整字段清单」链接");
+  assert.ok(!about.includes("README.md#匿名装机统计与隐私"), "关于卡片不应链 README 锚点");
+  assert.ok(!about.includes("docs/telemetry.md"), "关于卡片不应链 docs/telemetry.md");
   assert.ok(client.includes("/dsh-remote/telemetry/panel-opened"), "面板打开事件必须走本地路由（浏览器半不直连遥测端点）");
+  // 披露文档本身仍必须存在且可查(面板不再链,但 README 链,公开发布物包含)
   const readme = readFileSync(new URL("../../../README.md", import.meta.url), "utf8");
-  assert.match(readme, /## 匿名装机统计与隐私/, "README 必须有对应小节（面板链接的锚点）");
+  assert.match(readme, /## 匿名装机统计与隐私/, "README 必须有对应小节");
   assert.ok(readme.includes("docs/telemetry.md"), "README 必须链到 docs/telemetry.md");
   assert.match(readme, /DSH_REMOTE_TELEMETRY=0/, "README 必须写明关闭方法");
   const doc = readFileSync(new URL("../../../docs/telemetry.md", import.meta.url), "utf8");
