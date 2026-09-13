@@ -3,6 +3,22 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.4-beta.11] - 2026-09-13
+
+> 预发版。堵死「两个激活点并存」→ `duplicate loader entry id` 的崩溃。
+
+### Fixed
+
+- **插件已由 `dsh.profile.bundles` 声明时，绝不再写入 patch 激活行**。两者同时生效会让
+  dsh web 启动即报
+  `TypeError: duplicate loader entry id: dsh-remote-web` /
+  `dsh: plugin tree failed to load: failed to apply loader entry include (cordis:include)`
+  —— 整个插件树加载失败（实测生产日志）。
+  现在安装器先检查 bundles：已在里面就保持 bundles 形态（这条等价于插件市场形态，需要重启一次），
+  并且**在写入 patch 行之后再次复核 bundles 是否已清空；若没清掉就回滚 patch 行**，
+  宁可退回 bundles 也绝不留「两处激活」。新增两条硬约束用例双向锁死。
+- 回退到 bundles 形态时会先把插件条目写进 bundles（否则插件会失去激活点而完全不生效）。
+
 ## [0.6.4-beta.10] - 2026-09-13
 
 > 预发版。修掉「刷新后横幅还在、要点重启才消失」的误报。
