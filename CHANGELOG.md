@@ -3,6 +3,41 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.4] - 2026-09-13
+
+> **正式版**。本轮的预发版（beta.1 ~ beta.11）到此收束：安装体验、macOS 26 自启动、
+> 插件激活方式与匿名统计都已在生产环境验证过。
+
+### Added
+
+- **插件热加载**：安装插件改为写 profile 的 `cordis.patch.yml`（HMR 监听该文件，存盘约 1 秒装载），
+  **装完只需刷新页面，不必重启 dsh web**。实测：进程 pid 不变、安装耗时约 1.3 秒、面板接口立刻可用。
+- **匿名装机统计**：只上报「装机/连接是否成功」这类事件（12 个白名单事件 + 11 个白名单失败码），
+  不含账号、手机号、会话或文件内容、主机名、路径、设备指纹与 IP；标识是本机随机 ID（重装即变）。
+  环境变量 `DSH_REMOTE_TELEMETRY=0` 可完全关闭。披露文档见 [docs/telemetry.md](docs/telemetry.md)。
+- **macOS 26 自启动修复**：macOS 26 把 `gui/<uid>` 会话域置为 on-demand-only（`RunAtLoad`/`KeepAlive`
+  失效、只登记不启动），现在优先用 `user/<uid>` 域（实测崩溃后 launchd 自动重建），
+  失败才回退 `gui/<uid>` + `kickstart`（如实告知不支持自愈），再不行退化为后台进程。
+
+### Changed
+
+- **安装输出精简**：多阶段重复播报收敛成结尾一份汇总。
+- **面板不再要求「重启 DeepSeek harness」**：插件热加载 + bridge 是独立 launchd 进程，
+  装插件/在线更新都不需要重启；只有「磁盘插件版本与运行版本不同」时才提示**刷新页面**，
+  且不再自动重启（刷新零风险，重启会打断你的会话）。
+
+### Fixed
+
+- **`duplicate loader entry id` 崩溃**：patch 行与插件自带 bundle patch 同时生效会让 dsh web
+  启动即报 `plugin tree failed to load`。现在两条激活路径互斥：bundles 已声明就不写 patch 行；
+  写完 patch 行再复核 bundles 已清空，没清掉就回滚。
+- **「刷新后横幅还在」**：提示判断从"文件时间戳"改为"版本号比较" —— 补装把同一版本重写一遍
+  不再误报。
+- **更新提示的版本比较**：改为语义化比较（预设版低于同号正式版），装预发版的人不会被误判成落后。
+- `~/Library/LaunchAgents` 不存在时自动创建；服务 PATH 补 `/usr/sbin`、`/sbin`（修 `ioreg: command not found`）。
+- 安装器的配置目录统一为 `~/.dsh-remote`（修掉「面板读不到配置 / 运行状态文件散落进仓库」）。
+- **测试污染**：`harness-restart` 用例会覆盖开发者真实的 `~/Library/LaunchAgents`，已加 HOME 隔离与静态护栏。
+
 ## [0.6.4-beta.11] - 2026-09-13
 
 > 预发版。堵死「两个激活点并存」→ `duplicate loader entry id` 的崩溃。

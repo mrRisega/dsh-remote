@@ -1753,7 +1753,7 @@ const PLUGIN_ID = "dsh-remote-web";
 const PLUGIN_LEGACY_IDS = ["dsh-remote-ui"];
 const PLUGIN_ALL_IDS = [PLUGIN_ID, ...PLUGIN_LEGACY_IDS];
 /** 插件自身发布版本（与 dsh-remote 根包同步递增）。 */
-const PLUGIN_VERSION = "0.6.4-beta.11";
+const PLUGIN_VERSION = "0.6.4";
 const UPDATE_LOG = ".dsh-update.log";
 const UPDATE_MARKER = ".dsh-update-running";
 
@@ -1776,6 +1776,44 @@ async function npmLatestVersion() {
     } catch { /* 试下一个源 */ }
   }
   return "";
+}
+
+/**
+ * 语义化版本比较（只处理本仓库用到的形态：`X.Y.Z` 与 `X.Y.Z-<pre>.<n>`）。
+ * 为什么需要它：面板判断"有没有新版本"不能只用 `latest !== current` ——
+ * 预设版之间（beta.10 → beta.11）无法比较大小，而且预设版在 semver 里**低于**同号正式版
+ * （0.6.4 < 0.6.4），朴素不等判断会把"已经装了预设版"误判成落后。
+ * @returns {number} a>b → 1；a<b → -1；相等 → 0
+ */
+function compareVersions(a, b) {
+  const parse = (v) => {
+    const m = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?/.exec(String(v || "").trim());
+    if (!m) return null;
+    return { nums: [Number(m[1]), Number(m[2]), Number(m[3])], pre: m[4] ? m[4].split(".") : null };
+  };
+  const x = parse(a);
+  const y = parse(b);
+  if (!x || !y) return null; // 无法解析 → 交给调用方保守处理
+  for (let i = 0; i < 3; i += 1) {
+    if (x.nums[i] !== y.nums[i]) return x.nums[i] > y.nums[i] ? 1 : -1;
+  }
+  if (!x.pre && !y.pre) return 0;
+  if (!x.pre) return 1;   // 有预设版 < 无预设版（semver §11）
+  if (!y.pre) return -1;
+  const len = Math.max(x.pre.length, y.pre.length);
+  for (let i = 0; i < len; i += 1) {
+    const p1 = x.pre[i];
+    const p2 = y.pre[i];
+    if (p1 === undefined) return -1;
+    if (p2 === undefined) return 1;
+    const n1 = /^\d+$/.test(p1) ? Number(p1) : null;
+    const n2 = /^\d+$/.test(p2) ? Number(p2) : null;
+    if (n1 !== null && n2 !== null) { if (n1 !== n2) return n1 > n2 ? 1 : -1; continue; }
+    if (n1 !== null) return -1; // 数字标识符 < 字母标识符
+    if (n2 !== null) return 1;
+    if (p1 !== p2) return p1 > p2 ? 1 : -1;
+  }
+  return 0;
 }
 
 /** 以 detached 子进程执行 `npx --yes <UPDATE_SPEC>`（env 可覆盖 npm 源/更新通道）。 */
@@ -2856,7 +2894,12 @@ function registerRoutes(ctx, relayDir) {
       handler: async (_req, res) => {
         const latest = await npmLatestVersion();
         const current = PLUGIN_VERSION;
-        sendJson(res, 200, { ok: true, current, latest, outdated: !!latest && latest !== current });
+        // 正规比较：注册表版本**严格大于**本地版本才算有更新。
+        // 这样 0.6.4 < 0.6.4（正式版发布后预设版会正确提示升级），
+        // 而 0.6.4-beta.10 < 0.6.4 也能正确判断；解析不了时退回朴素不等（保守提示）。
+        const cmp = compareVersions(latest, current);
+        const outdated = cmp === null ? Boolean(latest && latest !== current) : cmp > 0;
+        sendJson(res, 200, { ok: true, current, latest, outdated });
       },
     },
     {

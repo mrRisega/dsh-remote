@@ -109,3 +109,28 @@ test("安装输出:服务状态字符串仍是插件面板可解析的稳定契�
   assert.ok(/\? `✅ 运行中/.test(src), "running 口径保留(带 pid)");
   assert.ok(/`未运行 \(\$\{st\.detail \|\| st\.status\}\)`/.test(src), "未运行口径保留(带原因)");
 });
+
+test("版本比较：预设版 < 同号正式版；beta.10 < beta.11（更新提示不能误判）", () => {
+  // 事故背景：面板原本用 `latest !== current` 判断"有没有新版本"，于是
+  // ① 0.6.4-beta.11 与 0.6.4-beta.10 无法比大小；② 正式版 0.6.4 发布后，
+  // 装了 0.6.4-beta.11 的人反而被当成"落后"（其实预设版 semver 低于正式版）。
+  const src = readFileSync(join(HERE, "..", "lib", "index.js"), "utf8");
+  const fnSrc = src.slice(src.indexOf("function compareVersions(a, b)"), src.indexOf("/** 以 detached 子进程执行"));
+  const compare = new Function(`${fnSrc}; return compareVersions;`)();
+  // semver §11：预设版低于同号正式版
+  assert.equal(compare("0.6.4-beta.11", "0.6.4"), -1, "预设版应低于同号正式版");
+  assert.equal(compare("0.6.4", "0.6.4-beta.11"), 1, "正式版应高于同号预设版");
+  // 预设版之间按数字标识符比较（不是字符串比较）
+  assert.equal(compare("0.6.4-beta.11", "0.6.4-beta.10"), 1, "beta.11 > beta.10");
+  assert.equal(compare("0.6.4-beta.10", "0.6.4-beta.9"), 1, "beta.10 > beta.9");
+  assert.equal(compare("0.6.4-beta.10", "0.6.4-beta.10"), 0);
+  // 正式版之间
+  assert.equal(compare("0.6.5", "0.6.4"), 1);
+  assert.equal(compare("0.7.0", "0.6.9"), 1);
+  assert.equal(compare("0.6.4", "0.6.4"), 0);
+  // 解析不了 → null（调用方退回保守判断）
+  assert.equal(compare("weird", "0.6.4"), null);
+  // 路由必须用严格大于判断 outdated
+  assert.match(src, /const cmp = compareVersions\(latest, current\)/, "update-check 应用 semver 比较");
+  assert.match(src, /cmp === null \? Boolean\(latest && latest !== current\) : cmp > 0/);
+});
