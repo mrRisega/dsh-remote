@@ -1,9 +1,16 @@
-// 「首次安装需要重启 DeepSeek harness」回归（0.6.2 新增）。
+// 「插件装载 / 刷新 / 重启」回归（0.6.2 新增，0.6.4-beta.9 语义修订）。
 //
 // 产品诉求（用户原话）：
-//   1. 安装完成后桌面端 UI 直接可用，并提示「首次安装需要重启 DeepSeek harness」，旁边给「重启」按钮；
-//   2. 常驻入口最底下要有「重启 DeepSeek harness」按钮；
-//   3. 首次打开（尚未重启）时，该按钮要出现在上方显眼位置。
+//   1. 安装完成后桌面端 UI 直接可用；
+//   2. 常驻入口最底下要有「重启 dsh web」按钮（排查用，始终可达）；
+//   3. 需要用户动一下时，该提示要出现在上方显眼位置。
+//
+// ⚠️ 0.6.4-beta.9 语义修订（用户反馈「能热加载了，这个设置窗口就不需要了」）：
+//   插件已改为 profile patch **热加载**装载（HMR 监听 cordis.patch.yml，存盘约 1 秒生效），
+//   运行环境(bridge)又是独立 launchd 进程 —— 所以「装插件 / 在线更新完成」都**不再需要重启
+//   DeepSeek harness**，那条横幅确实是误导。现在只在一种情形提示用户：
+//   **磁盘上的插件文件比当前进程新**（= 运行中被市场安装/在线更新改写），文案是
+//   「插件已更新，刷新页面即可生效」，并且**不自动重启**（刷新零风险，重启会打断用户会话）。
 //
 // 机制：dsh web 的插件（宿主半 + 浏览器半）都在**进程启动时**装载，市场安装/在线更新只是把文件
 // 写进 profile，当前进程里既没有 /dsh-remote/* 路由也没有面板入口 → 必须重启才生效。
@@ -12,7 +19,7 @@
 import assert from "node:assert/strict";
 import http from "node:http";
 import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -107,7 +114,7 @@ async function serve(routes) {
 
 // ─────────────────────────── 宿主半：状态机 ───────────────────────────
 
-test("首次安装（运行环境在本进程内补齐）→ 自动标记「需要重启」并在 /status 下发", async () => {
+test("首次安装（运行环境在本进程内补齐）→ **不再**提示重启 harness（热加载后已无必要）", async () => {
   const env = await setup();
   try {
     await writeConfig(env.relayDir);
@@ -118,16 +125,41 @@ test("首次安装（运行环境在本进程内补齐）→ 自动标记「需�
     const { host, base } = await serve(routes);
     try {
       const before = await (await fetch(`${base}/dsh-remote/status`)).json();
-      assert.equal(before.restart.pending, false, "运行环境补齐前不该提示重启");
+      assert.equal(before.restart.pending, false, "运行环境补齐前不该有提示");
 
       // 模拟后台 npx 安装完成：固化运行时落盘
       await writeFile(path.join(env.relayDir, "dsh-setup.mjs"), "// runtime stub");
-      await waitFor(async () => readFile(env.stateFile, "utf8").then(() => true).catch(() => false));
+      await sleep(400); // 给自愈调度一轮时间(以前这一轮会 markRestartPending)
 
       const after = await (await fetch(`${base}/dsh-remote/status`)).json();
-      assert.equal(after.restart.pending, true, "运行环境刚补齐 → 应提示需要重启 DeepSeek harness");
-      assert.equal(after.restart.kind, "first-install");
-      assert.match(String(after.restart.reason), /首次安装需要重启 DeepSeek harness/);
+      // bridge 是独立 launchd 进程、插件走 patch 热加载 → 补齐运行环境不需要重启 harness。
+      // 旧行为(提示"首次安装需要重启 DeepSeek harness")已被用户实测判定为误导,故断言必须为 false。
+      assert.equal(after.restart.pending, false,
+        "运行环境补齐**不该**再提示重启 harness（热加载 + 独立 bridge 进程）");
+    } finally { host.close(); routes.dispose(); }
+  } finally { await env.restore(); }
+});
+
+test("插件文件晚于本进程启动 → 提示「刷新页面」，且**不**自动重启", async () => {
+  const env = await setup();
+  try {
+    await writeConfig(env.relayDir);
+    await writeFile(path.join(env.relayDir, "dsh-setup.mjs"), "// runtime stub");
+    const routes = boot(env.relayDir);
+    const { host, base } = await serve(routes);
+    try {
+      const cur = await (await fetch(`${base}/dsh-remote/status`)).json();
+      // 用**真实的 bootId** 写回状态:否则 settleRestartState 会判定"这是上个进程写的 = 已重启过"
+      // 而把提示结清(那样就测不到"同进程内保留提示"这条语义了)。
+      await writeFile(env.stateFile, JSON.stringify({
+        pending: true, kind: "refresh", reason: "插件已更新，刷新页面即可生效",
+        at: Date.now() - 3000, bootId: cur.restart.bootId
+      }));
+
+      const st = await (await fetch(`${base}/dsh-remote/status`)).json();
+      assert.equal(st.restart.pending, true, "插件被运行时改写 → 应提示");
+      assert.equal(st.restart.kind, "refresh", "kind 必须是 refresh（刷新语义，不是重启）");
+      assert.match(String(st.restart.reason), /刷新页面/);
     } finally { host.close(); routes.dispose(); }
   } finally { await env.restore(); }
 });
@@ -148,18 +180,31 @@ test("重启已完成（bootId 变化）→ 自动撤下提示；同一进程内
     } finally { host.close(); routes.dispose(); }
   } finally { await a.restore(); }
 
-  // 场景 B：状态由**当前进程**写下（用户还没点重启，只是刷新了页面 / 插件重新装载）→ 必须保留。
-  // 走真实链路：插件自己写 pending（运行环境在本进程内补齐），再在同一进程内重新装载一次。
+  // 场景 B：状态由**当前进程**写下（用户还没处理，只是刷新了页面 / 插件重新装载）→ 必须保留提示。
+  // 注:0.6.4-beta.9 起"运行环境在本进程内补齐"不再写待重启(热加载后无必要),
+  // 所以这里直接按**真实 bootId** 写一份 kind=refresh 状态来构造该场景。
   const b = await setup();
   try {
     await writeConfig(b.relayDir);
+    await writeFile(path.join(b.relayDir, "dsh-setup.mjs"), "// runtime stub");
     process.env.DSH_RELAY_SELFHEAL_MS = "200";
+    // 本进程的 bootId:必须与 lib/index.js 的 BOOT_ID 完全一致,否则 settleRestartState
+    // 会判定"状态来自上一个进程 = 重启已完成"而把提示结清。
+    // 构造方式与 lib 相同;lib 对外不导出它,状态文件只在有 pending 时才写,故这里自行推出。
+    const sameProcessBootId = `${process.pid}-${Math.round(Date.now() - process.uptime() * 1000)}`;
     const routes1 = boot(b.relayDir);
     const { host: host1, base: base1 } = await serve(routes1);
-    await writeFile(path.join(b.relayDir, "dsh-setup.mjs"), "// runtime stub");
-    await waitFor(async () => readFile(b.stateFile, "utf8").then(() => true).catch(() => false));
-    const st1 = await (await fetch(`${base1}/dsh-remote/status`)).json();
-    assert.equal(st1.restart.pending, true, "运行环境补齐后应标记待重启");
+    await writeFile(b.stateFile, JSON.stringify({
+      pending: true, kind: "refresh", reason: "插件已更新，刷新页面即可生效",
+      at: Date.now() - 3000, bootId: sameProcessBootId
+    }));
+    // 把状态文件的 mtime 置为"刚写过":pluginInstalledAfterBoot() 判的是"插件文件晚于本进程启动"。
+    // 不这么做,第二次 apply() 的条件 `!pending && pluginInstalledAfterBoot()` 会为真,
+    // 于是 markRestartPending 又写一次(新 at/bootId),测的就不是"settle 不清"这条语义了。
+    const nowMs = Date.now() / 1000;
+    await utimes(b.stateFile, nowMs, nowMs);
+    const st1b = await (await fetch(`${base1}/dsh-remote/status`)).json();
+    assert.equal(st1b.restart.pending, true, "同进程写下的待处理状态应保留");
     host1.close();
     routes1.dispose();
 
@@ -169,7 +214,7 @@ test("重启已完成（bootId 变化）→ 自动撤下提示；同一进程内
     try {
       const st2 = await (await fetch(`${base2}/dsh-remote/status`)).json();
       assert.equal(st2.restart.pending, true, "同一进程内（还没真重启）不得误撤提示");
-      assert.equal(st2.restart.bootId, st1.restart.bootId, "bootId 应在同一进程内稳定不变");
+      assert.equal(st2.restart.bootId, sameProcessBootId, "bootId 应在同一进程内稳定不变");
     } finally { host2.close(); routes2.dispose(); }
   } finally { await b.restore(); }
 });
@@ -299,15 +344,11 @@ function loadPlugin(statusBody) {
   return { requests, states, render() { hook = 0; return registered.get("dsh-remote")({ close() {} }); } };
 }
 
-const STATUS_FIRST_INSTALL = {
+// 现在唯一会提示用户的状态是 kind=refresh（插件文件被运行时改写 → 刷新页面即可）
+const STATUS_REFRESH = {
   ok: true, config: { phone: "13800000000", deviceId: "dev-x" },
   service: { running: true, runtimeReady: true, launchd: {} },
-  restart: { pending: true, kind: "first-install", reason: "首次安装需要重启 DeepSeek harness" },
-};
-const STATUS_UPDATE = {
-  ok: true, config: { phone: "13800000000", deviceId: "dev-x" },
-  service: { running: true, runtimeReady: true, launchd: {} },
-  restart: { pending: true, kind: "update", reason: "已在线更新，需要重启 DeepSeek harness 生效" },
+  restart: { pending: true, kind: "refresh", reason: "插件已更新，刷新页面即可生效", at: Date.now() },
 };
 const STATUS_IDLE = {
   ok: true, config: { phone: "13800000000", deviceId: "dev-x" },
@@ -315,21 +356,26 @@ const STATUS_IDLE = {
   restart: { pending: false },
 };
 
-test("UI：待重启 → 顶部醒目提示「首次安装需要重启 DeepSeek harness」+ 重启按钮", () => {
+test("UI：插件更新后 → 顶部提示「刷新页面即可生效」+ 刷新按钮（不再喊重启 harness）", () => {
   const plugin = loadPlugin({
     ok: true,
     config: { phone: "13800000000", deviceId: "dev-x" },
     service: { running: true, runtimeReady: true, launchd: {} },
-    restart: { pending: true, kind: "first-install", reason: "首次安装需要重启 DeepSeek harness" },
+    restart: { pending: true, kind: "refresh", reason: "插件已更新，刷新页面即可生效" },
   });
-  plugin.states[0] = STATUS_FIRST_INSTALL; // mock 的 useEffect 不执行 → 直接注入面板状态
+  plugin.states[0] = STATUS_REFRESH; // mock 的 useEffect 不执行 → 直接注入面板状态
   const tree = plugin.render();
-  assert.ok(textHas(tree, "首次安装需要重启 DeepSeek harness"), "顶部应出现首次安装重启提示");
+  assert.ok(textHas(tree, "插件已更新，刷新页面即可生效"), "顶部应出现刷新提示");
+  // 不能再说"需要重启 DeepSeek harness" —— 热加载后那是误导（用户实测反馈）
+  assert.ok(!textHas(tree, "需要重启 DeepSeek harness"), "不应再出现「需要重启 DeepSeek harness」");
   const alert = find(tree, (n) => n.props && n.props.className === "dru-restart-alert");
   assert.ok(alert, "应有醒目提示块（dru-restart-alert）");
-  const btns = findAll(tree, (n) => n.props && String(n.props.className || "").includes("dru-btn") &&
-    (n.children || []).some((c) => typeof c === "string" && c.includes("重启 DeepSeek harness")));
-  assert.ok(btns.length >= 2, "提示块内 + 底部常驻各一个重启按钮，实际 " + btns.length);
+  // 主按钮应是「刷新页面」
+  const refreshBtn = find(tree, (n) => n.props && String(n.props.className || "").includes("dru-btn-primary") &&
+    (n.children || []).some((c) => typeof c === "string" && c.includes("刷新页面")));
+  assert.ok(refreshBtn, "提示块内主按钮应是「刷新页面」");
+  // 重启按钮仍可达（兜底），但不再是主按钮
+  assert.ok(textHas(tree, "重启 dsh web"), "应保留「重启 dsh web」作为兜底入口");
 });
 
 test("UI：常驻入口最底部始终有「重启 DeepSeek harness」按钮；不需要重启时也不消失", () => {
@@ -341,28 +387,29 @@ test("UI：常驻入口最底部始终有「重启 DeepSeek harness」按钮；�
   });
   plugin.states[0] = STATUS_IDLE;
   const tree = plugin.render();
-  assert.ok(!textHas(tree, "首次安装需要重启 DeepSeek harness"), "不需要重启时不该出现顶部提示");
+  assert.ok(!textHas(tree, "刷新页面即可生效"), "不需要动作时不该出现顶部提示");
   const foot = find(tree, (n) => n.props && n.props.className === "dru-restart-foot");
   assert.ok(foot, "底部应常驻重启按钮区（dru-restart-foot）");
-  assert.ok(textHas(foot, "重启 DeepSeek harness"), "常驻区应含重启按钮文案");
+  assert.ok(textHas(foot, "重启 dsh web"), "常驻区应含重启按钮文案（排查兜底，始终可达）");
 });
 
-test("UI：点「重启」→ 调用 /dsh-remote/harness/restart", async () => {
+test("UI：点「重启 dsh web」→ 调用 /dsh-remote/harness/restart", async () => {
   const plugin = loadPlugin({
     ok: true,
     config: { phone: "13800000000", deviceId: "dev-x" },
     service: { running: true, runtimeReady: true, launchd: {} },
-    restart: { pending: true, kind: "update", reason: "已在线更新，需要重启 DeepSeek harness 生效" },
+    restart: { pending: true, kind: "refresh", reason: "插件已更新，刷新页面即可生效" },
   });
-  plugin.states[0] = STATUS_UPDATE;
+  plugin.states[0] = STATUS_REFRESH;
   const tree = plugin.render();
-  // 顶部提示块内的那个按钮（常驻脚注里也有一个）
+  // 顶部提示块内的兜底重启按钮（常驻脚注里也有一个）
   const alert = find(tree, (n) => n.props && n.props.className === "dru-restart-alert");
   const btn = find(alert, (n) => n.props && String(n.props.className || "").includes("dru-btn") &&
-    (n.children || []).some((c) => typeof c === "string" && c.includes("重启 DeepSeek harness")));
+    (n.children || []).some((c) => typeof c === "string" && c.includes("重启 dsh web")));
   assert.ok(btn, "顶部提示块内应能定位到重启按钮");
   btn.props.onClick();
   await new Promise((r) => setImmediate(r));
   assert.ok(plugin.requests.some((r) => r.path === "/dsh-remote/harness/restart" && r.method === "POST"),
     "点击后应 POST /dsh-remote/harness/restart，实际 " + JSON.stringify(plugin.requests));
 });
+
