@@ -44,15 +44,21 @@ test("测试隔离：unset 系统操作开关的用例必须同时伪造 HOME（
 });
 
 test("安装输出:拼接汇总时「下一步」引导只有一处文案源(不再多处重复打印)", () => {
-  // 引导语只由汇总的 L.push 产出:selfHosted 与非自建各一条(互斥分支,用户只会看到一条)
+  // 引导语只由汇总的 L.push 产出:自建 / 热挂载 / 需重启 / 普通 四个**互斥**分支,
+  // 运行时只可能走其中一条 → 用户始终只看到一条引导。
   const pushes = src.match(/L\.push\("   下一步[:：]/g) || [];
-  assert.equal(pushes.length, 2, `「下一步」应只由汇总的 2 个互斥分支产出(实际 ${pushes.length} 处)`);
+  assert.equal(pushes.length, 4, `「下一步」应只由汇总的 4 个互斥分支产出(实际 ${pushes.length} 处)`);
   // 源码里不得再有其它直接打印引导的地方
   const direct = src.match(/console\.log\((?!.*L\.join)[^)]*下一步/g) || [];
   assert.equal(direct.length, 0, "除汇总外不得再直接打印引导");
   // 插件阶段不得再打印用户引导
   const converge = src.slice(src.indexOf("function convergePluginActivation"), src.indexOf("async function pluginCmd"));
   assert.ok(!/下一步|打开 dsh web → 设置/.test(converge), "插件阶段不应再重复打印引导");
+  // 互斥性:这些分支必须挂在同一条 if/else-if 链上,否则可能同时打出两条引导
+  const chain = src.slice(src.indexOf("} else if (hotMounted) {"), src.indexOf('L.push("\\n" + L.join'));
+  assert.ok(chain.length > 0, "应能定位到引导分支链");
+  assert.ok(/else if \(needRestart && restartResult/.test(chain), "热挂载与需重启必须在同一条 else-if 链上");
+  assert.ok(/else if \(needRestart\)/.test(chain), "兜底的手动重启分支也必须在同一条链上");
 });
 
 test("安装输出:「已创建自启动服务」路径只在汇总里打印一次", () => {
