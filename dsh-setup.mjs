@@ -1152,6 +1152,35 @@ function removeBundleEntry(pkgFile) {
  * 两条路都**只保留一个激活点**:写 patch 就同时从 bundles 移除,反之清掉 include,
  * 绝不两处并存(那正是历史上 dsh web 启动即报「重复 ID」崩溃的原因)。
  */
+
+/** 读取 profile 内已安装插件的版本（市场/包管理器装法）。 */
+function readInstalledPluginVersion(profileDir, name) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(profileDir, "node_modules", name, "package.json"), "utf8")).version;
+  } catch { return null; }
+}
+
+/**
+ * 市场装法下把插件包升到最新。
+ *
+ * 2026-09-13 实测的坑：用户在插件面板点「一键更新」时，本函数原先的调用方（marketManaged 分支）
+ * 只清 include、不动源码，日志写着"已保持市场管理的源码不变"，命令 exit 0、界面显示"安装完成"，
+ * 但插件包始终停在旧版本 —— 用户看到的就是"一键更新到不了最新版"。
+ *
+ * 规格判断：registry 规格（^0.6.3 / 0.6.3 / >=…）用 `add <name>@latest`；
+ * github:/git+/file:/https: 之类用 `update <name>` 让包管理器重新解析引用（例如 git HEAD）。
+ */
+function upgradeMarketManagedPlugin(profileDir, name, dep) {
+  const spec = String(dep ?? "").trim();
+  const isRegistryRange = /^[\^~><=v\d]/.test(spec);
+  const pm = sh("command -v pnpm >/dev/null 2>&1 && echo pnpm || echo npm").stdout.trim() || "npm";
+  const args = isRegistryRange ? `add ${name}@latest` : `update ${name}`;
+  const cmd = `${pm} ${args}`;
+  const r = sh(cmd, 180000, profileDir);
+  if (!r.ok) console.warn(`⚠️ ${cmd} 失败：${(r.stderr || r.stdout || "").trim().split("\n").slice(-3).join(" / ")}`);
+  return { ok: r.ok, cmd };
+}
+
 function convergePluginActivation(profileDir, pkgFile, patchFile, pluginDir, patch) {
   const pkg = JSON.parse(fs.readFileSync(pkgFile, "utf8"));
   const legacyDep = PLUGIN_LEGACY_IDS.map((id) => pkg.dependencies && pkg.dependencies[id]).find((v) => v !== undefined);
@@ -1162,10 +1191,24 @@ function convergePluginActivation(profileDir, pkgFile, patchFile, pluginDir, pat
   const managedByUs = !dep || String(dep).startsWith("file:");   // 无依赖或 file: 拷贝 → 我们管
 
   if (marketManaged && inBundles) {
-    // 插件市场安装形态：依赖与源码归市场管，我们只清历史 include（若旧版曾写过）
+    // 插件市场安装形态：源码归市场/包管理器管 → 只清历史 include，但**必须主动升级到最新**，
+    // 否则「一键更新」会报成功却什么都没做（2026-09-13 实测）。
     stripIncludeEntries(patchFile, patch, "插件市场安装形态无需用户 include");
-    console.log("ℹ 插件市场安装形态（bundles+dependency）：已保持市场管理的源码不变。");
-    console.log("   （该形态经 dsh.profile.bundles 激活，只在启动时读取 —— 装完需重启一次 dsh web）");
+    const depName = PLUGIN_ALL_IDS.find((id) => pkg.dependencies && pkg.dependencies[id] !== undefined) || PLUGIN_ID;
+    const before = readInstalledPluginVersion(profileDir, depName);
+    console.log(`ℹ 插件市场安装形态（bundles+dependency）：源码归包管理器管，正在升级到最新…（安装前 ${before ?? "未知"}）`);
+    const { ok, cmd } = upgradeMarketManagedPlugin(profileDir, depName, dep);
+    const after = readInstalledPluginVersion(profileDir, depName);
+    if (ok && after && after !== before) {
+      console.log(`✅ 插件包已升级：${before ?? "?"} → ${after}`);
+      console.log("   该形态经 dsh.profile.bundles 激活，只在启动时读取 —— 请重启 dsh web 生效。");
+    } else if (ok && after) {
+      console.log(`✅ 插件包已是市场最新版（${after}）。`);
+      console.log("   若面板仍显示旧版本，请重启 dsh web（bundles 只在启动时读取）。");
+    } else {
+      console.log(`⚠️ 插件包升级未成功（当前 ${after ?? "未知"}）。可手动执行：`);
+      console.log(`   cd ${profileDir} && ${cmd}`);
+    }
     return;
   }
 
