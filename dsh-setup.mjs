@@ -689,11 +689,13 @@ async function setup(argv) {
     // patch 激活形态:harness 的 HMR 监听 profile patch 文件,存盘后约 1 秒重新 compose。
     // 所以这里**先等热挂载**,等到了就完全不需要重启(用户只需刷新页面拿浏览器半)。
     if (needRestart && pluginResult && pluginResult.hotPatch) {
-      for (let i = 0; i < 20; i += 1) {
+      // HMR 通常 1~3 秒完成,但插件节点半还要起服务、注册路由,机器繁忙时会到十几秒;
+      // 给足 ~30 秒窗口,避免"其实已经热挂载成功、却报成需要重启"的误报(实测踩到)。
+      for (let i = 0; i < 45; i += 1) {
         const r = await fetch("http://127.0.0.1:3080/dsh-remote/status", { signal: AbortSignal.timeout(900) })
           .catch(() => null);
         if (r && r.ok) { hotMounted = true; break; }
-        sleepSync(600);
+        sleepSync(700);
       }
       if (hotMounted) needRestart = false;
     }
@@ -782,6 +784,12 @@ async function setup(argv) {
   } else if (needRestart && restartResult && restartResult.ok) {
     L.push("");
     L.push("   下一步: dsh web 已重启，直接打开 http://127.0.0.1:3080 → 设置 → 「远程控制」→ 注册/登录手机号。");
+  } else if (needRestart && pluginResult && pluginResult.hotPatch && pluginResult.changed) {
+    // patch 已写入但探测窗口内没等到面板接口:热加载很可能还在进行(插件节点半启动+注册路由)。
+    // 这种情况**不能**直接让用户重启 —— 先让他等几秒刷新,再给兜底方案。
+    L.push("");
+    L.push("ℹ 插件已按热加载方式登记（patch 已写入），若「设置 → 远程控制」还没出现：");
+    L.push("   等几秒后刷新页面即可；仍未出现再重启一次 dsh web（命令见 README）。");
   } else if (needRestart) {
     // 需要重启但没做成功:必须给出**可照抄**的命令,而不是只说"请重启"
     L.push("");
@@ -1187,8 +1195,11 @@ async function pluginCmd(argv) {
     return;
   }
 
-  // 安装：收敛到“恰好一处激活”（bundle patch 唯一激活点），绝不与市场/历史 include 并存
-  convergePluginActivation(profileDir, pkgFile, patchFile, pluginDir, patch);
+  // 安装：收敛到"恰好一处激活"（热挂载 patch 行 或 bundles，二选一），绝不与市场/历史 include 并存
+  //
+  // ⚠️ 必须 **return 结果**：setup() 依赖它判断激活形态(false/undefined = 走 bundles,需重启),
+  // 少了这个 return,安装后就不会去验证热挂载,白白多报一次"需要重启"(实测踩到)。
+  return convergePluginActivation(profileDir, pkgFile, patchFile, pluginDir, patch);
 
   // 引导语只在 setup 汇总里打印一次(这里不再重复;单独跑 `dsh-remote plugin` 也无需引导)
 }

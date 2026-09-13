@@ -3,6 +3,26 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.4-beta.8] - 2026-09-13
+
+> 预发版。热加载这条链路的三个缺陷修完并**端到端实测**：装完只需刷新页面。
+
+### Fixed
+
+- **热挂载验证被跳过**：`convergePluginActivation` 已经返回激活形态，但 `pluginCmd` 没有把它
+  `return` 出去 → `setup()` 拿不到「走的是 patch 热加载」这一信息 → 跳过热挂载验证，
+  明明热加载成功却仍然报「需要重启 dsh web」。已改为 return 并加回归护栏。
+- **热挂载探测窗口太短**：HMR 本身约 1 秒完成，但插件节点半还要起服务、注册路由，
+  机器繁忙时会到十几秒；探测窗口从约 12 秒放宽到约 30 秒。
+- **探测超时不再误报「需要重启」**：patch 行已写入而探测窗口内没等到接口时，
+  只说「等几秒刷新页面；仍未出现再重启」，不再把成功的热加载报成失败。
+
+### Verified
+
+- 冷装端到端实测（本机 macOS，真实 profile）：卸载到冷状态（接口 404）→ 执行安装 →
+  **dsh web 进程 pid 未变**、安装耗时 **1268ms**、`/dsh-remote/status` 立刻 200，
+  输出「插件已热加载（无需重启 dsh web）——刷新一下浏览器页面」。
+
 ## [0.6.4-beta.7] - 2026-09-13
 
 > 预发版。**装完不用再重启 dsh web 了** —— 插件改走热加载装载，刷新页面即可。
