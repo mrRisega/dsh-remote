@@ -18,11 +18,30 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { readdirSync } from "node:fs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SETUP = join(HERE, "..", "..", "..", "dsh-setup.mjs");
 
 const src = readFileSync(SETUP, "utf8");
+
+test("测试隔离：unset 系统操作开关的用例必须同时伪造 HOME（否则污染真实自启动）", () => {
+  // 事故复盘:harness-restart 用例 unset DSH_RELAY_SKIP_SERVICE 去走真实分支,
+  // 但没伪造 HOME → 插件写 plist 的路径是 join(homedir(), "Library/LaunchAgents/…"),
+  // 于是把**指向测试临时目录**的 plist 覆盖到开发者真实的 ~/Library/LaunchAgents,
+  // 临时目录随即被删 → 真实 bridge 自启动彻底失效(本机实测踩到,macOS 26 用户反馈排查时发现)。
+  // 静态护栏:凡 unset 该开关的用例,文件里必须出现 process.env.HOME =。
+  const rows = readdirSync(HERE).filter((f) => f.endsWith(".test.mjs"));
+  const offenders = [];
+  for (const f of rows) {
+    const text = readFileSync(join(HERE, f), "utf8");
+    if (/delete process\.env\.DSH_RELAY_SKIP_SERVICE/.test(text) && !/process\.env\.HOME\s*=/.test(text)) offenders.push(f);
+  }
+  assert.deepEqual(offenders, [], `这些用例会碰真实 HOME(必须伪造 HOME): ${offenders.join(", ")}`);
+  // 反向确认:护栏本身确有保护对象,否则是空断言
+  const guarded = rows.filter((f) => /delete process\.env\.DSH_RELAY_SKIP_SERVICE/.test(readFileSync(join(HERE, f), "utf8")));
+  assert.ok(guarded.length >= 3, `应至少有 3 个用例走真实分支(实际 ${guarded.length})`);
+});
 
 test("安装输出:拼接汇总时「下一步」引导只有一处文案源(不再多处重复打印)", () => {
   // 引导语只由汇总的 L.push 产出:selfHosted 与非自建各一条(互斥分支,用户只会看到一条)

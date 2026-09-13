@@ -52,8 +52,16 @@ async function setup({ list = "" } = {}) {
   await writeFile(path.join(fakeBin, "npx"), "#!/bin/sh\nexit 0\n"); await chmodSync(path.join(fakeBin, "npx"), 0o755);
 
   const saved = {};
-  for (const k of ["PATH", "DSH_TEST_LAUNCH_LOG", "DSH_TEST_LIST", "DSH_RELAY_SKIP_SERVICE", "DSH_RELAY_SELFHEAL_MS",
+  for (const k of ["HOME", "PATH", "DSH_TEST_LAUNCH_LOG", "DSH_TEST_LIST", "DSH_RELAY_SKIP_SERVICE", "DSH_RELAY_SELFHEAL_MS",
     "DSH_RELAY_RESTART_DRYRUN", "DSH_SETUP_NPX_DIR"]) saved[k] = process.env[k];
+  // HOME 必须一起伪造：本用例会 unset DSH_RELAY_SKIP_SERVICE 去走真实分支，
+  // 而插件的自启动 plist 路径写作 join(homedir(), "Library/LaunchAgents/…")。
+  // 不伪造 HOME 就会把**指向测试临时目录**的 plist 覆盖到开发者真实的
+  // ~/Library/LaunchAgents/com.dshremote.bridge.plist（实测污染，且临时目录随即被删 →
+  // 真实 bridge 自启动彻底失效）。这是测试对开发者机器的破坏，必须隔离。
+  const fakeHome = path.join(root, "home");
+  await mkdir(path.join(fakeHome, "Library", "LaunchAgents"), { recursive: true });
+  process.env.HOME = fakeHome;
   process.env.PATH = `${fakeBin}:${saved.PATH}`;
   process.env.DSH_TEST_LAUNCH_LOG = path.join(root, "launchctl.log");
   process.env.DSH_TEST_LIST = list;

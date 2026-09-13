@@ -3,12 +3,41 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
-## [0.6.4-beta.5] - 2026-09-13
+## [0.6.4-beta.6] - 2026-09-13
 
-> 预发版。把**安装那一刻的输出**收拾干净：不再重复引导、不再把「dsh web 没开」说成失败；
-> 并告诉你匿名装机统计怎么彻底关掉。
+> 预发版。修一个 macOS 26 上的自启动死角（服务登记了却永远不被启动），
+> 并顺手修掉一个会破坏开发者本机自启动的测试污染问题。
 
 ### Fixed
+
+- **macOS 26：自启动服务登记后永远不启动（`runs = 0`）**。macOS 26 会把 `gui/<uid>` 会话域
+  置于 **on-demand-only** 模式，该模式下 launchd 拒绝一切非按需派生，`RunAtLoad` 与 `KeepAlive`
+  全部失效——只登记、不启动，安装脚本于是报「自启动服务启动失败：服务未在运行」。
+  现在改为按**阶梯**启动：① 优先 `user/<uid>` 域（该域在 macOS 26 下仍支持自启动与崩溃自愈，
+  实测 `kill -9` 后 launchd 自动重建）；② 失败则回退 `gui/<uid>` 并用 `launchctl kickstart`
+  强制拉起一次（能起来，但进程退出后不会自动重建——这种情况会**如实告知**，不再假装完全成功）；
+  ③ 两者都不行则退化为后台进程（现在能用，但无自启/自愈，同样明确说明）。
+- **plist 补上 `LimitLoadToSessionType`**：这是 `user/<uid>` 域的必需项——缺它时
+  `launchctl bootstrap user/<uid>` 会直接失败（实测 `rc=5 Input/output error`），
+  也是恢复派生行为的条件。
+- **不再「问一次就判定失败」**：launchd 派生是异步的，旧实现 `bootstrap` 后立刻 `print` 一次，
+  必然看到 `state = not running` 而误报失败。现在改为轮询等待（约 8 秒），并能识别
+  `pended nondemand spawn` / `on-demand-only` 这一「登记了但从未派生」的特征，据此给出正确结论。
+- **自启动服务的 PATH 补上 `/usr/sbin`、`/sbin`**：bridge 会调用 `ioreg` 等系统命令，
+  缺这两个目录时服务日志会一直刷 `ioreg: command not found`。
+- **`~/Library/LaunchAgents` 不存在时不再直接报错中断安装**：改为自动创建目录，
+  失败时也只提示而不打断（全新账户 / 精简系统上会出现该目录缺失）。
+- **测试污染（会破坏你本机自启动）**：`harness-restart` 用例会 unset 测试隔离开关去走真实分支，
+  却没有伪造 `HOME`，而插件写 plist 用的是 `join(homedir(), "Library/LaunchAgents/…")`——
+  于是它把**指向测试临时目录**的 plist 覆盖到开发者真实的 `~/Library/LaunchAgents`，临时目录随即被删，
+  真实 bridge 自启动就彻底失效了。已为该用例加上 HOME 隔离，并新增静态护栏：
+  任何 unset 系统操作开关的用例都必须同时伪造 `HOME`。
+
+### Changed
+
+- **插件「关于」卡片不再堆文档链接**：移除「隐私说明：README「匿名装机统计与隐私」 ·
+  完整字段清单 docs/telemetry.md」那一行。匿名统计的采集/不采集/如何关闭仍写在卡片里，
+  完整字段清单在仓库 `docs/telemetry.md`（README 有链接）。
 
 - **`--no-autostart`（或平台不支持自启动）时不再自相矛盾地显示「✅ 运行中」**：以前这一行会同时
   打出「(当前平台不支持) — ✅ 运行中」，并继续承诺「打开 dsh web 后 bridge 会自动启动」——可自启动
