@@ -83,7 +83,7 @@ function ensureRuntimeCopy() {
     fs.cpSync(wsSrc, path.join(CONFIG_DIR, "node_modules", "ws"), { recursive: true, force: true });
   }
   fs.writeFileSync(verFile, ver);
-  console.log(`✅ 运行时已固化到 ${CONFIG_DIR}（自启动指向稳定路径，不再依赖 npx 缓存）`);
+  console.log(`✅ 运行时: ${CONFIG_DIR}`);
 }
 try { ensureRuntimeCopy(); } catch (e) { console.warn(`⚠️ 运行时固化跳过: ${e.message}`); }
 
@@ -219,8 +219,7 @@ function writeAutostartFile() {
   <key>EnvironmentVariables</key><dict><key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string><key>DSH_BRIDGE_INSTALL_SOURCE</key><string>${INSTALL_SOURCE}</string><key>DSH_BRIDGE_INSTALL_VERSION</key><string>${INSTALL_VERSION}</string></dict>
 </dict></plist>`;
     fs.writeFileSync(plistPath, plist);
-    console.log(`✅ 已创建自启动服务: ${plistPath}`);
-    return plistPath;
+    return plistPath; // 路径在最终汇总里统一展示(避免同一信息打印两遍)
   }
   if (process.platform === "linux") {
     const dir = path.join(os.homedir(), ".config/systemd/user");
@@ -228,8 +227,7 @@ function writeAutostartFile() {
     const unit = `[Unit]\nDescription=dsh-remote bridge (auto-starts with dsh web)\n\n[Service]\nExecStart=${runCmd}\nRestart=on-failure\nRestartSec=5\nEnvironment=PATH=/usr/local/bin:/usr/bin:/bin\nEnvironment=DSH_BRIDGE_INSTALL_SOURCE=${INSTALL_SOURCE}\nEnvironment=DSH_BRIDGE_INSTALL_VERSION=${INSTALL_VERSION}\n\n[Install]\nWantedBy=default.target\n`;
     const unitPath = autostartFilePath();
     fs.writeFileSync(unitPath, unit);
-    console.log(`✅ 已创建自启动服务: ${unitPath}`);
-    return unitPath;
+    return unitPath; // 路径在最终汇总里统一展示
   }
   console.log("⚠️ 当前平台暂不支持自启动，请手动运行 `dsh-remote run`");
   return null;
@@ -238,8 +236,7 @@ function writeAutostartFile() {
 function restartBridgeService() {
   const svcFile = autostartFilePath();
   if (svcFile && !fs.existsSync(svcFile)) {
-    console.log("[dsh-remote] 未检测到自启动服务，自动生成...");
-    writeAutostartFile();
+    writeAutostartFile(); // 静默补生成(调用方会汇总展示路径)
   }
   if (process.platform === "darwin") {
     const plistPath = autostartFilePath();
@@ -279,14 +276,25 @@ function restartBridgeService() {
   return { ok: false, status: "unsupported", detail: `平台 ${process.platform} 不支持自启动` };
 }
 
+/**
+ * dsh web 是否正在运行（127.0.0.1:3080）。
+ * bridge 本身依赖 dsh web 才工作：dsh web 没开时 bridge 起来也会立刻退出，
+ * 所以「装完当下 bridge 没在跑」是**正常状态**，不能当失败吓用户（见 install 汇总）。
+ */
+async function isDshWebUp(timeoutMs = 1200) {
+  try {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    await fetch("http://127.0.0.1:3080/", { signal: ac.signal });
+    clearTimeout(timer);
+    return true;
+  } catch { return false; }
+}
+
 function installAutostart() {
   const svcPath = writeAutostartFile();
   const r = restartBridgeService();
-  if (r.ok) {
-    console.log(`✅ 自启动服务已加载并运行${r.pid ? ` (pid=${r.pid})` : ""}`);
-  } else {
-    console.log(`⚠️ 自启动服务启动失败: ${r.detail || r.status}`);
-  }
+  // 不再在这里直接打印(信息在 install 汇总里给一次),身份由调用方持有
   return { path: svcPath, status: r };
 }
 
@@ -458,20 +466,40 @@ async function setup(argv) {
   }
 
   const pub = await fetchPublicConfig(cfg.api_url || DEFAULT_API);
-  console.log("\n══════════════════════════════════════");
-  console.log("✅ 安装完成！");
+  const webUp = await isDshWebUp();
+  // 服务状态字符串是给插件面板解析的稳定契约(running / 未运行),不要改口径
+  const svcState = st.ok
+    ? `✅ 运行中${st.pid ? ` (pid=${st.pid})` : ""}`
+    : `未运行 (${st.detail || st.status})`;
+  const L = [];
+  L.push("✅ 安装完成");
   if (selfHosted) {
-    console.log(`   服务器地址: ${cfg.tunnel_url}`);
-    console.log(`   手机端: 打开 ${cfg.tunnel_url.replace(/^ws/, "https")}/app/ ，用访问密钥登录即可。`);
+    L.push(`   服务器: ${cfg.tunnel_url}`);
+    L.push(`   手机端: 打开 ${cfg.tunnel_url.replace(/^ws/, "https")}/app/ ，用访问密钥登录`);
   } else {
-    console.log(`   远程控制地址: ${pub.app_url || DEFAULT_APP_URL}`);
-    console.log(`   下一步（小白/无需任何命令）: 打开 dsh web → 设置 → 「远程控制」→ 注册/登录手机号即可。`);
-    console.log(`   若你是从 DeepSeek App/插件市场 安装：请【完全退出并重开 App】（或刷新 profile），插件即生效。`);
-    console.log(`   登录后 bridge 会自动启动，手机端即可看到本机。`);
+    L.push(`   远程控制地址: ${pub.app_url || DEFAULT_APP_URL}`);
   }
-  if (svc.path) console.log(`   自启动服务: ${svc.path}`);
-  console.log(`   服务状态: ${st.ok ? "✅ 运行中" + (st.pid ? ` (pid=${st.pid})` : "") : "❌ 未运行(" + (st.detail || st.status) + ")"}`);
-  console.log("══════════════════════════════════════");
+  L.push(`   自启动服务: ${svc.path || "(当前平台不支持,可用 dsh-remote run 手动运行)"} — ${svcState}`);
+  // 唯一一处"下一步"引导(上面各阶段不再重复打印同样的话)
+  if (!st.ok && !webUp) {
+    // dsh web 没开时 bridge 起来即退,这是正常状态;要说清"什么时候会自己好",而不是甩一句"启动失败"
+    L.push("");
+    L.push("ℹ 检测到 dsh web 当前没有运行，所以 bridge 还没接上（正常，不是安装出错）。");
+    L.push("   打开 dsh web 后 bridge 会自动启动，无需任何命令。");
+    L.push("   如果 dsh web 已经开着但看不到本机，先重启 dsh web 让插件生效。");
+  } else if (!st.ok) {
+    L.push("");
+    L.push(`⚠️ bridge 未能启动: ${st.detail || st.status}`);
+    L.push(`   可查看日志: ${CONFIG_DIR}/.dsh-bridge.log`);
+  }
+  if (selfHosted) {
+    L.push("");
+    L.push("   下一步: 手机端用访问密钥登录即可（bridge 登录后自动启动）。");
+  } else {
+    L.push("");
+    L.push("   下一步: 打开 dsh web → 设置 → 「远程控制」→ 注册/登录手机号即可（无需任何命令）。");
+  }
+  console.log("\n" + L.join("\n") + "\n");
 }
 
 // ---------- plugin：安装/卸载 dsh web 远程控制插件 ----------
@@ -688,18 +716,13 @@ function convergePluginActivation(profileDir, pkgFile, patchFile, pluginDir, pat
       console.error(`❌ 插件入口缺失：${entryFile}（本包不完整？请用官方源重装：npx --registry=https://registry.npmjs.org @mrrisega/dsh-remote@latest）`);
       process.exit(1);
     }
-    console.log(`✅ 插件已拷贝到 ${pluginLocalDir}`);
     declarePluginDep(pkgFile);                      // file: 依赖(包管理器 install 不误删)
     const addedBundle = ensureBundleEntry(pkgFile); // bundles 声明 → 插件自带 patch 自动激活
-    const linked = ensurePluginLinked(profileDir, pluginLocalDir); // 自建 node_modules 链接
+    ensurePluginLinked(profileDir, pluginLocalDir);  // 自建 node_modules 链接
     stripInclude("bundle patch 已是唯一激活点");     // 清历史 include
-    console.log(addedBundle
-      ? `✅ 已加入 dsh.profile.bundles（${PLUGIN_ID} 自带 patch 自动生效）`
-      : `ℹ dsh.profile.bundles 已含 ${PLUGIN_ID}`);
-    console.log(linked
-      ? `✅ 已建立 node_modules/${PLUGIN_ID} → ${pluginLocalDir}（免包管理器即可解析）`
-      : `✅ node_modules/${PLUGIN_ID} 已就绪`);
-    console.log(`✅ 插件安装完成（bundle 形态，无用户 include）。配置目录: ${CONFIG_DIR}`);
+    // 只报结果不报过程:bundle 是否新加、node_modules 是否新建链接都属于实现细节
+    // (失败会各自抛错/提示),用户只需要知道"插件装好了、装在哪"。
+    console.log(`✅ 插件已就绪: ${pluginLocalDir}${addedBundle ? "" : "（此前已激活）"}`);
     return;
   }
 

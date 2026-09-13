@@ -1131,6 +1131,8 @@ window.__ModuleLoader__.load({
     }
 
     // ── 面板主体（渲染于设置页 settings.section 栏目内） ─────────────────────
+    // 匿名装机统计的「面板打开」只上报一次/每页（node 半还会每进程去重）。
+    var panelOpenedSent = false;
     function RemoteControlSection(props) {
 
       var statusArr = useState(null); var st = statusArr[0]; var setSt = statusArr[1];
@@ -1556,6 +1558,16 @@ window.__ModuleLoader__.load({
           cancelDevRetry();
         };
       }, [view, mode, loggedIn, phoneKey, serviceRunning]);
+
+      // ── 匿名装机统计（面板打开） ──────────────────────────────────────────────
+      // 只上报「面板被打开过」这一个事件名（node 半每进程去重、DSH_REMOTE_TELEMETRY=0 直接丢弃）；
+      // 不含任何账号、手机号、设备指纹、会话内容或文件内容——隐私边界见 docs/telemetry.md。
+      useEffect(function () {
+        if (panelOpenedSent) return undefined;
+        panelOpenedSent = true;
+        post("/dsh-remote/telemetry/panel-opened", {}).catch(function () { /* 静默：统计失败绝不影响面板 */ });
+        return undefined;
+      }, []);
 
       // ── 登录后自动闭环（0.6.4）：连接阶段短轮询 ──────────────────────────────
       // 登录成功（含从别处已登录、被面板读到）后立刻开始推进连接，之后自调度：
@@ -2410,6 +2422,26 @@ window.__ModuleLoader__.load({
             h("div", { className: "dru-hint", style: { marginBottom: 6 } }, "🛠 电脑端一键安装：bridge 与「远程访问」面板一次到位——云端/自建切换、账号登录、bridge 启停、一次性扫码访问、已授权设备管理、意见反馈都在这里。"),
             h("div", { className: "dru-hint", style: { marginBottom: 6 } }, "🔒 安全与通道：HTTP / WebSocket 全量透传，一次性访问密钥认证，面板实时显示设备与已授权设备列表；服务端可配置流量配额。"),
             h("div", { className: "dru-hint" }, "🛡 端到端加密：手机↔电脑之间的消息内容用「你的账号密码派生密钥」端到端加密——密钥与密码不落服务端（仅存校验值），中继只可见路径/大小/时间（详见 README「安全与隐私」）。"),
+            // 匿名装机统计（隐私披露）：开源项目必须把「采什么 / 不采什么 / 怎么关」写在用户看得到的地方。
+            h("div", { className: "dru-hint", style: { marginTop: 6 } },
+              "📊 匿名装机统计：只上报「装机/连接是否成功」这类事件（安装开始与失败原因、bridge 是否注册成功、是否首次远程打通）——"
+              + "不含任何账号、手机号、会话或文件内容、主机名、路径、设备指纹与 IP；标识是本机随机 ID（重装即变）。"
+              + "用环境变量 DSH_REMOTE_TELEMETRY=0 可完全关闭（不生成 ID、不发任何请求）。"),
+            h("div", { className: "dru-hint", style: { marginTop: 4 } },
+              "隐私说明：",
+              h("a", {
+                className: "dru-linkbtn",
+                href: "https://github.com/mrRisega/dsh-remote/blob/main/README.md#匿名装机统计与隐私",
+                target: "_blank",
+                rel: "noreferrer"
+              }, "README「匿名装机统计与隐私」"),
+              " · ",
+              h("a", {
+                className: "dru-linkbtn",
+                href: "https://github.com/mrRisega/dsh-remote/blob/main/docs/telemetry.md",
+                target: "_blank",
+                rel: "noreferrer"
+              }, "完整字段清单 docs/telemetry.md")),
             // 加入交流群（后台上传二维码后出现；点击弹出二维码大图便于扫码）
             community && community.qrcode
               ? h("div", { className: "dru-actions", style: { marginTop: 10 } },
