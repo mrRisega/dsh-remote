@@ -677,8 +677,11 @@ function scheduleRuntime(relayDir) {
       telemetryRuntimeProbe(relayDir); // 匿名遥测：环境刚补齐 → runtime_ready（每进程一次）
       if (awaitingRestartHint) {
         awaitingRestartHint = false;
-        // 首次安装：运行环境（bridge + 自启动）刚在本进程内补齐 → 提示重启，重启后即完全可用
-        markRestartPending(relayDir, "first-install", "首次安装需要重启 DeepSeek harness");
+        // 运行环境刚在本进程内补齐 —— **不需要重启 harness**：
+        //   · bridge 是独立 launchd 进程，补齐后自愈调度会直接把它拉起；
+        //   · 插件本体走 patch 热加载，装完即生效。
+        // 以前这里会 markRestartPending("first-install") 弹出"需要重启 DeepSeek harness"横幅，
+        // 在热加载落地后已经变成纯粹的误导（用户实测反馈），故移除。
       }
       const cfg = loadConfig(relayDir);
       const hasAcct = Boolean((cfg.phone || cfg.email) && cfg.password) || Boolean(cfg.local_key);
@@ -849,7 +852,10 @@ function writeRestartState(relayDir, state) {
   } catch { /* 写盘失败不致命：面板退化为不提示 */ }
 }
 
-/** 标记「需要重启 DeepSeek harness」。kind: first-install(首次安装) | update(在线更新)。 */
+/**
+ * 标记「需要用户动一下」的状态。kind = refresh(插件被运行时改写,刷新页面即可)。
+ * 历史 kind(first-install / update)已废弃:热加载落地后,装插件与在线更新都不再需要重启 harness。
+ */
 function markRestartPending(relayDir, kind, reason) {
   const cur = readRestartState(relayDir);
   if (cur.pending && cur.kind === kind) return cur; // 幂等：同一原因不反复重写
@@ -1739,7 +1745,7 @@ const PLUGIN_ID = "dsh-remote-web";
 const PLUGIN_LEGACY_IDS = ["dsh-remote-ui"];
 const PLUGIN_ALL_IDS = [PLUGIN_ID, ...PLUGIN_LEGACY_IDS];
 /** 插件自身发布版本（与 dsh-remote 根包同步递增）。 */
-const PLUGIN_VERSION = "0.6.4-beta.8";
+const PLUGIN_VERSION = "0.6.4-beta.9";
 const UPDATE_LOG = ".dsh-update.log";
 const UPDATE_MARKER = ".dsh-update-running";
 
@@ -1809,9 +1815,12 @@ function runOnlineUpdate(relayDir) {
         }
         appendLogLine(relayDir, UPDATE_LOG, `[update] npx 退出 code=${code ?? "?"}（${retried ? "默认源" : "官方源"}）`);
         clear();
-        // 在线更新改写了插件/运行环境文件 → 必须重启 DeepSeek harness 才装载新版本
-        if (code === 0) markRestartPending(relayDir, "update", "已在线更新，需要重启 DeepSeek harness 生效");
-        else telemetryRecord(relayDir, "update_failed", { fail_code: telemetryFailCodeFromText(readTail(join(relayDir, UPDATE_LOG))) });
+        // 在线更新改写了插件/运行环境文件 → 版本对不上时由 pluginInstalledAfterBoot() 自动识别，
+        // 面板会提示"刷新页面"。这里**不再**写"需要重启 DeepSeek harness"的待重启标记：
+        // 插件走 patch 热加载、bridge 是独立进程，重启 harness 已无必要（用户实测反馈）。
+        // 成功不发事件（update_started 已发过，失败才发 update_failed；白名单里没有 update_done，
+        // 硬发只会被服务端静默丢弃）。
+        if (code !== 0) telemetryRecord(relayDir, "update_failed", { fail_code: telemetryFailCodeFromText(readTail(join(relayDir, UPDATE_LOG))) });
       });
       child.on("error", (e) => {
         appendLogLine(relayDir, UPDATE_LOG, `[update] 子进程启动失败: ${e.message}`);
@@ -3325,8 +3334,12 @@ export function apply(ctx, config = {}) {
     ctx.logger?.info?.("dsh-remote-web: 检测到 DeepSeek harness 已重启，撤下「需要重启」提示");
   }
   if (!readRestartState(relayDir).pending && pluginInstalledAfterBoot()) {
-    markRestartPending(relayDir, "first-install", "首次安装需要重启 DeepSeek harness");
-    ctx.logger?.info?.("dsh-remote-web: 插件文件晚于本次进程启动 → 需要重启 DeepSeek harness");
+    // 唯一还需要用户动一下的情形:插件文件晚于本进程启动才落盘(= 运行中被市场安装/在线更新改写),
+    // 此时本进程里没有本插件的路由与面板。**先让用户刷新页面**(客户端半随之更新);
+    // 只有刷新后仍无面板才需要重启(那时多半是 profile patch 行没被 HMR 读到)。
+    // 不再对"首次安装/在线更新完成"提示重启:插件走 patch 热加载、bridge 是独立进程,重启 harness 无必要。
+    markRestartPending(relayDir, "refresh", "插件已更新，刷新页面即可生效");
+    ctx.logger?.info?.("dsh-remote-web: 插件文件晚于本次进程启动 → 提示刷新页面");
   }
   ctx.effect(() => registerRoutes(ctx, relayDir), "dsh-remote-web: /dsh-remote routes");
   // 0.1.2-rc.1+ 浏览器会话代持：换取 Harness 会话 Cookie 供 bridge 上游携带（手机点设备不再 401 白页）

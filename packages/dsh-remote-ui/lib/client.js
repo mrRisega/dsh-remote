@@ -1243,6 +1243,9 @@ window.__ModuleLoader__.load({
       // 是否需要重启 DeepSeek harness（首次安装/在线更新后置顶提醒 + 底部常驻按钮）
       var restartInfo = (st && st.restart) || {};
       var restartPending = !!restartInfo.pending;
+      // kind === "refresh" = 插件文件在运行中被改写(装完/更新完),只需刷新页面;
+      // 其余情况(极为罕见)才提重启 dsh web。
+      var isRefreshOnly = restartPending && restartInfo.kind === "refresh";
       // 连接阶段（node 半下发）：轮询拿到的新鲜结果优先，其次用 /status 里带的那一份；
       // 旧版 host（响应里没有 connect 字段）→ 回退到原来的 service.running 文案（行为不变）。
       var connInfo = conn || (st && st.connect) || null;
@@ -2446,9 +2449,11 @@ window.__ModuleLoader__.load({
         );
       }
 
-      // 【自动化】待重启时自动倒计时重启(见 autoRestartCancelled 说明);倒计时只在面板可见且无其他操作时推进
+      // 【自动化】待重启时自动倒计时重启(见 autoRestartCancelled 说明);倒计时只在面板可见且无其他操作时推进。
+      // ⚠️ isRefreshOnly(插件更新后只需刷新)时**不**自动重启:刷新是零风险动作,重启 dsh web 会打断
+      // 用户正在进行的会话,不能替他做这个决定 —— 让他点「刷新页面」即可。
       useEffect(function () {
-        if (!restartPending || busy !== "" || restartCancelled) { setRestartCountdown(null); return undefined; }
+        if (!restartPending || isRefreshOnly || busy !== "" || restartCancelled) { setRestartCountdown(null); return undefined; }
         var at = restartInfo.at || 0;
         if (autoRestartCancelled(at)) { setRestartCountdown(null); return undefined; }
         var left = Math.round(AUTO_RESTART_DELAY_MS / 1000);
@@ -2462,7 +2467,7 @@ window.__ModuleLoader__.load({
           restartHarness(); // 已有实现:重启 + 轮询等它回来 + 自动刷新页面
         }, 1000);
         return function () { clearInterval(iv); };
-      }, [restartPending, restartInfo.at, busy, restartCancelled]);
+      }, [restartPending, isRefreshOnly, restartInfo.at, busy, restartCancelled]);
 
       /** 取消本次自动重启(按事件持久化:同一 pending 事件不再自动重启)。 */
       var cancelAutoRestart = function () {
@@ -2508,9 +2513,13 @@ window.__ModuleLoader__.load({
                 h("span", { className: "dru-restart-alert-icon" }, "🔔"),
                 h("div", { style: { flex: "1" } },
                   h("div", { className: "dru-restart-alert-title" },
-                    restartInfo.kind === "update" ? "在线更新已完成，需要重启 DeepSeek harness" : "首次安装需要重启 DeepSeek harness"),
+                    // 插件已改为 patch 热加载:装插件/在线更新都不再需要重启 harness,
+                    // 唯一要用户动一下的情形是"插件文件在运行中被改写"→ 刷新页面即可。
+                    isRefreshOnly ? "插件已更新，刷新页面即可生效" : "需要重启 dsh web 才能载入新插件"),
                   h("div", { className: "dru-restart-alert-sub" },
-                    "插件本体与「远程访问」面板是在 DeepSeek harness 启动时装载的，重启之后即可正常使用（账号、二维码、bridge 全部生效）。"),
+                    isRefreshOnly
+                      ? "刚装好/刚更新的插件已在磁盘上，浏览器里的面板还是旧版本。刷新一下这个页面即可（手机端连接与已登录状态都不受影响）。"
+                      : "当前运行中的 dsh web 里还没有载入这个插件。先刷新页面；如果刷新后仍然看不到面板，再重启一次 dsh web。"),
                   // 【自动化】待重启时自动倒计时重启(用户零操作);倒计时期间可一键取消
                   restartCountdown !== null && restartCountdown > 0
                     ? h("div", { className: "dru-restart-auto", role: "status" },
@@ -2524,12 +2533,19 @@ window.__ModuleLoader__.load({
                     ? h("div", { className: "dru-restart-auto muted" }, "已取消自动重启 —— 你也可以随时点下面的按钮完成安装")
                     : null,
                   h("div", { className: "dru-actions", style: { marginTop: 10 } },
+                    isRefreshOnly
+                      ? h("button", {
+                          type: "button",
+                          className: "dru-btn dru-btn-primary",
+                          onClick: function () { try { location.reload(); } catch (e) { /* 忽略 */ } }
+                        }, "刷新页面")
+                      : null,
                     h("button", {
                       type: "button",
-                      className: "dru-btn dru-btn-primary",
+                      className: "dru-btn " + (isRefreshOnly ? "dru-btn-ghost" : "dru-btn-primary"),
                       disabled: busy !== "",
                       onClick: function () { restartHarness(); }
-                    }, busy === "restart" ? "重启中…" : (restartCountdown !== null && restartCountdown > 0 ? "立即重启（不用等）" : "重启 DeepSeek harness")),
+                    }, busy === "restart" ? "重启中…" : (restartCountdown !== null && restartCountdown > 0 ? "立即重启（不用等）" : "重启 dsh web")),
                     restartCountdown !== null && restartCountdown > 0
                       ? h("button", {
                           type: "button",
@@ -2545,13 +2561,13 @@ window.__ModuleLoader__.load({
         ),
         // 常驻入口最底部：「重启 DeepSeek harness」按钮始终可达（首次安装/更新/排查都用它）
         h("div", { className: "dru-restart-foot" },
-          h("div", { className: "dru-hint" }, "重启 DeepSeek harness：插件与面板在 harness 启动时装载，首次安装或在线更新后重启即可生效；仅重启 dsh web，不影响 bridge 与手机端连接。"),
+          h("div", { className: "dru-hint" }, "重启 dsh web：仅在「刷新页面后仍看不到面板」时才需要。日常安装/更新插件已自动热加载，装完刷新页面即可；重启只影响 dsh web 本身，不影响 bridge 与手机端连接。"),
           h("button", {
             type: "button",
             className: "dru-btn " + (restartPending ? "dru-btn-primary" : "dru-btn-ghost"),
             disabled: busy !== "",
             onClick: function () { restartHarness(); }
-          }, busy === "restart" ? "重启中…" : "🔄 重启 DeepSeek harness")
+          }, busy === "restart" ? "重启中…" : "🔄 重启 dsh web")
         ),
         renderCommunityModal()
       );

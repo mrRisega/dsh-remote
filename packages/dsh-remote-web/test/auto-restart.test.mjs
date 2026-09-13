@@ -1,7 +1,11 @@
-// 【自动化】首次安装/更新后「自动重启 DeepSeek harness」的安全回归（浏览器半，0.6.4）。
+// 【自动化】「自动重启 dsh web」的安全回归（浏览器半，0.6.4）。
 //
-// 目标：用户装完不需要点任何按钮 —— 面板发现「待重启」后自己倒计时重启，重启后自动恢复页面
+// 目标：**确实需要重启时**，用户不必自己点按钮 —— 面板发现待重启后自己倒计时重启，重启后自动恢复页面
 // （复用既有 restartHarness + waitHarnessBack：轮询到 harness 回来即自动刷新）。
+//
+// ⚠️ 0.6.4-beta.9 起：kind="refresh"（插件被运行时改写 → 只需刷新页面）**不再自动重启**，
+// 因为刷新是零风险动作、重启会打断用户正在进行的会话。因此本用例用 kind="update"
+// （非 refresh）来构造"确实需要重启"的场景，以覆盖倒计时链路。
 // 但「自动重启进程」是危险动作，本用例锁死四条安全阀：
 //   ① 只在面板可见时计时（用户没在看就不动）；
 //   ② 15 秒倒计时内可一键取消，取消标记按本次事件（restart.at）持久化，同一事件不再自动重启；
@@ -40,7 +44,9 @@ const LOGGED = { ok: true, config: { phone: "138****0000", hasPhone: true, mode:
 const KEY_URL = "https://app.test/a/K1";
 const SESSIONS = [{ id: "ms_1", label: "iPhone 15", os: "iOS", browser: "Safari", created_at: 1700000000000, last_seen_at: 1700000600000, revoked_at: null }];
 function statusWithRestart(pending, at) {
-  return Object.assign({}, LOGGED, { restart: { pending: !!pending, kind: "first-install", reason: "首次安装需要重启 DeepSeek harness", at: at || 0 } });
+  // kind 用 "update"(非 refresh):只有这一路才走自动重启倒计时;
+  // kind="refresh" 的面板只提示刷新页面(见 harness-restart.test.mjs)。
+  return Object.assign({}, LOGGED, { restart: { pending: !!pending, kind: "update", reason: "需要重启 dsh web 才能载入新插件", at: at || 0 } });
 }
 
 function loadPlugin(opts = {}) {
@@ -238,7 +244,7 @@ function loadPlugin(opts = {}) {
 test("待重启 + 面板可见 → 15 秒后自动重启(用户零操作),重启后 pending 结清即停止", async () => {
   const plugin = loadPlugin({ status: statusWithRestart(true, 1111) });
   let tree = await plugin.settle();
-  assert.ok(textHas(tree, "首次安装需要重启 DeepSeek harness"), "应显示待重启横幅");
+  assert.ok(textHas(tree, "需要重启 dsh web 才能载入新插件"), "应显示待重启横幅");
   assert.ok(textHas(tree, "秒后自动重启"), "应显示自动重启倒计时文案");
   assert.equal(plugin.counts().restartCalls, 0, "倒计时期间不得提前重启");
 
