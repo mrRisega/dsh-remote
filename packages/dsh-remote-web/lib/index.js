@@ -23,6 +23,7 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync, accessSync, chmodSync, openSync, closeSync, readSync, fstatSync, rmSync, statSync, constants as fsConstants } from "node:fs";
 import { join, dirname, sep } from "node:path";
 import { execSync, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { homedir, platform } from "node:os";
 import { fileURLToPath } from "node:url";
 
@@ -522,14 +523,22 @@ function ensureRuntime(relayDir) {
         JSON.stringify({ at: Date.now(), version: PLUGIN_VERSION, source: "plugin_market" }));
     } catch { /* 非关键：上报时按缺省判据降级 */ }
     const clear = () => { try { rmSync(marker, { force: true }); } catch { /* ignore */ } };
+    // 匿名遥测：补装生命周期（install_started → runtime_ready / install_failed(fail_code)）。
+    // 失败原因只归类到白名单 fail_code，绝不外发原始错误文本（可能含路径/主机名/用户名）。
+    const tb = telemetryBook(relayDir);
+    tb.installStartedAt = Date.now();
+    telemetryRecord(relayDir, "install_started");
     child.on("exit", (code) => {
       clear();
       appendLogLine(relayDir, AUTO_INSTALL_LOG, `[auto-install] npx 退出 code=${code ?? "?"}`);
+      if (code === 0 && runtimeReady(relayDir)) telemetryRuntimeReady(relayDir); // 退出码 0 ≠ 装好了
+      else if (code !== 0) telemetryRecord(relayDir, "install_failed", { fail_code: telemetryFailCodeFromText(readTail(log)) });
     });
     child.on("error", (e) => {
       clear();
       appendLogLine(relayDir, AUTO_INSTALL_LOG, `[auto-install] 启动失败: ${e.message}`);
       console.warn(`[dsh-remote-web] 自动安装子进程启动失败: ${e.message}`);
+      telemetryRecord(relayDir, "install_failed", { fail_code: telemetryFailCodeFromError(e) });
     });
     child.unref();
     console.log(`[dsh-remote-web] 检测到缺少桌面运行环境,已在后台自动安装(日志: ${log}),完成后将自动启动 bridge`);
@@ -537,6 +546,7 @@ function ensureRuntime(relayDir) {
   } catch (e) {
     console.warn(`[dsh-remote-web] 自动安装启动失败: ${e.message}`);
     try { rmSync(marker, { force: true }); } catch { /* ignore */ }
+    telemetryRecord(relayDir, "install_failed", { fail_code: telemetryFailCodeFromError(e) });
     return false;
   }
 }
@@ -661,8 +671,10 @@ function scheduleRuntime(relayDir) {
       if (!runtimeReady(relayDir)) {
         reapBrokenAutostart(relayDir); // 先摘掉指向不存在脚本的自启动，止住崩溃循环
         ensureRuntime(relayDir);       // 后台 npx 补齐（marker 防重入）；就绪后下一轮自动拉起
+        telemetryRuntimeProbe(relayDir); // 匿名遥测：补装超时归类（runtime_install_timeout）
         return;
       }
+      telemetryRuntimeProbe(relayDir); // 匿名遥测：环境刚补齐 → runtime_ready（每进程一次）
       if (awaitingRestartHint) {
         awaitingRestartHint = false;
         // 首次安装：运行环境（bridge + 自启动）刚在本进程内补齐 → 提示重启，重启后即完全可用
@@ -940,6 +952,10 @@ function restartHarness(relayDir, opts = {}) {
     if (unit) { mode = "systemd"; target = unit; }
   }
   const script = buildRestartScript(mode, target, cmd, relayDir);
+  // 匿名遥测：重启 DeepSeek harness（自动倒计时或手动按钮都经这里）——触发一次记一条。
+  // 放在 dry-run 之前：测试/诊断用的 dry-run 也走同一条入口，便于用例锁死这条埋点。
+  telemetryRecord(relayDir, "harness_restart");
+  telemetryFlushSoon(relayDir); // 本进程约 1~2 秒后就会被替换：尽量当下把这条发出去（发不出去留盘上，下次装载补发）
   if (opts.dryRun || process.env.DSH_RELAY_RESTART_DRYRUN === "1") {
     // 测试/诊断用：只返回将要执行的脚本，不做任何真实动作
     return { ok: true, status: "dry-run", mode, target, script, log: join(relayDir, RESTART_LOG_FILE) };
@@ -1723,7 +1739,7 @@ const PLUGIN_ID = "dsh-remote-web";
 const PLUGIN_LEGACY_IDS = ["dsh-remote-ui"];
 const PLUGIN_ALL_IDS = [PLUGIN_ID, ...PLUGIN_LEGACY_IDS];
 /** 插件自身发布版本（与 dsh-remote 根包同步递增）。 */
-const PLUGIN_VERSION = "0.6.4-beta.3";
+const PLUGIN_VERSION = "0.6.4-beta.4";
 const UPDATE_LOG = ".dsh-update.log";
 const UPDATE_MARKER = ".dsh-update-running";
 
@@ -1776,6 +1792,7 @@ function runOnlineUpdate(relayDir) {
     const marker = join(relayDir, UPDATE_MARKER);
     if (existsSync(marker)) return { ok: false, detail: "已有更新在进行中，请稍候" };
     appendLogLine(relayDir, UPDATE_LOG, `[update] 开始在线更新 ${UPDATE_SPEC} (${new Date().toISOString()})`);
+    telemetryRecord(relayDir, "update_started"); // 匿名遥测：在线更新开始
 
     let retried = false;
     const clear = () => { try { rmSync(marker, { force: true }); } catch { /* ignore */ } };
@@ -1794,10 +1811,12 @@ function runOnlineUpdate(relayDir) {
         clear();
         // 在线更新改写了插件/运行环境文件 → 必须重启 DeepSeek harness 才装载新版本
         if (code === 0) markRestartPending(relayDir, "update", "已在线更新，需要重启 DeepSeek harness 生效");
+        else telemetryRecord(relayDir, "update_failed", { fail_code: telemetryFailCodeFromText(readTail(join(relayDir, UPDATE_LOG))) });
       });
       child.on("error", (e) => {
         appendLogLine(relayDir, UPDATE_LOG, `[update] 子进程启动失败: ${e.message}`);
         clear();
+        telemetryRecord(relayDir, "update_failed", { fail_code: telemetryFailCodeFromError(e) });
       });
       child.unref();
       return child;
@@ -1806,6 +1825,7 @@ function runOnlineUpdate(relayDir) {
     return { ok: true, pid: child.pid, log: join(relayDir, UPDATE_LOG) };
   } catch (e) {
     try { rmSync(join(relayDir, UPDATE_MARKER), { force: true }); } catch { /* ignore */ }
+    telemetryRecord(relayDir, "update_failed", { fail_code: telemetryFailCodeFromError(e) });
     return { ok: false, detail: String(e.message || e) };
   }
 }
@@ -2223,6 +2243,501 @@ function ensureConnection(relayDir, opts = {}) {
   return { action: "start", result: r };
 }
 
+// ---------- 匿名装机/连接遥测（客户端半；契约与隐私边界见 docs/telemetry.md） ----------
+//
+// 背景（2026-09 生产诊断）：11 个新注册用户里只有 3 个把设备连上——6 人电脑端从未安装、2 人装了但
+// bridge 没连上。而「装不上」的人没有任何账号、也就没有任何数据，「本地 OK、新机器失败」因此无法归因。
+// 本通道只补这一段装机/连接事实，且必须守住开源项目的隐私边界：
+//
+//   · 完全匿名：不带 Authorization、不带任何账号标识；install_id 是本机随机 UUID（非硬件派生、
+//     重装即变，不可跨机器关联）；
+//   · 只发白名单事件（TELEMETRY_EVENT_NAMES）与白名单 fail_code（TELEMETRY_FAIL_CODES），
+//     原始错误文本一律不透传（它可能含路径/主机名）；
+//   · 允许的字段**只有**：install_id / 事件名 / fail_code / 版本号 / os(process.platform) /
+//     arch(process.arch) / node(仅主版本号)——唯一构造点是 telemetryEventOf()；
+//   · 禁止采集（代码与 docs/telemetry.md 双写死）：手机号、邮箱、账号 ID、任何会话内容或文件内容、
+//     真实 hostname / 用户名 / 文件路径、密码与密钥、设备指纹(machine_fp)、原始 IP、精确地理位置；
+//   · 可关闭：DSH_REMOTE_TELEMETRY=0 → 完全关闭（不生成 install_id、不落任何文件、不发任何请求）；
+//   · 全程静默：任何异常都被吞掉，绝不影响面板 / bridge / 连接流程与用户可见行为。
+//
+// 契约（服务端冻结）：POST <api_url>/api/telemetry/events，headers
+//   { content-type: application/json, x-dsh-client: dsh-remote/<PLUGIN_VERSION> }（无 Authorization），
+//   body { install_id, source: "plugin", events: [{ name, at, version, os, arch, node, fail_code? }] }，
+//   单批 ≤ 20 条、body ≤ 32KB。
+
+/** 事件名白名单：只用这些，其它一律不发。 */
+const TELEMETRY_EVENT_NAMES = new Set([
+  "install_started", "install_failed", "runtime_ready", "bridge_started", "bridge_registered",
+  "tunnel_disconnected", "first_remote_ok", "plugin_loaded", "panel_opened", "harness_restart",
+  "update_started", "update_failed",
+]);
+/** fail_code 白名单（白名单外的分类一律落 unknown）。 */
+const TELEMETRY_FAIL_CODES = new Set([
+  "node_missing", "node_too_old", "npm_unreachable", "npm_eacces", "platform_unsupported",
+  "runtime_install_timeout", "launchd_failed", "bridge_exit", "bind_conflict", "bind_device_limit", "unknown",
+]);
+/** node 半只发 source=plugin。 */
+const TELEMETRY_SOURCE = "plugin";
+const TELEMETRY_INSTALL_ID_FILE = ".telemetry-install-id";
+const TELEMETRY_QUEUE_FILE = ".telemetry-queue.json";
+const TELEMETRY_ONCE_FILE = ".telemetry-once.json";
+/** 本地队列上限（0600）：超出丢最旧，避免长离线机器把磁盘堆满。 */
+const TELEMETRY_QUEUE_MAX = 200;
+/** 单批事件上限 / body 上限（契约冻结）。 */
+const TELEMETRY_BATCH_MAX = 20;
+const TELEMETRY_BODY_MAX = 32 * 1024;
+/** 每 60s 或队列 ≥5 条时批量发送。 */
+const TELEMETRY_FLUSH_MS = 60_000;
+const TELEMETRY_FLUSH_THRESHOLD = 5;
+/** 失败退避（30s → 2m → 10m → 1h；落在 60s 心跳网格上），累计 6 次仍失败则丢弃该批。 */
+const TELEMETRY_BACKOFF_MS = [30_000, 120_000, 600_000, 3_600_000];
+const TELEMETRY_MAX_ATTEMPTS = 6;
+
+/**
+ * 发送心跳间隔（毫秒）。DSH_REMOTE_TELEMETRY_MS 仅供本仓库测试/诊断把节奏压到亚秒级
+ * （生产不必设置，与 DSH_RELAY_SELFHEAL_MS 同一约定）；调用时读取，import 之后再改也生效。
+ */
+function telemetryFlushMs() {
+  const v = Number(process.env.DSH_REMOTE_TELEMETRY_MS);
+  return Number.isFinite(v) && v > 0 ? Math.max(10, v) : TELEMETRY_FLUSH_MS;
+}
+
+/**
+ * 遥测开关：DSH_REMOTE_TELEMETRY=0/false/off/no → 完全关闭（不生成 install_id、不落文件、不发请求）；
+ * 默认开启（=1/true 显式开启）。
+ * 另外：DSH_RELAY_SKIP_SERVICE=1（测试/诊断隔离，见 skipsSystemOps）时同样不发送——
+ * 本仓库的测试脚本全局设了该变量，用例绝不能把匿名事件发到真实生产端点。
+ */
+function telemetryEnabled() {
+  if (skipsSystemOps()) return false;
+  const v = String(process.env.DSH_REMOTE_TELEMETRY ?? "").trim().toLowerCase();
+  return !(v === "0" || v === "false" || v === "off" || v === "no");
+}
+
+/**
+ * 第 attempt 次失败后到下次重试的退避时长（毫秒）：30s → 2m → 10m → 1h（封顶）。
+ * 设置了 DSH_REMOTE_TELEMETRY_MS 时按同一比例缩放（仅供本仓库测试把整条重试链压到亚秒级；
+ * 生产绝不设置该变量，生产值就是上面这串）。
+ */
+function telemetryBackoffMs(attempt) {
+  const base = TELEMETRY_BACKOFF_MS[Math.min(Math.max(attempt, 0), TELEMETRY_BACKOFF_MS.length - 1)];
+  const v = Number(process.env.DSH_REMOTE_TELEMETRY_MS);
+  const scale = Number.isFinite(v) && v > 0 ? Math.max(10, v) / TELEMETRY_FLUSH_MS : 1;
+  return Math.max(10, Math.round(base * scale));
+}
+
+/** 每个 relayDir 的遥测簿：内存队列 + 心跳句柄 + 退避/去重状态（进程重启即重置）。 */
+const telemetryBooks = new Map();
+function telemetryBook(relayDir) {
+  let b = telemetryBooks.get(relayDir);
+  if (!b) {
+    b = {
+      queue: null,          // null=尚未从磁盘读回
+      timer: null,          // 心跳定时器（unref，不阻塞进程退出）
+      kickPending: false,   // 已排队一次「立即发送」
+      sending: false,
+      attempts: 0,          // 当前批次连续失败次数
+      nextAt: 0,            // 退避解禁时间
+      closed: false,        // 插件已停摆（dispose）→ 不再调度发送
+      fired: new Set(),     // 本进程已发过的事件名（每进程每阶段只发一次）
+      runtimeMissingSeen: false,
+      installStartedAt: 0,
+      tunnelDown: false,    // 同一掉线周期只发一条 tunnel_disconnected
+      wasRegistered: false,
+    };
+    telemetryBooks.set(relayDir, b);
+  }
+  return b;
+}
+
+/**
+ * 只在配置目录**已存在**时落盘：遥测绝不为自己的统计去创建配置目录（否则会改变
+ * 「本机是否装过运行时」的既有语义——例如彻底卸载用例里 relayDir 本不该存在）。
+ * 目录还没出现时事件只留在内存里等下一次心跳，装好了/登录后目录出现即恢复持久化。
+ */
+function telemetryDirReady(relayDir) {
+  try { return Boolean(relayDir) && existsSync(relayDir); } catch { return false; }
+}
+
+/**
+ * 本机 install_id：<relayDir>/.telemetry-install-id（0600），首次 crypto.randomUUID()，之后复用。
+ * 它是**随机 UUID**（非硬件派生、不含机器信息、换机/重装即变），因此不可跨机器关联到同一个人。
+ * 生成/落盘失败 → 返回 null（本次不发，静默，不阻断任何流程）。
+ */
+function telemetryInstallId(relayDir) {
+  if (!telemetryEnabled()) return null;   // 关闭：连 ID 都不生成（更不落盘）
+  if (!telemetryDirReady(relayDir)) return null;
+  const file = join(relayDir, TELEMETRY_INSTALL_ID_FILE);
+  try {
+    const cur = readFileSync(file, "utf8").trim();
+    if (/^[0-9A-Za-z-]{16,64}$/.test(cur)) return cur;
+  } catch { /* 首次生成 */ }
+  try {
+    const id = randomUUID();
+    try {
+      writeFileSync(file, id, { mode: 0o600, flag: "wx" }); // wx：并发时不会互相覆盖
+    } catch {
+      const cur = readFileSync(file, "utf8").trim();        // 别的进程刚生成 → 复用它
+      if (cur) return cur;
+      throw new Error("install_id 写入失败");
+    }
+    try { chmodSync(file, 0o600); } catch { /* 权限位不生效不影响使用 */ }
+    return id;
+  } catch {
+    return null; // 生成失败 → 本次不发
+  }
+}
+
+/** 读回本地队列（懒加载；只接受白名单事件名，杜绝外来/损坏内容被转发）。 */
+function telemetryLoadQueue(relayDir, book) {
+  if (Array.isArray(book.queue)) return book.queue;
+  book.queue = [];
+  try {
+    const raw = JSON.parse(readFileSync(join(relayDir, TELEMETRY_QUEUE_FILE), "utf8"));
+    const list = Array.isArray(raw?.events) ? raw.events : [];
+    book.queue = list.filter((ev) => ev && typeof ev === "object" && TELEMETRY_EVENT_NAMES.has(String(ev.name)));
+  } catch { book.queue = []; }
+  return book.queue;
+}
+
+/** 落盘本地队列（0600；写不进去也不影响主流程——退化为只在内存里排队）。 */
+function telemetrySaveQueue(relayDir, book) {
+  try {
+    if (!telemetryDirReady(relayDir)) return;
+    const file = join(relayDir, TELEMETRY_QUEUE_FILE);
+    writeFileSync(file, JSON.stringify({ v: 1, events: book.queue || [] }), { mode: 0o600 });
+    try { chmodSync(file, 0o600); } catch { /* 非关键 */ }
+  } catch { /* 非关键 */ }
+}
+
+/** 从队列移除已送达/已放弃的一批（按引用比较，避免并发写入被误删）。 */
+function telemetryDrop(relayDir, book, batch) {
+  const queue = telemetryLoadQueue(relayDir, book);
+  for (const ev of batch) {
+    const i = queue.indexOf(ev);
+    if (i >= 0) queue.splice(i, 1);
+  }
+  telemetrySaveQueue(relayDir, book);
+}
+
+/** 一次性事件标记（跨进程、跨重启只发一次，如 first_remote_ok）读/写。 */
+function telemetryOnceFlags(relayDir) {
+  try {
+    const j = JSON.parse(readFileSync(join(relayDir, TELEMETRY_ONCE_FILE), "utf8"));
+    return j && typeof j === "object" ? j : {};
+  } catch { return {}; }
+}
+function telemetryMarkOnce(relayDir, name) {
+  try {
+    if (!telemetryDirReady(relayDir)) return;
+    writeFileSync(join(relayDir, TELEMETRY_ONCE_FILE),
+      JSON.stringify({ ...telemetryOnceFlags(relayDir), [name]: Date.now() }), { mode: 0o600 });
+  } catch { /* 非关键 */ }
+}
+
+/**
+ * 【唯一的 payload 构造点】把事件名 + 少量上下文编译成一条遥测事件。
+ * 字段仅限契约白名单：name / fail_code / at / version / os / arch / node。
+ * 这里**绝不**写入手机号、邮箱、账号 ID、会话或文件内容、hostname、用户名、文件路径、
+ * 密码/密钥、machine_fp、IP、地理位置等任何可识别信息（见 docs/telemetry.md「不采集什么」）。
+ * 返回 null = 事件名不在白名单 → 调用方一律不发。
+ */
+function telemetryEventOf(name, extra = {}) {
+  if (!TELEMETRY_EVENT_NAMES.has(name)) return null;
+  const ev = {
+    name,
+    at: Date.now(),
+    version: PLUGIN_VERSION,
+    os: process.platform,                                       // 仅平台名（darwin/linux/win32），非主机名
+    arch: process.arch,                                         // 仅架构（arm64/x64）
+    node: String(process.versions?.node || "").split(".")[0],   // 仅主版本号，如 "22"
+  };
+  if (name === "install_failed" || name === "update_failed") {
+    const code = String(extra.fail_code || "");
+    ev.fail_code = TELEMETRY_FAIL_CODES.has(code) ? code : "unknown"; // 白名单外 → unknown
+  }
+  return ev;
+}
+
+/** 从既有日志/错误文本归类 fail_code（白名单内）；原始文本绝不外发（可能含路径/主机名）。 */
+function telemetryFailCodeFromText(text) {
+  const t = String(text || "");
+  if (/EACCES|EPERM|permission denied|权限不足/i.test(t)) return "npm_eacces";
+  if (/platform|不支持的平台/i.test(t)) return "platform_unsupported";
+  if (/too old|版本过低|engine/i.test(t)) return "node_too_old";
+  if (/ENOENT|not found|No such file/i.test(t)) return "node_missing";
+  if (/ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ETIMEOUT|ECONNREFUSED|ENETUNREACH|ECONNRESET|network|registry|超时/i.test(t)) {
+    return "npm_unreachable";
+  }
+  return "unknown";
+}
+/** 子进程启动失败（spawn error）→ fail_code。 */
+function telemetryFailCodeFromError(e) {
+  const code = String(e?.code || "");
+  if (code === "ENOENT") return "node_missing";   // 连 node/npx 可执行文件都找不到 = 本机没有 node
+  if (code === "EACCES") return "npm_eacces";
+  return telemetryFailCodeFromText(e?.message);
+}
+
+/** 启动发送心跳（懒启动；unref 不阻塞进程退出）。 */
+function telemetryTickerStart(relayDir) {
+  const book = telemetryBook(relayDir);
+  if (book.timer || book.closed) return;
+  const t = setInterval(() => { void telemetryFlush(relayDir); }, telemetryFlushMs());
+  t.unref?.();
+  book.timer = t;
+}
+
+/** 排队一次「立即发送」（下一轮事件循环执行；不阻塞调用方）。 */
+function telemetryFlushSoon(relayDir) {
+  const book = telemetryBook(relayDir);
+  if (book.kickPending || book.closed || !telemetryEnabled()) return;
+  book.kickPending = true;
+  const t = setTimeout(() => { book.kickPending = false; void telemetryFlush(relayDir); }, 0);
+  t.unref?.();
+}
+
+/**
+ * 入队一条事件：白名单 → 队列（上限 200 丢最旧）→ 落盘 → 队列 ≥5 条立即发送，否则等 60s 心跳。
+ * 全程 try/catch 静默：遥测绝不能影响面板 / bridge / 连接流程或用户可见行为。
+ * @returns {boolean} 是否入队
+ */
+function telemetryRecord(relayDir, name, extra = {}) {
+  try {
+    if (!telemetryEnabled()) return false;   // 关闭：不落文件、不入队、不发请求
+    const ev = telemetryEventOf(name, extra);
+    if (!ev) return false;                   // 白名单外一律不发
+    const book = telemetryBook(relayDir);
+    if (book.closed) return false;
+    const queue = telemetryLoadQueue(relayDir, book);
+    queue.push(ev);
+    if (queue.length > TELEMETRY_QUEUE_MAX) queue.splice(0, queue.length - TELEMETRY_QUEUE_MAX); // 丢最旧
+    telemetrySaveQueue(relayDir, book);
+    telemetryTickerStart(relayDir);
+    if (queue.length >= TELEMETRY_FLUSH_THRESHOLD) telemetryFlushSoon(relayDir);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 每进程只发一次的事件（plugin_loaded / panel_opened / bridge_started / bridge_registered）。 */
+function telemetryOnce(relayDir, name, extra) {
+  if (!telemetryEnabled()) return false;
+  const book = telemetryBook(relayDir);
+  if (book.fired.has(name)) return false;
+  book.fired.add(name);
+  return telemetryRecord(relayDir, name, extra);
+}
+
+/** 跨进程只发一次的事件（first_remote_ok：持久化标记，先落标记再入队，宁可丢一条也不重复）。 */
+function telemetryOnceEver(relayDir, name, extra) {
+  if (!telemetryEnabled()) return false;
+  if (telemetryOnceFlags(relayDir)[name]) return false;
+  telemetryMarkOnce(relayDir, name);
+  return telemetryRecord(relayDir, name, extra);
+}
+
+/** 运行环境就绪（每进程一次）。 */
+function telemetryRuntimeReady(relayDir) {
+  if (!telemetryEnabled()) return false;
+  const book = telemetryBook(relayDir);
+  if (book.fired.has("runtime_ready")) return false;
+  book.fired.add("runtime_ready");
+  return telemetryRecord(relayDir, "runtime_ready");
+}
+
+/**
+ * 运行环境探针（在补装 watcher 与面板轮询里顺手调用，不额外起定时器）：
+ *   - 现在缺运行环境 → 记下「本进程见过缺失」，并在超过 INSTALL_STALE_MS 仍缺时归因为
+ *     install_failed(runtime_install_timeout)（每进程一次）；
+ *   - 之前见过缺失、现在已就绪 → runtime_ready（每进程一次）。
+ */
+function telemetryRuntimeProbe(relayDir) {
+  if (!telemetryEnabled()) return;
+  try {
+    const book = telemetryBook(relayDir);
+    if (runtimeReady(relayDir)) {
+      if (book.runtimeMissingSeen) telemetryRuntimeReady(relayDir);
+      return;
+    }
+    book.runtimeMissingSeen = true;
+    if (book.installStartedAt && Date.now() - book.installStartedAt > INSTALL_STALE_MS && !book.fired.has("install-timeout")) {
+      book.fired.add("install-timeout");
+      telemetryRecord(relayDir, "install_failed", { fail_code: "runtime_install_timeout" });
+    }
+  } catch { /* 静默 */ }
+}
+
+/**
+ * 「当前隧道是否断连中」判据（仅供遥测）：bridge 日志里最后一次「隧道断开」晚于最后一次
+ * 「隧道已连 / ✅ router 注册成功」即为断连中。只看行序，不读任何内容。
+ */
+function telemetryTunnelDown(relayDir) {
+  const lines = readTail(join(relayDir, BRIDGE_LOG_FILE)).split("\n");
+  let up = -1;
+  let down = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    if (/✅\s*router 注册成功|隧道已连/.test(line)) up = i;
+    else if (/隧道断开/.test(line)) down = i;
+  }
+  return down > up && down >= 0;
+}
+
+/** 「本机设备在账号设备表可见」（first_remote_ok 的第二个条件）：状态文件 / 日志 / 账号接口三选一。 */
+function telemetryAccountVisible(relayDir, conn) {
+  const src = String(conn?.registerSource || "");
+  if (src === "account_api" || src === "account" || src === "state_account") return true;
+  const state = bridgeStateFile(relayDir);
+  if (state && Number(state.account_bound_at) > 0) return true;   // bridge POST /api/devices 成功留下的证据
+  return Boolean(bridgeLogState(relayDir).accountBound);
+}
+
+/**
+ * 连接阶段观察（复用既有阶段引擎，不新造状态机）：阶段推进到 starting / online 时各发一次
+ * （每进程每阶段只发一次，避免 2~3s 轮询把事件刷爆），掉线时发一条 tunnel_disconnected
+ * （同一掉线周期去重）。由持有 conn 的路由调用。
+ */
+function telemetryObserveConnect(relayDir, conn) {
+  if (!telemetryEnabled() || !conn) return;
+  try {
+    const phase = String(conn.phase || "");
+    // bridge_started = bridge 进程被拉起（面板阶段 starting）
+    if (phase === "starting") telemetryOnce(relayDir, "bridge_started");
+    // bridge_registered = 设备已在中继注册成功（面板阶段 online）——这才是「真正可用」
+    if (phase === "online" || conn.registered) telemetryOnce(relayDir, "bridge_registered");
+    // tunnel_disconnected = bridge 掉线：日志里最后一次是「隧道断开」，或注册证据由真变假
+    const book = telemetryBook(relayDir);
+    const dropped = telemetryTunnelDown(relayDir) || (book.wasRegistered === true && !conn.registered);
+    if (dropped) {
+      if (!book.tunnelDown) {
+        book.tunnelDown = true;
+        telemetryRecord(relayDir, "tunnel_disconnected");
+      }
+    } else {
+      book.tunnelDown = false; // 已恢复/未掉线 → 复位，下一轮掉线可再记一条
+    }
+    if (conn.registered) book.wasRegistered = true;
+    // first_remote_ok = 本机首次观察到 online 且本机设备在账号设备表可见（跨进程只发一次）
+    if (phase === "online" && conn.registered && telemetryAccountVisible(relayDir, conn)) {
+      telemetryOnceEver(relayDir, "first_remote_ok");
+    }
+  } catch { /* 静默 */ }
+}
+
+/**
+ * 批量发送一批（≤20 条、≤32KB；调用方一律不 await）。成功出队；失败按 30s→2m→10m→1h 退避，
+ * 累计 6 次仍失败丢弃该批——不永久堆积、不阻塞任何主流程。
+ * 匿名：只有 content-type 与 x-dsh-client，**不带 Authorization**（服务端也不接受账号关联）。
+ */
+async function telemetryFlush(relayDir) {
+  const book = telemetryBook(relayDir);
+  try {
+    if (!telemetryEnabled() || book.closed) return;
+    if (book.sending) return;
+    if (Date.now() < book.nextAt) return;        // 退避中：等下一轮心跳到点再看
+    const queue = telemetryLoadQueue(relayDir, book);
+    if (!queue.length) return;
+    const installId = telemetryInstallId(relayDir);
+    if (!installId) return;                      // install_id 生成失败 → 本次不发
+    const build = (list) => JSON.stringify({ install_id: installId, source: TELEMETRY_SOURCE, events: list });
+    let batch = queue.slice(0, TELEMETRY_BATCH_MAX);
+    let body = build(batch);
+    while (batch.length > 1 && Buffer.byteLength(body, "utf8") > TELEMETRY_BODY_MAX) {
+      batch = batch.slice(0, batch.length - 1);  // body 超 32KB：收缩批次（正常远小于该上限）
+      body = build(batch);
+    }
+    if (Buffer.byteLength(body, "utf8") > TELEMETRY_BODY_MAX) {
+      telemetryDrop(relayDir, book, batch);      // 单条就超限 → 丢弃该批（防御性）
+      return;
+    }
+    const cfg = loadConfig(relayDir);
+    const api = String(cfg.api_url || DEFAULT_API).replace(/\/+$/, "");
+    book.sending = true;
+    let ok = false;
+    try {
+      const r = await fetch(`${api}/api/telemetry/events`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-dsh-client": `dsh-remote/${PLUGIN_VERSION}`,   // 契约冻结：dsh-remote/<version>（非 dsh-remote-web）
+        },
+        body,
+        signal: AbortSignal.timeout(8000),
+      });
+      ok = Boolean(r && r.ok);
+    } catch { ok = false; }                       // 网络失败 → 静默退避（老服务端 404 同理）
+    book.sending = false;
+    if (ok) {
+      telemetryDrop(relayDir, book, batch);
+      book.attempts = 0;
+      book.nextAt = 0;
+      return;
+    }
+    book.attempts += 1;
+    if (book.attempts >= TELEMETRY_MAX_ATTEMPTS) {
+      telemetryDrop(relayDir, book, batch);       // 上限 6 次仍失败 → 丢弃该批
+      book.attempts = 0;
+      book.nextAt = 0;
+      return;
+    }
+    book.nextAt = Date.now() + telemetryBackoffMs(book.attempts - 1);
+  } catch {
+    book.sending = false;                         // 任何异常：静默
+  }
+}
+
+/**
+ * 插件装载时的遥测初始化：读回磁盘队列（上次进程遗留的事件不丢，例如重启前那条 harness_restart）
+ * 并启动发送心跳。DSH_REMOTE_TELEMETRY=0 时连读都不读 → 零文件零请求。
+ */
+function telemetryStart(relayDir) {
+  try {
+    if (!telemetryEnabled()) return;
+    const book = telemetryBook(relayDir);
+    book.closed = false;
+    const queue = telemetryLoadQueue(relayDir, book);
+    telemetryTickerStart(relayDir);
+    if (queue.length) telemetryFlushSoon(relayDir);
+  } catch { /* 静默 */ }
+}
+
+/** 插件停摆（dispose）→ 停掉心跳，之后不再调度发送（磁盘队列留给下次装载）。 */
+function telemetryStop(relayDir) {
+  try {
+    const b = telemetryBooks.get(relayDir);
+    if (!b) return;
+    b.closed = true;
+    if (b.timer) { clearInterval(b.timer); b.timer = null; }
+  } catch { /* 静默 */ }
+}
+
+/** 内部接口（仅供本仓库测试与隐私审计；不属于插件对外契约，也不被面板/浏览器半使用）。 */
+export const __telemetryInternals = {
+  enabled: telemetryEnabled,
+  record: (relayDir, name, extra) => telemetryRecord(relayDir, name, extra),
+  flush: (relayDir) => telemetryFlush(relayDir),
+  installId: (relayDir) => telemetryInstallId(relayDir),
+  queueOf: (relayDir) => telemetryLoadQueue(relayDir, telemetryBook(relayDir)).slice(),
+  eventOf: (name, extra) => telemetryEventOf(name, extra),
+  eventNames: [...TELEMETRY_EVENT_NAMES],
+  failCodes: [...TELEMETRY_FAIL_CODES],
+  queueMax: TELEMETRY_QUEUE_MAX,
+  batchMax: TELEMETRY_BATCH_MAX,
+  bodyMax: TELEMETRY_BODY_MAX,
+  stateOf: (relayDir) => {
+    const b = telemetryBook(relayDir);
+    return { attempts: b.attempts, nextAt: b.nextAt, sending: b.sending, queueLen: telemetryLoadQueue(relayDir, b).length };
+  },
+  reset: (relayDir) => {
+    const b = telemetryBooks.get(relayDir);
+    if (b && b.timer) clearInterval(b.timer);
+    telemetryBooks.delete(relayDir);
+  },
+};
+
 /**
  * 安装信息上报（插件侧通道）：登录后把本机安装信息发给企业端，供「已登录用户升级插件后刷新版本号」
  * 之类的口径统计。无账号凭据不上报；失败静默（绝不阻塞面板、不弹错误）。
@@ -2391,7 +2906,20 @@ function registerRoutes(ctx, relayDir) {
         ensureConnection(relayDir);
         maybeReportInstall(relayDir);
         void ensureHarnessCookie(ctx, relayDir).catch(() => {}); // 同上:手机端授权会话自愈
-        sendJson(res, 200, { ok: true, connect: await composeConnect(relayDir) });
+        telemetryRuntimeProbe(relayDir); // 匿名遥测：运行环境刚补齐 → runtime_ready（不额外起定时器）
+        const connect = await composeConnect(relayDir);
+        telemetryObserveConnect(relayDir, connect); // 匿名遥测：bridge_started / bridge_registered / 掉线
+        sendJson(res, 200, { ok: true, connect });
+      },
+    },
+    // 面板打开（浏览器半在「远程访问」栏目首次渲染时调一次）：每进程只记一次。
+    // 只发事件名，不含任何账号/内容/设备信息；DSH_REMOTE_TELEMETRY=0 时静默丢弃。
+    {
+      method: "POST",
+      path: "/dsh-remote/telemetry/panel-opened",
+      handler: async (_req, res) => {
+        telemetryOnce(relayDir, "panel_opened");
+        sendJson(res, 200, { ok: true });
       },
     },
     // 手动重试（error 阶段的「重试」按钮）：清掉退避计数立刻再走一遍闭环。
@@ -2403,6 +2931,7 @@ function registerRoutes(ctx, relayDir) {
         maybeReportInstall(relayDir, { force: true });
         await sleep(600); // 给 launchctl 一点进入运行态的时间，重试点下去立刻能看到「正在启动 Bridge…」
         const connect = await composeConnect(relayDir);
+        telemetryObserveConnect(relayDir, connect); // 匿名遥测：同 bridge-status（去重后不会重复计数）
         sendJson(res, 200, { ok: true, retried: true, action: action && action.action ? action.action : "none", connect });
       },
     },
@@ -2780,6 +3309,11 @@ export function apply(ctx, config = {}) {
   const relayDir = config.relayDir || process.env.DSH_RELAY_DIR || DEFAULT_RELAY_DIR;
   // 全新激活（dsh web 重启后插件重新加载，或卸载后再次安装）→ 解除上次的「已卸载」停摆标记
   UNINSTALLED_DIRS.delete(relayDir);
+  // 匿名遥测：装载即初始化（读回上次进程遗留的磁盘队列，例如重启前那条 harness_restart，
+  // 并启动 60s 发送心跳），随后记一条 plugin_loaded（每进程一次）。
+  // DSH_REMOTE_TELEMETRY=0 → 这里连读都不读：零文件、零请求、零 install_id。
+  telemetryStart(relayDir);
+  telemetryOnce(relayDir, "plugin_loaded");
   // 清理上次进程残留的安装/更新 marker（宿主被重启/强杀时子进程清理回调会丢失）
   sweepStaleMarkers(relayDir);
   // 「待重启」状态结清 + 运行时安装检测：
@@ -2799,12 +3333,15 @@ export function apply(ctx, config = {}) {
   ctx.effect(() => scheduleHarnessMint(ctx, relayDir), "dsh-remote-web: harness browser-session mint");
   // 插件市场一键全功能:缺桌面运行环境则自动安装,登录后自动拉起 bridge(不依赖用户跑 npx)
   ctx.effect(() => scheduleRuntime(relayDir), "dsh-remote-web: runtime self-provision");
+  // 匿名遥测：插件停摆（卸载/重载）时停掉发送心跳；磁盘队列留给下次装载补发。
+  ctx.effect(() => () => telemetryStop(relayDir), "dsh-remote-web: telemetry flush ticker");
   // 【0.6.2】市场安装路径的「装到用户电脑上」第一步：插件加载即后台补装桌面运行环境
   // （bridge + 自启动），不再等用户先登录、也不再依赖 launchd 状态判断是否「已在运行」。
   // 已就绪时是零副作用 no-op；正在安装中/已卸载时 ensureRuntime 自身幂等挡下。
   const provisioned = ensureRuntime(relayDir);
   if (!provisioned && !runtimeReady(relayDir)) {
     ctx.logger?.info?.(`dsh-remote-web: 桌面运行环境缺失，已在后台自动安装（relayDir=${relayDir}）`);
+    telemetryRuntimeProbe(relayDir); // 匿名遥测：记下「本进程见过运行环境缺失」（装好后发 runtime_ready）
   }
   // 插件启动即上报本机安装信息（install_source/version + 主机 OS/架构；仅有账号凭据时上报，失败静默）。
   // 面板登录成功（POST /dsh-remote/config）时会再上报一次，覆盖「已登录用户升级插件」的口径。

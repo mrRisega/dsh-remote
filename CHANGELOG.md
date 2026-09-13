@@ -3,6 +3,34 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.4-beta.4] - 2026-09-13
+
+> 预发版。把**安装那一刻的输出**收拾干净：不再重复引导、不再把「dsh web 没开」说成失败；
+> 并告诉你匿名装机统计怎么彻底关掉。
+
+### Fixed
+
+- **安装时 dsh web 没在运行，不再显示让人误解的「服务启动失败」**：bridge 依赖 dsh web 才能工作，
+  dsh web 没开时 bridge 起来也会立刻退出——这是**正常状态**，不是安装出错。现在安装结束会如实说明
+  「检测到 dsh web 当前没有运行，所以 bridge 还没接上（正常，不是安装出错）；打开 dsh web 后
+  bridge 会自动启动，无需任何命令」，并补一句「如果 dsh web 已经开着但看不到本机，先重启 dsh web
+  让插件生效」。dsh web 确实开着却仍起不来时，才提示具体的 bridge 失败原因与日志路径。
+
+### Changed
+
+- **安装输出大幅精简**：同一段引导此前会在多个阶段重复打印（运行时固化、创建自启动服务、
+  服务已加载……），现在收敛成**结尾一份汇总**——远程控制地址 / 自启动服务路径与状态 / 下一步做什么，
+  一眼就能看完；自启动服务不再单独重复播报一次。
+
+### Added
+
+- **匿名装机统计可以一键关掉**：`export DSH_REMOTE_TELEMETRY=0` 即完全关闭（不生成随机 ID、
+  不落任何文件、不发任何请求，也不影响面板、bridge 与连接）；不想改环境变量也可以在中继 /
+  Nginx / 防火墙里直接丢弃 `POST /api/telemetry/events`。采集/不采集的完整清单与自行核实方法见
+  [docs/telemetry.md](docs/telemetry.md)，README 新增「数据与隐私」一节说明**统计的粒度**
+  （装机漏斗统计建立在审计日志之上，只统计注册 / 新增设备 / 真实登录 / 首次打通这类事件条数，
+  重复登记不记为新增）以及自建模式下数据只落在你自己的服务器。
+
 ## [0.6.4-beta.3] - 2026-09-13
 
 > 预发版。把「首次安装需要重启 DeepSeek harness」这一步**做成自动完成**，并补齐一个埋点盲区。
