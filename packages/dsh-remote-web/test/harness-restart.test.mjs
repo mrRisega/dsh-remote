@@ -140,6 +140,17 @@ test("首次安装（运行环境在本进程内补齐）→ **不再**提示重
   } finally { await env.restore(); }
 });
 
+test("补装把**同版本**插件重写一遍 → 不得提示（用户实测的误报）", async () => {
+  // 事故复盘:安装器/自愈补装会把 profile 副本整目录重写,即使是**同一个版本**。
+  // 旧实现只看"插件文件 mtime 晚于进程启动"→ 误判成"有新插件要装载"→ 弹出需要重启/刷新的横幅,
+  // 而用户刷新后横幅还在(因为第二次补装又写了一遍)、最后靠重启才消失。
+  // 现在判的是「磁盘版本 != 运行版本」,版本相同就什么都不提示。
+  const src = readFileSync(new URL("../lib/index.js", import.meta.url), "utf8");
+  const fn = src.slice(src.indexOf("function pluginInstalledAfterBoot("), src.indexOf("/** 本进程的启动命令"));
+  assert.match(fn, /diskVersion !== runningVersion/, "必须比较版本,而不是只看时间戳");
+  assert.match(fn, /PLUGIN_VERSION/, "必须用本进程装载的版本号做比较");
+});
+
 test("插件文件晚于本进程启动 → 提示「刷新页面」，且**不**自动重启", async () => {
   const env = await setup();
   try {
