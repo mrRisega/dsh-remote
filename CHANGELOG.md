@@ -3,6 +3,29 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.4-beta.3] - 2026-09-13
+
+> 预发版。把「首次安装需要重启 DeepSeek harness」这一步**做成自动完成**，并补齐一个埋点盲区。
+
+### Added
+
+- **装机最后一步自动化：待重启时面板自动重启 DeepSeek harness，用户不需要点任何按钮。**
+  插件本体与浏览器半是在 harness 启动时装载的，所以首次安装/在线更新后必须重启一次才生效 ——
+  此前需要用户自己看懂提示并点按钮（对非技术用户就是一道坎）。现在面板发现「待重启」后：
+  15 秒倒计时自动重启，重启完成后**页面自动恢复**（复用既有 waitHarnessBack：轮询到 harness 回来即刷新），
+  接着继续跑「连接中 → 已连接」流程。四条安全阀：① 面板不可见（用户没在看）→ 计时暂停，绝不在用户看不到时
+  重启进程；② 15 秒内可一键「取消自动重启」，取消标记按本次事件持久化（刷新也生效，下次安装/更新重新触发）；
+  ③ 面板上有其他操作在跑时暂停计时，不打断用户；④ 每事件只重启一次。
+- **手机端上报「看到了安装引导」**（`POST /api/guide-shown`，只记首次）。生产诊断里 11 个新用户有 6 人
+  **从未在电脑端安装**，但此前没有任何数据能证明"他看到了引导"；现在「看到引导 → 真正装上」的转化可量化
+  （管理后台用户详情新增「看到安装引导」时间）。
+
+### Tests
+
+- 新增 `packages/dsh-remote-web/test/auto-restart.test.mjs`（4 例，真实 `useEffect` + 假定时器 +
+  可控 `document.hidden`：15 秒自动重启且只一次、取消后不重启且标记跨刷新生效、隐藏时暂停、无待重启零请求）。
+- relay-router 新增「看到引导即上报」契约用例。`test:router` 29 / `test:plugin` 116 / `test:bridge` 85 全绿。
+
 ## [0.6.4-beta.2] - 2026-09-13
 
 > 预发版。修一个**真实用户反馈**的手机端阻塞：`dsh web authentication required; reopen the URL printed by dsh web`。

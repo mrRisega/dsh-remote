@@ -1287,6 +1287,21 @@ function installGuideHTML() {
     </div>`;
 }
 
+/**
+ * 上报「用户看到了空设备列表 + 安装引导」。
+ * 这是漏斗里最关键的中间态:生产诊断显示 11 个新用户里 6 人从未在电脑端安装,而此前没有任何数据
+ * 能证明"他看到了引导"。服务端只记首次(guide_shown_at);这里再加 localStorage 去重,避免重复请求。
+ * 失败完全静默:纯统计,绝不影响用户流程。
+ */
+function reportGuideShown() {
+  try {
+    if (!state.token) return;                                   // 未登录不报(服务端要求登录态)
+    if (localStorage.getItem("dsh-guide-shown") === "1") return; // 本机只报一次
+    localStorage.setItem("dsh-guide-shown", "1");
+    api("/api/guide-shown", {}, "POST").catch(() => {});
+  } catch (e) { /* 忽略 */ }
+}
+
 // ---------- 空设备态自动等待(无需用户手动刷新) ----------
 
 /**
@@ -1472,6 +1487,7 @@ async function refreshDevices() {
       `<div class="empty guide-wait" style="padding:0 0 8px;"><span class="loading"></span> 正在自动检测:电脑装好后会自己出现在这里,无需刷新本页</div>` +
       installGuideHTML();
     bindGuideCopy(list);
+    reportGuideShown(); // 盲区补齐:记录"看到了引导",用于量化「看到引导→真的装上」的转化
     scheduleDevicePoll();
     return;
   }

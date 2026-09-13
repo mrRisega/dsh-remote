@@ -285,3 +285,14 @@ test("推广页安装引导同样市场优先(与空设备态一致,避免两条
   const block = APP.slice(from, APP.indexOf("btn-copy-install", from) + 200);
   assert.ok(/插件市场[\s\S]{0,300}?npx @mrrisega\/dsh-remote[\s\S]{0,200}?复制/.test(block), "市场路径在前、终端命令在后(保留复制按钮)");
 });
+
+test("盲区补齐:空设备态展示引导时上报「看到引导」(只报一次、失败静默)", () => {
+  assert.match(APP, /function reportGuideShown\(\)/, "应有独立上报函数");
+  assert.match(APP, /api\("\/api\/guide-shown", \{\}, "POST"\)\.catch\(\(\) => \{\}\);/, "失败必须静默");
+  assert.match(APP, /if \(!state\.token\) return;/, "未登录不报(服务端要求登录态)");
+  assert.match(APP, /localStorage\.getItem\("dsh-guide-shown"\) === "1"/, "本机去重,避免重复请求");
+  // 触发点在渲染空设备引导的分支里
+  const from = APP.indexOf("const emptyText = boundOk");
+  const branch = APP.slice(from, APP.indexOf("lastOnlineCount = 0;", from));
+  assert.ok(branch.includes("installGuideHTML()") && branch.includes("reportGuideShown()"), "展示引导时同步上报");
+});

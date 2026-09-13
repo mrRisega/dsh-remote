@@ -142,6 +142,8 @@ window.__ModuleLoader__.load({
       ".dru-popup-foot button:hover{color:#0969da}",
       ".dru-popup .dru-msg{text-align:left}",
       ".dru-community-qr{display:block;width:220px;max-width:62vw;margin:0 auto;background:#ffffff;padding:10px;border-radius:10px;border:1px solid #d0d7de;box-sizing:content-box}",
+      ".dru-restart-auto{display:flex;align-items:center;gap:8px;margin-top:10px;font-size:12.5px;color:#1a7f37;background:#dafbe1;border-radius:8px;padding:8px 10px}",
+      ".dru-restart-auto.muted{color:#57606a;background:#f6f8fa}",
       ".dru-fb-community{margin-top:16px;padding-top:14px;border-top:1px dashed #d0d7de;text-align:center}",
       ".dru-fb-community .dru-community-qr{width:180px;max-width:56vw}",
       // ── 自管理：版本与更新（插件面板内提供在线更新/彻底卸载，市场无更新按钮） ──
@@ -1189,6 +1191,10 @@ window.__ModuleLoader__.load({
       // ── 💬 交流群（「加入交流群」按钮 + 弹窗）：同样放在全部既有字段之后 ──
       var communityArr = useState(null); var community = communityArr[0]; var setCommunity = communityArr[1]; // {qrcode,wechat}；null=未加载
       var commOpenArr = useState(false); var commOpen = commOpenArr[0]; var setCommOpen = commOpenArr[1];
+      // 【自动化】重启倒计时 / 是否已被用户取消(初值按本次 pending 事件的持久化标记,跨刷新生效)
+      var restartCancelArr = useState(function () { return autoRestartCancelled((st && st.restart && st.restart.at) || 0); });
+      var restartCancelled = restartCancelArr[0]; var setRestartCancelled = restartCancelArr[1];
+      var restartCountArr = useState(null); var restartCountdown = restartCountArr[0]; var setRestartCountdown = restartCountArr[1];
       // ── 🔗 登录后自动闭环：连接阶段（运行环境 → bridge 进程 → 设备已在中继注册=online） ──
       // conn 来自 GET /dsh-remote/bridge-status（node 半在返回前会自动补装/拉起/退避重试），
       // 面板据它显示「正在准备运行环境…/正在启动 Bridge…/正在连接中继…/已连接 ✅」，
@@ -1861,6 +1867,25 @@ window.__ModuleLoader__.load({
           });
       };
 
+      /**
+       * 【自动化】首次安装/在线更新后自动重启 DeepSeek harness —— 用户不需要点任何按钮。
+       *
+       * 为什么能自动:① 重启只是重启 dsh web(bridge 与手机端连接不受影响);② 重启后
+       * waitHarnessBack 会轮询到它回来并**自动刷新页面**,面板与「连接中→已连接」流程继续跑完。
+       * 安全阀:① 面板不可见(用户没在看)→ 不计时,回来再继续;② 15 秒倒计时内可一键取消,
+       * 取消标记按本次 pending 事件(at 时间戳)持久化,同一事件不再自动重启(下次安装/更新会重新触发);
+       * ③ 面板上有其他操作在跑(busy≠"")→ 暂停计时,避免打断用户正在做的事。
+       */
+      var AUTO_RESTART_DELAY_MS = 15000;
+      var RESTART_CANCEL_KEY = "dsh-remote-auto-restart-cancelled";
+
+      function autoRestartCancelled(at) {
+        try { return localStorage.getItem(RESTART_CANCEL_KEY) === String(at || ""); } catch (e) { return false; }
+      }
+      function markAutoRestartCancelled(at) {
+        try { localStorage.setItem(RESTART_CANCEL_KEY, String(at || "")); } catch (e) { /* 忽略 */ }
+      }
+
       /** 轮询等待 harness 回来；观察到「断过又恢复」或等待足够久后自动刷新页面。 */
       var waitHarnessBack = function (tries, sawDown) {
         if (tries > 40) { setMsg("err", "重启后仍未就绪，请手动刷新页面或重启 DeepSeek harness。"); setBusy(""); return; }
@@ -2402,6 +2427,31 @@ window.__ModuleLoader__.load({
         );
       }
 
+      // 【自动化】待重启时自动倒计时重启(见 autoRestartCancelled 说明);倒计时只在面板可见且无其他操作时推进
+      useEffect(function () {
+        if (!restartPending || busy !== "" || restartCancelled) { setRestartCountdown(null); return undefined; }
+        var at = restartInfo.at || 0;
+        if (autoRestartCancelled(at)) { setRestartCountdown(null); return undefined; }
+        var left = Math.round(AUTO_RESTART_DELAY_MS / 1000);
+        setRestartCountdown(left);
+        var iv = setInterval(function () {
+          if (document.hidden) return; // 用户没在看 → 暂停计时
+          left -= 1;
+          if (left > 0) { setRestartCountdown(left); return; }
+          clearInterval(iv);
+          setRestartCountdown(0);
+          restartHarness(); // 已有实现:重启 + 轮询等它回来 + 自动刷新页面
+        }, 1000);
+        return function () { clearInterval(iv); };
+      }, [restartPending, restartInfo.at, busy, restartCancelled]);
+
+      /** 取消本次自动重启(按事件持久化:同一 pending 事件不再自动重启)。 */
+      var cancelAutoRestart = function () {
+        markAutoRestartCancelled(restartInfo.at || 0);
+        setRestartCancelled(true);
+        setRestartCountdown(null);
+      };
+
       /** 交流群弹窗（复用满意度弹窗的 dru-popup 视觉；点遮罩/关闭即收起）。 */
       function renderCommunityModal() {
         if (!commOpen || !(community && community.qrcode)) return null;
@@ -2442,13 +2492,32 @@ window.__ModuleLoader__.load({
                     restartInfo.kind === "update" ? "在线更新已完成，需要重启 DeepSeek harness" : "首次安装需要重启 DeepSeek harness"),
                   h("div", { className: "dru-restart-alert-sub" },
                     "插件本体与「远程访问」面板是在 DeepSeek harness 启动时装载的，重启之后即可正常使用（账号、二维码、bridge 全部生效）。"),
+                  // 【自动化】待重启时自动倒计时重启(用户零操作);倒计时期间可一键取消
+                  restartCountdown !== null && restartCountdown > 0
+                    ? h("div", { className: "dru-restart-auto", role: "status" },
+                        h("span", { className: "loading" }),
+                        h("span", null, "安装已完成，将在 " + restartCountdown + " 秒后自动重启 DeepSeek harness（页面会自动恢复，无需操作）"))
+                    : null,
+                  restartCountdown === 0
+                    ? h("div", { className: "dru-restart-auto", role: "status" }, h("span", { className: "loading" }), h("span", null, "正在自动重启…"))
+                    : null,
+                  restartCancelled && restartCountdown === null
+                    ? h("div", { className: "dru-restart-auto muted" }, "已取消自动重启 —— 你也可以随时点下面的按钮完成安装")
+                    : null,
                   h("div", { className: "dru-actions", style: { marginTop: 10 } },
                     h("button", {
                       type: "button",
                       className: "dru-btn dru-btn-primary",
                       disabled: busy !== "",
                       onClick: function () { restartHarness(); }
-                    }, busy === "restart" ? "重启中…" : "重启 DeepSeek harness")
+                    }, busy === "restart" ? "重启中…" : (restartCountdown !== null && restartCountdown > 0 ? "立即重启（不用等）" : "重启 DeepSeek harness")),
+                    restartCountdown !== null && restartCountdown > 0
+                      ? h("button", {
+                          type: "button",
+                          className: "dru-btn dru-btn-ghost",
+                          onClick: cancelAutoRestart
+                        }, "取消自动重启")
+                      : null
                   )
                 )
               )
