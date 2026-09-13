@@ -11,10 +11,16 @@
 //     彻底卸载=profile 插件清理（uninstallSelf）+ 运行时清理（uninstallRuntime：停 bridge 自启动 /
 //     删 plist|unit / 杀残留进程 / 清空配置目录 ~/.dsh-remote），0.4.7 起回归真正「未安装」状态
 //   - 运行时自愈：缺运行环境自动后台安装、登录后自动拉起 bridge（0.4.2 起）
+//   - 登录后自动闭环（0.6.4）：GET /dsh-remote/bridge-status 下发连接阶段
+//     （no_account/no_runtime/installing/starting/connecting/online/error），并在返回前自动补装运行环境、
+//     拉起 bridge、清理卡死标记（带退避）；区分「bridge 进程在跑」与「设备已在中继注册成功（online）」。
+//     面板用 2~3s 短轮询自动推进到 online（无需点按钮/刷新页面），error 才给重试与诊断信息；
+//     另 POST /dsh-remote/connect/retry 手动重试、POST <api>/api/install-report 上报安装口径
+//     （install_source/version + host_os/arch，详见 installSourceOf）。
 //   - 0.1.2+ ?token 浏览器鉴权会话代持（0.4.1 起）
 //
 // 不依赖任何第三方包：只使用 node 内置模块与 cordis 注入的 webServer 服务。
-import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync, accessSync, chmodSync, openSync, closeSync, rmSync, statSync, constants as fsConstants } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync, accessSync, chmodSync, openSync, closeSync, readSync, fstatSync, rmSync, statSync, constants as fsConstants } from "node:fs";
 import { join, dirname, sep } from "node:path";
 import { execSync, spawn } from "node:child_process";
 import { homedir, platform } from "node:os";
@@ -371,6 +377,10 @@ function manualStatus() {
   })();
   const watcher = [];
   const bridge = [];
+  // 全部 bridge 子进程（含 launchd 托管链里的）：连接阶段判定「bridge 进程真的在跑」用它。
+  // launchd 作业本身跑的是 watcher（dsh-setup.mjs run），它再拉起 dsh-bridge.mjs 子进程——
+  // 只看 launchd.running 会把「watcher 在、bridge 子进程没起来」误判成「进程在跑」。
+  const allBridge = [];
   // 取候选进程的父 pid，判断是否属于 launchd 托管链
   const parentOf = (pid) => {
     const r = sh(`ps -o ppid= -p ${pid}`);
@@ -383,11 +393,17 @@ function manualStatus() {
     if (!m) continue;
     const pid = Number(m[1]);
     if (pid === process.pid || pid === launchdPid) continue;
-    if (launchdPid !== null && parentOf(pid) === launchdPid) continue; // launchd 托管的 bridge 子进程
-    if (/dsh-setup\.mjs/.test(m[2])) watcher.push(pid);
-    else if (/dsh-bridge\.mjs/.test(m[2])) bridge.push(pid);
+    const launchdManaged = launchdPid !== null && parentOf(pid) === launchdPid;
+    if (/dsh-setup\.mjs/.test(m[2])) {
+      if (!launchdManaged) watcher.push(pid);
+      continue;
+    }
+    if (/dsh-bridge\.mjs/.test(m[2])) {
+      allBridge.push(pid);
+      if (!launchdManaged) bridge.push(pid); // launchd 托管的 bridge 子进程（原语义：不计入 manual.bridge）
+    }
   }
-  return { watcher, bridge };
+  return { watcher, bridge, allBridge };
 }
 
 // ---------- 插件市场一键全功能：缺桌面运行环境时自动后台安装 dsh-remote ----------
@@ -395,6 +411,13 @@ function manualStatus() {
 const PROVISION_MARKER = ".dsh-setup-installing";
 const AUTO_INSTALL_LOG = ".dsh-setup-install.log";
 const STALE_MARKER_MS = 30 * 60 * 1000; // 超过该时长视为上次进程残留，插件启动时清理
+/**
+ * 「本次运行环境是插件自愈补装的」记录文件（install_source 判据）：
+ * 插件市场只装面板插件时，桌面运行环境由插件后台 `npx @mrrisega/dsh-remote` 补上，
+ * 这条路径归为 install_source=plugin_market；由用户自己跑安装器的（plist 里带
+ * DSH_BRIDGE_INSTALL_SOURCE=npx）归为 npx。见 installSourceOf()。
+ */
+const PROVISIONED_MARKER = ".dsh-provisioned-by-plugin";
 /**
  * 自愈 watcher 轮询间隔（默认 12s）。DSH_RELAY_SELFHEAL_MS 可覆盖——仅供测试把
  * 崩溃循环自愈链路压到亚秒级验证，生产不必设置。调用时读取（而非模块加载时固定），
@@ -436,10 +459,18 @@ function ensureRuntime(relayDir) {
     const log = join(relayDir, AUTO_INSTALL_LOG);
     const child = spawn(npxCommand(), ["--yes", UPDATE_SPEC], {
       detached: true,
-      env: spawnEnv({ npm_config_registry: "https://registry.npmjs.org" }),
+      // DSH_BRIDGE_INSTALL_SOURCE：本机运行环境是插件自愈补的 → 安装器原样透传到 plist/bridge env，
+      // 于是设备行上的 install_source 如实记成 plugin_market（而不是安装器默认的 npx）。
+      env: spawnEnv({ npm_config_registry: "https://registry.npmjs.org", DSH_BRIDGE_INSTALL_SOURCE: "plugin_market" }),
       stdio: ["ignore", openSync(log, "a"), openSync(log, "a")]
     });
     writeMarker(marker, child.pid); // 记 pid：宿主重启后可立即清理死进程残留
+    // 记下「本机运行环境是插件自愈补的」：登录后的 /api/install-report 与 bridge 设备登记
+    // 都据此上报 install_source=plugin_market（区分用户自己跑 npx 安装器的那条路径）。
+    try {
+      writeFileSync(join(relayDir, PROVISIONED_MARKER),
+        JSON.stringify({ at: Date.now(), version: PLUGIN_VERSION, source: "plugin_market" }));
+    } catch { /* 非关键：上报时按缺省判据降级 */ }
     const clear = () => { try { rmSync(marker, { force: true }); } catch { /* ignore */ } };
     child.on("exit", (code) => {
       clear();
@@ -476,7 +507,7 @@ function writeAutostartFile(relayDir) {
   <key>ThrottleInterval</key><integer>10</integer>
   <key>StandardOutPath</key><string>${join(relayDir, ".dsh-bridge.log")}</string>
   <key>StandardErrorPath</key><string>${join(relayDir, ".dsh-bridge.log")}</string>
-  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string></dict>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string><key>DSH_BRIDGE_INSTALL_SOURCE</key><string>${installSourceOf(relayDir)}</string><key>DSH_BRIDGE_INSTALL_VERSION</key><string>${PLUGIN_VERSION}</string></dict>
 </dict></plist>`;
   mkdirSync(dirname(plistPath), { recursive: true });
   writeFileSync(plistPath, plist, { mode: 0o644 });
@@ -901,6 +932,8 @@ async function relayFetch(relayDir, pathname, init) {
   try {
     // 6s 超时：relay 不可达时快速降级，不拖慢面板
     const res = await fetch(url, { ...init, signal: AbortSignal.timeout(6000) });
+    // 企业端拒绝当前 JWT（过期/轮换）→ 立刻让 token 缓存失效，下一次请求重新认证
+    if (res.status === 401 || res.status === 403) invalidateRelayToken(relayDir);
     const text = await res.text();
     let body = null;
     try {
@@ -1014,6 +1047,38 @@ const AUTH_RELAY_NOT_READY = "relay_not_ready";     // 凭证齐全但企业端�
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * relay token 短期缓存（60s）：连接阶段的 2~3s 短轮询会反复取 token，若每次都走 device-login
+ * （即账号密码认证），就会**每几秒打一次企业端认证接口**——审计日志刷屏、可能触发限流，且纯属浪费。
+ *   - TTL 60s：远短于 JWT 自身有效期；账号密码/共享密钥变更最多 60s 生效；
+ *   - 键含 api_url + 账号 + 模式：换账号、切自建/云端、换服务端会自动 miss；
+ *   - 并发合并（relayTokenInflight）：同一时刻多个请求共用一次认证；
+ *   - 只缓存成功结果；企业端回 401/403（JWT 过期/轮换）时 relayFetch 立即 invalidateRelayToken。
+ */
+const RELAY_TOKEN_TTL_MS = 60_000;
+const relayTokenCache = new Map();    // relayDir → { key, token, exp, status }
+const relayTokenInflight = new Map(); // relayDir → { key, promise }
+/** 缓存键：同一台机器换了账号/服务端/模式时自动失效，避免把别人的 token 用错地方。 */
+function relayTokenKeyOf(cfg) {
+  return [
+    (cfg.api_url || DEFAULT_API).replace(/\/+$/, ""),
+    cfg.local_key ? "local" : "saas",
+    cfg.local_key ? String(cfg.local_key).slice(0, 8) : (cfg.phone || cfg.email || ""),
+  ].join("|");
+}
+/** 丢弃某 relayDir 的 token 缓存（账号变更、退出登录、企业端拒绝 JWT 时调用）。 */
+function invalidateRelayToken(relayDir) {
+  if (!relayDir) return;
+  relayTokenCache.delete(relayDir);
+  deviceProbeCache.delete(relayDir); // 认证失效时「设备探活」结论同样过期（否则 15s 内不会重试）
+}
+/**
+ * 账号设备表探活缓存（见 accountDeviceBound）：企业端每次 GET /api/devices 都会写一行活跃明细
+ * （user_activity），因此绝不跟着 2.5s 的 UI 轮询打——15s 一次，且只在与中继注册证据缺失时才探。
+ */
+const DEVICE_PROBE_TTL_MS = 15_000;
+const deviceProbeCache = new Map(); // relayDir → { at, value }
+
 /** 单次 device-login：返回 { ok, status, token, code, detail }（不抛错，便于按原因降级/重试）。 */
 async function deviceLoginOnce(api, cfg, secret) {
   try {
@@ -1065,8 +1130,35 @@ async function localLoginOnce(cfg, api) {
  * ③ 网络抖动/5xx 退避重试一次；④ 失败时给出**可判定原因**而非空串（消除“尚未登录”误报）。
  * @returns {Promise<{token:string, reason:string, status:number, detail:string}>}
  */
-async function relayTokenWithReason(relayDir, cfgOverride) {
+async function relayTokenWithReason(relayDir, cfgOverride, opts = {}) {
   const cfg = cfgOverride && typeof cfgOverride === "object" ? { ...loadConfig(relayDir), ...cfgOverride } : loadConfig(relayDir);
+  const key = relayTokenKeyOf(cfg);
+  const now = Date.now();
+  const hit = relayTokenCache.get(relayDir);
+  if (!opts.force && hit && hit.key === key && hit.token && now < hit.exp) {
+    return { token: hit.token, reason: "", status: hit.status || 200, detail: "", cached: true };
+  }
+  // 并发合并：同一时刻的多个请求（状态轮询 / 二维码 / 设备列表 / 上报）共用一次认证
+  const flying = relayTokenInflight.get(relayDir);
+  if (!opts.force && flying && flying.key === key) return flying.promise;
+  const promise = relayTokenUncached(relayDir, cfg, cfgOverride).then((res) => {
+    if (res && res.token) {
+      relayTokenCache.set(relayDir, { key, token: res.token, exp: Date.now() + RELAY_TOKEN_TTL_MS, status: res.status || 200 });
+    } else {
+      relayTokenCache.delete(relayDir); // 失败不缓存：下一轮立刻重试
+    }
+    relayTokenInflight.delete(relayDir);
+    return res;
+  }, (e) => {
+    relayTokenInflight.delete(relayDir);
+    throw e;
+  });
+  relayTokenInflight.set(relayDir, { key, promise });
+  return promise;
+}
+
+/** 未缓存的真实取 token 逻辑（relayTokenWithReason 的缓存/合并外壳在这里之上一层）。 */
+async function relayTokenUncached(relayDir, cfg, cfgOverride) {
   const api = (cfg.api_url || DEFAULT_API).replace(/\/+$/, "");
   if (cfg.local_key) {
     let r = await localLoginOnce(cfg, api);
@@ -1470,6 +1562,10 @@ async function composeStatus(relayDir) {
     // 是否需要重启 DeepSeek harness（首次安装 / 在线更新后必须重启才加载插件本体）：
     // {pending, kind: first-install|update, reason, at}，供面板顶部醒目提示 + 重启按钮。
     restart: readRestartState(relayDir),
+    // 连接阶段（登录后自动闭环：环境 → bridge 进程 → 设备已在中继注册）：
+    // 面板用它显示「正在准备运行环境…/正在启动 Bridge…/正在连接中继…/已连接 ✅」，
+    // 并用 /dsh-remote/bridge-status 以 2~3s 短轮询自动推进（无需用户点按钮或刷新页面）。
+    connect: await composeConnect(relayDir, { cfg, launchd, manual }),
     // 隐私审计(2026-09):不再下发真实 hostname(移除 host 字段)——设备标识统一走 deviceId/服务端登记名
   };
 }
@@ -1608,7 +1704,9 @@ function spawnUpdater(relayDir, extraEnv) {
   return spawn(npxCommand(), ["--yes", UPDATE_SPEC], {
     detached: true,
     cwd: homedir(),
-    env: spawnEnv(extraEnv), // PATH 补 node 目录：App 最小 PATH 下也能跑 npx
+    // PATH 补 node 目录：App 最小 PATH 下也能跑 npx；同时保持本机既有的安装来源口径
+    // （在线更新会重跑安装器并重写 plist，若不带来源就会把 plugin_market 误记成 npx）。
+    env: spawnEnv({ DSH_BRIDGE_INSTALL_SOURCE: installSourceOf(relayDir), ...(extraEnv || {}) }),
     stdio: ["ignore", openSync(log, "a"), openSync(log, "a")]
   });
 }
@@ -1714,6 +1812,440 @@ function uninstallSelf(relayDir, profileDir, patchFile, pkgFile) {
 // ---------- 路由 ----------
 
 /** 路由表：{method, path, handler}。 */
+// ---------- 登录后自动闭环：连接阶段（运行环境 → bridge 进程 → 设备已在中继注册=online） ----------
+
+/**
+ * 生产现场（2026-09，id 42~52 共 11 个真实注册用户）：7 人注册后手机端 /api/devices 一直是空列表，
+ * 多人反复点「生成访问链接」（auth.key_create 10~23 次）而 device.bind 始终为 0——他们的电脑端
+ * bridge 从未连上过中继。典型路径：注册 → 手机端拿不到设备 → 反复轮询 → 放弃。
+ *
+ * 缺口不是某个按钮坏了，而是「登录 → 设备已在中继注册成功」这条链路既不可见也不自动：
+ * 用户看不出卡在哪一步（运行环境没装？bridge 没起？还是没注册上中继？），也不知道要不要刷新页面。
+ *
+ * 本段把链路拆成可查询的阶段（GET /dsh-remote/bridge-status），并刻意区分两个极易混淆的状态：
+ *   - starting ：「bridge 进程已在跑」——只说明进程起来了；
+ *   - online   ：「设备已在中继注册成功」——手机端能看到并进入这台电脑，这才是用户要的「能用了」。
+ * 阶段推进所需的动作（补装运行环境 / 拉起 bridge / 可重试错误退避重试）全部由 ensureConnection
+ * 在轮询里自动完成，用户零操作、零刷新；只有「彻底失败」才给按钮，且永远留一条可走的路。
+ */
+const BRIDGE_LOG_FILE = ".dsh-bridge.log";
+const BRIDGE_STATE_FILE = ".dsh-bridge-state.json";
+const BIND_ERROR_FILE = ".bind-error.json";
+/** 安装标记超时（进程已死或超 10 分钟）→ 视为卡死，清掉标记重新补装（否则 marker 会把补装永久挡住）。 */
+const INSTALL_STALE_MS = 10 * 60 * 1000;
+/** 设备登记失败提示只在一小时内当作「当前故障」（.bind-error.json 是持久文件，成功时才被清掉）。 */
+const BIND_ERROR_FRESH_MS = 60 * 60 * 1000;
+/** 自动重试退避（毫秒）：可重试错误按此节奏自动重试，用尽后停在 60s（仍会自动重试，不出现死胡同）。 */
+const CONNECT_BACKOFF_MS = [2000, 4000, 8000, 16_000, 30_000, 60_000];
+
+/** 连接阶段文案（面向非技术用户；node 半算好，面板直接显示，避免两端各写一套）。 */
+const CONNECT_TEXT = {
+  no_account: "请先登录手机号账号（下方「🔑 账号」卡片），登录后会自动完成剩余步骤",
+  no_runtime: "正在准备运行环境（首次约 1~2 分钟）…",
+  installing: "正在准备运行环境（首次约 1~2 分钟）…",
+  starting: "正在启动 Bridge…",
+  connecting: "正在连接中继…",
+  online: "已连接 ✅ 现在可以用手机扫码访问",
+  error: "连接失败，请按下方提示处理",
+};
+const CONNECT_PHASES = ["no_account", "no_runtime", "installing", "starting", "connecting", "online", "error"];
+
+/** 每个 relayDir 的连接状态簿（尝试次数 / 退避 / 上报节流）：放内存，进程重启即重置。 */
+const connectBooks = new Map();
+function connectBook(relayDir) {
+  let b = connectBooks.get(relayDir);
+  if (!b) {
+    b = { attempts: 0, lastAttemptAt: 0, reportAt: 0 };
+    connectBooks.set(relayDir, b);
+  }
+  return b;
+}
+/** 已尝试 attempts 次后的退避时长。 */
+function connectBackoffMs(attempts) {
+  const i = Math.min(Math.max(attempts, 0), CONNECT_BACKOFF_MS.length - 1);
+  return CONNECT_BACKOFF_MS[i];
+}
+/** 本机是否已有可用账号凭据（SaaS 账号或自建访问密钥）——没有就谈不上自动连接，先引导登录。 */
+function hasAccountCreds(cfg) {
+  return Boolean((cfg.phone || cfg.email) && cfg.password) || Boolean(cfg.local_key);
+}
+
+/** 读文件尾部（日志可能很长，只取末尾用于判定最近一次连接结果）。 */
+function readTail(filePath, maxBytes = 64 * 1024) {
+  try {
+    const fd = openSync(filePath, "r");
+    try {
+      const size = fstatSync(fd).size;
+      const start = Math.max(0, size - maxBytes);
+      const buf = Buffer.alloc(size - start);
+      readSync(fd, buf, 0, buf.length, start);
+      return buf.toString("utf8");
+    } finally {
+      closeSync(fd);
+    }
+  } catch { return ""; }
+}
+
+/** 读取 bridge 写的状态文件（新版 bridge 会写；旧版没有 → 走日志/账号兜底判据）。 */
+function bridgeStateFile(relayDir) {
+  try {
+    const j = JSON.parse(readFileSync(join(relayDir, BRIDGE_STATE_FILE), "utf8"));
+    return j && typeof j === "object" ? j : null;
+  } catch { return null; }
+}
+
+/**
+ * 从 bridge 日志尾部判定「最近一次连接是否注册成功」。
+ * 依据 dsh-bridge.mjs 的既有输出：`✅ 设备已登记到账号` / `✅ router 注册成功`；
+ * 出现新一轮连接（`隧道已连`）或登记失败/拒绝时，之前那次成功不再代表当前状态。
+ */
+function bridgeLogState(relayDir) {
+  const tail = readTail(join(relayDir, BRIDGE_LOG_FILE));
+  if (!tail) return { tunnelRegistered: false, accountBound: false, lastError: "" };
+  let tunnelRegistered = false;
+  let accountBound = false;
+  let lastError = "";
+  for (const raw of tail.split("\n")) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (/✅\s*router 注册成功/.test(line)) { tunnelRegistered = true; lastError = ""; continue; }
+    if (/✅\s*设备已登记到账号/.test(line)) { accountBound = true; lastError = ""; continue; }
+    if (/隧道已连|\[dsh-remote\] dsh web 在线，启动 bridge|bridge 退出/.test(line)) {
+      tunnelRegistered = false;
+      accountBound = false;
+      continue;
+    }
+    if (/拒绝注册|注册发送失败|设备登记失败|无法连接账号 API|设备数已达上限/.test(line)) {
+      tunnelRegistered = false;
+      accountBound = false;
+      lastError = line.slice(0, 300);
+    }
+  }
+  return { tunnelRegistered, accountBound, lastError };
+}
+
+/** 读取设备登记失败提示（bridge 在 409/网络失败时写 .bind-error.json）。 */
+function readBindError(relayDir) {
+  try {
+    const f = join(relayDir, BIND_ERROR_FILE);
+    if (!existsSync(f)) return null;
+    const j = JSON.parse(readFileSync(f, "utf8"));
+    return j && typeof j === "object" ? j : null;
+  } catch { return null; }
+}
+
+/** 运行环境安装状态：installing=安装子进程在跑；stale=标记超时/进程已死（可清掉重来）。 */
+function installStateOf(relayDir) {
+  const marker = join(relayDir, PROVISION_MARKER);
+  if (!existsSync(marker)) return { installing: false, stale: false, at: 0 };
+  const info = readMarkerInfo(marker) || {};
+  const at = Number(info.at) || 0;
+  const pidDead = info.pid ? pidAlive(Number(info.pid)) === false : false;
+  const stale = pidDead || (at > 0 && Date.now() - at > INSTALL_STALE_MS);
+  return { installing: !stale, stale, at };
+}
+
+/** 清掉卡死的安装标记（下轮 ensureRuntime 才能重新拉起补装）。 */
+function clearStaleInstallMarker(relayDir) {
+  try {
+    rmSync(join(relayDir, PROVISION_MARKER), { force: true });
+    appendLogLine(relayDir, AUTO_INSTALL_LOG, "[dsh-remote-web] 清理卡死的安装标记（安装进程已退出或超时），将重新补装运行环境");
+    return true;
+  } catch { return false; }
+}
+
+/** 账号设备表里是否已登记本机 device_id（手机端 /api/devices 能看到的那一份）+ 节流缓存。 */
+async function accountDeviceBound(relayDir, cfg) {
+  const deviceId = String(cfg.device_id || "");
+  if (!deviceId) return { bound: false, reason: "no_device_id" };
+  const cached = deviceProbeCache.get(relayDir);
+  if (cached && Date.now() - cached.at < DEVICE_PROBE_TTL_MS) return cached.value;
+  const done = (value) => { deviceProbeCache.set(relayDir, { at: Date.now(), value }); return value; };
+  const token = await relayToken(relayDir).catch(() => "");
+  if (!token) return done({ bound: false, reason: "no_token" });
+  const api = (cfg.api_url || DEFAULT_API).replace(/\/+$/, "");
+  try {
+    const r = await fetch(`${api}/api/devices`, {
+      headers: { authorization: `Bearer ${token}`, "x-dsh-client": `dsh-remote-web/${PLUGIN_VERSION}` },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!r.ok) {
+      if (r.status === 401 || r.status === 403) invalidateRelayToken(relayDir); // JWT 过期/轮换 → 下次重新认证
+      return done({ bound: false, reason: `http_${r.status}` });
+    }
+    const body = await r.json().catch(() => null);
+    const list = Array.isArray(body?.devices) ? body.devices : Array.isArray(body) ? body : [];
+    const bound = list.some((d) => String(d?.id || d?.device_id || "") === deviceId);
+    return done({ bound, reason: bound ? "" : "not_in_list", count: list.length });
+  } catch (e) {
+    return done({ bound: false, reason: `unreachable: ${e.message}` });
+  }
+}
+
+/**
+ * 计算当前连接阶段（纯读，不做任何系统操作）。
+ * 阶段：no_account | no_runtime | installing | starting | connecting | online | error
+ * 判据严格区分「进程在跑」与「已在中继注册」：
+ *   online 需要 bridge 进程在跑 **且** 有中继注册证据（状态文件 > 日志 > 账号设备表）。
+ */
+async function composeConnect(relayDir, opts = {}) {
+  const cfg = opts.cfg || loadConfig(relayDir);
+  const launchd = opts.launchd || launchdStatus();
+  const manual = opts.manual || manualStatus();
+  const book = connectBook(relayDir);
+  const now = Date.now();
+  const hasAcct = hasAccountCreds(cfg);
+  const runtime = runtimeReady(relayDir);
+  const inst = installStateOf(relayDir);
+  const bridgePids = Array.isArray(manual.allBridge) ? manual.allBridge : [];
+  const bridgeRunning = Boolean(launchd.running || bridgePids.length > 0 || (manual.bridge || []).length > 0);
+  const bindError = readBindError(relayDir);
+  const bindFresh = Boolean(bindError && (!bindError.at || now - Number(bindError.at) < BIND_ERROR_FRESH_MS));
+  const log = bridgeLogState(relayDir);
+  const state = bridgeStateFile(relayDir);
+  const deviceId = String(cfg.device_id || "");
+
+  // ── 中继注册证据（只有 bridge 进程在跑时才算「现在能用」） ──
+  let registered = false;
+  let registerSource = "";
+  if (runtime && bridgeRunning) {
+    if (state && state.phase === "online" && Number(state.tunnel_registered_at) > 0) {
+      registered = true; registerSource = "state";
+    } else if (log.tunnelRegistered) {
+      registered = true; registerSource = "tunnel";
+    } else if (state && Number(state.account_bound_at) > 0) {
+      registered = true; registerSource = "state_account";
+    } else if (log.accountBound) {
+      registered = true; registerSource = "account";
+    } else if (hasAcct) {
+      const probe = await accountDeviceBound(relayDir, cfg);
+      if (probe.bound) { registered = true; registerSource = "account_api"; }
+    }
+  }
+
+  let phase;
+  let error = null;
+  let detail = "";
+  let retryable = true;
+  if (UNINSTALLED_DIRS.has(relayDir)) {
+    phase = "error"; retryable = false;
+    error = { code: "uninstalled", message: "本插件已彻底卸载，重启 dsh web 后不再自动启动 bridge" };
+    detail = error.message;
+  } else if (!hasAcct) {
+    phase = "no_account"; retryable = false;
+    detail = "尚未登录账号：登录后会自动补装运行环境 → 启动 bridge → 连接中继，全程无需其他操作。";
+  } else if (!runtime) {
+    if (inst.stale) {
+      phase = "error";
+      error = {
+        code: "install_stuck",
+        message: "运行环境安装没有完成（上次安装进程已退出或超时），已清理残留标记并准备重新安装",
+      };
+      detail = error.message;
+    } else {
+      phase = inst.installing ? "installing" : "no_runtime";
+      detail = inst.installing
+        ? "正在后台安装运行环境（bridge 本体），首次约 1~2 分钟，装完会自动启动。"
+        : "检测到缺少运行环境，正在后台自动安装（首次约 1~2 分钟），无需任何操作。";
+    }
+  } else if (!bridgeRunning) {
+    if (launchd.crashing) {
+      phase = "error";
+      error = {
+        code: "launchd_crash",
+        message: `后台服务反复启动失败（launchd state=${launchd.state || "?"}，lastExit=${launchd.lastExitCode ?? "?"}）`,
+      };
+      detail = "已自动清理失效的自启动项并重新拉起，稍候会自动恢复。";
+    } else if (bindFresh && bindError) {
+      phase = "error";
+      error = { code: bindError.code || "bind_failed", message: bindError.message || "设备登记失败" };
+      detail = "bridge 因设备登记失败退出，已进入自动重试；请按提示处理后重试。";
+    } else {
+      phase = "starting";
+      detail = launchd.running
+        ? "后台服务已启动，正在等待 bridge 进程就绪…"
+        : "正在启动后台服务（bridge），通常几秒内完成，无需任何操作。";
+    }
+  } else if (registered) {
+    phase = "online";
+    detail = registerSource === "account_api" || registerSource === "account" || registerSource === "state_account"
+      ? "设备已登记到你的账号：手机端「设备列表」能看到这台电脑，扫码/打开链接即可进入。"
+      : "bridge 已注册到中继：手机端扫码/打开链接即可进入这台电脑。";
+  } else if (bindFresh && bindError) {
+    phase = "error";
+    error = { code: bindError.code || "bind_failed", message: bindError.message || "设备登记失败" };
+    detail = bindError.code === "device_limit_exceeded"
+      ? "已达本套餐设备数上限：同机重装会自动顶替旧设备；仍失败请到手机端「设备管理」解绑旧设备后点「重试」。"
+      : "请确认网络与账号状态后点「重试」；仍不成功可点「复制诊断信息」发给客服。";
+  } else {
+    phase = "connecting";
+    detail = "bridge 进程已在运行，正在等待设备注册到中继…通常几秒内完成。";
+  }
+
+  const wait = connectBackoffMs(book.attempts);
+  const elapsed = book.lastAttemptAt ? now - book.lastAttemptAt : wait;
+  const autoRetrying = phase !== "online" && phase !== "no_account" && retryable !== false;
+  const nextRetryInMs = autoRetrying ? Math.max(0, wait - elapsed) : 0;
+  const conn = {
+    phase,
+    online: phase === "online",
+    text: CONNECT_TEXT[phase] || "正在连接…",
+    detail,
+    retryable: retryable !== false,
+    deviceId,
+    runtimeReady: runtime,
+    installing: inst.installing,
+    installStale: inst.stale,
+    bridgeRunning,
+    bridgePids,
+    launchdState: launchd.state || "",
+    launchdCrashLoop: Boolean(launchd.crashing),
+    registered,
+    registerSource,
+    attempts: book.attempts,
+    nextRetryInMs,
+    error,
+    bindError: bindFresh && bindError ? { code: bindError.code || "", message: bindError.message || "" } : null,
+    logPath: join(relayDir, BRIDGE_LOG_FILE),
+    installLogPath: join(relayDir, AUTO_INSTALL_LOG),
+  };
+  conn.diagnostics = buildConnectDiagnostics(relayDir, conn, log);
+  return conn;
+}
+
+/** 可复制的诊断信息（面板「复制诊断信息」按钮）：版本 / relayDir / 阶段 / 最近错误 / 进程状态 / 日志路径。 */
+function buildConnectDiagnostics(relayDir, conn, log) {
+  return [
+    "dsh-remote 连接诊断",
+    `插件版本: ${PLUGIN_VERSION}`,
+    `配置目录: ${relayDir}`,
+    `连接阶段: ${conn.phase}（${conn.text}）`,
+    `设备 ID: ${conn.deviceId || "（未生成）"}`,
+    `运行环境: ${conn.runtimeReady ? "已就绪" : "缺失"}${conn.installing ? "（后台安装中）" : ""}${conn.installStale ? "（安装标记已超时）" : ""}`,
+    `bridge 进程: ${conn.bridgeRunning ? "在运行" : "未运行"}（pid=${conn.bridgePids && conn.bridgePids.length ? conn.bridgePids.join(",") : "-"}，launchd state=${conn.launchdState || "-"}，崩溃循环=${conn.launchdCrashLoop ? "是" : "否"}）`,
+    `中继注册: ${conn.registered ? "已注册（" + conn.registerSource + "）" : "未注册"}`,
+    `最近错误: ${conn.error ? conn.error.code + ": " + conn.error.message : (log && log.lastError ? log.lastError : "无")}`,
+    `自动重试: 已尝试 ${conn.attempts} 次${conn.nextRetryInMs ? `，约 ${Math.ceil(conn.nextRetryInMs / 1000)} 秒后重试` : ""}`,
+    `bridge 日志: ${conn.logPath}`,
+    `安装日志: ${conn.installLogPath}`,
+    `时间: ${new Date().toISOString()}`,
+  ].join("\n");
+}
+
+/**
+ * 自动闭环的动作执行（幂等、内部退避）：
+ *   ① 缺运行环境 → ensureRuntime（后台 npx 补装；卡死的安装标记先清掉）；
+ *   ② 不再缺环境但没账号 → 什么都不做（先把登录引导交给 UI）；
+ *   ③ 有账号但 bridge 没在跑 → startBridge（运行环境缺失时它自己会拒绝并转补装）。
+ * 由面板的短轮询驱动（GET /dsh-remote/bridge-status），因此用户在登录后不需要点任何按钮、
+ * 也不需要刷新页面；退避避免失败时把 launchctl/npx 打成风暴。
+ */
+function ensureConnection(relayDir, opts = {}) {
+  if (UNINSTALLED_DIRS.has(relayDir)) return null;
+  const book = connectBook(relayDir);
+  if (opts.force) { book.attempts = 0; book.lastAttemptAt = 0; }
+  const now = Date.now();
+  if (!opts.force && book.lastAttemptAt && now - book.lastAttemptAt < connectBackoffMs(book.attempts)) return null;
+  const cfg = loadConfig(relayDir);
+  if (!hasAccountCreds(cfg)) return null; // 未登录：不补装也不拉服务，先让用户登录
+  if (!runtimeReady(relayDir)) {
+    if (installStateOf(relayDir).stale) clearStaleInstallMarker(relayDir);
+    book.lastAttemptAt = now;
+    book.attempts += 1;
+    ensureRuntime(relayDir);
+    return { action: "provision" };
+  }
+  const launchd = launchdStatus();
+  const manual = manualStatus();
+  if (launchd.running || (manual.allBridge || []).length || (manual.bridge || []).length) {
+    book.attempts = 0; // 进程已在跑：退避计数归零，后续只等注册
+    book.lastAttemptAt = now;
+    return { action: "none" };
+  }
+  if (launchd.crashing) reapBrokenAutostart(relayDir);
+  book.lastAttemptAt = now;
+  book.attempts += 1;
+  const r = startBridge(relayDir);
+  if (r && r.ok === false) {
+    appendLogLine(relayDir, AUTO_INSTALL_LOG,
+      `[dsh-remote-web] 自动启动 bridge 未成功(${r.status || "?"}): ${r.detail || ""}`);
+  }
+  return { action: "start", result: r };
+}
+
+/**
+ * 安装信息上报（插件侧通道）：登录后把本机安装信息发给企业端，供「已登录用户升级插件后刷新版本号」
+ * 之类的口径统计。无账号凭据不上报；失败静默（绝不阻塞面板、不弹错误）。
+ * 契约：POST <api_url>/api/install-report，头 `authorization: Bearer <device-login JWT>`，
+ * body { device_id?, install_source, install_version, host_os, host_arch }，成功 200 {ok:true}；
+ * 404/400 一律忽略（老服务端没有该接口时不能报错）。
+ */
+const INSTALL_REPORT_FILE = ".dsh-install-report.json";
+const INSTALL_REPORT_TTL_MS = 24 * 3600 * 1000;
+const INSTALL_SOURCES = new Set(["npx", "plugin_market"]);
+/** 本机安装来源判据：环境变量 > 插件自愈记录 > 有运行环境即安装器部署 > 默认插件路径。 */
+function installSourceOf(relayDir) {
+  const env = String(process.env.DSH_BRIDGE_INSTALL_SOURCE || "").trim();
+  if (INSTALL_SOURCES.has(env)) return env;
+  if (existsSync(join(relayDir, PROVISIONED_MARKER))) return "plugin_market";
+  if (runtimeReady(relayDir)) return "npx";
+  return "plugin_market";
+}
+async function reportInstallOnce(relayDir, cfgOverride, opts = {}) {
+  const cfg = cfgOverride || loadConfig(relayDir);
+  if (!hasAccountCreds(cfg)) return { ok: false, skipped: "no_credentials" };
+  const source = installSourceOf(relayDir);
+  const version = PLUGIN_VERSION;
+  const marker = join(relayDir, INSTALL_REPORT_FILE);
+  if (!opts.force) {
+    try {
+      const prev = JSON.parse(readFileSync(marker, "utf8"));
+      if (prev && prev.version === version && prev.source === source && Date.now() - Number(prev.at || 0) < INSTALL_REPORT_TTL_MS) {
+        return { ok: true, skipped: "already_reported" };
+      }
+    } catch { /* 首次上报 */ }
+  }
+  const token = await relayToken(relayDir).catch(() => "");
+  if (!token) return { ok: false, skipped: "no_token" };
+  const api = (cfg.api_url || DEFAULT_API).replace(/\/+$/, "");
+  const body = {
+    ...(cfg.device_id ? { device_id: String(cfg.device_id) } : {}),
+    install_source: source,
+    install_version: version,
+    host_os: process.platform,
+    host_arch: process.arch,
+  };
+  try {
+    const r = await fetch(`${api}/api/install-report`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+        "x-dsh-client": `dsh-remote-web/${version}`,
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(6000),
+    });
+    // 老服务端没有该接口（404）或字段不认（400）→ 忽略，绝不影响 UI
+    if (r.status === 400 || r.status === 404) return { ok: false, skipped: `http_${r.status}` };
+    if (!r.ok) return { ok: false, status: r.status };
+    try { writeFileSync(marker, JSON.stringify({ at: Date.now(), version, source })); } catch { /* 非关键 */ }
+    return { ok: true, status: r.status, install_source: source, install_version: version };
+  } catch (e) {
+    return { ok: false, skipped: `unreachable: ${e.message}` };
+  }
+}
+/** 上报节流入口（fire-and-forget）：失败最多 60s 再试一次；成功则按 version/source 去重。 */
+function maybeReportInstall(relayDir, opts = {}) {
+  const book = connectBook(relayDir);
+  const now = Date.now();
+  if (!opts.force && book.reportAt && now - book.reportAt < 60_000) return;
+  book.reportAt = now;
+  // 认证走 relayTokenWithReason（60s token 缓存 + 并发合并），因此启动/登录/轮询多次调用
+  // 也只会打一次 device-login，不会放大企业端认证请求。
+  reportInstallOnce(relayDir, null, opts).catch(() => { /* 静默失败：不影响 UI */ });
+}
+
 function registerRoutes(ctx, relayDir) {
   // 本插件所在 profile(由插件自身文件位置推导,覆盖市场 git 安装与本地 include 两种形态)
   let profileDir = join(homedir(), ".dsh", "profiles", "web");
@@ -1794,6 +2326,30 @@ function registerRoutes(ctx, relayDir) {
       path: "/dsh-remote/status",
       handler: async (_req, res) => {
         sendJson(res, 200, await composeStatus(relayDir));
+      },
+    },
+    // 连接阶段短轮询端点（面板 2~3s 一次，非 online 时自动推进；online 后退避到 15s）。
+    // 返回前先执行自动闭环动作（缺环境→补装 / 有账号没进程→拉起 / 卡死标记→清理），
+    // 于是「登录后自动连上」不需要任何按钮或刷新；每步都自带退避，失败不会打成风暴。
+    {
+      method: "GET",
+      path: "/dsh-remote/bridge-status",
+      handler: async (_req, res) => {
+        ensureConnection(relayDir);
+        maybeReportInstall(relayDir);
+        sendJson(res, 200, { ok: true, connect: await composeConnect(relayDir) });
+      },
+    },
+    // 手动重试（error 阶段的「重试」按钮）：清掉退避计数立刻再走一遍闭环。
+    {
+      method: "POST",
+      path: "/dsh-remote/connect/retry",
+      handler: async (_req, res) => {
+        const action = ensureConnection(relayDir, { force: true });
+        maybeReportInstall(relayDir, { force: true });
+        await sleep(600); // 给 launchctl 一点进入运行态的时间，重试点下去立刻能看到「正在启动 Bridge…」
+        const connect = await composeConnect(relayDir);
+        sendJson(res, 200, { ok: true, retried: true, action: action && action.action ? action.action : "none", connect });
       },
     },
     {
@@ -1919,7 +2475,10 @@ function registerRoutes(ctx, relayDir) {
           }
         }
         saveConfig(relayDir, cfg);
+        invalidateRelayToken(relayDir); // 账号可能变了：丢弃旧 token 缓存，立即用新账号认证
         const bridgeRestart = startBridge(relayDir);
+        // 登录成功即上报本机安装信息（企业端用于「升级插件后刷新版本号」口径）；失败静默。
+        maybeReportInstall(relayDir, { force: true });
         sendJson(res, 200, { ok: true, bridgeRestart, ...(await composeStatus(relayDir)) });
       },
     },
@@ -1932,6 +2491,7 @@ function registerRoutes(ctx, relayDir) {
         delete cfg.phone;
         delete cfg.password;
         saveConfig(relayDir, cfg);
+        invalidateRelayToken(relayDir); // 退出登录：token 缓存立即失效
         sendJson(res, 200, { ok: true, ...(await composeStatus(relayDir)) });
       },
     },
@@ -2053,7 +2613,10 @@ function registerRoutes(ctx, relayDir) {
         const smsCode = String(body.sms_code ?? "").trim();
         const password = String(body.password ?? "");
         if (!phone || !smsCode || !password) return sendJson(res, 400, { ok: false, error: "手机号、短信验证码与密码必填" });
-        const payload = { phone, sms_code: smsCode, password };
+        // 全量透传 body（不挑字段）：注册来源 reg_source（面板=panel_register／手机端网页=remoteweb_register）
+        // 等扩展字段必须原样进企业端，否则「用户从哪注册的」这类增长口径会全部丢失。
+        const payload = { ...body, phone, sms_code: smsCode, password };
+        delete payload.__parseError;
         const captchaId = body.captcha_id ?? body.captchaId;
         const captchaAnswer = body.captcha_answer ?? body.captcha;
         if (captchaId !== void 0) payload.captcha_id = String(captchaId);
@@ -2189,5 +2752,8 @@ export function apply(ctx, config = {}) {
   if (!provisioned && !runtimeReady(relayDir)) {
     ctx.logger?.info?.(`dsh-remote-web: 桌面运行环境缺失，已在后台自动安装（relayDir=${relayDir}）`);
   }
+  // 插件启动即上报本机安装信息（install_source/version + 主机 OS/架构；仅有账号凭据时上报，失败静默）。
+  // 面板登录成功（POST /dsh-remote/config）时会再上报一次，覆盖「已登录用户升级插件」的口径。
+  maybeReportInstall(relayDir);
   ctx.logger?.info?.(`dsh-remote-web: /dsh-remote routes ready (relayDir=${relayDir})`);
 }
