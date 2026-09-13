@@ -65,6 +65,20 @@ test("安装输出:真失败(dsh web 在运行但 bridge 没起来)必须给原�
   assert.ok(/\.dsh-bridge\.log/.test(failBranch), "真失败分支要给出日志路径供排查");
 });
 
+test("安装输出:跳过/不支持自启动时不得自相矛盾地显示「运行中」", () => {
+  const block = src.slice(src.indexOf("const webUp = await isDshWebUp();"));
+  // 三态判定必须存在:未安装 与 运行中/未运行 分开
+  assert.ok(/const svcSkipped = st\.status === "skipped"/.test(block), "应识别 skipped/unsupported/无路径三态");
+  assert.ok(/未安装（本次显式跳过）/.test(block), "显式跳过要说清是跳过");
+  assert.ok(/未安装（当前平台不支持自启动）/.test(block), "平台不支持要说清原因");
+  // 跳过分支的文案里不能出现「运行中」
+  const skippedBranch = block.slice(block.indexOf("if (svcSkipped) {"), block.indexOf("} else if (!st.ok && !webUp) {"));
+  const texts = (skippedBranch.match(/L\.push\((`[^`]*`|"[^"]*")/g) || []).join("\n");
+  assert.ok(!/运行中/.test(texts), `未安装自启动服务时不得声称「运行中」:\n${texts}`);
+  // 未安装时也不该承诺「打开 dsh web 就会自动启动」(那是自启动服务在管)
+  assert.ok(!/自动启动/.test(texts), "未安装自启动服务时不得承诺自动启动");
+});
+
 test("安装输出:服务状态字符串仍是插件面板可解析的稳定契约", () => {
   // 插件半按 running / 未运行 解析,不能因为排版调整改口径
   assert.ok(/\? `✅ 运行中/.test(src), "running 口径保留(带 pid)");

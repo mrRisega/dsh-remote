@@ -467,10 +467,13 @@ async function setup(argv) {
 
   const pub = await fetchPublicConfig(cfg.api_url || DEFAULT_API);
   const webUp = await isDshWebUp();
-  // 服务状态字符串是给插件面板解析的稳定契约(running / 未运行),不要改口径
-  const svcState = st.ok
-    ? `✅ 运行中${st.pid ? ` (pid=${st.pid})` : ""}`
-    : `未运行 (${st.detail || st.status})`;
+  // 服务状态字符串是给插件面板解析的稳定契约(running / 未运行),不要改口径。
+  // 三分支:running / 未运行(有原因) / 未安装(跳过或平台不支持)——最后一种既不能显示"运行中",
+  // 也不能显示"未运行(原因)",它压根没装(此前会打出自相矛盾的"(当前平台不支持) — ✅ 运行中")。
+  const svcSkipped = st.status === "skipped" || st.status === "unsupported" || !svc.path;
+  const svcState = svcSkipped
+    ? (st.status === "skipped" ? "未安装（本次显式跳过）" : "未安装（当前平台不支持自启动）")
+    : (st.ok ? `✅ 运行中${st.pid ? ` (pid=${st.pid})` : ""}` : `未运行 (${st.detail || st.status})`);
   const L = [];
   L.push("✅ 安装完成");
   if (selfHosted) {
@@ -479,9 +482,15 @@ async function setup(argv) {
   } else {
     L.push(`   远程控制地址: ${pub.app_url || DEFAULT_APP_URL}`);
   }
-  L.push(`   自启动服务: ${svc.path || "(当前平台不支持,可用 dsh-remote run 手动运行)"} — ${svcState}`);
+  L.push(svcSkipped
+    ? `   自启动服务: ${svcState}，可用 \`dsh-remote run\` 手动运行 bridge`
+    : `   自启动服务: ${svc.path} — ${svcState}`);
   // 唯一一处"下一步"引导(上面各阶段不再重复打印同样的话)
-  if (!st.ok && !webUp) {
+  if (svcSkipped) {
+    // 没装自启动服务,就没有"服务状态"可谈,更不该给出"打开 dsh web 就会自动启动"的承诺
+    L.push("");
+    L.push("ℹ 未安装自启动服务：需要时执行 `dsh-remote run`（前台运行 bridge），或重新安装以启用自启动。");
+  } else if (!st.ok && !webUp) {
     // dsh web 没开时 bridge 起来即退,这是正常状态;要说清"什么时候会自己好",而不是甩一句"启动失败"
     L.push("");
     L.push("ℹ 检测到 dsh web 当前没有运行，所以 bridge 还没接上（正常，不是安装出错）。");
