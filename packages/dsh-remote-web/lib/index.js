@@ -228,9 +228,20 @@ function applySaaSMode(cfg) {
  * 老版本(无该鉴权)下 connection 服务没有 authenticatedUrl → 静默跳过,行为不变。
  */
 const HARNESS_COOKIE_FILE = ".harness-cookie.json";
+/**
+ * 手机端 401「dsh web authentication required; reopen the URL printed by dsh web」的根因就在这里：
+ * 该 Cookie 由本插件在进程内经 ?token= 换取后交给 bridge 代持，**dsh web 每次重启都会换签名密钥**，
+ * 旧 Cookie 立即失效。旧实现只在启动后重试 20 次(约 60s)就放弃、之后 6 小时才刷新一次 ——
+ * 一旦启动那一刻 connection 服务还没就绪（或用户按引导重启 harness 后插件先于服务就绪），
+ * Cookie 就会长时间不可用，手机端看到那段英文提示且**无法自行恢复**（他打不开电脑上打印的 URL）。
+ * 现在改为：① 启动后持续重试 10 分钟；② 每 30 分钟主动刷新；③ 面板每次查状态时按需补齐；
+ * ④ bridge 撞到 401 会写「作废」标记，插件下次查状态立即重取。四处叠加后用户无需任何操作。
+ */
 const HARNESS_AUTH_RETRY_MS = 3000;
-const HARNESS_AUTH_RETRY_MAX = 20; // 最多约 60s 等 connection 服务就绪
-const HARNESS_AUTH_REFRESH_MS = 6 * 3600 * 1000;
+const HARNESS_AUTH_RETRY_WINDOW_MS = 10 * 60 * 1000; // 持续尝试 10 分钟,不再 60s 后放弃
+const HARNESS_AUTH_REFRESH_MS = 30 * 60 * 1000;      // 主动刷新周期(本地一次 fetch,成本可忽略)
+const HARNESS_COOKIE_STALE_MS = 30 * 60 * 1000;      // 超过视为陈旧 → 按需重取
+const HARNESS_COOKIE_REVOKED_FILE = ".harness-cookie-revoked"; // bridge 撞 401 时写的标记
 
 /** 读取响应里的 set-cookie(兼容 getSetCookie / get 两种实现)。 */
 function setCookieOf(res) {
@@ -270,24 +281,63 @@ async function mintHarnessCookie(ctx, relayDir) {
   }
 }
 
-/** 后台调度:启动重试直到换取成功,成功后每 6h 刷新(与插件生命周期同进退)。 */
-function scheduleHarnessMint(ctx, relayDir) {
-  let succeeded = false;
-  let retries = 0;
-  const attempt = async () => {
-    if (succeeded) return;
-    if (await mintHarnessCookie(ctx, relayDir)) succeeded = true;
-  };
-  const bootIv = setInterval(() => {
-    if (succeeded || ++retries > HARNESS_AUTH_RETRY_MAX) {
-      clearInterval(bootIv);
-      return;
+/** 读取当前 Cookie 文件状态:{cookie, authority, mintedAt} 或 null。 */
+function readHarnessCookie(relayDir) {
+  try {
+    const j = JSON.parse(readFileSync(join(relayDir, HARNESS_COOKIE_FILE), "utf8"));
+    return j && typeof j.cookie === "string" && j.cookie ? j : null;
+  } catch {
+    return null;
+  }
+}
+
+let harnessMintInflight = false;
+let harnessMintLastAt = 0;
+
+/**
+ * 按需确保 Cookie 可用(去重 + 限频):
+ *   缺失 / 超过 HARNESS_COOKIE_STALE_MS / bridge 写了作废标记 → 重取一次。
+ * 被 /dsh-remote/status 与 /dsh-remote/bridge-status 调用(面板轮询 2.5~30s),
+ * 因此只要面板开着,手机端 401 会在秒级内自愈;不需要用户做任何事。
+ * @param {object} ctx cordis 上下文
+ * @param {string} relayDir 配置目录
+ * @param {{force?: boolean}} [opts]
+ * @returns {Promise<boolean>} 本次是否确认 Cookie 可用
+ */
+async function ensureHarnessCookie(ctx, relayDir, opts) {
+  const force = !!(opts && opts.force);
+  const revoked = existsSync(join(relayDir, HARNESS_COOKIE_REVOKED_FILE));
+  if (!force && !revoked) {
+    const cur = readHarnessCookie(relayDir);
+    if (cur && Date.now() - Number(cur.mintedAt || 0) < HARNESS_COOKIE_STALE_MS) return true;
+  }
+  if (harnessMintInflight) return false;              // 去重:同一时刻只换一次
+  if (Date.now() - harnessMintLastAt < 5000) return false; // 限频:5s 内不重复换
+  harnessMintInflight = true;
+  harnessMintLastAt = Date.now();
+  try {
+    const ok = await mintHarnessCookie(ctx, relayDir);
+    if (ok || revoked) {
+      try { rmSync(join(relayDir, HARNESS_COOKIE_REVOKED_FILE), { force: true }); } catch { /* ignore */ }
     }
-    void attempt();
+    if (!ok && revoked) console.warn("[dsh-remote-web] 浏览器会话 Cookie 已被 dsh web 作废,重取失败,下次查状态再试");
+    return ok;
+  } finally {
+    harnessMintInflight = false;
+  }
+}
+
+/** 后台调度:启动后持续重试(10 分钟窗口) + 每 30 分钟主动刷新(与插件生命周期同进退)。 */
+function scheduleHarnessMint(ctx, relayDir) {
+  const startedAt = Date.now();
+  const bootIv = setInterval(() => {
+    if (Date.now() - startedAt > HARNESS_AUTH_RETRY_WINDOW_MS) { clearInterval(bootIv); return; }
+    void ensureHarnessCookie(ctx, relayDir, { force: true }).catch(() => {});
   }, HARNESS_AUTH_RETRY_MS);
   bootIv.unref?.();
+  void ensureHarnessCookie(ctx, relayDir, { force: true }).catch(() => {}); // 立刻来一次
   const refreshIv = setInterval(() => {
-    void mintHarnessCookie(ctx, relayDir).catch(() => {});
+    void ensureHarnessCookie(ctx, relayDir).catch(() => {});
   }, HARNESS_AUTH_REFRESH_MS);
   refreshIv.unref?.();
   return () => {
@@ -1673,7 +1723,7 @@ const PLUGIN_ID = "dsh-remote-web";
 const PLUGIN_LEGACY_IDS = ["dsh-remote-ui"];
 const PLUGIN_ALL_IDS = [PLUGIN_ID, ...PLUGIN_LEGACY_IDS];
 /** 插件自身发布版本（与 dsh-remote 根包同步递增）。 */
-const PLUGIN_VERSION = "0.6.4-beta.1";
+const PLUGIN_VERSION = "0.6.4-beta.2";
 const UPDATE_LOG = ".dsh-update.log";
 const UPDATE_MARKER = ".dsh-update-running";
 
@@ -2325,6 +2375,9 @@ function registerRoutes(ctx, relayDir) {
       method: "GET",
       path: "/dsh-remote/status",
       handler: async (_req, res) => {
+        // 按需补齐浏览器会话 Cookie(不 await:状态接口不能被本地换 Cookie 拖慢)。
+        // 面板轮询会持续触达本接口 → 手机端的 401 会在秒级内自愈。
+        void ensureHarnessCookie(ctx, relayDir).catch(() => {});
         sendJson(res, 200, await composeStatus(relayDir));
       },
     },
@@ -2337,6 +2390,7 @@ function registerRoutes(ctx, relayDir) {
       handler: async (_req, res) => {
         ensureConnection(relayDir);
         maybeReportInstall(relayDir);
+        void ensureHarnessCookie(ctx, relayDir).catch(() => {}); // 同上:手机端授权会话自愈
         sendJson(res, 200, { ok: true, connect: await composeConnect(relayDir) });
       },
     },

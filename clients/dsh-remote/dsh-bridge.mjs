@@ -215,6 +215,16 @@ function saveLocalConfig(cfg) {
  * 不带则 401 → 手机端白页;bridge 对所有上游 HTTP/WS 请求自动携带,让手机表现为已授权浏览器。
  */
 const HARNESS_COOKIE_FILE = ".harness-cookie.json";
+/** dsh web 因会话失效返回的 401 文案(见 @deepseek-ai/dsh-client-connection 的 writeUnauthorized)。 */
+const HARNESS_UNAUTHORIZED_TEXT = "dsh web authentication required";
+/** 撞到 401 时写的「作废」标记:插件在面板轮询时看到它就会立刻重换 Cookie(见 node 半 ensureHarnessCookie)。 */
+const HARNESS_COOKIE_REVOKED_FILE = ".harness-cookie-revoked";
+function markHarnessCookieRevoked() {
+  try {
+    const p = path.join(path.dirname(CONFIG_PATH), HARNESS_COOKIE_REVOKED_FILE);
+    fs.writeFileSync(p, String(Date.now()), { mode: 0o600 });
+  } catch { /* 忽略:标记只为加速自愈 */ }
+}
 function harnessCookieOf() {
   try {
     const p = path.join(path.dirname(CONFIG_PATH), HARNESS_COOKIE_FILE);
@@ -485,8 +495,29 @@ async function doHttp(method, path, reqHeaders, body, isB64) {
     // 新协议 http 帧的 body 一律 base64;旧协议 body 是原始文本
     init.body = isB64 ? Buffer.from(String(body), "base64") : String(body);
   }
-  const res = await fetch(url, { ...init, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
+  let res = await fetch(url, { ...init, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
   let buf = Buffer.from(await res.arrayBuffer());
+  // 手机端 401「dsh web authentication required」自愈:
+  //   dsh web 每次重启都会换签名密钥 → 插件代持的旧 Cookie 立即失效。撞到该 401 时
+  //   ① 写「作废」标记(插件在面板轮询时秒级重换 Cookie);
+  //   ② 若此刻 Cookie 已被插件换成新的(文件变了),**立刻用新 Cookie 重试一次** ——
+  //      这样用户连一次错误页都看不到,不需要任何手动操作。
+  if (res.status === 401) {
+    const text = buf.length > 0 && buf.length < 4096 ? buf.toString("utf8") : "";
+    if (text.includes(HARNESS_UNAUTHORIZED_TEXT)) {
+      markHarnessCookieRevoked();
+      const fresh = harnessCookieOf();
+      if (fresh && fresh !== ck) {
+        console.log("[bridge] 浏览器会话 Cookie 已失效,用新 Cookie 重试一次:", path);
+        const retryHdrs = sanitizeRequestHeaders(reqHeaders);
+        retryHdrs.Cookie = fresh;
+        res = await fetch(url, { ...init, headers: retryHdrs, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
+        buf = Buffer.from(await res.arrayBuffer());
+      } else {
+        console.warn("[bridge] 浏览器会话 Cookie 已失效(已标记,等待插件重换):", path);
+      }
+    }
+  }
   // 移动端适配层:text/html(含 </head> 且匹配官方特征)在 gzip 前注入响应式 <style>/<script>;
   // 非 html / SSE / 二进制 / 上游已压缩等其余响应一律原样(env DSH_MOBILE_ADAPTER=0 关闭)。
   // sanitizeResponseHeaders 会剥 content-encoding(undici 已解压,原头会误导浏览器);

@@ -3,6 +3,29 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.4-beta.2] - 2026-09-13
+
+> 预发版。修一个**真实用户反馈**的手机端阻塞：`dsh web authentication required; reopen the URL printed by dsh web`。
+
+### Fixed
+
+- **手机端白页 / 401「dsh web authentication required」可以自愈了，用户无需任何操作**：
+  成因是 dsh web 每次重启都会更换浏览器会话签名密钥，插件用 `?token=` 换来的 Cookie 立即失效
+  —— 而这条提示（"reopen the URL printed by dsh web"）**对手机用户不可执行**（他们打不开电脑上打印的 URL）。
+  旧实现只在插件启动后重试 20 次（约 60 秒）就放弃、之后 6 小时才刷新一次；一旦启动那一刻 dsh web
+  的 connection 服务还没就绪，Cookie 就会长时间不可用，用户只能自己重启/重扫（真实用户 #53 17702513221
+  就是遇到这个）。现在四处叠加，把恢复时间压到秒级、且不需要用户做任何事：
+  1. 插件启动后**持续重试 10 分钟**（不再 60 秒后放弃），并改为**每 30 分钟主动刷新**；
+  2. 面板每次查状态（`/dsh-remote/status` 与 `/dsh-remote/bridge-status`，2.5~30 秒一次）都会**按需补齐** Cookie（5 秒限频 + 并发去重，不拖慢接口）；
+  3. bridge 撞到该 401 时写 `.harness-cookie-revoked` 标记，插件下一次查状态立刻重换；
+  4. bridge 发现 Cookie 已被换成新的，**用新 Cookie 立刻重试一次** —— 这一条能让用户连错误页都看不到
+     （回归用例：上游 401 → 自愈后手机端拿到 200）。
+
+### Tests
+
+- 新增 `clients/dsh-remote/test/harness-cookie-selfheal.test.mjs`（3 例，走真实 `handleHttpFrame/doHttp` 全链路：
+  401 自愈重试拿到 200、标记落盘、bridge 与插件的标记名/端点接线一致）。`test:bridge` 85 全绿。
+
 ## [0.6.4-beta.1] - 2026-09-13
 
 > 预发版（`beta` 通道，`latest` 仍为 0.6.3）。主题：**首次安装不再卡**。
