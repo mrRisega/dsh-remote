@@ -32,8 +32,13 @@ import { childStopped } from "./clients/dsh-remote/src/lifecycle.mjs";
 
 const THIS_DIR = path.dirname(fileURLToPath(import.meta.url)); // 本包目录（仓库或 node_modules）
 const IS_NPM_INSTALL = THIS_DIR.includes(`${path.sep}node_modules${path.sep}`);
-// 配置目录：npm 安装时放在用户目录（node_modules 内不可写）；仓库开发时放在仓库根。
-const CONFIG_DIR = process.env.DSH_RELAY_DIR || (IS_NPM_INSTALL ? path.join(os.homedir(), ".dsh-remote") : THIS_DIR);
+// 配置目录：**两种形态统一放 ~/.dsh-remote**（npx/npm 安装时 node_modules 内不可写，故放用户目录；
+// 仓库开发时也放同一处）。为什么不按形态分叉：插件半的默认配置目录本来就是 ~/.dsh-remote
+// （见 packages/dsh-remote-web/lib/index.js 的 DEFAULT_RELAY_DIR），而激活块会把这里写进 relayDir。
+// 两边不一致会出现「安装器把 .dsh-config.json 写进仓库根，插件却去 ~/.dsh-remote 找配置」→
+// 面板显示成未登录/空配置，且安装器的状态文件散落进仓库工作区（实测踩到）。
+// 需要隔离（测试 / 多账号 / 多实例）时用 DSH_RELAY_DIR 显式覆盖。
+const CONFIG_DIR = process.env.DSH_RELAY_DIR || path.join(os.homedir(), ".dsh-remote");
 const CONFIG_PATH = path.join(CONFIG_DIR, ".dsh-config.json");
 // 默认云端服务地址（服务商 SaaS 入口；自建用户用 --server/--key 指向自己的 router）
 const DEFAULT_API = "https://n.risegao.cn:13443/relay-api";
@@ -414,6 +419,82 @@ async function isDshWebUp(timeoutMs = 1200) {
   } catch { return false; }
 }
 
+/**
+ * 解析 dsh web profile 目录（安装与插件管理共用同一口径）。
+ */
+function resolveProfileDir(argv = []) {
+  const i = argv.indexOf("--profile");
+  return i > -1 && argv[i + 1]
+    ? argv[i + 1]
+    : process.env.DSH_PROFILE_DIR || path.join(os.homedir(), ".dsh", "profiles", "web");
+}
+
+/** 监听 127.0.0.1:3080 的进程 pid（= dsh web）。lsof 不可用时回退 pgrep。 */
+function dshWebPid() {
+  const l = sh("lsof -nP -iTCP:3080 -sTCP:LISTEN -t 2>/dev/null || true");
+  const pid = String(l.stdout || "").trim().split(/\s+/).filter(Boolean)[0];
+  if (pid && /^\d+$/.test(pid)) return Number(pid);
+  const p = sh("pgrep -f 'dsh web' 2>/dev/null | head -1");
+  const p2 = String(p.stdout || "").trim();
+  return /^\d+$/.test(p2) ? Number(p2) : null;
+}
+
+/**
+ * 进程启动时刻（毫秒）。
+ * 用 `ps -o lstart=`（如 "Sun Sep 13 13:54:43 2026"）——它**不含年份以外的 TZ 差异**，
+ * 比 `ps -o etimes=` 稳（后者在部分平台不可用），比 /proc 通用。
+ */
+function processStartMs(pid) {
+  try {
+    const r = sh(`ps -o lstart= -p ${Number(pid)}`);
+    const t = Date.parse(String(r.stdout || "").trim());
+    return Number.isFinite(t) ? t : 0;
+  } catch { return 0; }
+}
+
+/**
+ * 重启 dsh web。
+ * dsh web 由**用户手工或 launchd** 跑着，插件是进程启动时装载的，所以更新插件后必须重启它才有面板。
+ * 阶梯：launchd job（macOS）→ systemd user unit（Linux）→ 原命令行自拉起 → 交给用户手动。
+ */
+function dshWebLaunchdJob() {
+  const l = sh("launchctl list 2>/dev/null | grep -i dsh | grep -v dshremote || true");
+  for (const line of String(l.stdout || "").split("\n")) {
+    const label = line.trim().split(/\s+/).pop();
+    if (label && /dsh/i.test(label)) return label;
+  }
+  return null;
+}
+
+function restartDshWeb() {
+  const uid = process.getuid();
+  if (process.platform === "darwin") {
+    const job = dshWebLaunchdJob();
+    if (job) {
+      const r = sh(`launchctl kickstart -k gui/${uid}/${job}`);
+      if (r.ok) return { ok: true, how: `launchctl kickstart ${job}` };
+    }
+  }
+  if (process.platform === "linux") {
+    const r = sh("systemctl --user restart dsh-web 2>/dev/null || systemctl --user restart dsh 2>/dev/null");
+    if (r.ok) return { ok: true, how: "systemctl --user restart dsh-web" };
+  }
+  // 兜底：沿用原命令行重启（只在能拿到真实 node 入口时做，npx 缓存路径不可靠）
+  const pid = dshWebPid();
+  if (!pid) return { ok: false, how: "", detail: "未找到 dsh web 进程" };
+  const cmd = String(sh(`ps -o command= -p ${pid}`).stdout || "").trim();
+  if (!cmd || /node_modules\/\.bin|_npx/.test(cmd)) {
+    return { ok: false, how: "", detail: "无法获取可复用的启动命令（可能是经 npx 启动），请手动重启" };
+  }
+  try {
+    const child = spawn("/bin/sh", ["-c", cmd], { detached: true, stdio: "ignore", cwd: os.homedir() });
+    child.unref();
+    return { ok: true, how: "原命令行重新拉起" };
+  } catch (e) {
+    return { ok: false, how: "", detail: e.message };
+  }
+}
+
 function installAutostart() {
   const svcPath = writeAutostartFile();
   const r = restartBridgeService();
@@ -523,6 +604,7 @@ async function setup(argv) {
   const key = argValue(argv, "--key");
   const noAutostart = hasFlag(argv, "--no-autostart");
   const noPlugin = hasFlag(argv, "--no-plugin");
+  const noRestart = hasFlag(argv, "--no-restart");
   const selfHosted = Boolean(server || key);
 
   let cfg = loadConfig();
@@ -580,16 +662,63 @@ async function setup(argv) {
   const st = svc.status;
 
   // 自动安装 dsh web 插件（非致命：失败只提示，不阻断安装）
+  let pluginResult = null;
   if (!noPlugin) {
     try {
-      await pluginCmd([]);
+      pluginResult = await pluginCmd([]);
     } catch (e) {
       console.warn(`⚠️ 插件安装未完成：${e.message}`);
     }
   }
 
-  const pub = await fetchPublicConfig(cfg.api_url || DEFAULT_API);
+  // 插件是**进程启动时**装载的：刚装进 profile 的插件，运行中的 dsh web 里并没有
+  // （既没有 /dsh-remote/* 路由，也没有「设置 → 远程控制」面板项）。
+  // 这里做一个确定性判断：进程启动时间早于插件落盘时间 → 必须重启 dsh web 才生效。
+  const pluginDir = path.join(resolveProfileDir(argv), PLUGIN_LOCAL_DIR);
+  const pluginMtime = fs.existsSync(path.join(pluginDir, "lib", "index.js"))
+    ? fs.statSync(path.join(pluginDir, "lib", "index.js")).mtimeMs
+    : 0;
+  let webPid = null;
+  let needRestart = false;
+  let hotMounted = false;
   const webUp = await isDshWebUp();
+  if (webUp) {
+    webPid = dshWebPid();
+    const startedAt = webPid ? processStartMs(webPid) : 0;
+    needRestart = Boolean(pluginMtime && startedAt && startedAt < pluginMtime);
+    // patch 激活形态:harness 的 HMR 监听 profile patch 文件,存盘后约 1 秒重新 compose。
+    // 所以这里**先等热挂载**,等到了就完全不需要重启(用户只需刷新页面拿浏览器半)。
+    if (needRestart && pluginResult && pluginResult.hotPatch) {
+      for (let i = 0; i < 20; i += 1) {
+        const r = await fetch("http://127.0.0.1:3080/dsh-remote/status", { signal: AbortSignal.timeout(900) })
+          .catch(() => null);
+        if (r && r.ok) { hotMounted = true; break; }
+        sleepSync(600);
+      }
+      if (hotMounted) needRestart = false;
+    }
+  }
+  // 需要就用**最省事的方式**替用户重启:插件装完还要用户自己琢磨怎么重启,是这一步唯一的手工负担
+  let restartResult = null;
+  if (needRestart && !noRestart && webUp) {
+    console.log("");
+    console.log("ℹ 检测到运行中的 dsh web 早于本次插件安装 —— 插件只在进程启动时装载，");
+    console.log("  所以「设置 → 远程控制」面板暂时还没出现。正在为你重启 dsh web（2 秒后执行，Ctrl-C 可跳过）…");
+    sleepSync(2000);
+    restartResult = restartDshWeb();
+    if (restartResult.ok) {
+      // 等它回来再确认端口确实在听(避免"重启完其实没起来"还要用户自己发现)
+      for (let i = 0; i < 20; i += 1) {
+        if (await isDshWebUp(800)) break;
+        sleepSync(700);
+      }
+    }
+    console.log(restartResult.ok
+      ? `✅ 已重启 dsh web（${restartResult.how}）`
+      : `⚠️ 自动重启失败: ${restartResult.detail}`);
+  }
+
+  const pub = await fetchPublicConfig(cfg.api_url || DEFAULT_API);
   // 服务状态字符串是给插件面板解析的稳定契约(running / 未运行),不要改口径。
   // 三分支:running / 未运行(有原因) / 未安装(跳过或平台不支持)——最后一种既不能显示"运行中",
   // 也不能显示"未运行(原因)",它压根没装(此前会打出自相矛盾的"(当前平台不支持) — ✅ 运行中")。
@@ -646,6 +775,21 @@ async function setup(argv) {
   if (selfHosted) {
     L.push("");
     L.push("   下一步: 手机端用访问密钥登录即可（bridge 登录后自动启动）。");
+  } else if (hotMounted) {
+    L.push("");
+    L.push("   下一步: 插件已热加载（无需重启 dsh web）——刷新一下浏览器页面，");
+    L.push("          再打开 设置 → 「远程控制」→ 注册/登录手机号即可。");
+  } else if (needRestart && restartResult && restartResult.ok) {
+    L.push("");
+    L.push("   下一步: dsh web 已重启，直接打开 http://127.0.0.1:3080 → 设置 → 「远程控制」→ 注册/登录手机号。");
+  } else if (needRestart) {
+    // 需要重启但没做成功:必须给出**可照抄**的命令,而不是只说"请重启"
+    L.push("");
+    L.push("⚠️ 还需要重启一次 dsh web，插件面板才会出现（插件只在进程启动时装载）。");
+    L.push("   请手动执行（任选其一）：");
+    L.push("     launchctl kickstart -k gui/$(id -u)/com.dshweb.dev     # 用 launchd 托管时");
+    L.push("     kill $(lsof -ti tcp:3080 -sTCP:LISTEN) && dsh web --no-open   # 手动启动时");
+    L.push("   重启后：打开 http://127.0.0.1:3080 → 设置 → 「远程控制」→ 注册/登录手机号。");
   } else {
     L.push("");
     L.push("   下一步: 打开 dsh web → 设置 → 「远程控制」→ 注册/登录手机号即可（无需任何命令）。");
@@ -719,8 +863,121 @@ function stripPluginEntries(patch) {
 }
 
 /**
- * 归一化 patch 基座：去掉 dsh 新 profile 默认的空文档占位行 `[]`。
- * 默认 cordis.patch.yml 是「顶部注释 + []」，若保留 [] 再往下拼 `- insert:`，
+ * 解析 patch 文本里的 insert 行 id（与 dshmarket 同口径的极简解析，不引 YAML 依赖）。
+ * 用途有二：① 判断本插件是否已激活（幂等）；② **写完校验**——patch 文件形态非法时
+ * dsh web 会直接启动失败，所以每次写入后必须重新解析确认结果仍是「一行一条的 insert 列表」。
+ * @returns {{ids: string[], badLines: string[]}} badLines 非空 = 文件形态不合法
+ */
+function parsePatchInsertIds(text) {
+  const ids = [];
+  const badLines = [];
+  for (const raw of String(text ?? "").split(/\r?\n/)) {
+    // 先剥注释与尾部空白;注意 id 行在块内是缩进的(`    - id: xxx`),不能要求顶格
+    const line = raw.replace(/#.*$/, "").replace(/\s+$/, "");
+    const trimmed = line.trim();
+    if (trimmed === "") continue;
+    if (trimmed === "[]") continue;                               // 新 profile 的空文档占位
+    if (/^-\s*insert:\s*$/.test(trimmed)) continue;              // insert 块头(可缩进)
+    const m = /^-\s*id:\s*(\S+)\s*$/.exec(trimmed);            // 条目行(可缩进)
+    if (m) { ids.push(m[1]); continue; }
+    // 其余缩进行属于某个条目的字段(name/config/...),合法;顶层非列表行才是异常形态
+    if (/^\s+\S/.test(line)) continue;
+    badLines.push(trimmed);
+  }
+  return { ids, badLines };
+}
+
+/**
+ * 写入 patch 前校验基座形态。
+ * 只接受「空/仅占位/现有条目」三种基座；发现异常内容就**拒写**（绝不把一个本来还能用的
+ * profile 弄坏 —— 改动前先确认目标文件是可安全追加的形态，而不是先写再看结果）。
+ * @returns {{ok: boolean, reason?: string, cleaned: string, insertedIds: string[]}}
+ */
+function validatePatchBase(text) {
+  const { ids, badLines } = parsePatchInsertIds(text);
+  if (badLines.length) {
+    return { ok: false, reason: `patch 文件含无法识别的行（未做改动）: ${badLines[0].slice(0, 60)}`, cleaned: "", insertedIds: ids };
+  }
+  // 去掉空文档占位 `[]`（它在条目之前会让整份文档变成「数组套列表」而解析失败）
+  const cleaned = String(text ?? "").split(/\r?\n/).filter((l) => l.trim() !== "[]").join("\n").trim();
+  return { ok: true, cleaned, insertedIds: ids };
+}
+
+/** 安全写回 patch（原子：先写同目录临时文件再 rename，避免中途被打断留下半截文件）。 */
+function writePatchAtomic(patchFile, text) {
+  const tmp = `${patchFile}.dsh-remote.tmp`;
+  fs.writeFileSync(tmp, text);
+  fs.renameSync(tmp, patchFile);
+}
+
+/**
+ * 原子地写入插件 patch 激活行；写后**重新解析校验**，不合法立即回滚。
+ * 返回 {ok, changed, reason?, basePatch}
+ */
+function ensurePatchActivation(patchFile, pluginLocalDir, pkgFile) {
+  const original = fs.readFileSync(patchFile, "utf8");
+  // 幂等：已经是唯一激活点就什么都不做（但要确保 bundles 里没有重复激活）
+  const base = validatePatchBase(original);
+  if (!base.ok) return { ok: false, reason: base.reason, changed: false, basePatch: original };
+  const hasOurRow = base.insertedIds.some((id) => PLUGIN_ALL_IDS.includes(id));
+  if (hasOurRow) {
+    const bundleRemoved = removeBundleEntry(pkgFile);
+    if (bundleRemoved) console.log("✅ 已从 dsh.profile.bundles 移除重复激活点（激活统一走 patch 行）");
+    // 已有条目也要**自我修正**：配置目录变了（换安装方式 / 之前写错）时 relayDir 必须跟着更新，
+    // 否则面板会一直去旧目录找 .dsh-config.json（表现就是"未登录 / 空配置"）。
+    const want = pluginBlock(CONFIG_DIR);
+    const wantDir = (/relayDir: '([^']*)'/.exec(want) || [])[1] || "";
+    if (wantDir && !original.includes(`relayDir: '${wantDir}'`)) {
+      const base2 = validatePatchBase(stripPluginEntries(original));
+      if (base2.ok) {
+        const merged2 = `${base2.cleaned ? base2.cleaned + "\n" : ""}\n${want}\n`;
+        const chk = parsePatchInsertIds(merged2);
+        if (!chk.badLines.length && chk.ids.filter((id) => id === PLUGIN_ID).length === 1) {
+          writePatchAtomic(patchFile, merged2);
+          console.log(`✅ 已同步激活行的 relayDir → ${wantDir}`);
+          return { ok: true, changed: true, basePatch: original };
+        }
+      }
+      console.warn("⚠️ 激活行的 relayDir 与当前配置目录不一致，但未能安全改写（保持原样）");
+    }
+    return { ok: true, changed: bundleRemoved, basePatch: original };
+  }
+  // 写前再次校验我们的块本身可解析（id 行必须能被 parsePatchInsertIds 认出来）
+  // ⚠️ relayDir 必须传**配置目录**(CONFIG_DIR, 即 ~/.dsh-remote),不是插件安装目录:
+  // 面板要读的是该目录下的 .dsh-config.json(账号/中继配置);传成 pluginLocalDir 会让面板
+  // 对着插件源码目录找配置 → 界面显示成"未登录 / 空配置"(实测踩到)。
+  const block = pluginBlock(CONFIG_DIR);
+  if (!parsePatchInsertIds(block).ids.includes(PLUGIN_ID)) {
+    return { ok: false, reason: "生成的激活块自身不合法", changed: false, basePatch: original };
+  }
+  const merged = `${base.cleaned ? base.cleaned + "\n" : ""}\n${block}\n`;
+  // 写后校验：整份文件必须仍是干净的 insert 列表，且我们的 id 恰好出现一次
+  const check = parsePatchInsertIds(merged);
+  if (check.badLines.length || check.ids.filter((id) => id === PLUGIN_ID).length !== 1) {
+    return { ok: false, reason: "合并后的 patch 校验未通过（未做改动）", changed: false, basePatch: original };
+  }
+  writePatchAtomic(patchFile, merged);
+  const after = fs.readFileSync(patchFile, "utf8");
+  const verify = parsePatchInsertIds(after);
+  if (verify.badLines.length || verify.ids.filter((id) => id === PLUGIN_ID).length !== 1) {
+    writePatchAtomic(patchFile, original); // 回滚
+    return { ok: false, reason: "写入后校验失败，已回滚", changed: false, basePatch: original };
+  }
+  removeBundleEntry(pkgFile); // 单一激活点：bundles 里不能再有本插件
+  return { ok: true, changed: true, basePatch: original };
+}
+
+/** 清理 patch 中引用本插件的条目块（含前置注释/收尾标记）。返回是否发生变更。 */
+function stripIncludeEntries(patchFile, patch, reason) {
+  const next = stripPluginEntries(patch);
+  if (next === patch) return false;
+  writePatchAtomic(patchFile, next);
+  console.log(`✅ 已移除 ${patchFile} 中的冗余 include（${reason}；激活点必须唯一，避免重复 ID 崩溃）`);
+  return true;
+}
+
+/**
+ * 归一化 patch 基座：去掉 dsh 新 profile 默认的空文档占位行 `[]`。 * 默认 cordis.patch.yml 是「顶部注释 + []」，若保留 [] 再往下拼 `- insert:`，
  * YAML 会报 “end of the stream or a document separator is expected”（dsh web 启动即崩）。
  * 返回内容不含结尾换行；[] 行只在独立成行时视为占位，不影响真正的条目。
  */
@@ -828,13 +1085,17 @@ function removeBundleEntry(pkgFile) {
 
 /**
  * 插件安装(pluginCmd 非卸载分支)收敛策略 —— 2026-09-06「重复 ID 崩溃」根治；
- * 2026-09 插件由 dsh-remote-ui 更名 dsh-remote-web，本函数同时兼容清理旧名残留：
- * dsh-remote-web 是带 dsh.bundle.patch 的 bundle：package.json 的 dsh.profile.bundles
- * 声明它后，加载器会自动应用插件自带的 cordis.patch.yml（节点半+浏览器半的唯一激活点）。
- * 若用户级 cordis.patch.yml 再手工 insert 同一个 id，dsh web 启动即报“重复 ID”崩溃。
- * 因此本命令【绝不写用户 include】，只负责：让插件以 bundle 形态可解析，
- * 并清理历史遗留的 include 块与旧名(≤0.4.9 dsh-remote-ui)痕迹。
- * 市场形态(github:/npm 依赖)则完全交由市场管理，只清理 include。
+ * 2026-09 插件由 dsh-remote-ui 更名 dsh-remote-web，本函数同时兼容清理旧名残留。
+ *
+ * ⚠️ 2026-09-13 调整:「恰好一处激活」仍然成立,但**激活点二选一**:
+ *   · dsh-setup 安装(file: 依赖 + 自建 node_modules 链接)→ 激活点 = 用户级 cordis.patch.yml
+ *     的一行 insert。理由:harness 的 web profile 是 `patchReload: "live"`,会加载
+ *     `@deepseek-ai/cordis-plugin-hmr` 监听该文件,**存盘后约 1 秒重新 compose 并动态装载**,
+ *     用户不需要重启 dsh web(只需刷新页面拿到浏览器半)。插件市场自己也是这套机制。
+ *   · 插件市场安装(github:/npm: 依赖,源码归市场管)→ 激活点 = dsh.profile.bundles
+ *     (插件自带 bundle patch)。bundles 只在启动时读、没有 watcher,所以这一路仍需重启。
+ * 两条路都**只保留一个激活点**:写 patch 就同时从 bundles 移除,反之清掉 include,
+ * 绝不两处并存(那正是历史上 dsh web 启动即报「重复 ID」崩溃的原因)。
  */
 function convergePluginActivation(profileDir, pkgFile, patchFile, pluginDir, patch) {
   const pkg = JSON.parse(fs.readFileSync(pkgFile, "utf8"));
@@ -845,18 +1106,11 @@ function convergePluginActivation(profileDir, pkgFile, patchFile, pluginDir, pat
   const marketManaged = dep && !String(dep).startsWith("file:"); // github:/npm: 等由市场/包管理器管源码
   const managedByUs = !dep || String(dep).startsWith("file:");   // 无依赖或 file: 拷贝 → 我们管
 
-  const stripInclude = (reason) => {
-    const newPatch = stripPluginEntries(patch);
-    if (newPatch !== patch) {
-      fs.writeFileSync(patchFile, newPatch);
-      console.log(`✅ 已移除 ${patchFile} 中的冗余 include（${reason}；激活统一走插件自带 bundle patch，避免重复 ID 崩溃）`);
-    }
-  };
-
   if (marketManaged && inBundles) {
     // 插件市场安装形态：依赖与源码归市场管，我们只清历史 include（若旧版曾写过）
-    stripInclude("插件市场安装形态无需用户 include");
+    stripIncludeEntries(patchFile, patch, "插件市场安装形态无需用户 include");
     console.log("ℹ 插件市场安装形态（bundles+dependency）：已保持市场管理的源码不变。");
+    console.log("   （该形态经 dsh.profile.bundles 激活，只在启动时读取 —— 装完需重启一次 dsh web）");
     return;
   }
 
@@ -867,14 +1121,19 @@ function convergePluginActivation(profileDir, pkgFile, patchFile, pluginDir, pat
       console.error(`❌ 插件入口缺失：${entryFile}（本包不完整？请用官方源重装：npx --registry=https://registry.npmjs.org @mrrisega/dsh-remote@latest）`);
       process.exit(1);
     }
-    declarePluginDep(pkgFile);                      // file: 依赖(包管理器 install 不误删)
-    const addedBundle = ensureBundleEntry(pkgFile); // bundles 声明 → 插件自带 patch 自动激活
-    ensurePluginLinked(profileDir, pluginLocalDir);  // 自建 node_modules 链接
-    stripInclude("bundle patch 已是唯一激活点");     // 清历史 include
-    // 只报结果不报过程:bundle 是否新加、node_modules 是否新建链接都属于实现细节
-    // (失败会各自抛错/提示),用户只需要知道"插件装好了、装在哪"。
-    console.log(`✅ 插件已就绪: ${pluginLocalDir}${addedBundle ? "" : "（此前已激活）"}`);
-    return;
+    declarePluginDep(pkgFile);                       // file: 依赖(包管理器 install 不误删)
+    ensurePluginLinked(profileDir, pluginLocalDir);   // node_modules 链接(name 才能被解析)
+    // 唯一激活点:patch 行(+ 顺带把 bundles 里的本插件条目移除,避免两处并存)
+    const r = ensurePatchActivation(patchFile, pluginLocalDir, pkgFile);
+    if (r.ok) {
+      console.log(`✅ 插件已就绪: ${pluginLocalDir}`);
+      return { hotPatch: true, changed: r.changed, basePatch: r.basePatch };
+    }
+    // patch 行写不进去(文件形态异常)→ 回退 bundles(需重启),保证功能可用
+    console.warn(`⚠️ 无法写入 patch 激活行（${r.reason}），改为 bundles 形态（需重启 dsh web 生效）`);
+    ensureBundleEntry(pkgFile);
+    console.log(`✅ 插件已就绪: ${pluginLocalDir}（bundles 形态）`);
+    return { hotPatch: false, changed: true, basePatch: patch };
   }
 
   // 异常形态：有非 file: 依赖但不在 bundles（无法靠 bundle patch 激活）
@@ -884,10 +1143,7 @@ function convergePluginActivation(profileDir, pkgFile, patchFile, pluginDir, pat
 
 async function pluginCmd(argv) {
   const uninstall = hasFlag(argv, "--uninstall");
-  const profileIdx = argv.indexOf("--profile");
-  const profileDir = profileIdx > -1 && argv[profileIdx + 1]
-    ? argv[profileIdx + 1]
-    : process.env.DSH_PROFILE_DIR || path.join(os.homedir(), ".dsh", "profiles", "web");
+  const profileDir = resolveProfileDir(argv);
   const pkgFile = path.join(profileDir, "package.json");
   const patchFile = path.join(profileDir, "cordis.patch.yml");
   const pluginDir = path.join(THIS_DIR, "packages", PLUGIN_ID);
@@ -906,11 +1162,8 @@ async function pluginCmd(argv) {
 
   if (uninstall) {
     // 移除 patch 中的插件条目（兼容旧版无标记条目；旧名 dsh-remote-ui 一并清理）
-    const newPatch = stripPluginEntries(patch);
-    if (newPatch !== patch) {
-      fs.writeFileSync(patchFile, newPatch);
-      console.log(`✅ 已从 ${patchFile} 移除插件条目`);
-    } else {
+    // 用原子写回:卸载同样不能在 profile 配置上留下半截文件
+    if (!stripIncludeEntries(patchFile, patch, "卸载清理")) {
       console.log(`ℹ patch 中未发现 ${PLUGIN_ID}（或历史名）条目。`);
     }
     // 清理本地目录与链接：当前名 + 历史名(dsh-remote-ui-plugin / node_modules/dsh-remote-ui)
@@ -937,8 +1190,7 @@ async function pluginCmd(argv) {
   // 安装：收敛到“恰好一处激活”（bundle patch 唯一激活点），绝不与市场/历史 include 并存
   convergePluginActivation(profileDir, pkgFile, patchFile, pluginDir, patch);
 
-  console.log("   打开 dsh web → 设置 → 「远程控制」，注册/登录手机号即可（无需任何命令）。");
-  console.log("   若从 DeepSeek App/插件市场 安装：请完全退出并重开 App 让插件生效。");
+  // 引导语只在 setup 汇总里打印一次(这里不再重复;单独跑 `dsh-remote plugin` 也无需引导)
 }
 
 // ---------- main ----------

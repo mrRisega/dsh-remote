@@ -3,6 +3,42 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.4-beta.7] - 2026-09-13
+
+> 预发版。**装完不用再重启 dsh web 了** —— 插件改走热加载装载，刷新页面即可。
+
+### Changed
+
+- **安装插件改为「热加载」装载，不再要求重启 dsh web。** 此前插件是写进 `dsh.profile.bundles` 激活的，
+  而那个清单**只在 dsh web 启动时读一次**；装完插件后运行中的进程里既没有 `/dsh-remote/*` 路由，
+  也没有「设置 → 远程控制」面板项，用户必须自己想办法重启（这正是「装完没有界面」的原因）。
+  现在改为写 profile 的 `cordis.patch.yml` 一行 `insert`：harness 的 web profile 是
+  `patchReload: "live"`，会加载 `@deepseek-ai/cordis-plugin-hmr` 监听该文件，**存盘后约 1 秒重新
+  compose 并动态装载**（插件市场用的也是这套机制）。安装结束会**验证热加载确实生效**，
+  然后提示「刷新页面即可」；万一热加载不生效，才退回原来的重启阶梯。
+
+### Fixed
+
+- **只保留一个激活点**：写 patch 行的同时把 `dsh.profile.bundles` 里的同名条目移除。
+  两处并存会让 dsh web 启动即报「重复 ID」崩溃（历史问题），所以两个方向都要收口。
+- **`relayDir` 写错**：激活行里必须写**配置目录**（`~/.dsh-remote`，面板要从那里读 `.dsh-config.json`），
+  之前会写成插件安装目录 → 面板显示成「未登录 / 空配置」。现在还会**自我修正**：已有激活行的
+  relayDir 与当前配置目录不一致时自动改写。
+- **仓库开发形态的配置目录与插件默认值不一致**：安装器在仓库模式下把配置目录当成仓库根，而插件默认
+  是 `~/.dsh-remote` → 面板读不到安装器写的配置，运行状态文件还会散落进仓库工作区。两者统一为
+  `~/.dsh-remote`（需要隔离时用 `DSH_RELAY_DIR` 覆盖）。
+- **`~/Library/LaunchAgents` 不存在时自动创建**，写入失败只提示不中断安装。
+- **patch 文件写入全程加护栏**：写前校验基座形态（含 `[]` 占位会被清掉、异常行**拒写**）、
+  原子写回（同目录临时文件 + rename）、**写后重新解析校验**，不合法立即回滚。
+  宁可回退到 bundles 形态（需重启），也绝不把一份能用的 profile 弄坏。
+- **测试隔离**：`harness-restart` 用例会 unset 测试隔离开关走真实分支却没伪造 `HOME`，
+  把指向测试临时目录的 plist 覆盖到开发者真实的 `~/Library/LaunchAgents`（临时目录随即删除 →
+  真实自启动失效）。已加 HOME 隔离 + 静态护栏：凡 unset 开关的用例必须伪造 `HOME`。
+
+### Added
+
+- `dsh-remote install --no-restart`：连「需要时的自动重启」也跳过，改为打印可照抄的手动命令。
+
 ## [0.6.4-beta.6] - 2026-09-13
 
 > 预发版。修一个 macOS 26 上的自启动死角（服务登记了却永远不被启动），
