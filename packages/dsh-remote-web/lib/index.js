@@ -887,7 +887,15 @@ function pluginInstalledAfterBoot() {
     const pkgFile = join(dirname(dirname(here)), "package.json");
     const mtimeMs = statSync(pkgFile).mtimeMs;
     const bootMs = Date.now() - process.uptime() * 1000;
-    return mtimeMs > bootMs + 2000;
+    if (!(mtimeMs > bootMs + 2000)) return false;
+    // ⚠️ 只看时间戳会**误报**:安装器补装/在线更新会把同样的文件重写一遍(哪怕是同一个版本),
+    // 时间戳变新 → 被当成"有新插件要装载" → 弹出"需要重启/刷新"横幅(用户实测踩到:
+    // 自愈补装把 profile 副本重写了一次,运行中的旧代码就写下了"需要重启")。
+    // 真正该提示用户的只有一件事:**磁盘上的插件版本与本进程装载的版本不同**。
+    // 版本相同 → 运行中的代码就是目标版本,什么都不用做。
+    const diskVersion = String(JSON.parse(readFileSync(pkgFile, "utf8")).version || "");
+    const runningVersion = String(PLUGIN_VERSION || "");
+    return Boolean(diskVersion && runningVersion && diskVersion !== runningVersion);
   } catch { return false; }
 }
 
@@ -1745,7 +1753,7 @@ const PLUGIN_ID = "dsh-remote-web";
 const PLUGIN_LEGACY_IDS = ["dsh-remote-ui"];
 const PLUGIN_ALL_IDS = [PLUGIN_ID, ...PLUGIN_LEGACY_IDS];
 /** 插件自身发布版本（与 dsh-remote 根包同步递增）。 */
-const PLUGIN_VERSION = "0.6.4-beta.9";
+const PLUGIN_VERSION = "0.6.4-beta.10";
 const UPDATE_LOG = ".dsh-update.log";
 const UPDATE_MARKER = ".dsh-update-running";
 
