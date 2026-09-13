@@ -170,3 +170,14 @@ test("安全护栏：原子写回 —— 不留 .tmp 残留，且末尾换行规
     assert.ok(readPatch(profile).endsWith("\n"), "文件应以换行结尾");
   } finally { cleanup(profile); }
 });
+
+test("回归护栏：plugin 子命令必须把激活结果 return 给 setup（否则热挂载验证被跳过）", () => {
+  // 事故复盘：convergePluginActivation 已经返回 {hotPatch}，但 pluginCmd 没把它 return 出去，
+  // 于是 setup() 拿不到激活形态 → 跳过热挂载验证 → 明明热挂载成功却仍报「需要重启」。
+  const src = readFileSync(SETUP, "utf8");
+  const call = src.match(/return convergePluginActivation\(profileDir[^\n]*/);
+  assert.ok(call, "pluginCmd 必须 return convergePluginActivation(...) 的结果");
+  // setup() 必须真的消费这个结果
+  assert.match(src, /pluginResult = await pluginCmd\(\[\]\)/, "setup 应保存 pluginCmd 的返回值");
+  assert.match(src, /pluginResult\.hotPatch/, "应据 hotPatch 判断是否走热挂载形态");
+});
