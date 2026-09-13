@@ -6,6 +6,9 @@ node_modules/
 data/
 *.local
 
+# 本机运行时产物（bridge/插件在仓库目录里跑时产生；绝不入库）
+.dsh-*
+
 # 系统
 .DS_Store
 .dsh-config.json
@@ -28,3 +31,15 @@ scripts/dsh-net-hosts-install.sh
 *security-audit*
 *secreport*.md
 
+# 内部诊断/分析产物（2026-09-13 起铁律）：开源仓库一律禁止入库。
+# 用户数据、漏斗诊断、运营分析、看板设计、生产只读脚本等内部产物统一放仓库外的
+# ../dsh-relay-internal/（私有目录）；下面这些规则是兜底，防止误落回仓库被提交。
+docs/internal/
+*诊断*.md
+*漏斗*.md
+*ANALYTICS*.md
+*analytics*.md
+*DIAGNOSIS*.md
+*diagnosis*.md
+*cohort*.md
+*prod-readonly*

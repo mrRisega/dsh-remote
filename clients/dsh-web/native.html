@@ -85,7 +85,13 @@
       background: var(--bg); border: 1px dashed var(--border); border-radius: 10px; line-height: 1.75;
     }
     .empty { text-align: center; color: var(--muted); font-size: 13px; padding: 24px 0; }
-    /* ---------- 新用户安装引导(空设备状态) ---------- */
+    /* ---------- 新用户安装引导(空设备状态):市场路径(条件)+ 命令路径(兜底)+ 收敛指引 ---------- */
+    .guide-path { border: 1px solid var(--line, #d0d7de); border-radius: 10px; padding: 12px 14px; margin: 10px 0; background: #f6f8fa; }
+    .guide-path-tag { display: inline-block; font-size: 12px; font-weight: 700; color: #1a7f37; background: #dafbe1; border-radius: 999px; padding: 1px 10px; margin-bottom: 8px; }
+    .guide-more { margin-top: 8px; font-size: 13px; }
+    .guide-more > summary { cursor: pointer; color: #0969da; }
+    .guide-more > ol { margin-top: 8px; }
+    .guide-wait { color: #57606a; font-size: 12.5px; }
     .guide {
       text-align: left; background: var(--bg); border: 1px solid var(--border);
       border-radius: 10px; padding: 14px 16px; margin: 4px 0 10px;
@@ -624,10 +630,15 @@ function toast(msg, ms = 2500) {
   setTimeout(() => t.classList.remove("show"), ms);
 }
 function esc(s) { return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+/** 当前渲染出的在线设备数(0 = 需要自动等待上线,见 scheduleDevicePoll)。 */
+let lastOnlineCount = 0;
+
 function setView(v) {
   ["boot", "login", "devices", "promo"].forEach(n => $(`view-${n}`).classList.toggle("hidden", n !== v));
   // 进入登录页时刷新所有当前可见的验证码,保证永远是新的、无需手动点击
   if (v === "login") refreshVisibleCaptchas();
+  // 离开设备页 → 停掉自动探测;进入设备页 → 清零计数(下一次刷新重新决定是否轮询)
+  if (v === "devices") resetDevicePoll(); else cancelDevicePoll();
 }
 /** 刷新当前可见的图形验证码(密码/短信/注册/重置各自的验证码区)。 */
 function refreshVisibleCaptchas() {
@@ -991,7 +1002,9 @@ async function doRegister() {
   if (password.length < 8) { msg.className = "auth-msg err"; msg.textContent = "密码至少 8 位"; return; }
   if (password !== password2) { msg.className = "auth-msg err"; msg.textContent = "两次输入的密码不一致"; return; }
   msg.className = "auth-msg"; msg.innerHTML = '<span class="loading"></span> 注册中...';
-  const payload = { phone, sms_code: sms, password };
+  // reg_source:注册来源上报(运营统计) —— 手机端网页注册固定为 remoteweb_register。
+  // 可选新增字段:服务端旧版本忽略未知字段,无需版本判断;手机端不是安装方,不传安装来源。
+  const payload = { phone, sms_code: sms, password, reg_source: "remoteweb_register" };
   // 邀请链接携带的邀请码(注册后首次绑设备计有效邀请)
   if (window.__inviteCode) payload.invite_code = window.__inviteCode;
   const res = await api("/api/register", payload);
@@ -1235,18 +1248,98 @@ function installGuideHTML() {
   const cmdInstall = "npx @mrrisega/dsh-remote";
   return `
     <div class="guide">
-      <div class="guide-title">💻 电脑端还没连接?</div>
-      <div class="guide-sub">在你要控制的电脑上安装 dsh-bridge,保持在线后本页即可看到并进入:</div>
+      <div class="guide-title">💻 还差最后一步:在电脑上装一下</div>
+      <div class="guide-sub">本页会自动检测——电脑装好并登录后,设备会自己出现在这里,<b>不需要刷新页面</b>。</div>
       <ol>
-        <li><b>安装 Node.js 22+</b> — 从 <code>nodejs.org</code> 下载安装,终端运行 <code>node -v</code> 确认版本 ≥ v22。</li>
-        <li><b>一键安装</b> — 终端执行(自动安装 bridge + dsh web 插件,并创建开机自启服务):
-          <div class="guide-cmd"><code>${esc(cmdInstall)}</code><button type="button" class="guide-copy" data-guide-copy="${esc(cmdInstall)}">复制</button></div>
-        </li>
-        <li><b>登录账号</b> — 运行 <code>npx @mrrisega/dsh-remote settings</code> 打开设置页,用本页注册的手机号与密码登录。</li>
-        <li><b>保持运行</b> — 服务常驻后台(launchd / systemd 自启),回到本页点「刷新设备列表」即可看到电脑上线。</li>
+        <li><b>在你要控制的电脑上打开 DeepSeek Harness</b>(就是平时写代码的那个窗口)。</li>
       </ol>
+      <div class="guide-path">
+        <div class="guide-path-tag">如果你有「插件市场」入口 · 不用敲命令</div>
+        <ol>
+          <li>在 Harness 里打开<b>插件市场 / 插件中心</b>(不同版本位置不同,通常在设置或侧栏)。</li>
+          <li>搜索 <code>dsh-remote</code> → 点<b>安装</b> — 只装一个面板插件,运行环境与开机自启由它自动补齐。</li>
+          <li>按面板提示<b>重启一次 DeepSeek Harness</b>。</li>
+        </ol>
+      </div>
+      <div class="guide-path">
+        <div class="guide-path-tag">没有市场入口?用这条命令 · 一条搞定</div>
+        <ol>
+          <li>在电脑上打开「终端 / Terminal」,把下面这条命令<b>整行复制粘贴</b>进去回车:
+            <div class="guide-cmd"><code>${esc(cmdInstall)}</code><button type="button" class="guide-copy" data-guide-copy="${esc(cmdInstall)}">复制</button></div>
+          </li>
+        </ol>
+      </div>
+      <div class="guide-path">
+        <div class="guide-path-tag">两条路走完后都一样</div>
+        <ol>
+          <li>在电脑上打开「设置 → 📱 远程访问」,用<b>本页注册的手机号</b>登录。</li>
+          <li>回到本页稍等几秒,电脑会自己出现在列表里(不用刷新)。</li>
+        </ol>
+      </div>
+      <details class="guide-more">
+        <summary>安装报错 / 想手动控制?展开看细节</summary>
+        <ol>
+          <li><b>提示找不到 node</b> — 先在电脑上装 Node.js 22+(从 <code>nodejs.org</code> 下载),终端运行 <code>node -v</code> 确认 ≥ v22 后,再重跑上面那条命令。</li>
+          <li><b>想看/改配置</b> — 运行 <code>npx @mrrisega/dsh-remote settings</code> 打开设置页,登录账号、启停 bridge、切换自建服务都在这里。</li>
+          <li><b>服务要常驻</b> — 命令安装会自动创建开机自启(launchd / systemd);插件市场安装时由插件自动补齐。</li>
+        </ol>
+      </details>
     </div>`;
 }
+
+// ---------- 空设备态自动等待(无需用户手动刷新) ----------
+
+/**
+ * 设备轮询:手机端停留在这页时,若一台在线设备都没有,就自动轻量探测(见 probeOnlineDevices),
+ * 一旦电脑上线立即自动切到设备列表——用户不需要点「刷新设备列表」。
+ * 首次 10 次每 5s(等首装最急的那一分钟),之后退到 20s;页面不可见时暂停,回到前台立即探测。
+ */
+let devicePollTimer = null;
+let devicePollTicks = 0;
+function cancelDevicePoll() {
+  if (devicePollTimer) { clearTimeout(devicePollTimer); devicePollTimer = null; }
+}
+function scheduleDevicePoll() {
+  cancelDevicePoll();
+  if (lastOnlineCount > 0) return;                        // 已有在线设备 → 停止轮询
+  if (document.hidden) return;                            // 页面不可见 → 暂停(visibilitychange 恢复)
+  if ($("view-devices").classList.contains("hidden")) return; // 已离开设备页
+  const wait = devicePollTicks < 10 ? 5000 : 20000;
+  devicePollTimer = setTimeout(() => {
+    devicePollTimer = null;
+    devicePollTicks += 1;
+    void probeOnlineDevices();
+  }, wait);
+}
+function resetDevicePoll() { cancelDevicePoll(); devicePollTicks = 0; }
+
+/**
+ * 轻量探测:只问 Router 的实时在线设备(带 dsh_token cookie,不写账号库),
+ * 因此可以放心高频轮询,不会污染 /api/devices 的活跃统计。
+ * 一旦发现设备(数量变化或首次出现)→ 走一次完整刷新,渲染出可点选的设备列表。
+ */
+async function probeOnlineDevices() {
+  try {
+    const r = await fetch("/_devices", { cache: "no-store" });
+    if (r.status === 401) { await refreshDevices(); return; } // 登录态失效:交给完整刷新路径(会提示重新登录)
+    const d = await r.json().catch(() => ({}));
+    const ids = (Array.isArray(d.devices) ? d.devices : []).filter(x => x && x.id).map(x => String(x.id));
+    if (ids.length > 0 && ids.length !== lastOnlineCount) {
+      devicePollTicks = 0;
+      await refreshDevices();
+      return;
+    }
+  } catch { /* 网络抖动:下一轮再试 */ }
+  scheduleDevicePoll();
+}
+
+// 回到前台 / 切到设备页时立即探测一次(不用等下一个轮询周期)
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) { cancelDevicePoll(); return; }
+  if (!$("view-devices").classList.contains("hidden")) {
+    if (lastOnlineCount > 0) void refreshDevices(); else void probeOnlineDevices();
+  }
+});
 
 /** 为引导卡片内的「复制」按钮绑定命令复制。 */
 function bindGuideCopy(root) {
@@ -1364,16 +1457,22 @@ async function refreshDevices() {
         listHintHTML(`⚠️ 暂时无法确认实时在线状态${routerErr ? `(${esc(routerErr)})` : ""}。以下为账号已绑定设备,请检查网络后点「刷新设备列表」重试。`);
       return;
     }
-    list.innerHTML = `<div class="empty">获取在线设备失败:${esc(routerErr)}。<br>请检查网络后点"刷新"重试。</div>`;
+    lastOnlineCount = 0;
+    list.innerHTML = `<div class="empty">获取在线设备失败:${esc(routerErr)}。<br>会自动重试,也可以点"刷新"。</div>`;
+    scheduleDevicePoll();
     return;
   }
 
-  // 一个已绑定/在线设备都没有 → 展示安装引导(不再是空白/无解释)
+  // 一个已绑定/在线设备都没有 → 展示安装引导 + 自动等待(不再是空白/无解释,也不需要手动刷新)
   if (all.length === 0) {
-    $("signal-label").textContent = "暂无在线设备";
+    lastOnlineCount = 0;
+    $("signal-label").textContent = "等待电脑上线…";
     const emptyText = boundOk ? "还没有绑定任何设备" : "暂无在线设备";
-    list.innerHTML = `<div class="empty" style="padding:12px 0 8px;">${emptyText}</div>${installGuideHTML()}`;
+    list.innerHTML = `<div class="empty" style="padding:12px 0 8px;">${emptyText}</div>` +
+      `<div class="empty guide-wait" style="padding:0 0 8px;"><span class="loading"></span> 正在自动检测:电脑装好后会自己出现在这里,无需刷新本页</div>` +
+      installGuideHTML();
     bindGuideCopy(list);
+    scheduleDevicePoll();
     return;
   }
 
@@ -1385,10 +1484,12 @@ async function refreshDevices() {
     ));
   }
 
+  lastOnlineCount = online.length;
   $("signal-label").textContent = boundOk
     ? `设备 ${all.length} 台${online.length ? ` · ${online.length} 台在线` : " · 当前均离线"}`
     : (online.length ? `在线设备 ${online.length} 台` : "暂无在线设备");
   $("dot-signal").classList.toggle("on", online.length > 0);
+  scheduleDevicePoll(); // 全部离线时继续自动等上线;有在线设备则自动停止
   if (online.length) void applyQuotaHint();
 
   // 行点击:在线 → E2EE 门控后进入(未启用/无能力 → 原明文流程,零行为变化);离线 → 轻提示引导
@@ -1574,7 +1675,8 @@ async function renderPromo() {
   const guide = gc.app_install_guide || "";
   $("promo-install").innerHTML = guide
     ? `<b>安装引导</b><br/>${guide}`
-    : `<div class="promo-install-title">🚀 电脑端安装 · 一条命令</div>
+    : `<div class="promo-install-title">🚀 电脑端安装 · 二选一</div>
+       <div class="promo-install-hint"><b>有「插件市场」入口</b>:在电脑上打开 DeepSeek Harness → 插件市场搜索 <code>dsh-remote</code> → 安装 → 按提示重启一次。<br/><b>没有市场入口</b>:用下面这条命令(整行复制到终端回车),同样一条搞定。</div>
        <div class="promo-install-cmd"><code>npx @mrrisega/dsh-remote</code><button type="button" class="primary" id="btn-copy-install">复制</button></div>
        <div class="promo-install-hint">自动安装 bridge 与 dsh web 插件并创建开机自启;安装后运行 <code>npx @mrrisega/dsh-remote settings</code> 打开设置页登录账号,手机端即可看到电脑上线。</div>`;
   const copyInstallBtn = $("btn-copy-install");
@@ -2625,7 +2727,7 @@ $("btn-send-reset-sms").onclick = () => sendSms("reset");
 $("reset-captcha-img").onclick = () => loadCaptchaInto("reset-captcha-img");
 $("btn-password-reset").onclick = () => doPasswordReset();
 $("reset-pass").addEventListener("keydown", (e) => { if (e.key === "Enter") $("btn-password-reset").onclick(); });
-$("btn-refresh").onclick = refreshDevices;
+$("btn-refresh").onclick = () => { resetDevicePoll(); void refreshDevices(); };
 $("btn-manage-devices").onclick = toggleManageDevices;
 // 推广页:月付/年付 Tab
 $("promo-tab-monthly").onclick = () => switchPromoBilling("monthly");

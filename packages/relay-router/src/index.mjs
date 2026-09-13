@@ -113,6 +113,31 @@ function reportMilestone(userId, kind) {
   } catch { /* ignore */ }
 }
 
+/**
+ * 上报设备在线态给企业端(权威在线信号)。
+ *
+ * 为什么需要:企业端 `devices.online` 列历史上只置 1、无清 0 路径(实测 15/15 恒为在线),
+ * 而 `last_seen_at` 只在 bridge 重新登记时更新 —— 长时间运行的 bridge 会被误判离线。
+ * router 是**唯一真正知道 bridge 当前是否在线**的地方(内存 devices Map),因此在:
+ *   ① bridge 注册成功 → 立刻上报 online=true;
+ *   ② 断开(cleanupDevice)→ 上报 online=false;
+ *   ③ 每 60s 给仍在线设备各补一次 true(**兼作心跳**,让企业端的 last_seen 新鲜度口径可用)。
+ * 失败静默:企业端不可达绝不影响隧道业务。
+ */
+const PRESENCE_SWEEP_MS = 60_000;
+function reportPresence(deviceId, userId, online) {
+  try {
+    const uid = Number(userId);
+    if (!deviceId || !Number.isInteger(uid) || uid <= 0 || !INTERNAL_TOKEN) return;
+    fetch(`${ENTERPRISE_INTERNAL_URL}/api/internal/device-presence`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${INTERNAL_TOKEN}` },
+      body: JSON.stringify({ device_id: String(deviceId), user_id: uid, online: online === true }),
+      signal: AbortSignal.timeout(3000)
+    }).catch(() => { /* 静默:企业端不可达不影响隧道 */ });
+  } catch { /* ignore */ }
+}
+
 /** 依次用 enterprise/本地密钥校验 JWT;返回 claims 或 null。 */
 function verifyAnyJwt(token) {
   const claims = verifyJwt(token, JWT_SECRET);
@@ -766,6 +791,7 @@ bridgeWss.on("connection", (ws, req) => {
           /* ignore */
         }
         console.log(`[router] bridge 注册: ${deviceId} (user=${dev.userId}, plan=${dev.plan}, name=${dev.name})`);
+        reportPresence(deviceId, dev.userId, true); // 权威在线信号:企业端据此刷新 last_seen/online
         return;
       }
       // 注册后的业务帧(bridge 回包)
@@ -787,6 +813,8 @@ bridgeWss.on("connection", (ws, req) => {
 function cleanupDevice(dev) {
   if (devices.get(dev.deviceId) === dev) devices.delete(dev.deviceId);
   console.log(`[router] bridge 断开: ${dev.deviceId}`);
+  // 只有真的从 Map 里摘掉才上报离线(避免重复 close 把刚重连上的设备误标离线)
+  if (!devices.has(dev.deviceId)) reportPresence(dev.deviceId, dev.userId, false);
   for (const [id, p] of pendingHttp) {
     if (p.deviceId === dev.deviceId) {
       pendingHttp.delete(id);
@@ -1005,6 +1033,16 @@ server.listen(PORT, HOST, () => {
     setInterval(refreshQuotaConfig, QUOTA_REFRESH_MS);
   }
 });
+
+
+// presence 心跳:每 60s 给仍在线设备各补一次 online=true(兼作 last_seen 心跳)。
+// 企业端以「last_seen 新鲜度(180s TTL)」判定在线,故离线设备会在最多 3 分钟内自然掉落;
+// 无在线设备时不发任何请求。unref:不阻塞进程退出(测试环境友好)。
+const presenceSweep = setInterval(() => {
+  if (devices.size === 0) return;
+  for (const dev of devices.values()) reportPresence(dev.deviceId, dev.userId, true);
+}, PRESENCE_SWEEP_MS);
+presenceSweep.unref?.();
 
 // 优雅退出
 function shutdown() {

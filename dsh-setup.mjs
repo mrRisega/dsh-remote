@@ -131,6 +131,16 @@ function preferredNode() {
 }
 const NODE_BIN = preferredNode();
 
+// ---------- 安装口径（随 bridge 环境变量注入；服务端存到设备行，供运营统计） ----------
+/**
+ * install_source：本文件即「一键安装器」→ 默认 npx（用户自己跑 `npx @mrrisega/dsh-remote` 的那条路径）。
+ * 插件市场那条路径由插件半自愈补装：插件 spawn 本安装器时显式传入
+ * DSH_BRIDGE_INSTALL_SOURCE=plugin_market，这里原样透传（外部注入 > 硬编码默认）。
+ * install_version：优先取外部注入（插件/在线更新器），否则取本包 package.json 版本。
+ */
+const INSTALL_SOURCE = String(process.env.DSH_BRIDGE_INSTALL_SOURCE || "").trim() || "npx";
+const INSTALL_VERSION = String(process.env.DSH_BRIDGE_INSTALL_VERSION || "").trim() || pkgVersion();
+
 // ---------- 配置读写 ----------
 function loadConfig() {
   try { return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8")); }
@@ -206,7 +216,7 @@ function writeAutostartFile() {
   <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>${path.join(CONFIG_DIR, ".dsh-bridge.log")}</string>
   <key>StandardErrorPath</key><string>${path.join(CONFIG_DIR, ".dsh-bridge.log")}</string>
-  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string></dict>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string><key>DSH_BRIDGE_INSTALL_SOURCE</key><string>${INSTALL_SOURCE}</string><key>DSH_BRIDGE_INSTALL_VERSION</key><string>${INSTALL_VERSION}</string></dict>
 </dict></plist>`;
     fs.writeFileSync(plistPath, plist);
     console.log(`✅ 已创建自启动服务: ${plistPath}`);
@@ -215,7 +225,7 @@ function writeAutostartFile() {
   if (process.platform === "linux") {
     const dir = path.join(os.homedir(), ".config/systemd/user");
     fs.mkdirSync(dir, { recursive: true });
-    const unit = `[Unit]\nDescription=dsh-remote bridge (auto-starts with dsh web)\n\n[Service]\nExecStart=${runCmd}\nRestart=on-failure\nRestartSec=5\nEnvironment=PATH=/usr/local/bin:/usr/bin:/bin\n\n[Install]\nWantedBy=default.target\n`;
+    const unit = `[Unit]\nDescription=dsh-remote bridge (auto-starts with dsh web)\n\n[Service]\nExecStart=${runCmd}\nRestart=on-failure\nRestartSec=5\nEnvironment=PATH=/usr/local/bin:/usr/bin:/bin\nEnvironment=DSH_BRIDGE_INSTALL_SOURCE=${INSTALL_SOURCE}\nEnvironment=DSH_BRIDGE_INSTALL_VERSION=${INSTALL_VERSION}\n\n[Install]\nWantedBy=default.target\n`;
     const unitPath = autostartFilePath();
     fs.writeFileSync(unitPath, unit);
     console.log(`✅ 已创建自启动服务: ${unitPath}`);
@@ -350,6 +360,9 @@ async function runBridge() {
         ...process.env,
         DSH_BRIDGE_CONFIG: CONFIG_PATH,
         DSH_BRIDGE_TUNNEL_URL: cfg.tunnel_url,
+        // 安装口径透传给 bridge（bridge 把它随设备登记请求一起上报给账号 API）
+        DSH_BRIDGE_INSTALL_SOURCE: INSTALL_SOURCE,
+        DSH_BRIDGE_INSTALL_VERSION: INSTALL_VERSION,
         ...(saas ? { DSH_BRIDGE_PHONE: (cfg.phone || cfg.email || ""), DSH_BRIDGE_PASSWORD: cfg.password, DSH_BRIDGE_API: apiUrl, DSH_BRIDGE_SECRET: cfg.bridge_secret || "" } : {}),
         ...(local ? { DSH_BRIDGE_LOCAL_KEY: cfg.local_key } : {})
       };

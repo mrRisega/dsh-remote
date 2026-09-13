@@ -123,6 +123,24 @@ test("忘记密码(短信重置):登录卡入口 + 重置表单字段与端点�
   assert.match(APP, /请用新密码登录/);
 });
 
+test("注册请求上报 reg_source=remoteweb_register(注册来源归因;字段可选,不传安装来源)", () => {
+  // 端点与调用形态不变:POST /api/register,payload 由 doRegister 构造
+  assert.match(APP, /api\("\/api\/register", payload\)/);
+  // 来源值精确匹配服务端白名单(panel_register / remoteweb_register / api_unknown)
+  assert.match(APP, /reg_source:\s*"remoteweb_register"/);
+  // 断言 reg_source 确实落在注册 payload 字面量里(防被挪到别处或写成别的值)
+  const callIdx = APP.indexOf('api("/api/register", payload)');
+  assert.ok(callIdx > 0, "应有 POST /api/register 且以 payload 为 body 的调用");
+  const before = APP.slice(Math.max(0, callIdx - 800), callIdx);
+  assert.match(before, /const payload = \{[^}]*\bphone\b[^}]*sms_code[^}]*password[^}]*\}/);
+  assert.match(before, /const payload = \{[^}]*reg_source:\s*"remoteweb_register"[^}]*\}/);
+  // 注册流程字段零回归:短信验证码与邀请码仍在同一 payload
+  assert.match(before, /sms_code: sms/);
+  assert.match(before, /payload\.invite_code = window\.__inviteCode/);
+  // 手机端不是安装方:不臆造安装来源字段
+  assert.doesNotMatch(before, /install_source|install_version/);
+});
+
 // ============================================================
 // E2EE Phase-3 源码级契约(native.html 手机端客户端;docs/e2ee-protocol.md §2.3/§3.4/§5/§6.4)
 // ============================================================
@@ -217,4 +235,53 @@ test("付费页底部「加入交流群」卡片:取 public-config.community.qrc
   assert.match(APP, /img\.onerror = \(\) => \{ card\.classList\.add\("hidden"\); \}/);
   // 每次刷新配置都会重新评估(renderPromoPlans 末尾调用)
   assert.match(APP, /  renderPromoCommunity\(\);\n\}/);
+});
+
+// 首装漏斗修复(2026-09-13 诊断):手机端空设备态不再让用户"等不到就算了"。
+// 生产证据:11 个真实用户(id 42~52)中 6 人只注册了手机端、电脑端从未安装(面板活动为 0),
+// 原因是引导只给了「装 Node.js + 终端跑 npx」这一条技术路径;剩下多人在空列表前反复轮询后流失。
+test("空设备态:安装引导改为「插件市场安装」优先,终端命令收进进阶折叠", () => {
+  assert.match(APP, /插件市场/, "引导必须给出插件市场安装路径(零终端)");
+  assert.match(APP, /搜索 <code>dsh-remote<\/code>/, "市场路径要能照着做(搜索 dsh-remote)");
+  assert.match(APP, /如果你有「插件市场」入口/, "市场路径必须标明前提(DSH 本身没有内置市场,入口来自第三方市场插件)");
+  assert.match(APP, /没有市场入口\?用这条命令/, "必须给没有市场入口的用户一条可执行兜底路径");
+  assert.match(APP, /两条路走完后都一样/, "两条路径要收敛到同一段「登录 + 自动出现」指引");
+  assert.match(APP, /不需要刷新页面|无需刷新本页/, "要明确告诉用户不用手动刷新");
+  // 终端路径保留但降级:必须包在 <details> 进阶折叠里,且仍可一键复制命令
+  // 模板里用的是 `${esc(cmdInstall)}`,故按区间断言(折叠段内必须有命令块且引用 cmdInstall)
+  const from = APP.indexOf('<details class="guide-more">');
+  const more = APP.slice(from, APP.indexOf("</details>", from));
+  assert.ok(from > 0, "应有进阶折叠 <details class=\"guide-more\">");
+  assert.ok(/Node\.js 22\+/.test(more) && more.includes("settings"), "折叠区应讲「缺 Node 怎么办」与「settings 手动控制」，不重复主路径命令");
+  assert.match(APP, /data-guide-copy="\$\{esc\(cmdInstall\)\}"/, "终端命令保留复制按钮");
+  // 后台配置仍可整体覆盖
+  assert.match(APP, /const custom = pubConfig && pubConfig\.app_install_guide;\s*\n\s*if \(custom\) return custom;/);
+});
+
+test("空设备态:自动等待电脑上线(轻量探测 + 退避 + 前台恢复),不必点刷新", () => {
+  assert.match(APP, /let devicePollTimer = null;/, "需要模块级轮询句柄");
+  assert.match(APP, /let lastOnlineCount = 0;/, "需要记录在线设备数决定是否继续等待");
+  assert.match(APP, /function scheduleDevicePoll\(\)/, "需要调度函数");
+  assert.match(APP, /function cancelDevicePoll\(\)/, "需要取消函数(离页/隐藏时停)");
+  // 轻量探测只打 Router 实时接口(不写账号库、不污染活跃统计)
+  assert.match(APP, /async function probeOnlineDevices\(\)[\s\S]{0,400}?fetch\("\/_devices", \{ cache: "no-store" \}\)/);
+  assert.match(APP, /ids\.length > 0 && ids\.length !== lastOnlineCount/, "发现设备才走完整刷新");
+  // 首装最急的一分钟 5s,之后退到 20s;隐藏时暂停
+  assert.match(APP, /devicePollTicks < 10 \? 5000 : 20000/);
+  assert.match(APP, /if \(document\.hidden\) return;\s*\/\/ 页面不可见/);
+  assert.match(APP, /document\.addEventListener\("visibilitychange"/, "回前台立即探测");
+  // 各渲染分支都要安排/停止轮询
+  assert.match(APP, /lastOnlineCount = online\.length;[\s\S]{0,400}?scheduleDevicePoll\(\); \/\/ 全部离线时继续自动等上线/);
+  assert.match(APP, /lastOnlineCount = 0;[\s\S]{0,600}?scheduleDevicePoll\(\);\s*\n\s*return;/);
+  // 手动刷新按钮重置退避
+  assert.match(APP, /\$\("btn-refresh"\)\.onclick = \(\) => \{ resetDevicePoll\(\); void refreshDevices\(\); \};/);
+  // 等待提示文案
+  assert.match(APP, /正在自动检测:电脑装好后会自己出现在这里,无需刷新本页/);
+});
+
+test("推广页安装引导同样市场优先(与空设备态一致,避免两条引导自相矛盾)", () => {
+  assert.match(APP, /电脑端安装 · 二选一/, "推广页引导应同时给出市场与命令两条路");
+  const from = APP.indexOf('"promo-install").innerHTML');
+  const block = APP.slice(from, APP.indexOf("btn-copy-install", from) + 200);
+  assert.ok(/插件市场[\s\S]{0,300}?npx @mrrisega\/dsh-remote[\s\S]{0,200}?复制/.test(block), "市场路径在前、终端命令在后(保留复制按钮)");
 });

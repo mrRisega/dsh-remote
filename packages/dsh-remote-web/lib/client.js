@@ -408,6 +408,13 @@ window.__ModuleLoader__.load({
     // 导致 busy 护栏失效（重复请求）或误拦（该重试却跳过）。
     var akeyInFlight = { v: false };
     var devInFlight = { v: false };
+    /** 连接阶段轮询的在途标记（同上：必须放组件外，否则闭包过期会重复请求）。 */
+    var connInFlight = { v: false };
+    /** 最近一次连接阶段（供自调度定时器决定快/慢轮询节奏，避免依赖渲染闭包）。 */
+    var connPhaseRef = { v: "" };
+    /** 连接阶段轮询节奏：未连通时 2.5s（自动推进），已连接后退避到 15s；页面隐藏时完全停下。 */
+    var CONN_POLL_FAST_MS = 2500;
+    var CONN_POLL_SLOW_MS = 15000;
     function cancelAkeyRetry() { clearLater(akeyRetry.timer); akeyRetry.timer = null; }
     function cancelDevRetry() { clearLater(devRetry.timer); devRetry.timer = null; }
 
@@ -1182,6 +1189,12 @@ window.__ModuleLoader__.load({
       // ── 💬 交流群（「加入交流群」按钮 + 弹窗）：同样放在全部既有字段之后 ──
       var communityArr = useState(null); var community = communityArr[0]; var setCommunity = communityArr[1]; // {qrcode,wechat}；null=未加载
       var commOpenArr = useState(false); var commOpen = commOpenArr[0]; var setCommOpen = commOpenArr[1];
+      // ── 🔗 登录后自动闭环：连接阶段（运行环境 → bridge 进程 → 设备已在中继注册=online） ──
+      // conn 来自 GET /dsh-remote/bridge-status（node 半在返回前会自动补装/拉起/退避重试），
+      // 面板据它显示「正在准备运行环境…/正在启动 Bridge…/正在连接中继…/已连接 ✅」，
+      // 并用短轮询自动推进到 online —— 用户不需要点按钮、也不需要刷新页面。
+      var connArr = useState(null); var conn = connArr[0]; var setConn = connArr[1];
+      var copiedDiagArr = useState(false); var copiedDiag = copiedDiagArr[0]; var setCopiedDiag = copiedDiagArr[1];
 
       var refresh = useCallback(function () {
         setBusy("status");
@@ -1222,6 +1235,13 @@ window.__ModuleLoader__.load({
       // 是否需要重启 DeepSeek harness（首次安装/在线更新后置顶提醒 + 底部常驻按钮）
       var restartInfo = (st && st.restart) || {};
       var restartPending = !!restartInfo.pending;
+      // 连接阶段（node 半下发）：轮询拿到的新鲜结果优先，其次用 /status 里带的那一份；
+      // 旧版 host（响应里没有 connect 字段）→ 回退到原来的 service.running 文案（行为不变）。
+      var connInfo = conn || (st && st.connect) || null;
+      var connPhase = (connInfo && connInfo.phase) || "";
+      var connOnline = connPhase === "online";
+      var connText = (connInfo && connInfo.text) || "";
+      var connError = connInfo && connInfo.error ? connInfo.error : null;
       // 账号标识（掩码手机号）：登录成功/换账号时变化 → 触发上方的重取 effect（比布尔 loggedIn 更敏感）
       var phoneKey = (st && st.config && st.config.phone) || "";
       var launchdPid = st && st.service && st.service.launchd && st.service.launchd.pid;
@@ -1531,6 +1551,87 @@ window.__ModuleLoader__.load({
         };
       }, [view, mode, loggedIn, phoneKey, serviceRunning]);
 
+      // ── 登录后自动闭环（0.6.4）：连接阶段短轮询 ──────────────────────────────
+      // 登录成功（含从别处已登录、被面板读到）后立刻开始推进连接，之后自调度：
+      //   非 online → 2.5s 一次（阶段自动前进，用户零操作）；online → 15s 一次（退避，只做保活/新设备发现）。
+      // 页面隐藏时 pollConnect 直接返回（不空转），回前台由 visibilitychange 立即补一次。
+      // 依赖里只有「视图/模式/登录态」：阶段变化不重建定时器，避免每次推进都多发一次请求。
+      useEffect(function () {
+        if (view !== "home" || mode !== "saas" || !loggedIn) return undefined;
+        var stopped = false;
+        var timer = null;
+        var tick = function () {
+          if (stopped) return;
+          clearLater(timer);
+          timer = later(function () {
+            timer = null;
+            tick();
+          }, connPhaseRef.v === "online" ? CONN_POLL_SLOW_MS : CONN_POLL_FAST_MS);
+          pollConnect();
+        };
+        var onVisible = function () { if (!document.hidden && !stopped) pollConnect(); };
+        try { document.addEventListener("visibilitychange", onVisible); } catch (e) { /* 环境无 document */ }
+        if (!document.hidden) { pollConnect(); tick(); }
+        return function () {
+          stopped = true;
+          clearLater(timer);
+          try { document.removeEventListener("visibilitychange", onVisible); } catch (e) { /* 忽略 */ }
+        };
+      }, [view, mode, loggedIn]);
+
+      /**
+       * 连接阶段轮询：GET /dsh-remote/bridge-status（node 半在返回前自动补装运行环境 / 拉起 bridge /
+       * 清理卡死标记，并自带退避），面板据此自动推进「准备运行环境 → 启动 Bridge → 连接中继 → 已连接」。
+       * 关键点：
+       *   - document.hidden 时完全不发请求（后台标签页不空转）；回前台由 visibilitychange 立即补一次；
+       *   - 阶段推进到 online 时自动重取二维码与已授权设备列表 —— 用户不用刷新页面就能扫码。
+       */
+      function pollConnect() {
+        if (document.hidden) return;
+        if (connInFlight.v) return;
+        connInFlight.v = true;
+        api("/dsh-remote/bridge-status").then(function (b) {
+          if (!b || !b.ok || !b.connect) return;
+          var prev = connPhaseRef.v;
+          connPhaseRef.v = b.connect.phase || "";
+          setConn(b.connect);
+          if (b.connect.phase === "online") {
+            // 已连接：立刻补一次二维码/设备列表（首次连上时 prev 不是 online → 无条件重取）
+            if (prev !== "online") {
+              akeyRetry.attempt = 0; devRetry.attempt = 0;
+              loadAccessKey();
+              loadDevices();
+            } else if (devSessions !== null) {
+              refreshDeviceList(); // 手机扫码后设备列表自动出现，无需刷新页面
+            }
+          }
+        }).catch(function () { /* 轮询失败静默：下一轮自动重试 */ })
+          .finally(function () { connInFlight.v = false; });
+      }
+
+      /** 「重试」按钮：POST /dsh-remote/connect/retry（清退避 + 立刻再走一遍闭环），随后刷新阶段。 */
+      var retryConnect = function () {
+        setBusy("connect-retry");
+        post("/dsh-remote/connect/retry").then(function (b) {
+          if (b && b.connect) { connPhaseRef.v = b.connect.phase || ""; setConn(b.connect); }
+          setMsg("ok", "已重新开始连接，正在自动重试…");
+        }).catch(function (e) {
+          setMsg("err", "重试失败：" + e.message);
+        }).finally(function () { setBusy(""); });
+      };
+
+      /** 「复制诊断信息」：版本 / 配置目录 / 阶段 / 最近错误 / 进程状态 / 日志路径（node 半已拼好）。 */
+      var copyDiagnostics = function () {
+        var text = (connInfo && connInfo.diagnostics) || "";
+        if (!text) return;
+        try {
+          navigator.clipboard.writeText(text).then(function () {
+            setCopiedDiag(true);
+            later(function () { setCopiedDiag(false); }, 1500);
+          });
+        } catch (e) { /* 剪贴板不可用：文案里已给出日志路径，用户可自行查看 */ }
+      };
+
       function setMsg(kind, text) { setMessage({ kind: kind, text: text }); }
 
       // ---------- 登录(密码/短信) ----------
@@ -1588,7 +1689,10 @@ window.__ModuleLoader__.load({
         if (rpass.length < 8) { setMsg("err", "密码至少 8 位"); return; }
         if (rpass !== rpass2) { setMsg("err", "两次输入的密码不一致"); return; }
         setBusy("register");
-        var regPayload = { phone: rphone.trim(), sms_code: rsms.trim(), password: rpass };
+        // reg_source：注册来源（增长口径）——面板内注册 = panel_register；
+        // 手机端网页注册走 clients/dsh-web/native.html（= remoteweb_register）。
+        // 节点半 /dsh-remote/register 全量透传 body，企业端白名单外的值会归一成 api_unknown。
+        var regPayload = { phone: rphone.trim(), sms_code: rsms.trim(), password: rpass, reg_source: "panel_register" };
         var invite = rInvite.trim().toUpperCase();
         if (invite) regPayload.invite_code = invite;
         if (rcap) { regPayload.captcha_id = rcap.id; regPayload.captcha_answer = rcapTxt.trim(); }
@@ -1947,12 +2051,59 @@ window.__ModuleLoader__.load({
         var expMs = akey ? toMs(akey.expires_at) : 0;
         var remainMs = expMs ? expMs - nowTick : 0;
         var loggedInSaaS = !!(st && st.config && st.config.phone);
+        // 状态行优先用连接阶段文案（node 半下发的 user-facing 文案）：
+        // 「正在准备运行环境（首次约 1~2 分钟）… / 正在启动 Bridge… / 正在连接中继… / 已连接 ✅ …」；
+        // 旧版 host 没有 connect 字段 → 完全回退到原来的 running 文案（既有行为不变）。
         var statusTxt = st === null
           ? "查询中…"
           : !loggedInSaaS
             ? "请先登录（下方账号卡片）后启用远程访问"
-            : serviceRunning ? "已连接（可远程访问）" : "等待设备连接";
-        var dotCls = "dru-dot " + (loggedInSaaS && serviceRunning ? "dru-dot-on" : "dru-dot-off");
+            : connInfo ? connText : serviceRunning ? "已连接（可远程访问）" : "等待设备连接";
+        var dotOn = loggedInSaaS ? (connInfo ? connOnline : serviceRunning) : false;
+        var dotCls = "dru-dot " + (dotOn ? "dru-dot-on" : "dru-dot-off");
+
+        /**
+         * 连接阶段区块：把「环境 → bridge 进程 → 中继注册」的自动推进过程如实展示出来，
+         * 面向非技术用户——非 online 阶段一律说明「正在自动进行，无需操作」；
+         * 只有失败（error）才给可操作项：重试 / 复制诊断信息 / 日志路径，绝不出现死胡同。
+         */
+        function renderConnectBlock() {
+          if (!loggedInSaaS || !connInfo) return null;
+          var phase = connInfo.phase || "";
+          if (phase === "online") {
+            return h("div", { className: "dru-meta", style: { marginTop: 6 } },
+              connInfo.registerSource === "account_api" || connInfo.registerSource === "account" || connInfo.registerSource === "state_account"
+                ? "设备已登记到你的账号：手机端「设备列表」可以看到这台电脑。"
+                : "设备已注册到中继：手机端扫码或打开链接即可进入这台电脑。");
+          }
+          var rows = [];
+          if (phase === "error") {
+            rows.push(h("div", { className: "dru-msg dru-msg-err", style: { marginTop: 6 } },
+              "⚠️ " + ((connError && connError.message) || connText)));
+            if (connInfo.detail) rows.push(h("div", { className: "dru-hint", style: { marginTop: 4 } }, connInfo.detail));
+            if (connInfo.nextRetryInMs > 0) {
+              rows.push(h("div", { className: "dru-hint", style: { marginTop: 4 } },
+                "已自动重试 " + (connInfo.attempts || 0) + " 次，约 " + Math.ceil(connInfo.nextRetryInMs / 1000) + " 秒后自动再试（也可以点下面按钮立刻重试）"));
+            }
+            rows.push(h("div", { className: "dru-actions", style: { marginTop: 8 } },
+              h("button", { type: "button", className: "dru-btn dru-btn-primary", disabled: busy !== "", onClick: retryConnect }, busy === "connect-retry" ? "重试中…" : "重试"),
+              h("button", { type: "button", className: "dru-btn dru-btn-ghost", onClick: copyDiagnostics }, copiedDiag ? "已复制" : "复制诊断信息")));
+            rows.push(h("div", { className: "dru-hint", style: { marginTop: 6 } },
+              "查看日志：bridge " + (connInfo.logPath || "") + " ，安装 " + (connInfo.installLogPath || "") + "（把「复制诊断信息」的内容发给客服可加速定位）"));
+            return h("div", null, rows);
+          }
+          // 非错误阶段：只解释「正在自动做什么」，并说明不需要任何操作
+          if (connInfo.detail) rows.push(h("div", { className: "dru-hint", style: { marginTop: 6 } }, connInfo.detail));
+          if (connInfo.installing || phase === "no_runtime") {
+            rows.push(h("div", { className: "dru-hint", style: { marginTop: 4 } },
+              "首次安装会自动下载并配置，期间请不要关闭 DeepSeek；装完会自动启动 bridge，无需任何操作。"));
+          }
+          if (connInfo.deviceId) rows.push(h("div", { className: "dru-meta" }, "设备 ID：" + connInfo.deviceId));
+          rows.push(h("div", { className: "dru-actions", style: { marginTop: 8 } },
+            h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "", onClick: retryConnect }, busy === "connect-retry" ? "立即重试中…" : "立即重试"),
+            h("button", { type: "button", className: "dru-btn dru-btn-ghost", onClick: copyDiagnostics }, copiedDiag ? "已复制" : "复制诊断信息")));
+          return h("div", null, rows);
+        }
         // Phase-5:端到端加密(E2EE)状态行 —— 未登录/旧 host 未下发 e2ee 一律不渲染
         // （桌面宽屏与手机镜像共用同一面板：纯文字状态行、不弹层不打扰）；启用=绿点绿字（🔒已启用），
         // 未启用=灰字 + 中性原因文案（回退普通 HTTPS 连接，不宣称“灰度等待”）。
@@ -1969,6 +2120,7 @@ window.__ModuleLoader__.load({
             h("span", { className: dotCls }),
             h("span", null, statusTxt)
           ),
+          renderConnectBlock(),
           renderE2eeBadge(),
           akeyMsg
             ? h("div", { className: "dru-msg dru-msg-" + akeyMsg.kind, style: { marginTop: 8 } },
@@ -1999,7 +2151,9 @@ window.__ModuleLoader__.load({
                 ),
                 h("div", { className: "dru-hint", style: { marginTop: 4 } },
                   !serviceRunning
-                    ? "本机 bridge 未运行：先在下方「🖥 Bridge 服务」卡启动。"
+                    ? (connInfo && connPhase !== "online"
+                        ? "本机 bridge 正在自动准备中（" + connText + "）：连上后这个链接/二维码即可使用，无需其他操作。"
+                        : "本机 bridge 未运行：先在下方「🖥 Bridge 服务」卡启动。")
                     : "打开链接/扫码进入即登录态；同设备重复扫码只更新授权，不新增设备。")
               )
             )
@@ -2195,6 +2349,11 @@ window.__ModuleLoader__.load({
               h("span", null, st ? serviceStateText : "查询中…"),
               launchdPid ? h("span", { className: "dru-meta", style: { marginTop: 0 } }, "(pid=" + launchdPid + ")") : null
             ),
+            // 自动连接进度（登录后由面板 2.5s 短轮询自动推进）：让用户在 bridge 卡也能一眼看到
+            // 「到底走到哪一步了」——进程在跑≠能用，注册到中继才算。
+            connInfo && connPhase && connPhase !== "no_account"
+              ? h("div", { className: "dru-hint", style: { marginTop: 6 } }, "自动连接进度：" + connText)
+              : null,
             h("div", { className: "dru-actions", style: { marginTop: 10 } },
               !serviceRunning
                 ? h("button", { type: "button", className: "dru-btn dru-btn-primary", disabled: busy !== "", onClick: function () { toggleBridge(true); } }, busy === "start" ? "启动中…" : "启动 bridge")

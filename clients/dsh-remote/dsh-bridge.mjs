@@ -155,6 +155,45 @@ function clearBindError() {
   try { fs.rmSync(BIND_ERROR_FILE, { force: true }); } catch { /* 非关键 */ }
 }
 
+/**
+ * bridge 运行状态文件:供 dsh web 插件面板判定「设备是否已在中继注册成功」(连接阶段 online)。
+ * 面板用它把「bridge 进程在跑」与「设备已注册、手机端真的能用」区分开——后者才是用户关心的状态,
+ * 只按进程存活判断会谎报可用。
+ *   { device_id, started_at, account_bound_at, tunnel_registered_at, phase, last_error? }
+ * 每次进程启动都 reset 一次:上一轮进程的成功记录不能代表当前这一轮。
+ */
+const BRIDGE_STATE_FILE = path.join(path.dirname(CONFIG_PATH), ".dsh-bridge-state.json");
+function persistBridgeState(patch, opts = {}) {
+  try {
+    fs.mkdirSync(path.dirname(BRIDGE_STATE_FILE), { recursive: true });
+    let base = {};
+    if (!opts.reset) {
+      try { base = JSON.parse(fs.readFileSync(BRIDGE_STATE_FILE, "utf8")) || {}; } catch { base = {}; }
+    }
+    fs.writeFileSync(BRIDGE_STATE_FILE, JSON.stringify({ ...base, ...patch, at: Date.now() }, null, 2), { mode: 0o600 });
+  } catch { /* 非关键:面板侧还有日志/账号兜底判据 */ }
+}
+
+// ---------- 安装来源 / 版本(服务端设备行统计口径) ----------
+// DSH_BRIDGE_INSTALL_SOURCE 由一键安装器(dsh-setup.mjs)注入 = npx;未设置表示这台电脑走的是
+// 「插件市场装面板插件 + 插件自愈补装运行环境」那条路径 = plugin_market;白名单外一律 unknown。
+const INSTALL_SOURCE_VALUES = new Set(["npx", "plugin_market"]);
+function resolveInstallSource() {
+  const v = String(process.env.DSH_BRIDGE_INSTALL_SOURCE || "").trim();
+  if (INSTALL_SOURCE_VALUES.has(v)) return v;
+  return v ? "unknown" : "plugin_market";
+}
+/** 安装版本:安装器注入的包版本优先,其次本包 package.json 版本(读不到留空)。 */
+function resolveInstallVersion() {
+  const v = String(process.env.DSH_BRIDGE_INSTALL_VERSION || "").trim();
+  if (v) return v;
+  try {
+    return JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8")).version || "";
+  } catch { return ""; }
+}
+const INSTALL_SOURCE = resolveInstallSource();
+const INSTALL_VERSION = resolveInstallVersion();
+
 // ---------- 稳定设备身份(.dsh-config.json) ----------
 
 function loadLocalConfig() {
@@ -921,12 +960,19 @@ async function registerDeviceInAccount(token) {
         device_id: DEVICE_ID,
         device_name: os.hostname() || "dsh-bridge",
         pub_key: pubKey,
-        machine_fp: MACHINE_FP // v6 同机识别:服务端据此自动顶替旧设备(重装不再被设备数卡死)
+        machine_fp: MACHINE_FP, // v6 同机识别:服务端据此自动顶替旧设备(重装不再被设备数卡死)
+        // 安装口径(服务端存到设备行,供运营统计「市场安装/自愈补装」vs「安装器 npx」):
+        //   install_source: npx(安装器注入) | plugin_market(插件拉起/自愈,默认) | unknown(白名单外)
+        install_source: INSTALL_SOURCE,
+        install_version: INSTALL_VERSION,
+        host_os: process.platform,
+        host_arch: process.arch
       })
     });
     const d = await r.json().catch(() => ({}));
     if (r.status === 201 || r.status === 200) {
       clearBindError();
+      persistBridgeState({ device_id: DEVICE_ID, account_bound_at: Date.now(), phase: "bound" });
       console.log(`[bridge] ✅ 设备已登记到账号: ${DEVICE_ID}`);
       return;
     }
@@ -961,6 +1007,7 @@ function connectTunnel(token) {
   ws.on("open", () => {
     tunnelRetry = 0;
     console.log(`[bridge] 隧道已连 ${endpoint},注册 ${DEVICE_ID}...`);
+    persistBridgeState({ device_id: DEVICE_ID, phase: "connecting" }); // 新一轮连接:上一轮的成功记录已过期
     try {
       // caps:bridge E2EE 能力上报(§6.2/§7.1;router 纯透传)。enabled=false → 空数组(明文回退)
       ws.send(JSON.stringify({ type: "tunnel-register", deviceId: DEVICE_ID, token, name: os.hostname() || "dsh-bridge", caps: e2ee.caps() }));
@@ -981,10 +1028,13 @@ function connectTunnel(token) {
     try {
       receive(raw, (frame) => {
         if (frame?.type === "tunnel-register-ok") {
+          // 中继注册成功 = 手机端此刻真的能进这台电脑:面板据此把阶段推进到 online(已连接 ✅)
+          persistBridgeState({ device_id: DEVICE_ID, tunnel_registered_at: Date.now(), phase: "online", last_error: null });
           console.log(`[bridge] ✅ router 注册成功: ${DEVICE_ID},等待手机访问 /remote/${DEVICE_ID}/`);
           return;
         }
         if (frame?.type === "tunnel-register-err") {
+          persistBridgeState({ phase: "error", last_error: { code: frame.code || "register_err", message: frame.message || "router 拒绝注册" } });
           console.error(`[bridge] router 拒绝注册: ${frame.code} ${frame.message || ""}`);
           return;
         }
@@ -1037,6 +1087,8 @@ async function runTunnel() {
     console.error("[bridge] 隧道模式需要账号认证:请设 DSH_BRIDGE_TOKEN,或 DSH_BRIDGE_PHONE+DSH_BRIDGE_PASSWORD");
     process.exit(1);
   }
+  // 新进程开始:重置状态文件(上一轮的成功记录不能代表这一轮,面板据此判定 online)
+  persistBridgeState({ device_id: DEVICE_ID, started_at: Date.now(), phase: "connecting", last_error: null }, { reset: true });
   await initE2ee(token);
   await registerDeviceInAccount(token);
   connectTunnel(token);
