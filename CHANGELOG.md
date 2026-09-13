@@ -10,8 +10,11 @@ All notable changes to dsh-remote are documented here. This project follows
 
 ### Added
 
-- **插件热加载**：安装插件改为写 profile 的 `cordis.patch.yml`（HMR 监听该文件，存盘约 1 秒装载），
-  **装完只需刷新页面，不必重启 dsh web**。实测：进程 pid 不变、安装耗时约 1.3 秒、面板接口立刻可用。
+- **插件热加载**：安装插件改为写 profile 的 `cordis.patch.yml`（HMR 监听该文件），
+  **首次安装装完只需刷新页面、不必重启 dsh web**。实测：进程 pid 不变、安装耗时约 1.3 秒、面板接口立刻可用。
+  边界（实测）：HMR 只认 **patch 文件的变化**，而加载器按 URL 缓存模块 —— 所以
+  **同一插件升级到新版本时 patch 行内容没变，热加载不生效，仍需重启一次 dsh web**；
+  安装器会按版本号核对并如实提示，不会谎报成功。
 - **匿名装机统计**：只上报「装机/连接是否成功」这类事件（12 个白名单事件 + 11 个白名单失败码），
   不含账号、手机号、会话或文件内容、主机名、路径、设备指纹与 IP；标识是本机随机 ID（重装即变）。
   环境变量 `DSH_REMOTE_TELEMETRY=0` 可完全关闭。披露文档见 [docs/telemetry.md](docs/telemetry.md)。
@@ -35,6 +38,9 @@ All notable changes to dsh-remote are documented here. This project follows
   不再误报。
 - **更新提示的版本比较**：改为语义化比较（预设版低于同号正式版），装预发版的人不会被误判成落后。
 - `~/Library/LaunchAgents` 不存在时自动创建；服务 PATH 补 `/usr/sbin`、`/sbin`（修 `ioreg: command not found`）。
+- **热加载探测改为按版本判断**：此前只检查面板接口是否 200（旧版本本来就有这个接口），
+  于是「profile 已更新到新版本、运行中仍是旧版本」会被误报成"热加载成功"。现在比对运行中版本与
+  本次安装版本，不一致就如实提示需要重启 dsh web。
 - 安装器的配置目录统一为 `~/.dsh-remote`（修掉「面板读不到配置 / 运行状态文件散落进仓库」）。
 - **测试污染**：`harness-restart` 用例会覆盖开发者真实的 `~/Library/LaunchAgents`，已加 HOME 隔离与静态护栏。
 

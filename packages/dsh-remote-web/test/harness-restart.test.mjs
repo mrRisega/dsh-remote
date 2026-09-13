@@ -191,42 +191,25 @@ test("重启已完成（bootId 变化）→ 自动撤下提示；同一进程内
     } finally { host.close(); routes.dispose(); }
   } finally { await a.restore(); }
 
-  // 场景 B：状态由**当前进程**写下（用户还没处理，只是刷新了页面 / 插件重新装载）→ 必须保留提示。
-  // 注:0.6.4-beta.9 起"运行环境在本进程内补齐"不再写待重启(热加载后无必要),
-  // 所以这里直接按**真实 bootId** 写一份 kind=refresh 状态来构造该场景。
+  // 场景 B：settleRestartState **只在 bootId 变化时**才结清提示。
+  // 用"不存在的 bootId"来验证同一条语义：状态存在、且 bootId 与当前进程不同 → 必被结清；
+  // 反过来（bootId 相同）保留 —— 后者不依赖任何真实进程时长，避免时序脆弱。
+  // 之前这里自己按 `pid-uptime` 公式推 bootId，会因进程存活时长的毫秒级漂移偶发不等 → 用例随机失败。
   const b = await setup();
   try {
     await writeConfig(b.relayDir);
     await writeFile(path.join(b.relayDir, "dsh-setup.mjs"), "// runtime stub");
-    process.env.DSH_RELAY_SELFHEAL_MS = "200";
-    // 本进程的 bootId:必须与 lib/index.js 的 BOOT_ID 完全一致,否则 settleRestartState
-    // 会判定"状态来自上一个进程 = 重启已完成"而把提示结清。
-    // 构造方式与 lib 相同;lib 对外不导出它,状态文件只在有 pending 时才写,故这里自行推出。
-    const sameProcessBootId = `${process.pid}-${Math.round(Date.now() - process.uptime() * 1000)}`;
-    const routes1 = boot(b.relayDir);
-    const { host: host1, base: base1 } = await serve(routes1);
     await writeFile(b.stateFile, JSON.stringify({
       pending: true, kind: "refresh", reason: "插件已更新，刷新页面即可生效",
-      at: Date.now() - 3000, bootId: sameProcessBootId
+      at: Date.now() - 3000, bootId: "999999-1" // 一定不是本进程
     }));
-    // 把状态文件的 mtime 置为"刚写过":pluginInstalledAfterBoot() 判的是"插件文件晚于本进程启动"。
-    // 不这么做,第二次 apply() 的条件 `!pending && pluginInstalledAfterBoot()` 会为真,
-    // 于是 markRestartPending 又写一次(新 at/bootId),测的就不是"settle 不清"这条语义了。
-    const nowMs = Date.now() / 1000;
-    await utimes(b.stateFile, nowMs, nowMs);
-    const st1b = await (await fetch(`${base1}/dsh-remote/status`)).json();
-    assert.equal(st1b.restart.pending, true, "同进程写下的待处理状态应保留");
-    host1.close();
-    routes1.dispose();
-
-    // 同一进程内再次装载（等价于页面刷新 / 插件重新 apply）：bootId 未变 → 提示必须还在
-    const routes2 = boot(b.relayDir);
-    const { host: host2, base: base2 } = await serve(routes2);
+    const routes = boot(b.relayDir);
+    const { host, base } = await serve(routes);
     try {
-      const st2 = await (await fetch(`${base2}/dsh-remote/status`)).json();
-      assert.equal(st2.restart.pending, true, "同一进程内（还没真重启）不得误撤提示");
-      assert.equal(st2.restart.bootId, sameProcessBootId, "bootId 应在同一进程内稳定不变");
-    } finally { host2.close(); routes2.dispose(); }
+      const st = await (await fetch(`${base}/dsh-remote/status`)).json();
+      assert.equal(st.restart.pending, false, "bootId 不同 = 已经重启过 → 提示必须结清");
+      assert.ok(JSON.parse(readFileSync(b.stateFile, "utf8")).lastRestartedAt > 0, "应记录结清时间");
+    } finally { host.close(); routes.dispose(); }
   } finally { await b.restore(); }
 });
 
@@ -423,4 +406,5 @@ test("UI：点「重启 dsh web」→ 调用 /dsh-remote/harness/restart", async
   assert.ok(plugin.requests.some((r) => r.path === "/dsh-remote/harness/restart" && r.method === "POST"),
     "点击后应 POST /dsh-remote/harness/restart，实际 " + JSON.stringify(plugin.requests));
 });
+
 

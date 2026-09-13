@@ -208,3 +208,15 @@ test("硬约束：写入 patch 行后 bundles 必须被清空（单一激活点�
     assert.equal(patchRows + inBundles, 1, `激活点必须恰好一个：patch=${patchRows} bundles=${inBundles}`);
   } finally { cleanup(profile); }
 });
+
+test("回归护栏：热挂载探测必须比对**版本**，不能只看接口 200", () => {
+  // 事故复盘：profile 已更新到 0.6.4，运行中的插件仍是 beta.10，而旧探测只看
+  // `/dsh-remote/status` 是否 200（旧版本本来就有这个接口）→ 误报"热加载成功"，
+  // 用户以为已生效、实际还在跑旧代码。
+  const src = readFileSync(SETUP, "utf8");
+  assert.match(src, /dsh-remote\/self/, "探测应查 /dsh-remote/self（带版本号的那个接口）");
+  assert.match(src, /running === wantVersion/, "应比对运行版本与本次安装版本");
+  assert.match(src, /const wantVersion = pkgVersion\(\)/, "期望版本取自本次安装的包版本");
+  // 拿不到匹配版本时不得谎报成功
+  assert.match(src, /runningSeen/, "应记住探测窗口里看到的旧版本，用于给出准确提示");
+});

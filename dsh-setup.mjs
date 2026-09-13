@@ -681,6 +681,7 @@ async function setup(argv) {
   let webPid = null;
   let needRestart = false;
   let hotMounted = false;
+  let runningSeen = ""; // 探测窗口里看到过的运行中插件版本(超时时用于给出准确提示)
   const webUp = await isDshWebUp();
   if (webUp) {
     webPid = dshWebPid();
@@ -690,11 +691,30 @@ async function setup(argv) {
     // 所以这里**先等热挂载**,等到了就完全不需要重启(用户只需刷新页面拿浏览器半)。
     if (needRestart && pluginResult && pluginResult.hotPatch) {
       // HMR 通常 1~3 秒完成,但插件节点半还要起服务、注册路由,机器繁忙时会到十几秒;
-      // 给足 ~30 秒窗口,避免"其实已经热挂载成功、却报成需要重启"的误报(实测踩到)。
+      // ⚠️ 判据必须是**运行中的插件版本 == 我们刚装上的版本**,不能只看"接口是否 200" ——
+      // 旧版本插件本来就有这个接口,接口通不代表新代码已装载(实测踩到:profile 已是 0.6.4,
+      // 运行中仍报 beta.10,而探测却认为"热挂载成功")。
+      const wantVersion = pkgVersion();
+      // 先**主动触发**一次 HMR：patch 文件是唯一被监听的对象。
+      // 注意边界（实测）：这招对"插件首次出现在 patch 行里"有效（行从无到有 = 真变化，
+      // 约 1~3 秒装载）；但对"同一插件换了新版本"**无效** —— patch 行内容没变，
+      // 而且加载器按 URL 缓存模块，改写插件文件本身不会重新装载。后者必须重启 dsh web。
+      // 因此下面按**版本**轮询，等不到就如实让用户重启。
+      try {
+        const patchPath = path.join(resolveProfileDir(argv), "cordis.patch.yml");
+        const cur = fs.readFileSync(patchPath, "utf8");
+        fs.writeFileSync(patchPath, cur);
+      } catch { /* 忽略：轮询会给出结论 */ }
       for (let i = 0; i < 45; i += 1) {
-        const r = await fetch("http://127.0.0.1:3080/dsh-remote/status", { signal: AbortSignal.timeout(900) })
+        const r = await fetch("http://127.0.0.1:3080/dsh-remote/self", { signal: AbortSignal.timeout(900) })
           .catch(() => null);
-        if (r && r.ok) { hotMounted = true; break; }
+        if (r && r.ok) {
+          const j = await r.json().catch(() => null);
+          const running = j && typeof j.version === "string" ? j.version : "";
+          if (running && running === wantVersion) { hotMounted = true; break; }
+          // 接口通但版本还是旧的 → HMR 还没换过来(或没触发),继续等
+          runningSeen = running || runningSeen;
+        }
         sleepSync(700);
       }
       if (hotMounted) needRestart = false;
@@ -788,8 +808,13 @@ async function setup(argv) {
     // patch 已写入但探测窗口内没等到面板接口:热加载很可能还在进行(插件节点半启动+注册路由)。
     // 这种情况**不能**直接让用户重启 —— 先让他等几秒刷新,再给兜底方案。
     L.push("");
-    L.push("ℹ 插件已按热加载方式登记（patch 已写入），若「设置 → 远程控制」还没出现：");
-    L.push("   等几秒后刷新页面即可；仍未出现再重启一次 dsh web（命令见 README）。");
+    if (runningSeen) {
+      L.push(`ℹ 插件已按热加载方式登记，但运行中的 dsh web 仍在用旧版本（${runningSeen} → 期望 ${pkgVersion()}）：`);
+      L.push("   刷新页面即可（浏览器半会跟着更新）；若刷新后功能仍不对，再重启一次 dsh web。");
+    } else {
+      L.push("ℹ 插件已按热加载方式登记（patch 已写入），若「设置 → 远程控制」还没出现：");
+      L.push("   等几秒后刷新页面即可；仍未出现再重启一次 dsh web（命令见 README）。");
+    }
   } else if (needRestart) {
     // 需要重启但没做成功:必须给出**可照抄**的命令,而不是只说"请重启"
     L.push("");
