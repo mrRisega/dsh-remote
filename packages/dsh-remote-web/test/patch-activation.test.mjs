@@ -181,3 +181,30 @@ test("回归护栏：plugin 子命令必须把激活结果 return 给 setup（�
   assert.match(src, /pluginResult = await pluginCmd\(\[\]\)/, "setup 应保存 pluginCmd 的返回值");
   assert.match(src, /pluginResult\.hotPatch/, "应据 hotPatch 判断是否走热挂载形态");
 });
+
+test("硬约束：插件已在 bundles 时**绝不**写 patch 行（两个激活点 = duplicate id 崩溃）", () => {
+  // 事故复盘：patch 行与插件自带 bundle patch 同时生效时，dsh web 启动即
+  //   TypeError: duplicate loader entry id: dsh-remote-web
+  //   Error: dsh: plugin tree failed to load: failed to apply loader entry include (cordis:include)
+  // 整个插件树加载失败（实测生产日志）。所以这两条激活路径必须互斥。
+  const profile = makeProfile({ bundles: [...PLUGIN_BUNDLES, "dsh-remote-web"] });
+  const relay = join(profile, "relay");
+  try {
+    const out = installPlugin(profile, relay);
+    assert.match(out, /已由 dsh\.profile\.bundles 声明/, "应识别并保持 bundles 形态");
+    assert.equal((readPatch(profile).match(/- id: dsh-remote-web/g) || []).length, 0,
+      "bundles 已声明时不得再写 patch 行（否则重复 ID）");
+    assert.ok(readBundles(profile).includes("dsh-remote-web"), "bundles 形态应保持");
+  } finally { cleanup(profile); }
+});
+
+test("硬约束：写入 patch 行后 bundles 必须被清空（单一激活点双向收口）", () => {
+  const profile = makeProfile({ bundles: [...PLUGIN_BUNDLES, "dsh-remote-web"] });
+  const relay = join(profile, "relay");
+  try {
+    installPlugin(profile, relay);
+    const patchRows = (readPatch(profile).match(/- id: dsh-remote-web/g) || []).length;
+    const inBundles = readBundles(profile).filter((b) => b === "dsh-remote-web").length;
+    assert.equal(patchRows + inBundles, 1, `激活点必须恰好一个：patch=${patchRows} bundles=${inBundles}`);
+  } finally { cleanup(profile); }
+});

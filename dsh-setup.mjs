@@ -921,10 +921,26 @@ function writePatchAtomic(patchFile, text) {
 /**
  * 原子地写入插件 patch 激活行；写后**重新解析校验**，不合法立即回滚。
  * 返回 {ok, changed, reason?, basePatch}
+ *
+ * ⚠️ 硬约束：**本函数绝不能在插件已在 dsh.profile.bundles 时写入 patch 行**。
+ * 两个激活点同时存在时，dsh web 启动即 `duplicate loader entry id: dsh-remote-web`
+ * 并导致「plugin tree failed to load」——整个插件树加载失败（实测日志）。
+ * 因此所有 return 之前都要保证：要么只有 patch 行、要么只有 bundles 条目。
  */
 function ensurePatchActivation(patchFile, pluginLocalDir, pkgFile) {
   const original = fs.readFileSync(patchFile, "utf8");
-  // 幂等：已经是唯一激活点就什么都不做（但要确保 bundles 里没有重复激活）
+  const pkgBundles = () => {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(pkgFile, "utf8"));
+      return (pkg.dsh && pkg.dsh.profile && Array.isArray(pkg.dsh.profile.bundles))
+        ? pkg.dsh.profile.bundles.filter((b) => PLUGIN_ALL_IDS.includes(b)) : [];
+    } catch { return []; }
+  };
+  // 基座就是「插件已在 bundles」→ 保持 bundles 形态（不写 patch 行），避免两个激活点并存。
+  // 这一路等价于插件市场安装形态：需要重启 dsh web 才装载。
+  if (pkgBundles().length) {
+    return { ok: false, reason: "插件已由 dsh.profile.bundles 声明（保持单一激活点，不写 patch 行）", changed: false, bundleOnly: true, basePatch: original };
+  }
   const base = validatePatchBase(original);
   if (!base.ok) return { ok: false, reason: base.reason, changed: false, basePatch: original };
   const hasOurRow = base.insertedIds.some((id) => PLUGIN_ALL_IDS.includes(id));
@@ -972,6 +988,12 @@ function ensurePatchActivation(patchFile, pluginLocalDir, pkgFile) {
     return { ok: false, reason: "写入后校验失败，已回滚", changed: false, basePatch: original };
   }
   removeBundleEntry(pkgFile); // 单一激活点：bundles 里不能再有本插件
+  // 双保险：上面那次移除若没生效（并发写 package.json / 解析失败），**回滚本次 patch 行**，
+  // 宁可退回 bundles 形态（需重启）也绝不留"两处激活"→ dsh web 启动会 duplicate id 崩掉。
+  if (pkgBundles().length) {
+    writePatchAtomic(patchFile, original);
+    return { ok: false, reason: "bundles 条目未能移除，已回滚 patch 行以免重复激活", changed: false, bundleOnly: true, basePatch: original };
+  }
   return { ok: true, changed: true, basePatch: original };
 }
 
@@ -1137,10 +1159,14 @@ function convergePluginActivation(profileDir, pkgFile, patchFile, pluginDir, pat
       console.log(`✅ 插件已就绪: ${pluginLocalDir}`);
       return { hotPatch: true, changed: r.changed, basePatch: r.basePatch };
     }
-    // patch 行写不进去(文件形态异常)→ 回退 bundles(需重启),保证功能可用
-    console.warn(`⚠️ 无法写入 patch 激活行（${r.reason}），改为 bundles 形态（需重启 dsh web 生效）`);
-    ensureBundleEntry(pkgFile);
-    console.log(`✅ 插件已就绪: ${pluginLocalDir}（bundles 形态）`);
+    // patch 行不能写(文件形态异常,或插件已由 bundles 声明)→ 回退 bundles(需重启),保证功能可用。
+    // 这条路的输出要如实说明"装完要重启一次",不能让人以为已经热加载了。
+    if (r.bundleOnly) {
+      console.log("ℹ 该插件已由 dsh.profile.bundles 声明（保持单一激活点，不重复写入 patch 行）");
+    } else {
+      console.warn(`⚠️ 无法写入 patch 激活行（${r.reason}），改为 bundles 形态（需重启 dsh web 生效）`);
+      ensureBundleEntry(pkgFile); // 回退激活点：插件仍可用，代价是必须重启一次
+    }
     return { hotPatch: false, changed: true, basePatch: patch };
   }
 
