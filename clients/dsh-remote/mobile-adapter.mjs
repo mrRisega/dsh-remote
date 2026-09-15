@@ -478,13 +478,31 @@ const SCRIPT = `(() => {
 
       const toggleSel = '[aria-label="打开侧边栏"], [aria-label="关闭侧边栏"], [aria-label="Open sidebar"], [aria-label="Close sidebar"]';
       const toggleOf = () => document.querySelector(toggleSel) || document.querySelector(".hHd-Xa_toggle");
-      const expanded = () => !frame.hasAttribute("data-sidebar-collapsed");
+      /* 官方用 data-sidebar-collapsed 表达折叠态，但写法有两种可能：只输出属性本身，
+         或输出 attribute 的值（例如 =false）。旧实现只看 hasAttribute 是否存在，
+         只兼容前一种：一旦官方用带值写法，就会被永久判定为「展开」→ 遮罩常亮且拦截点击、
+         汉堡按钮被隐藏 → 手机端整屏阴影、点哪都没反应（用户实测）。
+         这里改成读值，两种写法都能正确判断。 */
+      const truthyAttr = (el, name) => {
+        const v = el.getAttribute(name);
+        if (v === null) return false;
+        const s = String(v).trim().toLowerCase();
+        return !(s === "" || s === "false" || s === "0" || s === "off" || s === "no");
+      };
+      const collapsed = () => truthyAttr(frame, "data-sidebar-collapsed");
+      const expanded = () => !collapsed();
 
       /* 遮罩:点击 = 点官方 toggle(走官方 store,无私有状态) */
       const scrim = document.createElement("div");
       scrim.className = "dsh-ma-scrim";
       document.body.appendChild(scrim);
-      scrim.addEventListener("click", (e) => { e.stopPropagation(); const t = toggleOf(); if (t) t.click(); });
+      scrim.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const t = toggleOf();
+        if (t) { t.click(); return; }
+        /* 兜底:找不到官方 toggle 时**至少让用户能自救**（否则就是"点哪都没反应"的死局） */
+        document.documentElement.classList.remove("dsh-ma-sidebar-open", "dsh-ma-details-open");
+      });
 
       /* 顶部小鲸鱼/菜单按钮 */
       const hamburger = document.createElement("button");
@@ -496,21 +514,44 @@ const SCRIPT = `(() => {
       hamburger.addEventListener("click", (e) => {
         e.stopPropagation(); e.preventDefault();
         const t = toggleOf();
-        if (t) t.click();
-        else document.documentElement.classList.add("dsh-ma-sidebar-open"); /* 兜底 */
+        if (t) { t.click(); return; }
+        /* 兜底（无官方 toggle）：按当前状态切换，保证"开得了也关得掉" */
+        const open = document.documentElement.classList.contains("dsh-ma-sidebar-open");
+        if (open) document.documentElement.classList.remove("dsh-ma-sidebar-open", "dsh-ma-details-open");
+        else document.documentElement.classList.add("dsh-ma-sidebar-open");
       });
 
-      /* 状态唯一真源 = 官方 frame 的 data 属性 */
+      /* 侧栏是否**真的**滑进了视口。这是"遮罩能不能拦截点击"的最后一道保险：
+         只要官方属性语义与我们理解的不一致，光看属性就可能误判；而遮罩一旦拦截整屏，
+         用户看到的就是"整屏阴影 + 点哪都没反应"。以实测几何为准，误判也不会挡住用户。 */
+      const inView = (el) => {
+        if (!el) return false;
+        try { const r = el.getBoundingClientRect(); return !!r && r.right > 8 && r.width > 40; }
+        catch (e2) { return false; }
+      };
+      const sidebarInView = () => inView(sidebar || document.querySelector(".dsh-ma-sidebar"));
+      /* 状态唯一真源 = 官方 frame 的 data 属性（判定）+ 真实几何（放行遮罩） */
       const sync = () => {
         const open = expanded();
-        document.documentElement.classList.toggle("dsh-ma-sidebar-open", open);
-        if (hamburger) hamburger.style.display = open ? "none" : "";
-        const dOpen = !frame.hasAttribute("data-details-collapsed") && !!details;
+        const scrimOn = open && sidebarInView();
+        document.documentElement.classList.toggle("dsh-ma-sidebar-open", scrimOn);
+        /* 汉堡按钮**始终可见**：以前判定为"展开"时会把它 display:none 隐藏，
+           于是判定一旦出错（或遮罩因异常常亮），用户既点不动内容、也没有任何入口 —— 死局。
+           保持可见 + 点它可开可关（见其 click 处理），任何异常状态下都留一条出路。 */
+        if (hamburger) hamburger.style.display = "";
+        // 详情栏同理：只有"判定为展开"且"真的在视口里"才让遮罩拦截
+        const dOpen = !truthyAttr(frame, "data-details-collapsed") && !!details && inView(details);
         document.documentElement.classList.toggle("dsh-ma-details-open", dOpen);
       };
       try {
         new MutationObserver(sync).observe(frame, { attributes: true, attributeFilter: ["data-sidebar-collapsed", "data-details-collapsed"] });
       } catch (e2) { /* 退化:仅在下次 boot 同步 */ }
+      // 几何变化（旋转屏幕 / 窗口缩放 / 侧栏动画结束）也要重算，否则会把 boot 时的判定一直沿用
+      try {
+        window.addEventListener("resize", sync, { passive: true });
+        window.addEventListener("orientationchange", sync, { passive: true });
+        if (sidebar && typeof ResizeObserver === "function") new ResizeObserver(sync).observe(sidebar);
+      } catch (e2) { /* 非关键 */ }
       sync();
       /* 窄屏抽屉:点选会话(激活行)/点侧栏内「新建会话」后自动收起(官方不做;适配层点官方 toggle)。
          仅当:窄屏 && 抽屉展开 && 点击发生在侧栏抽屉内;行内「⋯」按钮 stopPropagation 不会误触。 */

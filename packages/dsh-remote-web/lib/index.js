@@ -499,10 +499,56 @@ function appendLogLine(relayDir, name, line) {
  * 已有环境(包括手动 npx 装过)直接跳过。返回 true=已就绪。
  * 注意：默认优先官方源——镜像(npmmirror)可能滞后于刚发布的版本，装到旧版会把
  * 已被 0.4.5 移除的“用户 include”重新写回 profile（历史上造成 dsh web 重复 ID 崩溃）。 */
+/**
+ * 补装失败退避（2026-09-15 生产事故）。
+ *
+ * 背景：Windows 用户补装 `npx @mrrisega/dsh-remote` 持续失败时，自愈调度每轮都重试，
+ * 生产遥测里看到单机 12 秒一次、累计 606 次的失败风暴（1659 次 install_failed 全在 Windows）。
+ * 这既刷屏日志、也让真实失败原因淹没在噪声里。
+ *
+ * 策略：连续失败后按 30s → 2m → 10m 退避（封顶 10 分钟）；用户点「一键修复 / 一键更新」时
+ * 显式放行（resetProvisionRetry），保证人工操作永远能立即重试。
+ */
+const PROVISION_RETRY_BACKOFF_MS = [30_000, 120_000, 600_000];
+
+function provisionRetryGate(relayDir) {
+  const key = String(relayDir);
+  let st = provisionRetry.get(key);
+  if (!st) { st = { fails: 0, nextAt: 0 }; provisionRetry.set(key, st); }
+  if (Date.now() < st.nextAt) {
+    return { ok: false, waitMs: st.nextAt - Date.now(), fails: st.fails };
+  }
+  return { ok: true, st };
+}
+
+function noteProvisionFailure(relayDir) {
+  const key = String(relayDir);
+  const st = provisionRetry.get(key) || { fails: 0, nextAt: 0 };
+  st.fails += 1;
+  const wait = PROVISION_RETRY_BACKOFF_MS[Math.min(st.fails, PROVISION_RETRY_BACKOFF_MS.length) - 1];
+  st.nextAt = Date.now() + wait;
+  provisionRetry.set(key, st);
+  return { fails: st.fails, waitMs: wait };
+}
+
+function noteProvisionSuccess(relayDir) {
+  provisionRetry.delete(String(relayDir));
+}
+
+/** 用户显式要求重试（一键修复/一键更新）→ 清掉退避，让这次一定真的执行。 */
+function resetProvisionRetry(relayDir) {
+  provisionRetry.delete(String(relayDir));
+}
+
 function ensureRuntime(relayDir) {
   if (UNINSTALLED_DIRS.has(relayDir)) return false; // 已彻底卸载：不再自动安装运行环境
   if (runtimeReady(relayDir)) return true;
   if (skipsSystemOps()) return false; // 测试隔离：绝不在用例里 spawn 真实 npx 安装
+  const gate = provisionRetryGate(relayDir);
+  if (!gate.ok) {
+    // 退避中：不重复 spawn（避免失败风暴）。面板会据 provisionRetryInfo() 显示"上次失败、X 后可重试"。
+    return false;
+  }
   const marker = join(relayDir, PROVISION_MARKER);
   if (existsSync(marker)) return false; // 正在安装中
   try {
@@ -531,13 +577,23 @@ function ensureRuntime(relayDir) {
     child.on("exit", (code) => {
       clear();
       appendLogLine(relayDir, AUTO_INSTALL_LOG, `[auto-install] npx 退出 code=${code ?? "?"}`);
-      if (code === 0 && runtimeReady(relayDir)) telemetryRuntimeReady(relayDir); // 退出码 0 ≠ 装好了
-      else if (code !== 0) telemetryRecord(relayDir, "install_failed", { fail_code: telemetryFailCodeFromText(readTail(log)) });
+      if (code === 0 && runtimeReady(relayDir)) {
+        noteProvisionSuccess(relayDir);
+        telemetryRuntimeReady(relayDir); // 退出码 0 ≠ 装好了
+      } else {
+        // 退出码非 0，或退出码 0 但安装脚本没落盘（装到一半/装错包）→ 都算失败并进入退避
+        const code2 = code === 0 ? "install_script_missing" : telemetryFailCodeFromText(readTail(log));
+        const back = noteProvisionFailure(relayDir);
+        appendLogLine(relayDir, AUTO_INSTALL_LOG,
+          `[auto-install] 第 ${back.fails} 次失败（归因 ${code2}），${Math.round(back.waitMs / 1000)}s 后才会重试`);
+        telemetryRecord(relayDir, "install_failed", { fail_code: code2 });
+      }
     });
     child.on("error", (e) => {
       clear();
       appendLogLine(relayDir, AUTO_INSTALL_LOG, `[auto-install] 启动失败: ${e.message}`);
       console.warn(`[dsh-remote-web] 自动安装子进程启动失败: ${e.message}`);
+      noteProvisionFailure(relayDir);
       telemetryRecord(relayDir, "install_failed", { fail_code: telemetryFailCodeFromError(e) });
     });
     child.unref();
@@ -546,6 +602,7 @@ function ensureRuntime(relayDir) {
   } catch (e) {
     console.warn(`[dsh-remote-web] 自动安装启动失败: ${e.message}`);
     try { rmSync(marker, { force: true }); } catch { /* ignore */ }
+    noteProvisionFailure(relayDir);
     telemetryRecord(relayDir, "install_failed", { fail_code: telemetryFailCodeFromError(e) });
     return false;
   }
@@ -713,6 +770,8 @@ function stopBridge() {
  * 直到 dsh web 重启（profile 引用已移除，插件整体不再加载）或重新激活（apply 时清除）。
  */
 const UNINSTALLED_DIRS = new Set();
+/** 补装失败退避状态（relayDir → {fails, nextAt}）；见 provisionRetryGate。 */
+const provisionRetry = new Map();
 
 /** 标记某 relayDir 已完成彻底卸载（其后续自愈/代持调度全部停摆）。 */
 function markUninstalled(relayDir) {
@@ -1753,7 +1812,7 @@ const PLUGIN_ID = "dsh-remote-web";
 const PLUGIN_LEGACY_IDS = ["dsh-remote-ui"];
 const PLUGIN_ALL_IDS = [PLUGIN_ID, ...PLUGIN_LEGACY_IDS];
 /** 插件自身发布版本（与 dsh-remote 根包同步递增）。 */
-const PLUGIN_VERSION = "0.6.5";
+const PLUGIN_VERSION = "0.6.6-beta.1";
 const UPDATE_LOG = ".dsh-update.log";
 const UPDATE_MARKER = ".dsh-update-running";
 
@@ -1816,6 +1875,29 @@ function compareVersions(a, b) {
   return 0;
 }
 
+/**
+ * 最近一次在线更新的失败信息（内存态，TTL 10 分钟）。
+ *
+ * 为什么需要它：此前"一键更新/一键修复"点了没反应 —— spawn 是异步的，npx 解析失败时
+ * 同步分支仍然返回 `{ok:true}`，而错误只写进 `.dsh-update.log`；前端看到 ok:true 就显示
+ * 「更新已开始」，2 秒后轮询到 marker 被清（running:false）便显示「已更新完成」——
+ * 版本没变、运行环境仍缺失，界面上没有任何失败提示（用户实测：点了没反应）。
+ * 现在失败原因进内存态并可查询，前端在"没成功"时能如实报错。
+ */
+const updateFailures = new Map(); // relayDir → { at, detail, failCode }
+const UPDATE_FAILURE_TTL_MS = 10 * 60 * 1000;
+
+function noteUpdateFailure(relayDir, detail, failCode) {
+  updateFailures.set(String(relayDir), { at: Date.now(), detail: String(detail || "未知原因"), failCode: failCode || "unknown" });
+}
+
+function recentUpdateFailure(relayDir) {
+  const rec = updateFailures.get(String(relayDir));
+  if (!rec) return null;
+  if (Date.now() - rec.at > UPDATE_FAILURE_TTL_MS) { updateFailures.delete(String(relayDir)); return null; }
+  return rec;
+}
+
 /** 以 detached 子进程执行 `npx --yes <UPDATE_SPEC>`（env 可覆盖 npm 源/更新通道）。 */
 function spawnUpdater(relayDir, extraEnv) {
   const log = join(relayDir, UPDATE_LOG);
@@ -1842,7 +1924,18 @@ function runOnlineUpdate(relayDir) {
   try {
     mkdirSync(relayDir, { recursive: true });
     const marker = join(relayDir, UPDATE_MARKER);
-    if (existsSync(marker)) return { ok: false, detail: "已有更新在进行中，请稍候" };
+    if (existsSync(marker)) {
+      // 残留 marker（进程被强杀/上次异常退出）会让点击**永久**被拒，前端还会把它当成
+      // "正在跟踪进度"而只转圈不报错。超过 10 分钟一律视为陈旧并清理。
+      let stale = false;
+      try { stale = Date.now() - statSync(marker).mtimeMs > 10 * 60 * 1000; } catch { /* ignore */ }
+      if (stale) {
+        try { rmSync(marker, { force: true }); } catch { /* ignore */ }
+        appendLogLine(relayDir, UPDATE_LOG, "[update] 清理超过 10 分钟的陈旧 in-progress 标记");
+      } else {
+        return { ok: false, detail: "已有更新在进行中，请稍候（若长时间无进展，最多 10 分钟后可重试）" };
+      }
+    }
     appendLogLine(relayDir, UPDATE_LOG, `[update] 开始在线更新 ${UPDATE_SPEC} (${new Date().toISOString()})`);
     telemetryRecord(relayDir, "update_started"); // 匿名遥测：在线更新开始
 
@@ -1866,17 +1959,34 @@ function runOnlineUpdate(relayDir) {
         // 插件走 patch 热加载、bridge 是独立进程，重启 harness 已无必要（用户实测反馈）。
         // 成功不发事件（update_started 已发过，失败才发 update_failed；白名单里没有 update_done，
         // 硬发只会被服务端静默丢弃）。
-        if (code !== 0) telemetryRecord(relayDir, "update_failed", { fail_code: telemetryFailCodeFromText(readTail(join(relayDir, UPDATE_LOG))) });
+        if (code !== 0) {
+          const tail = readTail(join(relayDir, UPDATE_LOG));
+          const fc = telemetryFailCodeFromText(tail);
+          // 只把最后的可读片段给用户看（不含完整路径/用户名）；分类码仍按白名单上报
+          const lastLine = String(tail || "").split("\n").map((l) => l.trim()).filter(Boolean).slice(-1)[0] || "";
+          noteUpdateFailure(relayDir, lastLine || `安装进程退出码 ${code}`, fc);
+          telemetryRecord(relayDir, "update_failed", { fail_code: fc });
+        } else {
+          updateFailures.delete(String(relayDir)); // 成功即清掉旧失败
+        }
       });
       child.on("error", (e) => {
         appendLogLine(relayDir, UPDATE_LOG, `[update] 子进程启动失败: ${e.message}`);
         clear();
-        telemetryRecord(relayDir, "update_failed", { fail_code: telemetryFailCodeFromError(e) });
+        const fc = telemetryFailCodeFromError(e);
+        noteUpdateFailure(relayDir, e.message, fc); // ← 面板可查询，不再只躺在日志里
+        telemetryRecord(relayDir, "update_failed", { fail_code: fc });
       });
       child.unref();
       return child;
     };
     const child = run();
+    // spawn 是异步的：解析失败时 pid 可能是 undefined。此时**不能**同步返回 ok:true，
+    // 否则前端会显示"更新已开始"、随后看到 running:false 便报"已完成"（实测的静默失败）。
+    if (!child || !child.pid) {
+      const rec = recentUpdateFailure(relayDir);
+      return { ok: false, detail: (rec && rec.detail) || "无法启动更新进程（npx 不可用？）", failCode: rec ? rec.failCode : "unknown" };
+    }
     return { ok: true, pid: child.pid, log: join(relayDir, UPDATE_LOG) };
   } catch (e) {
     try { rmSync(join(relayDir, UPDATE_MARKER), { force: true }); } catch { /* ignore */ }
@@ -2517,14 +2627,29 @@ function telemetryEventOf(name, extra = {}) {
 /** 从既有日志/错误文本归类 fail_code（白名单内）；原始文本绝不外发（可能含路径/主机名）。 */
 function telemetryFailCodeFromText(text) {
   const t = String(text || "");
-  if (/EACCES|EPERM|permission denied|权限不足/i.test(t)) return "npm_eacces";
-  if (/platform|不支持的平台/i.test(t)) return "platform_unsupported";
-  if (/too old|版本过低|engine/i.test(t)) return "node_too_old";
-  if (/ENOENT|not found|No such file/i.test(t)) return "node_missing";
-  if (/ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ETIMEOUT|ECONNREFUSED|ENETUNREACH|ECONNRESET|network|registry|超时/i.test(t)) {
-    return "npm_unreachable";
+  // 顺序有意义：从"最具体"到"最泛"。
+  // 2026-09-15：Windows 装机失败此前**全部**落到 unknown（1659 次 install_failed 无法定位），
+  // 所以把真实会遇到的形态拆开。仍然只上报枚举，原始文本不出机器（见下方注释与隐私测试）。
+  // ① Windows 上 `npx.cmd` 根本调不起来（不是内部命令 / 找不到 cmd / EINVAL 等）
+  if (/npx(\.cmd)?\s+(is not recognized|不是内部或外部命令)|不是内部或外部命令|无法将.*识别为/i.test(t)) return "npx_cmd_unavailable";
+  if (/EINVAL|spawn .*\.cmd/i.test(t)) return "npx_cmd_unavailable";
+  // ② 拿到的包不对：404 / 版本被 deprecate / 装完仍没有安装脚本
+  if (/404|Not Found - GET|ETARGET|No matching version/i.test(t)) return "install_script_missing";
+  // ③ 纯网络层问题（含 npm ERR! network / 超时 / TLS）
+  if (/ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ETIMEOUT|ECONNREFUSED|ENETUNREACH|ECONNRESET|ERR_SOCKET_TIMEOUT|npm ERR! network|registry\.npmjs\.org.*(timeout|timed out)|超时/i.test(t)) {
+    return "registry_timeout";
   }
-  return "unknown";
+  if (/network|registry|EAI|socket hang up/i.test(t)) return "npm_unreachable";
+  // ④ 权限（含只读目录 / 沙箱拦截）
+  if (/EACCES|EPERM|permission denied|权限不足|read-only file system/i.test(t)) return "npm_eacces";
+  if (/platform|不支持的平台/i.test(t)) return "platform_unsupported";
+  if (/too old|版本过低|engine|Unsupported engine/i.test(t)) return "node_too_old";
+  if (/ENOENT|not found|No such file|Cannot find module/i.test(t)) return "node_missing";
+  // ⑤ 输出是乱码（Windows GBK 代码页下 npm 输出可能整段不可读）→ 谁都没法归因，单独标出来
+  if (/[\uFFFD]/.test(t)) return "npx_output_encoding";
+  // ⑥ 兜底：进程确实退出了非零码，但日志里没有可识别的特征 —— 标成 npx_exit_nonzero，
+  // 与"启动都没起来"（npx_cmd_unavailable / node_missing）区分开，便于下轮定位。
+  return "npx_exit_nonzero";
 }
 /** 子进程启动失败（spawn error）→ fail_code。 */
 function telemetryFailCodeFromError(e) {
@@ -2777,6 +2902,9 @@ export const __telemetryInternals = {
   installId: (relayDir) => telemetryInstallId(relayDir),
   queueOf: (relayDir) => telemetryLoadQueue(relayDir, telemetryBook(relayDir)).slice(),
   eventOf: (name, extra) => telemetryEventOf(name, extra),
+  // 归因函数也暴露出来：Windows 装机失败此前全落到 unknown，需要能被用例逐条锁住
+  failCodeFromText: (text) => telemetryFailCodeFromText(text),
+  failCodeFromError: (e) => telemetryFailCodeFromError(e),
   eventNames: [...TELEMETRY_EVENT_NAMES],
   failCodes: [...TELEMETRY_FAIL_CODES],
   queueMax: TELEMETRY_QUEUE_MAX,
@@ -2913,7 +3041,15 @@ function registerRoutes(ctx, relayDir) {
       method: "GET",
       path: "/dsh-remote/self/update-log",
       handler: async (_req, res) => {
-        sendJson(res, 200, { ok: true, running: existsSync(join(relayDir, UPDATE_MARKER)), log: tailOf(join(relayDir, UPDATE_LOG)) });
+        const failure = recentUpdateFailure(relayDir);
+        sendJson(res, 200, {
+          ok: true,
+          running: existsSync(join(relayDir, UPDATE_MARKER)),
+          log: tailOf(join(relayDir, UPDATE_LOG)),
+          // 供前端在"没成功"时如实报错（此前失败只写日志，界面显示"已完成"）
+          failure: failure ? { detail: failure.detail, failCode: failure.failCode, at: failure.at } : null,
+          version: PLUGIN_VERSION
+        });
       },
     },
     {
