@@ -61,10 +61,17 @@
 ### 失败码白名单（`fail_code`）
 
 `node_missing` · `node_too_old` · `npm_unreachable` · `npm_eacces` · `platform_unsupported` ·
-`runtime_install_timeout` · `launchd_failed` · `bridge_exit` · `bind_conflict` · `bind_device_limit` · `unknown`
+`runtime_install_timeout` · `launchd_failed` · `bridge_exit` · `bind_conflict` · `bind_device_limit` ·
+`npx_cmd_unavailable` · `registry_timeout` · `install_script_missing` · `npx_exit_nonzero` ·
+`npx_output_encoding` · `unknown`
 
 > 原始错误文本**绝不外发**（它可能含文件路径、用户名、主机名）：只做白名单归类，
 > 归不进去的一律记 `unknown`。
+>
+> `npx_cmd_unavailable` / `registry_timeout` / `install_script_missing` / `npx_exit_nonzero` /
+> `npx_output_encoding` 是 2026-09 为定位「Windows 上装不上运行环境」而拆细的形态
+> （命令调不起来 / 注册表超时 / 包或安装脚本缺失 / 退出码非零 / 输出乱码）——
+> 它们仍然只是**枚举值**，不包含任何原始文本。
 
 ## 3. 不采集什么（硬边界）
 
