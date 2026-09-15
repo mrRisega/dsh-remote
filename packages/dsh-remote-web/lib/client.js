@@ -1010,7 +1010,15 @@ window.__ModuleLoader__.load({
             if (!b.running) {
               clearInterval(iv);
               setUpdating(false);
-              setUpdated(true);
+              // 关键:进程结束 ≠ 更新成功。以前这里无条件显示"已更新完成"，
+              // 于是 spawn 失败（例如 npx 不可用）时界面只报成功、真实原因躺在日志里 ——
+              // 用户看到的就是"点了一键修复没反应"。现在按失败信息与版本是否变化如实反馈。
+              if (b.failure && b.failure.detail) {
+                setUpdated(false);
+                setSelfMsg({ kind: "err", text: "更新失败：" + b.failure.detail + "（可点「复制诊断信息」，或查看下方日志）" });
+              } else {
+                setUpdated(true);
+              }
               loadVer();
               doCheck();
             }
