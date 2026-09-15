@@ -1812,7 +1812,7 @@ const PLUGIN_ID = "dsh-remote-web";
 const PLUGIN_LEGACY_IDS = ["dsh-remote-ui"];
 const PLUGIN_ALL_IDS = [PLUGIN_ID, ...PLUGIN_LEGACY_IDS];
 /** 插件自身发布版本（与 dsh-remote 根包同步递增）。 */
-const PLUGIN_VERSION = "0.6.6-beta.2";
+const PLUGIN_VERSION = "0.6.6-beta.3";
 const UPDATE_LOG = ".dsh-update.log";
 const UPDATE_MARKER = ".dsh-update-running";
 
@@ -2436,10 +2436,17 @@ const TELEMETRY_EVENT_NAMES = new Set([
   "tunnel_disconnected", "first_remote_ok", "plugin_loaded", "panel_opened", "harness_restart",
   "update_started", "update_failed",
 ]);
-/** fail_code 白名单（白名单外的分类一律落 unknown）。 */
+/**
+ * fail_code 白名单 —— **必须与服务端 TELEMETRY_FAIL_CODES 完全一致**。
+ * 两个用途：① 构造事件时校验（白名单外会被清成空串，等于归因白做）；
+ * ② 受信边界：只有枚举值能出网络，原始错误文本永不上报。
+ * 2026-09-15 教训：新增归因码时忘了同步这里，1659 次 Windows 失败仍然只会显示 unknown。
+ */
 const TELEMETRY_FAIL_CODES = new Set([
   "node_missing", "node_too_old", "npm_unreachable", "npm_eacces", "platform_unsupported",
-  "runtime_install_timeout", "launchd_failed", "bridge_exit", "bind_conflict", "bind_device_limit", "unknown",
+  "runtime_install_timeout", "launchd_failed", "bridge_exit", "bind_conflict", "bind_device_limit",
+  "npx_cmd_unavailable", "registry_timeout", "install_script_missing", "npx_exit_nonzero", "npx_output_encoding",
+  "unknown",
 ]);
 /** node 半只发 source=plugin。 */
 const TELEMETRY_SOURCE = "plugin";

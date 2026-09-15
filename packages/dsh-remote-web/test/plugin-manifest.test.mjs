@@ -83,6 +83,22 @@ test("一键更新：前端在进程结束但没成功时必须报错，而不�
   assert.match(indexSrc, /failure: failure \? \{ detail: failure\.detail/, "update-log 应下发 failure");
 });
 
+test("运行时同步：客户端脚本必须按**内容**补齐（否则手机端修复永远到不了用户）", () => {
+  // 事故背景（2026-09-15 实测）：手机端遮罩 bug 的修复落在 clients/dsh-remote/mobile-adapter.mjs，
+  // 而 bridge 是把**配置目录里那份**脚本注入官方页面后发给手机的。装置器原先只在"版本号变化"时
+  // 才覆盖运行时副本，于是出现过：改了、发了版、用户升级了，但手机端拿到的仍是旧脚本 —— 修复不生效。
+  // 现在按内容比对，只要与装置器手里的不一致就覆盖。
+  const setup = readFileSync(join(REPO, "dsh-setup.mjs"), "utf8");
+  assert.match(setup, /function syncRuntimeClientFiles/, "应有按内容同步的客户端脚本同步函数");
+  assert.match(setup, /mobile-adapter\.mjs/, "必须覆盖 mobile-adapter.mjs（手机端注入层）");
+  assert.match(setup, /dsh-bridge\.mjs/, "必须覆盖 dsh-bridge.mjs");
+  assert.match(setup, /equals\(/, "应按内容比对（而非只看版本号）");
+  assert.match(setup, /syncRuntimeClientFiles\(\)/, "应实际调用同步");
+  // 仓库开发形态也必须同步（否则本地测试拿到的是陈旧副本，测了个寂寞）
+  const devBranch = setup.slice(setup.indexOf("if (!IS_NPM_INSTALL) {"), setup.indexOf("fs.mkdirSync(CONFIG_DIR, { recursive: true });\n  const ver = pkgVersion();"));
+  assert.match(devBranch, /syncRuntimeClientFiles\(\)/, "仓库形态也要同步客户端脚本");
+});
+
 test("补装失败退避：Windows 的失败风暴不再每轮重试", () => {
   assert.match(indexSrc, /PROVISION_RETRY_BACKOFF_MS\s*=\s*\[30_000, 120_000, 600_000\]/, "应有 30s→2m→10m 退避");
   assert.match(indexSrc, /function provisionRetryGate/, "应有退避闸门");
@@ -90,18 +106,29 @@ test("补装失败退避：Windows 的失败风暴不再每轮重试", () => {
   assert.match(indexSrc, /noteProvisionSuccess\(relayDir\)/, "成功要清退避");
 });
 
-test("失败归因：Windows 真实错误不再全部落到 unknown（1659 次无法定位的教训）", () => {
+test("失败归因：客户端白名单必须与服务端逐字一致，且事件真的带上新码", () => {
   const codes = ["npx_cmd_unavailable", "registry_timeout", "install_script_missing", "npx_exit_nonzero", "npx_output_encoding"];
-  for (const c of codes) {
-    assert.ok(indexSrc.includes(`"${c}"`), `客户端归因应包含 ${c}`);
-  }
-  // 与服务端白名单保持一致（服务端不认的码会被静默丢弃 → 又变成 unknown）
-  const server = join(REPO, "..", "dsh-relay-enterprise", "relay-enterprise", "src", "api.js");
-  if (existsSync(server)) {
-    const apiSrc = readFileSync(server, "utf8");
-    for (const c of codes) {
-      assert.ok(apiSrc.includes(`"${c}"`), `服务端 TELEMETRY_FAIL_CODES 必须接受 ${c}（否则上报被丢弃）`);
-    }
+
+  // ① 行为断言：构造一个带新码的事件，payload 里必须真的有这个码。
+  //    （教训：只断言"文件里有这个字面量"是不够的 —— 客户端白名单没同步时，
+  //      telemetryEventOf 会把白名单外的码清成空串，1659 次 Windows 失败仍然只显示 unknown。）
+  const out = JSON.parse(execFileSync(process.execPath, ["-e", `
+    import("${INDEX}").then((m) => {
+      const ev = m.__telemetryInternals.eventOf("install_failed", { fail_code: "npx_cmd_unavailable" });
+      console.log(JSON.stringify({ fail_code: ev && ev.fail_code, queued: m.__telemetryInternals.failCodes }));
+    });
+  `], { encoding: "utf8" }).trim());
+  assert.equal(out.fail_code, "npx_cmd_unavailable", "客户端白名单必须放行新码，否则归因被清空");
+  for (const c of codes) assert.ok(out.queued.includes(c), `客户端 failCodes 应含 ${c}`);
+
+  // ② 与服务端白名单**集合级**一致（少一个码 = 上报被丢弃、多一个 = 服务端拒收）
+  const serverPath = join(REPO, "..", "dsh-relay-enterprise", "relay-enterprise", "src", "api.js");
+  if (existsSync(serverPath)) {
+    const apiSrc = readFileSync(serverPath, "utf8");
+    const block = /const TELEMETRY_FAIL_CODES = new Set\(\[([\s\S]*?)\]\);/.exec(apiSrc);
+    assert.ok(block, "应能读到服务端白名单");
+    const serverCodes = [...block[1].matchAll(/"([a-z_]+)"/g)].map((m) => m[1]).sort();
+    assert.deepEqual([...out.queued].sort(), serverCodes, "客户端与服务端的 fail_code 白名单必须完全一致");
   }
 });
 

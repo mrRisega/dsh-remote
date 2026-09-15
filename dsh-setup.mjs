@@ -70,8 +70,48 @@ function findDepWs(startDir) {
   return null;
 }
 
+/** 同步运行时文件时一并覆盖的客户端脚本（bridge 会把这些直接发给手机/桌面，必须与装置器一致）。 */
+const RUNTIME_CLIENT_FILES = ["mobile-adapter.mjs", "dsh-bridge.mjs", "e2ee-shim.mjs", "e2ee-client.mjs", "e2ee-shim-script.js", "mobile-adapter.test.mjs"];
+
+/**
+ * 把"客户端脚本"补齐到配置目录。
+ *
+ * ⚠️ 2026-09-15 实测的坑：只按**版本号**判断"要不要同步"是不够的 ——
+ * 手机端遮罩 bug 的修复落在 `clients/dsh-remote/mobile-adapter.mjs` 里（bridge 会把它注入官方页面后
+ * 直接发给手机）。用户升级到新版本时，若配置目录里那份旧脚本没被覆盖，
+ * **修复就永远到不了手机**（现场表现：改了、发了版，用户还是整屏阴影）。
+ * 所以这里按**内容**比对：只要与装置器手里的不一致就覆盖（幂等、无副作用）。
+ * @returns {number} 实际覆盖的文件数
+ */
+function syncRuntimeClientFiles() {
+  const destRoot = path.join(CONFIG_DIR, "clients", "dsh-remote");
+  let n = 0;
+  for (const name of RUNTIME_CLIENT_FILES) {
+    const src = path.join(THIS_DIR, "clients", "dsh-remote", name);
+    if (!fs.existsSync(src)) continue;
+    const dst = path.join(destRoot, name);
+    try {
+      if (fs.existsSync(dst) && fs.readFileSync(src).equals(fs.readFileSync(dst))) continue; // 一致 → 不动
+      fs.mkdirSync(path.dirname(dst), { recursive: true });
+      fs.copyFileSync(src, dst);
+      n += 1;
+    } catch { /* 单个文件失败不影响整体 */ }
+  }
+  return n;
+}
+
 function ensureRuntimeCopy() {
-  if (!IS_NPM_INSTALL) return; // 仓库开发形态：原地使用
+  // 仓库开发形态：装置器要使用**仓库里这份**（实时生效），但配置目录里的运行时副本
+  // 仍必须与之一致 —— 否则 bridge 会把陈旧脚本发给手机（上面的 syncRuntimeClientFiles 说明）。
+  if (!IS_NPM_INSTALL) {
+    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+    const srcSetup = path.join(THIS_DIR, "dsh-setup.mjs");
+    const dstSetup = path.join(CONFIG_DIR, "dsh-setup.mjs");
+    try { if (!fs.existsSync(dstSetup) || !fs.readFileSync(srcSetup).equals(fs.readFileSync(dstSetup))) fs.copyFileSync(srcSetup, dstSetup); } catch { /* ignore */ }
+    const n = syncRuntimeClientFiles();
+    if (n > 0) console.log(`✅ 运行时: 已同步 ${n} 个客户端脚本到 ${CONFIG_DIR}`);
+    return;
+  }
   fs.mkdirSync(CONFIG_DIR, { recursive: true });
   const ver = pkgVersion();
   const setupTarget = path.join(CONFIG_DIR, "dsh-setup.mjs");
@@ -79,7 +119,12 @@ function ensureRuntimeCopy() {
   const verFile = path.join(CONFIG_DIR, ".dsh-setup-version");
   let cur = "";
   try { cur = fs.readFileSync(verFile, "utf8").trim(); } catch { /* 首次 */ }
-  if (fs.existsSync(setupTarget) && cur === ver) return; // 同版本幂等跳过
+  if (fs.existsSync(setupTarget) && cur === ver) {
+    // 版本没变也要确保客户端脚本一致（版本号相同但脚本被修过的情况真实存在）
+    const n = syncRuntimeClientFiles();
+    if (n > 0) console.log(`✅ 运行时: 已同步 ${n} 个客户端脚本到 ${CONFIG_DIR}`);
+    return;
+  }
   fs.cpSync(path.join(THIS_DIR, "dsh-setup.mjs"), setupTarget);
   fs.cpSync(path.join(THIS_DIR, "clients"), path.join(CONFIG_DIR, "clients"), { recursive: true, force: true });
   const wsSrc = findDepWs(THIS_DIR);
@@ -896,6 +941,42 @@ function stripPluginEntries(patch) {
 }
 
 /**
+ * 语义化版本比较（只处理本仓库用到的形态：X.Y.Z 与 X.Y.Z-<pre>.<n>）。
+ * 为什么需要：装置器必须判断"本地这份包 vs profile 里已装的那份"谁更新 ——
+ * 用字符串比较会把 0.6.6-beta.2 与 0.6.5 比错（预设版低于同号正式版），
+ * 于是要么跳过本该做的升级、要么把新版降级。任一侧解析不了返回 null（调用方保守处理）。
+ * @returns {number|null} a>b → 1；a<b → -1；相等 → 0；无法解析 → null
+ */
+function compareVersionStrings(a, b) {
+  const parse = (v) => {
+    const m = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?/.exec(String(v || "").trim());
+    if (!m) return null;
+    return { nums: [Number(m[1]), Number(m[2]), Number(m[3])], pre: m[4] ? m[4].split(".") : null };
+  };
+  const x = parse(a);
+  const y = parse(b);
+  if (!x || !y) return null;
+  for (let i = 0; i < 3; i += 1) if (x.nums[i] !== y.nums[i]) return x.nums[i] > y.nums[i] ? 1 : -1;
+  if (!x.pre && !y.pre) return 0;
+  if (!x.pre) return 1;   // 预设版 < 同号正式版（semver §11）
+  if (!y.pre) return -1;
+  const len = Math.max(x.pre.length, y.pre.length);
+  for (let i = 0; i < len; i += 1) {
+    const p1 = x.pre[i];
+    const p2 = y.pre[i];
+    if (p1 === undefined) return -1;
+    if (p2 === undefined) return 1;
+    const n1 = /^\d+$/.test(p1) ? Number(p1) : null;
+    const n2 = /^\d+$/.test(p2) ? Number(p2) : null;
+    if (n1 !== null && n2 !== null) { if (n1 !== n2) return n1 > n2 ? 1 : -1; continue; }
+    if (n1 !== null) return -1;
+    if (n2 !== null) return 1;
+    if (p1 !== p2) return p1 > p2 ? 1 : -1;
+  }
+  return 0;
+}
+
+/**
  * 解析 patch 文本里的 insert 行 id（与 dshmarket 同口径的极简解析，不引 YAML 依赖）。
  * 用途有二：① 判断本插件是否已激活（幂等）；② **写完校验**——patch 文件形态非法时
  * dsh web 会直接启动失败，所以每次写入后必须重新解析确认结果仍是「一行一条的 insert 列表」。
@@ -952,7 +1033,7 @@ function writePatchAtomic(patchFile, text) {
  * 并导致「plugin tree failed to load」——整个插件树加载失败（实测日志）。
  * 因此所有 return 之前都要保证：要么只有 patch 行、要么只有 bundles 条目。
  */
-function ensurePatchActivation(patchFile, pluginLocalDir, pkgFile) {
+function ensurePatchActivation(patchFile, pluginLocalDir, pkgFile, opts = {}) {
   const original = fs.readFileSync(patchFile, "utf8");
   const pkgBundles = () => {
     try {
@@ -961,10 +1042,20 @@ function ensurePatchActivation(patchFile, pluginLocalDir, pkgFile) {
         ? pkg.dsh.profile.bundles.filter((b) => PLUGIN_ALL_IDS.includes(b)) : [];
     } catch { return []; }
   };
-  // 基座就是「插件已在 bundles」→ 保持 bundles 形态（不写 patch 行），避免两个激活点并存。
-  // 这一路等价于插件市场安装形态：需要重启 dsh web 才装载。
-  if (pkgBundles().length) {
+  // 插件已在 bundles 时默认**不**写 patch 行（两条激活路径互斥，否则 duplicate id 崩树）。
+  // 但有两个例外必须主动改写激活点：
+  //   · forcePatch：源码已被我们换成本地这份（升级场景）→ 必须转 patch 行才能热加载；
+  //   · 插件市场形态（bundles 里的条目由包管理器管）→ 保持 bundles，不碰。
+  const inBundles = pkgBundles();
+  if (inBundles.length && !opts.forcePatch) {
     return { ok: false, reason: "插件已由 dsh.profile.bundles 声明（保持单一激活点，不写 patch 行）", changed: false, bundleOnly: true, basePatch: original };
+  }
+  if (inBundles.length && opts.forcePatch) {
+    // 自己动手摘掉 bundles 条目（不依赖调用方的执行顺序），再走 patch 行激活
+    removeBundleEntry(pkgFile);
+    if (pkgBundles().length) {
+      return { ok: false, reason: "无法移除 dsh.profile.bundles 中的本插件条目", changed: false, basePatch: original };
+    }
   }
   const base = validatePatchBase(original);
   if (!base.ok) return { ok: false, reason: base.reason, changed: false, basePatch: original };
@@ -1139,6 +1230,37 @@ function removeBundleEntry(pkgFile) {
 }
 
 /**
+ * 把我们手上这份插件包落到 profile 并激活（唯一激活点 = patch 行 → 热加载）。
+ * 两条路径共用：① 无依赖或 file: 依赖（我们自己管源码）；② 市场装法但本地版本更新。
+ * @returns {{hotPatch:boolean, changed:boolean, basePatch?:string}|undefined}
+ */
+function activateLocalCopy(profileDir, pkgFile, patchFile, pluginDir, patch, pkg, opts = {}) {
+  const pluginLocalDir = copyPluginIntoProfile(profileDir, pluginDir);
+  // forcePatch 由 ensurePatchActivation 内部处理（摘 bundles → 写 patch 行），
+  // 这样不依赖调用顺序：源码既已换成本地这份，激活点就必须跟着改，否则装完仍看不到新版。
+
+  const entryFile = path.join(pluginLocalDir, "lib", "index.js");
+  if (!fs.existsSync(entryFile)) {
+    console.error(`❌ 插件入口缺失：${entryFile}（本包不完整？请用官方源重装：npx --registry=https://registry.npmjs.org @mrrisega/dsh-remote@latest）`);
+    process.exit(1);
+  }
+  declarePluginDep(pkgFile);                        // file: 依赖(包管理器 install 不误删)
+  ensurePluginLinked(profileDir, pluginLocalDir);    // node_modules 链接(name 才能被解析)
+  const r = ensurePatchActivation(patchFile, pluginLocalDir, pkgFile, { forcePatch: !!opts.forcePatch });
+  if (r.ok) {
+    console.log(`✅ 插件已就绪: ${pluginLocalDir}${opts.forcePatch ? "（激活点已转为 patch 行，装完即热加载）" : ""}`);
+    return { hotPatch: true, changed: r.changed, basePatch: r.basePatch };
+  }
+  if (r.bundleOnly) {
+    console.log("ℹ 该插件已由 dsh.profile.bundles 声明（保持单一激活点，不重复写入 patch 行）");
+  } else {
+    console.warn(`⚠️ 无法写入 patch 激活行（${r.reason}），改为 bundles 形态（需重启 dsh web 生效）`);
+    ensureBundleEntry(pkgFile);
+  }
+  return { hotPatch: false, changed: true, basePatch: patch };
+}
+
+/**
  * 插件安装(pluginCmd 非卸载分支)收敛策略 —— 2026-09-06「重复 ID 崩溃」根治；
  * 2026-09 插件由 dsh-remote-ui 更名 dsh-remote-web，本函数同时兼容清理旧名残留。
  *
@@ -1196,6 +1318,22 @@ function convergePluginActivation(profileDir, pkgFile, patchFile, pluginDir, pat
     stripIncludeEntries(patchFile, patch, "插件市场安装形态无需用户 include");
     const depName = PLUGIN_ALL_IDS.find((id) => pkg.dependencies && pkg.dependencies[id] !== undefined) || PLUGIN_ID;
     const before = readInstalledPluginVersion(profileDir, depName);
+    // ⚠️ 关键：装置器**手上这份包的版本**才是权威（用户跑的就是它）。
+    // 以前这里无条件"去 npm 装 market 渠道的最新版"，于是本地跑 0.6.6-beta.2 时，
+    // profile 里市场装的 0.6.5 被判成"已是最新"→ 什么都不做（测试自己就踩到：
+    // 「✅ 插件包已是市场最新版（0.6.5）」，明明带的是 beta）。
+    // 现在：本地严格更新 → 直接落本地包（顺带把激活点换成 patch 行，拿到热加载）；
+    // 相等 → 不做；本地更旧 → 不动（绝不降级）。
+    const localVer = pkgVersion();
+    const cmpLocal = compareVersionStrings(localVer, before);
+    if (cmpLocal !== null && cmpLocal > 0) {
+      console.log(`ℹ 本地包更新（${before ?? "未装"} → ${localVer}），落本地版本并改用热加载激活…`);
+      return activateLocalCopy(profileDir, pkgFile, patchFile, pluginDir, patch, pkg, { forcePatch: true });
+    }
+    if (cmpLocal !== null && cmpLocal < 0) {
+      console.log(`ℹ profile 里已是更新版本（${before} > ${localVer}），保持不动（不降级）。`);
+      return;
+    }
     console.log(`ℹ 插件市场安装形态（bundles+dependency）：源码归包管理器管，正在升级到最新…（安装前 ${before ?? "未知"}）`);
     const { ok, cmd } = upgradeMarketManagedPlugin(profileDir, depName, dep);
     const after = readInstalledPluginVersion(profileDir, depName);
@@ -1212,31 +1350,9 @@ function convergePluginActivation(profileDir, pkgFile, patchFile, pluginDir, pat
     return;
   }
 
-  if (managedByUs) {
-    const pluginLocalDir = copyPluginIntoProfile(profileDir, pluginDir);
-    const entryFile = path.join(pluginLocalDir, "lib", "index.js");
-    if (!fs.existsSync(entryFile)) {
-      console.error(`❌ 插件入口缺失：${entryFile}（本包不完整？请用官方源重装：npx --registry=https://registry.npmjs.org @mrrisega/dsh-remote@latest）`);
-      process.exit(1);
-    }
-    declarePluginDep(pkgFile);                       // file: 依赖(包管理器 install 不误删)
-    ensurePluginLinked(profileDir, pluginLocalDir);   // node_modules 链接(name 才能被解析)
-    // 唯一激活点:patch 行(+ 顺带把 bundles 里的本插件条目移除,避免两处并存)
-    const r = ensurePatchActivation(patchFile, pluginLocalDir, pkgFile);
-    if (r.ok) {
-      console.log(`✅ 插件已就绪: ${pluginLocalDir}`);
-      return { hotPatch: true, changed: r.changed, basePatch: r.basePatch };
-    }
-    // patch 行不能写(文件形态异常,或插件已由 bundles 声明)→ 回退 bundles(需重启),保证功能可用。
-    // 这条路的输出要如实说明"装完要重启一次",不能让人以为已经热加载了。
-    if (r.bundleOnly) {
-      console.log("ℹ 该插件已由 dsh.profile.bundles 声明（保持单一激活点，不重复写入 patch 行）");
-    } else {
-      console.warn(`⚠️ 无法写入 patch 激活行（${r.reason}），改为 bundles 形态（需重启 dsh web 生效）`);
-      ensureBundleEntry(pkgFile); // 回退激活点：插件仍可用，代价是必须重启一次
-    }
-    return { hotPatch: false, changed: true, basePatch: patch };
-  }
+  // 源码归我们（无依赖或 file: 依赖）→ 必然用本地这份，激活点也必须是 patch 行（热加载）。
+  if (managedByUs) return activateLocalCopy(profileDir, pkgFile, patchFile, pluginDir, patch, pkg, { forcePatch: true });
+
 
   // 异常形态：有非 file: 依赖但不在 bundles（无法靠 bundle patch 激活）
   console.log(`ℹ 检测到依赖 ${PLUGIN_ID}(${dep}) 但未声明在 dsh.profile.bundles——插件不会激活。`);
