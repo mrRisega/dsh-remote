@@ -28,18 +28,32 @@ const indexSrc = readFileSync(INDEX, "utf8");
 const clientSrc = readFileSync(CLIENT, "utf8");
 
 test("清单：dsh.client 不得声明不存在的宿主包（幻影 inject 会让插件永不装载）", () => {
-  for (const pkg of ["packages/dsh-remote-web/package.json", "packages/dsh-remote-ui/package.json"]) {
-    const manifest = JSON.parse(readFileSync(join(REPO, pkg), "utf8"));
-    const client = manifest.dsh && manifest.dsh.client;
-    assert.ok(client, `${pkg} 应有 dsh.client`);
-    assert.equal(client.platform, "web");
-    const inject = client.inject || [];
-    assert.deepEqual(inject, [], `${pkg} 的 inject 必须为空：我们的浏览器半只 require("react")，不需要任何宿主包`);
-    // 若将来真要用宿主扩展点，必须验证该包真实存在
-    for (const name of inject) {
-      assert.ok(!/dsh-client-runtime|dsh-client-collection/.test(name), `inject 里不得出现不存在的包名：${name}`);
-    }
+  // 注：旧名别名包 dsh-remote-ui 已于 2026-09-15 退役并从仓库删除（npm 上已 deprecate），
+  // 因此这里只校验当前插件包 dsh-remote-web。
+  const pkg = "packages/dsh-remote-web/package.json";
+  const manifest = JSON.parse(readFileSync(join(REPO, pkg), "utf8"));
+  const client = manifest.dsh && manifest.dsh.client;
+  assert.ok(client, `${pkg} 应有 dsh.client`);
+  assert.equal(client.platform, "web");
+  const inject = client.inject || [];
+  assert.deepEqual(inject, [], `${pkg} 的 inject 必须为空：我们的浏览器半只 require("react")，不需要任何宿主包`);
+  for (const name of inject) {
+    assert.ok(!/dsh-client-runtime|dsh-client-collection/.test(name), `inject 里不得出现不存在的包名：${name}`);
   }
+});
+
+test("旧名别名包确已退役：目录/同步脚本/发布步骤都不应再存在", () => {
+  assert.ok(!existsSync(join(REPO, "packages", "dsh-remote-ui")), "别名目录应已删除");
+  assert.ok(!existsSync(join(REPO, "scripts", "sync-legacy-alias.mjs")), "别名同步脚本应已删除");
+  const root = JSON.parse(readFileSync(join(REPO, "package.json"), "utf8"));
+  for (const k of ["sync:alias", "check:alias"]) {
+    assert.ok(!(k in root.scripts), `package.json 不应再有 ${k}`);
+  }
+  assert.ok(!/check:alias/.test(root.scripts.check || ""), "check 不应再引用别名校验");
+  // 但**旧名清理/迁移逻辑必须保留**：老用户升级依赖它
+  const setup = readFileSync(join(REPO, "dsh-setup.mjs"), "utf8");
+  assert.match(setup, /PLUGIN_LEGACY_IDS/, "安装器必须保留旧名清理（老用户升级路径）");
+  assert.match(setup, /dsh-remote-ui/, "旧名清理里应仍认得 dsh-remote-ui");
 });
 
 test("清单：浏览器半只依赖 shell 提供的 react（不 require 宿主客户端包）", () => {

@@ -49,10 +49,10 @@ non-negotiables, because each of them has already broken something in production
    must attach those assets — run `npm run release:tarballs` (or let
    `.github/workflows/release-tarballs.yml` do it on a `v*` tag). A pinned URL silently keeps
    shipping the old build to every storefront.
-5. **Keep the legacy alias until the renamed entry is merged.** `packages/dsh-remote-ui/` is
-   generated from `packages/dsh-remote-web/` by `npm run sync:alias` (`npm run check` fails
-   when it drifts). Deleting it while the renamed entry is still under review makes the
-   already-listed entry — and every install pointing at it — 404.
+5. **The legacy alias is retired (2026-09-15).** `packages/dsh-remote-ui/` was removed from this
+   repo and `dsh-remote-ui` on npm is now deprecated; publish only `dsh-remote-web` (plugin) and
+   `@mrrisega/dsh-remote` (installer). The old-name *cleanup* paths in the installer/plugin
+   (`PLUGIN_LEGACY_IDS`) stay — they let machines that installed the old name migrate cleanly.
 6. **Market copy says "highlights", never "selling points".** Descriptions must stay factual
    and checkable against the code, and must touch only our own entry.
 

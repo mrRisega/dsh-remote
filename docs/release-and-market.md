@@ -14,7 +14,7 @@
 | `packages/dsh-remote-web/package.json` → `version` | dsh web 插件包（市场条目指向它） |
 | `packages/dsh-remote-web/lib/index.js` → `PLUGIN_VERSION` | 面板内「版本与更新」用它做自检/更新比较 |
 
-兼容别名包 `packages/dsh-remote-ui/` 由脚本生成，**不要手改**（见 §4）。
+旧名别名包 `dsh-remote-ui` **已退役**（仓库内已删除、npm 已 deprecate，见 §4）。
 
 ## 2. 发版步骤（顺序不能颠倒）
 
@@ -37,23 +37,25 @@ bash scripts/release-tarballs.sh        # 或 npm run release:tarballs
 1. **URL 只允许 `releases/latest/download/<常量名>.tgz`**
    ✅ `https://github.com/mrRisega/dsh-remote/releases/latest/download/dsh-remote-web.tgz`
    ❌ `…/releases/download/v0.6.0/dsh-remote-web.tgz` —— 钉死版本后，插件升到 0.6.2 市场仍装 0.6.0。
-2. **资产名不带版本号**（`dsh-remote-web.tgz` / `dsh-remote-ui.tgz`）。`latest/download/` 只在请求时解析 `latest`，文件名照字面取；带版本号的名字必然在下次发版后 404。
+2. **资产名不带版本号**（`dsh-remote-web.tgz`）。`latest/download/` 只在请求时解析 `latest`，文件名照字面取；带版本号的名字必然在下次发版后 404。
 3. **每次发版都必须挂上这两个同名资产**，否则 `latest/download` 会 404、市场安装失败。已自动化：
    - 手动：`npm run release:tarballs`（`scripts/release-tarballs.sh`：打包 → 校验包内版本 → 建/更新 `v<version>` Release → 校验 latest/download）
    - CI：`.github/workflows/release-tarballs.yml` —— 推 `v*` tag 或手动 `workflow_dispatch` 时自动完成同样的事
 
 > 注意事项：GitHub 资产 CDN 有缓存，刚发布后立刻校验可能仍返回旧内容，带 `?cb=<时间戳>` 或等几分钟再验。
 
-## 4. 旧名兼容别名（灰度改名）
+## 4. 旧名别名已退役（2026-09-15）
 
-改名会让**已上线的旧条目 URL 直接 404**（市场安装按钮当场失效），而新条目审核需要时间，因此改名必须灰度：
+改名灰度期结束，别名包**已删除**，后续不再维护：
 
-- 保留 `packages/dsh-remote-ui/` 作为**自动生成的别名包**（自包含副本，包名/插件 id/浏览器 id 全部回到旧名），
-  由 `bash scripts/sync-legacy-alias.mjs` 从 `packages/dsh-remote-web/` 生成；`npm run check` 内含漂移校验
-  （`check:alias`），改源包后必须重新生成，否则 CI 失败。
-- 旧名同时发布到 npm（`dsh-remote-ui`），既让旧条目可走 npm 快装，也防止名字被抢注。
-- **新条目合并后再退役**：删除别名目录 → `npm deprecate dsh-remote-ui "renamed to dsh-remote-web"` →
-  提交旧条目移除 PR。**审核通过前绝不删除旧路径。**
+- 仓库里已移除：`packages/dsh-remote-ui/`、`scripts/sync-legacy-alias.mjs`、
+  `npm run sync:alias` / `check:alias`（`npm run check` 不再包含别名校验）。
+- npm 上的 `dsh-remote-ui` 已标记 **deprecated**（`latest` 会永久停在 0.6.5），
+  安装/更新会看到迁移提示：改用 `@mrrisega/dsh-remote`（插件包 `dsh-remote-web`）。
+- **安装器仍保留旧名清理逻辑**（`PLUGIN_LEGACY_IDS`）：老用户升级时会自动移除 profile 里
+  旧名（`dsh-remote-ui`）的依赖 / bundles 条目 / 本地目录与链接，避免残留导致重复激活。
+  这部分**不要删**，它是老用户能从旧版平滑升上来的保证。
+- 不要再往 npm 发 `dsh-remote-ui`；旧条目若仍存在于某个市场（已过时、已改名），删除即可。
 
 ## 5. 市场条目提交规则（awesome-dsh-plugin / deepseek1024 / 其它）
 
@@ -83,6 +85,5 @@ stars/条目/下载量全部停更（先看他们的 build 工作流，再怀疑
 
 | 脚本 | 用途 |
 |---|---|
-| `scripts/sync-legacy-alias.mjs`（`npm run sync:alias` / `check:alias`） | 生成/校验旧名别名包 |
 | `scripts/release-tarballs.sh`（`npm run release:tarballs`） | 打包 + 建/更新 Release + 校验 latest/download |
 | `.github/workflows/release-tarballs.yml` | 打 tag 或手动触发时自动出包 |
