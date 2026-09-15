@@ -15,6 +15,19 @@ All notable changes to dsh-remote are documented here. This project follows
 - 插件包升级成功后明确提示需要**重启一次 dsh web** —— 市场装法经 `dsh.profile.bundles` 激活，
   该文件只在启动时读取（与"首次安装可热挂载"的边界一致，见 0.6.4 说明）。
 
+## [0.6.6-beta.2] - 2026-09-15
+
+> 预发版。**旧名别名包正式退役**（改名早已完成，不需要再维护第二个包）。
+
+### Changed
+
+- **删除 `packages/dsh-remote-ui/` 别名包与它的同步脚本**（`npm run sync:alias` / `check:alias`），
+  发布步骤与文档同步更新。npm 上的 `dsh-remote-ui` 已标记 **deprecated**，
+  `latest` 永久停在 0.6.5，安装/更新会看到迁移提示：改用 `@mrrisega/dsh-remote`（插件包 `dsh-remote-web`）。
+- **但安装器与插件的旧名清理逻辑（`PLUGIN_LEGACY_IDS`）保留**：曾经装过 `dsh-remote-ui` 的机器
+  升级时会自动移除旧名的依赖 / bundles 条目 / 本地目录与链接，避免残留导致「重复 ID」崩溃。
+  这是老用户平滑升级的保证，不要删。
+
 ## [0.6.6-beta.1] - 2026-09-15
 
 > 预发版。针对 0.6.5 推广后社群集中反馈的三类问题（手机端整屏阴影点不动、扫码后插件加载失败、
