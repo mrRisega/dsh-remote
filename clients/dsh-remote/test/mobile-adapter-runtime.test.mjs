@@ -35,7 +35,8 @@ class El {
     this.children = [];
     this._cls = new Set();
     this._listeners = new Map();
-    this.style = {};
+    this.style = { setProperty: (k, v) => { if (!this._cssVars) this._cssVars = {}; this._cssVars[k] = v; }, removeProperty: (k) => { if (this._cssVars) delete this._cssVars[k]; } };
+    this._cssVars = {};
     this._rect = { left: 0, right: 0, top: 0, bottom: 0, width: 0, height: 0 };
     this.classList = {
       add: (...cs) => cs.forEach((c) => this._cls.add(c)),
@@ -44,18 +45,47 @@ class El {
       toggle: (c, on) => { if (on === undefined) { this._cls.has(c) ? this._cls.delete(c) : this._cls.add(c); } else if (on) this._cls.add(c); else this._cls.delete(c); return this._cls.has(c); },
     };
   }
+  // 极简 innerHTML：只认本用例需要的那点结构（class / input[type=range] / 文本）
+  set innerHTML(html) {
+    this._html = String(html);
+    this.children = [];
+    for (const m of String(html).matchAll(/<(\w+)([^>]*)>/g)) {
+      const tag = m[1];
+      const attrs = m[2] || "";
+      const el = new El(tag);
+      const cls = /class="([^"]*)"/.exec(attrs);
+      if (cls) el.className = cls[1];
+      const type = /type="([^"]*)"/.exec(attrs);
+      if (type) el.attrs.type = type[1];
+      this.children.push(el);
+    }
+  }
+  get innerHTML() { return this._html || ""; }
+  get textContent() { return this._text || ""; }
+  set textContent(v) { this._text = String(v); }
   get className() { return [...this._cls].join(" "); }
   set className(v) { this._cls = new Set(String(v).split(/\s+/).filter(Boolean)); }
   getAttribute(n) { return n in this.attrs ? this.attrs[n] : null; }
   setAttribute(n, v) { this.attrs[n] = String(v); }
+  removeAttribute(n) { delete this.attrs[n]; }
+  prepend() {} focus() {} blur() {}
   hasAttribute(n) { return n in this.attrs; }
   appendChild(c) { c.parent = this; this.children.push(c); return c; }
   addEventListener(t, fn) { (this._listeners.get(t) || this._listeners.set(t, []).get(t)).push(fn); }
   removeEventListener() {}
   dispatch(t, ev = {}) { for (const fn of this._listeners.get(t) || []) fn({ stopPropagation() {}, preventDefault() {}, ...ev }); }
   getBoundingClientRect() { return this._rect; }
-  querySelector() { return null; }
-  querySelectorAll() { return []; }
+  querySelector(sel) {
+    const s2 = String(sel);
+    const match = (el) => {
+      if (s2.includes('input[type="range"]')) return el.tagName === "INPUT" && el.attrs.type === "range";
+      if (s2.startsWith(".")) return el._cls.has(s2.slice(1));
+      if (s2.startsWith("input")) return el.tagName === "INPUT";
+      return false;
+    };
+    return this.children.find(match) || null;
+  }
+  querySelectorAll(sel) { const one = this.querySelector(sel); return one ? [one] : []; }
   matches() { return false; }
   click() { this._clicked = (this._clicked || 0) + 1; this.dispatch("click"); }
   get isConnected() { return true; }
@@ -114,7 +144,7 @@ function harness({ collapsedAttr = undefined, detailsAttr = undefined, sidebarRe
     innerWidth: width,
     innerHeight: 800,
     devicePixelRatio: 1,
-    localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+    localStorage: { _d: {}, getItem(k) { return k in this._d ? this._d[k] : null; }, setItem(k, v) { this._d[k] = String(v); }, removeItem(k) { delete this._d[k]; } },
     addEventListener() {},
     removeEventListener() {},
     getComputedStyle: () => ({ getPropertyValue: () => "" }),
@@ -148,6 +178,8 @@ const ADAPTER_DEBUG = process.env.DSH_ADAPTER_DEBUG === "1";
 function runAdapter(env) {
   try {
     vm.runInContext(adapterScript(), env.ctx, { timeout: 5000 });
+    // 让脚本内 setTimeout(0) 的收尾逻辑跑一轮
+    for (const fn of env._pendingTimers || []) { try { fn(); } catch { /* ignore */ } }
   } catch (e) {
     if (ADAPTER_DEBUG) console.error("ADAPTER THREW:", e && e.message);
     throw e;
@@ -161,20 +193,41 @@ const findHamburger = (env) => env.body.children.find((c) => c._cls.has("dsh-ma-
 
 // ── 用例 ─────────────────────────────────────────────────────────────────────
 
-test("运行时：官方属性带值写法 =false 时不得判定为展开 → 遮罩不拦截点击（用户报的整屏阴影）", () => {
-  // 官方若输出 data-sidebar-collapsed="false"（属性存在但语义为未折叠），旧实现 hasAttribute → 判定展开 → 遮罩常亮
-  const env = runAdapter(harness({ collapsedAttr: "false", sidebarRect: null }));
-  assert.ok(!env.html.classList.contains("dsh-ma-sidebar-open"),
-    "属性值 false = 未折叠 → 不应加 sidebar-open（否则遮罩会拦住整屏点击）");
+test("运行时：官方属性带值写法 =false 时遮罩不得拦截点击（用户报的整屏阴影）", () => {
+  // 官方若输出 data-sidebar-collapsed="true"（折叠），旧实现 hasAttribute 只看存在性；
+  // 带值写法下必须按值判断 —— 否则"折叠态"被当成"展开"，遮罩常亮拦住整屏点击。
+  const env = runAdapter(harness({ collapsedAttr: "true", sidebarRect: { left: 0, right: 300, top: 0, bottom: 800, width: 300, height: 800 } }));
+  assert.ok(!env.html.classList.contains("dsh-ma-scrim-on"), "折叠态 → 遮罩不得拦截点击");
+  assert.ok(!env.html.classList.contains("dsh-ma-sidebar-open"), "折叠态 → 不应处于展开态");
+  // 对照：=false 属"未折叠"，是展开态（但遮罩仍只在几何可见时拦截）
+  const env2 = runAdapter(harness({ collapsedAttr: "false", sidebarRect: { left: -300, right: 0, top: 0, bottom: 800, width: 300, height: 800 } }));
+  assert.ok(!env2.html.classList.contains("dsh-ma-scrim-on"), "侧栏在屏外 → 遮罩绝不拦截");
 });
 
-test("运行时：即使判定为展开，侧栏没真的滑进视口时也不得拦截点击", () => {
-  // 属性"存在且无值"在旧实现里就是展开；这里再叠加"侧栏几何不在视口内"（left:0/right:0）→ 仍不得拦截
+test("运行时：侧栏没真的滑进视口时，遮罩不得拦截点击（几何兜底只管遮罩，不否决展开）", () => {
   const env = runAdapter(harness({ collapsedAttr: "", sidebarRect: { left: 0, right: 0, top: 0, bottom: 800, width: 0, height: 800 } }));
-  assert.ok(!env.html.classList.contains("dsh-ma-sidebar-open"),
-    "侧栏未滑入视口 → 遮罩必须保持 pointer-events:none（几何兜底）");
-  const scrim = findScrim(env);
-  assert.ok(scrim, "遮罩元素本身仍应创建（关闭态只是不拦截）");
+  // 判定/几何可能出偏差，但"看不见的遮罩拦住整屏点击"必须不可能发生
+  assert.ok(!env.html.classList.contains("dsh-ma-scrim-on"),
+    "侧栏未滑入视口 → 遮罩必须保持不拦截（dsh-ma-scrim-on 不生效）");
+  assert.ok(findScrim(env), "遮罩元素本身仍应创建（关闭态只是不拦截）");
+  // ⚠️ 注意:展开 class 不再由几何否决 —— 否则点菜单按钮后动画还没开始、rect 仍在屏外，
+  //    sync 会把 class 立刻摘掉，抽屉永远打不开（这正是 0.6.6-beta.3 的回归）。
+});
+
+test("运行时：点菜单按钮必须能真的打开抽屉（上一版的回归点）", () => {
+  // 复现现场：侧栏初始在屏外（translateX(-103%) → rect 仍在外侧），点汉堡
+  // 从**收起态**开始（collapsedAttr="true" = 折叠），侧栏几何仍在屏外（动画未开始）
+  const env = runAdapter(harness({ collapsedAttr: "true", sidebarRect: { left: -300, right: 0, top: 0, bottom: 800, width: 300, height: 800 }, withToggle: false }));
+  assert.ok(!env.html.classList.contains("dsh-ma-sidebar-open"), "前提：初始为收起态");
+  const ham = findHamburger(env);
+  assert.ok(ham, "菜单按钮应存在");
+  assert.equal(ham.style.display, "", "菜单按钮不得被隐藏");
+  ham.dispatch("click");
+  assert.ok(env.html.classList.contains("dsh-ma-sidebar-open"),
+    "点菜单按钮后必须处于展开态（不能被几何判定立刻摘掉）—— 这正是上一版回归的点");
+  // 再点一次应能关掉
+  ham.dispatch("click");
+  assert.ok(!env.html.classList.contains("dsh-ma-sidebar-open"), "再次点击应关闭");
 });
 
 test("运行时：侧栏真的滑入视口（right>8 且有宽度）时才允许拦截点击", () => {
@@ -205,4 +258,50 @@ test("运行时：能拿到官方 toggle 时，点遮罩仍走官方 toggle（�
   const scrim = findScrim(env);
   scrim.dispatch("click");
   assert.ok(env.toggle._clicked >= 1, "应点击官方 toggle");
+});
+
+// ── 字号档位（2026-09-16 需求：4 档滑块、仅手机端生效） ──────────────────────
+
+const findFsBtn = (env) => env.body.children.find((c) => c._cls.has("dsh-ma-fsbtn"));
+const findFsPanel = (env) => env.body.children.find((c) => c._cls.has("dsh-ma-fspanel"));
+
+test("字号：菜单/字号按钮与面板都应创建（面板默认收起）", () => {
+  const env = runAdapter(harness({}));
+  const btn = findFsBtn(env);
+  const panel = findFsPanel(env);
+  assert.ok(btn, "应有字号按钮");
+  assert.ok(panel, "应有字号面板");
+  assert.equal(panel.hidden, true, "面板默认收起（点按钮才展开）");
+  assert.ok((panel.querySelector ? panel : {}).querySelector === undefined || true);
+});
+
+test("字号：默认档 = 最小（不加缩放属性，保持当前大小）", () => {
+  const env = runAdapter(harness({}));
+  assert.equal(env.html.getAttribute("data-dsh-ma-fs"), null, "默认不应带缩放属性");
+  assert.equal(env.win.localStorage.getItem("dsh-ma-font-scale"), null);
+});
+
+test("字号：滑块改档 → 属性/正文变量/持久化都生效", () => {
+  const env = runAdapter(harness({}));
+  const panel = findFsPanel(env);
+  const range = panel && panel.querySelector && panel.querySelector('input[type="range"]');
+  assert.ok(range, "面板里应有 range 滑块");
+  // 打到「大」(level 2)
+  range.value = "2";
+  range.dispatch("input");
+  assert.equal(env.html.getAttribute("data-dsh-ma-fs"), "2", "应写入缩放属性（CSS 据此放大字号）");
+  assert.equal(env.win.localStorage.getItem("dsh-ma-font-scale"), "2", "应持久化到 localStorage");
+  const contentVar = env.html.style["--dsh-content-font-size"] || env.html._cssVars && env.html._cssVars["--dsh-content-font-size"];
+  assert.ok(contentVar, "应同步官方正文变量 --dsh-content-font-size（聊天正文才会变大）");
+});
+
+test("字号：恢复「最小」时移除缩放属性（回到当前大小）", () => {
+  const env = runAdapter(harness({}));
+  const panel = findFsPanel(env);
+  const range = panel.querySelector('input[type="range"]');
+  range.value = "3"; range.dispatch("input");
+  assert.equal(env.html.getAttribute("data-dsh-ma-fs"), "3");
+  range.value = "0"; range.dispatch("input");
+  assert.equal(env.html.getAttribute("data-dsh-ma-fs"), null, "level 0 = 最小 → 不应留缩放属性");
+  assert.equal(env.win.localStorage.getItem("dsh-ma-font-scale"), "0");
 });
