@@ -1,0 +1,50 @@
+# dsh-remote self-hosted router — one-command container deployment (tunnel mode)
+#
+#   docker compose up -d
+#   curl http://127.0.0.1:13444/_devices     # expect 401 (auth required)
+#
+# Environment:
+#   DSH_LOCAL_JWT_SECRET     secret for local JWTs (self-hosted auth)
+#   DSH_LOCAL_ACCESS_KEYS    comma-separated access keys for POST /_login
+#   DSH_ENTERPRISE_JWT_SECRET
+#                            optional: accept SaaS JWT tokens (shared secret with
+#                            the commercial account system)
+#
+# For production, put a TLS reverse proxy (nginx/Caddy) in front and point the
+# bridge / phone app at the https/wss endpoint (see docs/self-hosting.md).
+#
+# 日志:
+#   容器内 /var/log/dsh-remote 绑定到宿主机 ./logs/router,轮转由应用自己做
+#   (DSH_LOG_MAX_MB 单文件上限 / DSH_LOG_KEEP 保留份数)。
+#   logging.options 给 docker 自己的 json-file 驱动加上限,避免 docker logs 无限增长。
+services:
+  relay-router:
+    build: .
+    image: dsh-remote-router:latest
+    container_name: dsh-remote-router
+    restart: unless-stopped
+    ports:
+      - "13444:13444"            # router: HTTP + WS (/_bridge)
+    volumes:
+      # 日志持久化:容器重建/升级不丢日志
+      - ./logs/router:/var/log/dsh-remote
+    environment:
+      DSH_ROUTER_PORT: "13444"
+      DSH_ENTERPRISE_JWT_SECRET: ${DSH_ENTERPRISE_JWT_SECRET:-please-change-me}
+      DSH_LOCAL_JWT_SECRET: ${DSH_LOCAL_JWT_SECRET:-please-change-me}
+      DSH_LOCAL_ACCESS_KEYS: ${DSH_LOCAL_ACCESS_KEYS:-}
+      # 日志目录(与 Dockerfile 默认一致,显式写出便于调整)
+      DSH_LOG_DIR: /var/log/dsh-remote
+      DSH_LOG_MAX_MB: "10"
+      DSH_LOG_KEEP: "5"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:13444/_devices').then(r=>process.exit(r.status===401?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s

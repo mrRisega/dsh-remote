@@ -1,0 +1,2449 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#f6f8fa" />
+  <title>dsh-remote</title>
+  <style>
+    :root {
+      --bg: #f6f8fa; --card: #ffffff; --border: #d0d7de;
+      --text: #1f2328; --muted: #57606a; --accent: #0969da;
+      --ok: #1a7f37; --warn: #9a6700; --err: #cf222e;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: var(--bg); color: var(--text); min-height: 100vh;
+      display: flex; flex-direction: column;
+    }
+    header {
+      padding: 12px 20px; display: flex; align-items: center; gap: 12px;
+      border-bottom: 1px solid var(--border); background: rgba(255,255,255,.85);
+      backdrop-filter: blur(8px); z-index: 10;
+    }
+    header .logo {
+      width: 32px; height: 32px; border-radius: 8px; flex-shrink: 0;
+      background: linear-gradient(135deg, var(--accent), #6e40c9);
+      display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 14px;
+      color: #fff;
+    }
+    header h1 { font-size: 15px; font-weight: 600; }
+    header .sub { font-size: 11px; color: var(--muted); }
+    header .spacer { flex: 1; }
+    /* 顶部导航按钮统一风格:官网 / 升级方案 / 退出 同款胶囊按钮 */
+    header .nav-link, header .nav-btn, #btn-logout {
+      font-size: 12px; padding: 0 12px; height: 29px; line-height: 27px; border-radius: 999px; cursor: pointer;
+      border: 1px solid var(--border); background: var(--bg); color: var(--text);
+      text-decoration: none; white-space: nowrap; flex: none; width: auto; margin-top: 0;
+      box-sizing: border-box; display: inline-flex; align-items: center; justify-content: center;
+    }
+    header .nav-btn.accent { border-color: var(--accent); color: var(--accent); font-weight: 700; }
+    header .nav-link:active, header .nav-btn:active, #btn-logout:active { opacity: .7; }
+    main { flex: 1; padding: 20px; max-width: 640px; width: 100%; margin: 0 auto; }
+    .card {
+      background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+      padding: 20px; margin-bottom: 16px;
+    }
+    .card h2 { font-size: 15px; font-weight: 600; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; }
+    .card h2 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+    .card h2 .dot.on { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+    label { display: block; font-size: 12px; color: var(--muted); margin: 12px 0 6px; }
+    input {
+      width: 100%; padding: 12px 14px; border-radius: 8px; font-size: 15px;
+      background: var(--bg); border: 1px solid var(--border); color: var(--text); outline: none;
+    }
+    input:focus { border-color: var(--accent); }
+    button {
+      width: 100%; padding: 13px; border-radius: 8px; font-size: 15px; font-weight: 600;
+      background: var(--accent); color: #fff; border: none; cursor: pointer; margin-top: 14px;
+    }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    button.secondary { background: transparent; border: 1px solid var(--border); color: var(--text); }
+    .msg { font-size: 13px; margin-top: 10px; min-height: 18px; }
+    .msg.err { color: var(--err); }
+    .msg.ok { color: var(--ok); }
+    .device {
+      display: flex; align-items: center; gap: 12px; padding: 14px;
+      border: 1px solid var(--border); border-radius: 10px; margin-bottom: 10px;
+      background: var(--bg); cursor: pointer;
+    }
+    .device:active { border-color: var(--accent); }
+    .device .icon { width: 40px; height: 40px; border-radius: 10px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 18px; background: rgba(47,129,247,.12); }
+    .device .name { font-size: 15px; font-weight: 600; }
+    .device .meta { font-size: 12px; color: var(--muted); margin-top: 2px; }
+    .device .status { margin-left: auto; font-size: 12px; padding: 3px 10px; border-radius: 20px; }
+    .device .status.on { color: var(--ok); background: rgba(63,185,80,.12); }
+    /* 离线设备:整行置灰、不可进入,标注离线原因 */
+    .device.off { cursor: default; }
+    .device.off:active { border-color: var(--border); }
+    .device.off .icon { background: rgba(87,96,106,.16); }
+    .device.off .name { color: var(--muted); }
+    .list-hint {
+      margin: 2px 0 14px; padding: 10px 12px; font-size: 12.5px; color: var(--muted);
+      background: var(--bg); border: 1px dashed var(--border); border-radius: 10px; line-height: 1.75;
+    }
+    .empty { text-align: center; color: var(--muted); font-size: 13px; padding: 24px 0; }
+    /* ---------- 新用户安装引导(空设备状态):市场路径(条件)+ 命令路径(兜底)+ 收敛指引 ---------- */
+    .guide-path { border: 1px solid var(--line, #d0d7de); border-radius: 10px; padding: 12px 14px; margin: 10px 0; background: #f6f8fa; }
+    .guide-path-tag { display: inline-block; font-size: 12px; font-weight: 700; color: #1a7f37; background: #dafbe1; border-radius: 999px; padding: 1px 10px; margin-bottom: 8px; }
+    .guide-more { margin-top: 8px; font-size: 13px; }
+    .guide-more > summary { cursor: pointer; color: #0969da; }
+    .guide-more > ol { margin-top: 8px; }
+    .guide-wait { color: #57606a; font-size: 12.5px; }
+    .guide {
+      text-align: left; background: var(--bg); border: 1px solid var(--border);
+      border-radius: 10px; padding: 14px 16px; margin: 4px 0 10px;
+      font-size: 13px; color: var(--text); line-height: 1.8;
+    }
+    .guide .guide-title { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
+    .guide .guide-sub { color: var(--muted); font-size: 12.5px; margin-bottom: 8px; }
+    .guide ol { padding-left: 20px; margin: 0; }
+    .guide li { margin-bottom: 10px; }
+    .guide code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "PingFang SC", monospace;
+      font-size: 12px; background: rgba(9,105,218,.08); color: var(--accent);
+      padding: 1px 5px; border-radius: 4px; word-break: break-all;
+    }
+    .guide-cmd {
+      display: flex; align-items: center; gap: 8px; margin-top: 6px;
+      background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
+    }
+    .guide-cmd code { flex: 1; min-width: 0; background: none; color: var(--text); padding: 0; }
+    .guide-copy {
+      flex-shrink: 0; width: auto; margin: 0; padding: 5px 10px; font-size: 12px;
+      background: transparent; border: 1px solid var(--border); color: var(--accent);
+      border-radius: 6px; cursor: pointer;
+    }
+    .guide-copy:active { background: rgba(9,105,218,.08); }
+    .hidden { display: none !important; }
+    .loading { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; vertical-align: middle; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .toast {
+      position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+      background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+      padding: 10px 18px; font-size: 13px; z-index: 100; display: none; max-width: 90vw;
+    }
+    .toast.show { display: block; }
+
+    /* ---------- 认证卡片(浅色高对比,遵循主流登录体验) ---------- */
+    #view-login { padding: 12px 0; }
+    .auth-card {
+      background: #ffffff; border: 1px solid #d0d7de; border-radius: 12px;
+      padding: 24px; max-width: 420px; margin: 0 auto; color: #1f2328;
+      box-shadow: 0 8px 24px rgba(0,0,0,.10);
+    }
+    .auth-card h2 { font-size: 17px; font-weight: 700; color: #1f2328; margin-bottom: 4px; }
+    .auth-tabs { display: flex; gap: 8px; margin: 16px 0; }
+    .auth-tab {
+      flex: 1; padding: 9px 0; text-align: center; border-radius: 8px; cursor: pointer;
+      font-size: 14px; font-weight: 600; color: #57606a; background: #f6f8fa; border: 1px solid #d0d7de;
+      user-select: none;
+    }
+    .auth-tab.active { color: #0969da; background: #ffffff; border-color: #0969da; }
+    .auth-field { margin-bottom: 13px; }
+    .auth-field > label { display: block; font-size: 13px; font-weight: 600; color: #1f2328; margin: 0 0 6px; }
+    .auth-input {
+      width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid #d0d7de;
+      background: #ffffff; color: #1f2328; font-size: 15px; outline: none; box-sizing: border-box;
+    }
+    .auth-input:focus { border-color: #0969da; box-shadow: 0 0 0 3px rgba(9,105,218,.15); }
+    .auth-btn {
+      width: 100%; padding: 11px; border-radius: 8px; border: none; background: #0969da;
+      color: #ffffff; font-size: 15px; font-weight: 600; cursor: pointer; margin-top: 4px;
+    }
+    .auth-btn:disabled { opacity: .6; cursor: not-allowed; }
+    .auth-btn.ghost { background: #f6f8fa; color: #1f2328; border: 1px solid #d0d7de; }
+    .auth-btn.danger { background: #ffffff; color: #cf222e; border: 1px solid #cf222e; }
+    .auth-captcha { display: flex; gap: 8px; align-items: stretch; }
+    .auth-captcha .auth-input { flex: 1; min-width: 0; }
+    .auth-captcha-img {
+      width: 118px; height: 44px; border-radius: 8px; border: 1px solid #d0d7de; cursor: pointer;
+      background: #f6f8fa; display: flex; align-items: center; justify-content: center; overflow: hidden; flex-shrink: 0;
+    }
+    .auth-captcha-img svg { display: block; width: 100%; height: 100%; }
+    .auth-sms { display: flex; gap: 8px; align-items: stretch; }
+    .auth-sms .auth-input { flex: 1; min-width: 0; }
+    .auth-send-btn {
+      flex: 0 0 auto; width: auto; margin-top: 0; padding: 0 16px;
+      border-radius: 8px; border: 1px solid #0969da;
+      background: #ffffff; color: #0969da; font-size: 13px; font-weight: 600; cursor: pointer; white-space: nowrap;
+    }
+    .auth-send-btn:disabled { color: #8c959f; border-color: #d0d7de; cursor: not-allowed; }
+    .auth-link { background: none; border: none; color: #0969da; font-size: 12.5px; cursor: pointer; padding: 0; }
+    .auth-link:hover { text-decoration: underline; }
+    .auth-hint { font-size: 14px; color: #57606a; margin-top: 6px; line-height: 1.7; }
+    .auth-msg { font-size: 14px; margin-top: 10px; min-height: 18px; }
+    .auth-msg.err { color: #cf222e; }
+    .auth-msg.ok { color: #1a7f37; }
+    .auth-user { display: flex; align-items: center; gap: 10px; margin: 12px 0 16px; }
+    .auth-user .avatar { width: 40px; height: 40px; border-radius: 50%; background: #0969da; color: #fff; display: flex; align-items: center; justify-content: center; font-size: 17px; font-weight: 700; flex-shrink: 0; }
+    .auth-user .mail { font-size: 14px; font-weight: 600; color: #1f2328; word-break: break-all; }
+    .auth-user .plan { font-size: 12px; color: #57606a; margin-top: 2px; }
+
+    /* ---- 大号行动按钮(升级方案 / 邀请链接) ---- */
+    .usage-card { font-size: 14px; color: var(--text); line-height: 1.9; }
+    .usage-card code { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; font-size: 13px; }
+    /* ---------- 弹层(支付二维码 / 挽留) ---------- */
+    .modal-overlay { position: fixed; inset: 0; z-index: 900; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; padding: 20px; }
+    .modal-card { background: #ffffff; border: 1px solid var(--border); border-radius: 14px; padding: 22px; width: 100%; max-width: 340px; position: relative; box-shadow: 0 12px 40px rgba(0,0,0,.25); text-align: center; }
+    .modal-card h3 { font-size: 16px; font-weight: 700; color: var(--text); margin-bottom: 14px; }
+    .modal-close { position: absolute; top: 8px; right: 12px; width: 32px; height: 32px; margin: 0; padding: 0; background: transparent; border: none; color: var(--muted); font-size: 22px; line-height: 1; cursor: pointer; border-radius: 50%; }
+    .modal-close:active { background: var(--bg); }
+
+    /* ---------- E2EE(端到端加密)Phase-3:状态徽标 / 能力标记 / 解锁层 ----------
+     * 视觉风格与全页一致(浅色卡片 + 胶囊徽标)。徽标与解锁层文案见
+     * docs/e2ee-protocol.md §2.3(信任文案)。密钥仅驻内存,见 JS 端注释。 */
+    #dsh-e2ee-badge {
+      display: inline-flex; align-items: center; gap: 5px;
+      font-size: 11px; padding: 2px 10px; height: 24px; border-radius: 999px;
+      white-space: nowrap; border: 1px solid var(--border); background: var(--bg);
+      color: var(--muted); margin-left: 4px; flex: none;
+    }
+    #dsh-e2ee-badge.ok { color: var(--ok); border-color: rgba(26,127,55,.45); background: rgba(26,127,55,.08); }
+    #dsh-e2ee-badge.warn { color: var(--warn); border-color: rgba(154,103,0,.4); background: rgba(154,103,0,.07); }
+    #dsh-e2ee-badge.err { color: var(--err); border-color: rgba(207,34,46,.4); background: rgba(207,34,46,.06); }
+    .e2ee-chip {
+      display: inline-block; font-size: 11px; padding: 1px 8px; border-radius: 999px;
+      color: var(--ok); background: rgba(26,127,55,.1); border: 1px solid rgba(26,127,55,.35);
+      margin-left: 6px; vertical-align: 1px; white-space: nowrap;
+    }
+    .device .e2ee-cap { margin-left: 8px; font-size: 15px; }
+    #unlock-modal .modal-card { max-width: 400px; text-align: left; }
+    #unlock-modal h3 { margin-bottom: 6px; }
+    .e2ee-unlock-who { font-size: 13px; color: var(--text); margin-bottom: 4px; }
+    .e2ee-unlock-who b { font-weight: 600; }
+    .e2ee-unlock-copy {
+      font-size: 12.5px; color: var(--muted); line-height: 1.85; text-align: left;
+      background: var(--bg); border: 1px dashed var(--border); border-radius: 10px;
+      padding: 10px 12px; margin: 8px 0 4px;
+    }
+    .e2ee-unlock-copy b { color: var(--text); }
+    .e2ee-unlock-msg { font-size: 13px; margin-top: 8px; min-height: 16px; }
+    .e2ee-unlock-msg.err { color: var(--err); }
+    .e2ee-unlock-msg.ok { color: var(--ok); }
+    #unlock-modal .auth-btn { margin-top: 12px; }
+    .e2ee-unlock-row { display: flex; gap: 10px; margin-top: 12px; }
+    .e2ee-unlock-row .auth-btn { flex: 1; margin: 0; }
+    .e2ee-unlock-note { font-size: 11.5px; color: var(--muted); margin-top: 10px; line-height: 1.7; }
+    .e2ee-statusline {
+      margin: 2px 0 10px; padding: 8px 12px; font-size: 12px; line-height: 1.7;
+      background: var(--bg); border: 1px solid var(--border); border-left: 3px solid var(--ok);
+      border-radius: 8px; color: var(--text);
+    }
+    .e2ee-statusline.warn { border-left-color: var(--warn); }
+
+    /* ==================================================================
+       移动端适配层(2026-09-17)
+       ------------------------------------------------------------------
+       为什么补这一层:此前整份文件 **没有任何 @media 规则**,也没有处理
+       safe-area —— 但 <meta viewport> 声明了 viewport-fit=cover,等于「宣称要
+       铺满刘海屏」却不为刘海/Home 条留边,内容会被遮住。
+       实测在 375px 宽(iPhone SE/12 mini 等)上还会出现:
+         · header 一行塞了 logo+标题+副标题+退出+E2EE 徽标+官网+升级按钮,
+           flex 不换行且子项不收缩 → 右侧按钮被挤出屏幕;
+         · 设备名(如 gaoangdeMacBook-Pro.local)不截断,把「在线」状态胶囊顶出可视区。
+       本层只做「小屏与安全区」相关修正,桌面观感保持不变。
+       ================================================================== */
+
+    /* ---- 安全区(所有尺寸生效:只要用了 viewport-fit=cover 就该留边) ---- */
+    body {
+      padding-left: env(safe-area-inset-left, 0px);
+      padding-right: env(safe-area-inset-right, 0px);
+      padding-bottom: env(safe-area-inset-bottom, 0px);
+      /* 移动端点按不要出现灰色高亮块,改用 :active 反馈 */
+      -webkit-tap-highlight-color: transparent;
+      /* 下拉回弹不带动整页(避免误触刷新) */
+      overscroll-behavior-y: contain;
+    }
+    header { padding-top: max(12px, env(safe-area-inset-top, 0px)); }
+
+    /* 弹性子项默认 min-width:auto,长文本会把兄弟挤出去;统一允许收缩 */
+    header > div, .card h2, .device > div { min-width: 0; }
+
+    /* ---- 小屏(≤480px:绝大多数手机竖屏) ---- */
+    @media (max-width: 480px) {
+      main { padding: 12px; }
+      .card { padding: 14px; border-radius: 10px; margin-bottom: 12px; }
+
+      /* header:允许换行成两行,标题截断,按钮不再被挤出屏幕 */
+      header { padding: 10px 12px; gap: 8px; flex-wrap: wrap; row-gap: 8px; }
+      header .logo { width: 28px; height: 28px; font-size: 12px; border-radius: 7px; }
+      header h1 { font-size: 14px; }
+      header .sub { font-size: 10.5px; }
+      header > div { overflow: hidden; }
+      header h1, header .sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      /* 导航胶囊:小屏收紧内边距,但保持 ≥30px 的可点高度 */
+      header .nav-link, header .nav-btn, #btn-logout {
+        font-size: 11.5px; padding: 0 10px; height: 30px; line-height: 28px;
+      }
+
+      /* 设备行:名称截断,状态胶囊固定不被顶走 */
+      .device { padding: 12px; gap: 10px; margin-bottom: 8px; }
+      .device .icon { width: 36px; height: 36px; font-size: 16px; border-radius: 9px; }
+      .device .name { font-size: 14.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .device .meta {
+        font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      .device .status { flex: none; font-size: 11.5px; padding: 3px 9px; }
+
+      /* 触摸目标:主要操作按钮抬高到 ≥44px(可点性下限) */
+      button { padding: 14px; }
+
+      /* 代码块/长 URL 不撑破布局 */
+      code, .list-hint, .guide { overflow-wrap: anywhere; }
+    }
+
+    /* ---- 极窄屏(≤360px) ---- */
+    @media (max-width: 360px) {
+      main { padding: 10px; }
+      .device .icon { width: 32px; height: 32px; font-size: 15px; }
+      .card { padding: 12px; }
+    }
+
+    /* ---- 横屏矮屏:压缩纵向留白,避免首屏只剩 header ---- */
+    @media (max-height: 480px) and (orientation: landscape) {
+      main { padding: 10px 14px; }
+      .card { padding: 12px 14px; margin-bottom: 10px; }
+    }
+
+    /* ---- 极窄屏:官网链接次要,让位给「升级方案」 ---- */
+    @media (max-width: 360px) {
+      header .nav-link { display: none; }
+    }
+
+  </style>
+<script>
+/* 百度统计(仅官方 SaaS 域名生效):
+ * 本页面同时被 SaaS 与自建部署使用;自建部署(其他域名)不加载、不采集任何数据。 */
+var _hmt = _hmt || [];
+(function() {
+  if (location.hostname !== "n.risegao.cn") return; // 非官方 SaaS 域名:跳过采集
+  var hm = document.createElement("script");
+  hm.src = "https://hm.baidu.com/hm.js?9ec1d21cfebe4404b427e8fb44289f42";
+  var s = document.getElementsByTagName("script")[0];
+  s.parentNode.insertBefore(hm, s);
+})();
+</script>
+</head>
+<body>
+<header>
+  <div class="logo">DSH</div>
+  <div>
+    <h1>dsh-remote</h1>
+    <div class="sub" id="conn-status">未连接</div>
+  </div>
+  <button id="btn-logout" class="hidden">退出</button>
+  <span id="dsh-e2ee-badge" class="hidden" title="端到端加密状态"></span>
+  <div class="spacer"></div>
+  <a class="nav-link" href="https://n.risegao.cn:8085/" target="_blank" rel="noopener">官网</a>
+</header>
+
+<main id="view-main">
+  <!-- 首屏读取态:会话判定完成前不渲染登录或设备界面,消除闪烁 -->
+  <div id="view-boot">
+    <div class="card" style="text-align:center;">
+      <div class="empty" id="boot-status-text"><span class="loading"></span> 正在读取登录状态…</div>
+    </div>
+  </div>
+
+  <!-- 登录/注册视图 -->
+  <div id="view-login" class="hidden">
+    <div class="auth-card">
+      <!-- 已登录态 -->
+      <div id="auth-logged-in" class="hidden">
+        <h2>账号</h2>
+        <div class="auth-user">
+          <div class="avatar" id="auth-avatar">D</div>
+          <div>
+            <div class="mail" id="auth-email">-</div>
+            <div class="plan" id="auth-plan">-</div>
+          </div>
+        </div>
+        <button class="auth-btn danger" id="btn-logout-inline" style="margin-top:8px;">退出登录</button>
+      </div>
+
+      <!-- 未登录态:登录/注册 tabs -->
+      <div id="auth-logged-out">
+        <h2 id="auth-login-title">远程控制</h2>
+        <div class="auth-hint" id="auth-hint-login">登录后可远程控制电脑上的 dsh web，体验与本地一致。</div>
+        <div class="auth-tabs">
+          <div class="auth-tab active" id="tab-login">登录</div>
+          <div class="auth-tab" id="tab-register">注册</div>
+        </div>
+
+        <!-- 登录表单 -->
+        <div id="auth-login-form">
+          <div class="auth-field"><label>手机号</label><input class="auth-input" id="login-phone" type="tel" placeholder="11 位手机号" autocomplete="tel" inputmode="tel" /></div>
+          <!-- 密码登录(默认) -->
+          <div id="login-mode-pass">
+            <div class="auth-field"><label>密码</label><input class="auth-input" id="login-pass" type="password" placeholder="密码" autocomplete="current-password" /></div>
+            <!-- 渐进式图形验证码:默认隐藏,仅当服务端要求(连续失败/首次登录被拒)时展示 -->
+            <div class="auth-field hidden" id="login-captcha-row">
+              <label>验证码</label>
+              <div class="auth-captcha"><input class="auth-input" id="login-captcha" type="text" placeholder="图中数字" autocomplete="off" inputmode="numeric" maxlength="6" /><div class="auth-captcha-img" id="login-captcha-img" title="看不清?点击刷新"></div></div>
+            </div>
+          </div>
+          <!-- 短信验证码登录(次级,不显眼) -->
+          <div id="login-mode-sms" class="hidden">
+            <div class="auth-field"><label>短信验证码</label>
+              <div class="auth-sms"><input class="auth-input" id="login-sms-code" type="text" placeholder="6 位验证码" autocomplete="off" inputmode="numeric" maxlength="6" /><button class="auth-send-btn" id="btn-send-login-sms" type="button">获取验证码</button></div>
+            </div>
+            <div class="auth-field hidden" id="login-sms-captcha-row">
+              <div class="auth-captcha"><input class="auth-input" id="login-sms-captcha" type="text" placeholder="图中数字" autocomplete="off" inputmode="numeric" maxlength="6" /><div class="auth-captcha-img" id="login-sms-captcha-img" title="看不清?点击刷新"></div></div>
+            </div>
+          </div>
+          <!-- 开源自部署:访问密钥登录(本地认证,免账号体系) -->
+          <div id="login-mode-local" class="hidden">
+            <div class="auth-field"><label>访问密钥</label><input class="auth-input" id="login-local-key" type="password" placeholder="自建服务的访问密钥" autocomplete="off" /></div>
+            <button class="auth-btn" id="btn-local-login">密钥登录</button>
+            <div class="auth-hint">自建服务模式:在你自己的服务器部署后,在服务器配置中生成访问密钥填入即可。</div>
+          </div>
+          <button class="auth-btn" id="btn-login">登 录</button>
+          <div style="text-align:center;margin-top:8px;"><button class="auth-link" id="btn-toggle-login-sms" type="button">验证码登录</button> · <button class="auth-link" id="btn-toggle-login-local" type="button">自建服务密钥</button></div>
+          <!-- 忘记密码(短信重置):仅 SaaS 账号体系(自建模式在 applyDeploymentMode 隐藏) -->
+          <div style="text-align:center;margin-top:4px;"><button class="auth-link" id="btn-forgot-pass" type="button">忘记密码?</button></div>
+          <div class="auth-msg" id="login-msg"></div>
+        </div>
+
+        <!-- 注册表单 -->
+        <div id="auth-register-form" class="hidden">
+          <div class="auth-field"><label>手机号</label><input class="auth-input" id="reg-phone" type="tel" placeholder="11 位手机号" autocomplete="tel" inputmode="tel" /></div>
+          <div class="auth-field"><label>短信验证码</label>
+            <div class="auth-sms"><input class="auth-input" id="reg-sms-code" type="text" placeholder="6 位验证码" autocomplete="off" inputmode="numeric" maxlength="6" /><button class="auth-send-btn" id="btn-send-reg-sms" type="button">获取验证码</button></div>
+          </div>
+          <div class="auth-field hidden" id="reg-sms-captcha-row">
+            <div class="auth-captcha"><input class="auth-input" id="reg-sms-captcha" type="text" placeholder="图中数字" autocomplete="off" inputmode="numeric" maxlength="6" /><div class="auth-captcha-img" id="reg-sms-captcha-img" title="看不清?点击刷新"></div></div>
+          </div>
+          <div class="auth-field"><label>密码</label><input class="auth-input" id="reg-pass" type="password" placeholder="至少 8 位" autocomplete="new-password" /></div>
+          <div class="auth-field"><label>确认密码</label><input class="auth-input" id="reg-pass2" type="password" placeholder="再次输入密码" autocomplete="new-password" /></div>
+          <button class="auth-btn" id="btn-register">注 册</button>
+          <div class="auth-msg" id="reg-msg"></div>
+        </div>
+      </div>
+
+      <!-- 忘记密码 / 短信重置(仅 SaaS 账号体系):手机号 + 图形验证码 + 短信验证码 + 新密码。
+           提交 POST {apiBase}/api/password/reset(body {phone,sms_code,new_password} → 200 {ok:true});
+           成功后本地 token/cookie/threads 全清,回登录页用新密码登录。 -->
+      <div id="auth-reset-form" class="hidden">
+        <h2>重置密码</h2>
+        <div class="auth-field"><label>手机号</label><input class="auth-input" id="reset-phone" type="tel" placeholder="11 位手机号" autocomplete="tel" inputmode="tel" /></div>
+        <div class="auth-field" id="reset-captcha-row">
+          <label>图形验证码</label>
+          <div class="auth-captcha"><input class="auth-input" id="reset-captcha" type="text" placeholder="图中数字" autocomplete="off" inputmode="numeric" maxlength="6" /><div class="auth-captcha-img" id="reset-captcha-img" title="看不清?点击刷新"></div></div>
+        </div>
+        <div class="auth-field"><label>短信验证码</label>
+          <div class="auth-sms"><input class="auth-input" id="reset-sms-code" type="text" placeholder="6 位验证码" autocomplete="off" inputmode="numeric" maxlength="6" /><button class="auth-send-btn" id="btn-send-reset-sms" type="button">获取验证码</button></div>
+        </div>
+        <div class="auth-field"><label>新密码</label><input class="auth-input" id="reset-pass" type="password" placeholder="至少 8 位" autocomplete="new-password" /></div>
+        <div class="auth-hint">⚠️ 修改后所有已授权设备/会话将失效，需重新登录与解锁;端到端加密的旧会话无法恢复。</div>
+        <button class="auth-btn" id="btn-password-reset">重置密码</button>
+        <div class="auth-msg" id="reset-msg"></div>
+        <div style="text-align:center;margin-top:8px;"><button class="auth-link" id="btn-back-to-login" type="button">← 返回登录</button></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 设备列表视图(实时在线设备选择 + 设备管理) -->
+  <div id="view-devices" class="hidden">
+    <div class="card">
+      <h2><span class="dot" id="dot-signal"></span><span id="signal-label">我的设备</span></h2>
+      <div id="device-list"></div>
+      <button id="btn-refresh" class="secondary">刷新设备列表</button>
+      <button id="btn-manage-devices" class="secondary" style="margin-top:8px;">管理设备(移除/换机)</button>
+      <div id="manage-device-list" class="hidden"></div>
+    </div>
+
+    <div class="card usage-card">
+      <b>使用说明</b><br/>
+      1. 电脑上运行 <code>dsh-bridge</code> 并保持在线;<br/>
+      2. 列表展示你的全部已绑定设备及实时状态,🟢 在线设备可直接点选进入,灰色为离线;<br/>
+      3. 进入后加载电脑端 <b>dsh web 原生界面</b>(与电脑本地一致,含设置/凭据)。<br/>
+      点选设备进入;单台在线也需点选确认,不会自动跳转。
+    </div>
+  </div>
+
+</main>
+
+<!-- E2EE(Phase-3)解锁层:仅在「账号启用 e2ee ∧ 设备声明 e2ee-v2」时出现。
+     密钥/MK 仅存本页内存;输入即触发 WebCrypto 派生 + /_e2ee/ctrl 握手(见 JS)。 -->
+<div class="modal-overlay hidden" id="unlock-modal">
+  <div class="modal-card">
+    <h3>🔒 端到端加密解锁</h3>
+    <div class="e2ee-unlock-who">设备:<b id="unlock-device-name">-</b></div>
+    <div class="e2ee-unlock-copy" id="unlock-copy">请输入账号密码以开启 🔒 端到端加密。密码仅在本页内存中参与密钥派生,不会发送给中继,也不被保存;刷新或重开页面需再次输入。</div>
+    <div class="auth-field"><label for="unlock-pass">账号密码</label><input class="auth-input" id="unlock-pass" type="password" placeholder="登录密码(≥8 位)" autocomplete="current-password" /></div>
+    <div class="e2ee-unlock-msg" id="unlock-msg"></div>
+    <div class="e2ee-unlock-row">
+      <button type="button" class="auth-btn ghost" id="btn-unlock-skip">暂不加密(明文)</button>
+      <button type="button" class="auth-btn" id="btn-unlock-go">解锁并建立加密会话</button>
+    </div>
+    <div class="e2ee-unlock-note">忘记/重置密码后,旧的加密会话无法恢复(服务端不保存你的内容,无法代为解密)。</div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+/* ============================================================
+ * native.html — dsh-remote 手机端 PWA(隧道模式)
+ *
+ * 架构:
+ *   本页(手机,公开地址 /app/)只做三件事:登录/注册、查实时在线设备、跳转。
+ *   进入设备后浏览器直接加载 https://<你的域名>/ 根路径,
+ *   nginx → relay-router → bridge WebSocket 隧道 → 电脑端 dsh web(127.0.0.1:3080),
+ *   页面体验与电脑本地一致(WebRTC/DataChannel 时代已废弃删除)。
+ *
+ * 流程:
+ *   登录/注册/会话恢复 → GET /_devices(router 实时 WS Map,校验 dsh_token cookie)
+ *     0/1/多台在线 → 一律进设备选择页(0 台展示安装引导),由用户点选设备
+ *       enterDevice(id) 写 dsh_device cookie 后跳 /
+ *   忘记密码(短信重置):登录卡入口 → POST /api/password/reset,成功后清 token/cookie/threads 回登录
+ *   显式退出(/app/?logout=1)→ 先清 localStorage/Cookie 再渲染登录页
+ * ============================================================ */
+
+// ---------- 配置(默认按页面 origin 推断;public-config 再覆盖 api 地址) ----------
+const origin = window.location.origin;
+let API_BASE = (window.DSH_RELAY_API || origin + "/relay-api").replace(/\/+$/, "");
+/** 公共配置缓存(域名/价格/试用/邀请规则/安装教程)。 */
+let pubConfig = null;
+/** 部署模式:saas = 云端账号体系(手机号登录);self = 自建部署(访问密钥登录)。 */
+let deploymentMode = "saas";
+
+async function loadPublicConfig() {
+  try {
+    const r = await fetch(API_BASE + "/api/public-config", { signal: AbortSignal.timeout(6000) });
+    const d = await r.json();
+    if (d.api_url) API_BASE = d.api_url.replace(/\/+$/, "");
+    pubConfig = d;
+    deploymentMode = "saas";
+  } catch {
+    // 无 enterprise public-config → 自建部署:仅访问密钥登录,无账号体系
+    deploymentMode = "self";
+  }
+  applyDeploymentMode();
+}
+
+/** 按部署模式隔离登录 UI:SaaS 只保留手机号登录/注册;自建只保留访问密钥。
+ *  登录/注册表单的显隐统一交给 switchAuthTab 管理,这里只切模式相关元素。 */
+function applyDeploymentMode() {
+  const self = deploymentMode === "self";
+  const title = $("auth-login-title");
+  const hint = $("auth-hint-login");
+  if (title) title.textContent = self ? "自建服务登录" : "远程控制";
+  if (hint) hint.textContent = self
+    ? "输入服务器访问密钥即可登录(密钥在你部署服务器的配置中生成,如 open.env)。"
+    : "登录后可远程控制电脑上的 dsh web，体验与本地一致。";
+  // 自建:只显示密钥表单;SaaS:隐藏密钥入口
+  $("login-mode-local").classList.toggle("hidden", !self);
+  $("btn-toggle-login-local").classList.toggle("hidden", !self);
+  $("btn-toggle-login-sms").classList.toggle("hidden", self);
+  // 忘记密码(短信重置)属 SaaS 账号体系:自建模式隐藏
+  const forgotPass = $("btn-forgot-pass");
+  if (forgotPass) forgotPass.closest("div").classList.toggle("hidden", self);
+  const phoneField = $("login-phone")?.closest(".auth-field");
+  if (phoneField) phoneField.classList.toggle("hidden", self);
+  // 密码/短信表单互斥:自建模式两者都隐藏;SaaS 模式按当前 loginMode 显示其一
+  $("login-mode-pass").classList.toggle("hidden", self || loginMode !== "pass");
+  $("login-mode-sms").classList.toggle("hidden", self || loginMode !== "sms");
+  $("btn-login").classList.toggle("hidden", self);
+  $("tab-register").classList.toggle("hidden", self);
+  // 自建模式不展示升级/邀请相关按钮
+  // 恢复当前 tab 的登录/注册表单显隐(自建模式强制登录 tab)
+  const isLoginTab = $("tab-login").classList.contains("active");
+  switchAuthTab(self || isLoginTab ? "login" : "register");
+}
+
+const $ = (id) => document.getElementById(id);
+const state = {
+  token: localStorage.getItem("dsh_token") || "",
+  user: JSON.parse(localStorage.getItem("dsh_user") || "null")
+};
+
+// ---------- 工具 ----------
+function toast(msg, ms = 2500) {
+  const t = $("toast"); t.textContent = msg; t.classList.add("show");
+  setTimeout(() => t.classList.remove("show"), ms);
+}
+function esc(s) { return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+/** 当前渲染出的在线设备数(0 = 需要自动等待上线,见 scheduleDevicePoll)。 */
+let lastOnlineCount = 0;
+
+function setView(v) {
+  ["boot", "login", "devices"].forEach(n => $(`view-${n}`).classList.toggle("hidden", n !== v));
+  // 进入登录页时刷新所有当前可见的验证码,保证永远是新的、无需手动点击
+  if (v === "login") refreshVisibleCaptchas();
+  // 离开设备页 → 停掉自动探测;进入设备页 → 清零计数(下一次刷新重新决定是否轮询)
+  if (v === "devices") resetDevicePoll(); else cancelDevicePoll();
+}
+/** 刷新当前可见的图形验证码(密码/短信/注册/重置各自的验证码区)。 */
+function refreshVisibleCaptchas() {
+  if (!$("login-captcha-row").classList.contains("hidden")) loadCaptchaInto("login-captcha-img");
+  if (!$("login-sms-captcha-row").classList.contains("hidden")) loadCaptchaInto("login-sms-captcha-img");
+  if (!$("reg-sms-captcha-row").classList.contains("hidden")) loadCaptchaInto("reg-sms-captcha-img");
+  const resetForm = $("auth-reset-form");
+  if (resetForm && !resetForm.classList.contains("hidden") && !$("reset-captcha-row").classList.contains("hidden")) loadCaptchaInto("reset-captcha-img");
+}
+function setConn(text, ok) {
+  $("conn-status").textContent = text;
+  $("conn-status").style.color = ok ? "var(--ok)" : "var(--muted)";
+}
+
+// ---------- 账号 API ----------
+async function api(path, body, method = "POST") {
+  const r = await fetch(API_BASE + path, {
+    method,
+    headers: { "content-type": "application/json", ...(state.token ? { authorization: `Bearer ${state.token}` } : {}) },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  return { status: r.status, data: await r.json().catch(() => ({})) };
+}
+
+// ---------- 图形验证码(通用:加载到指定 img,id 存 dataset) ----------
+async function loadCaptchaInto(imgElId) {
+  const imgEl = $(imgElId);
+  imgEl.innerHTML = '<span class="auth-hint">加载中</span>';
+  delete imgEl.dataset.captchaId;
+  try {
+    const r = await fetch(API_BASE + "/api/captcha");
+    if (!r.ok) throw new Error("http " + r.status);
+    const d = await r.json();
+    imgEl.dataset.captchaId = d.captcha_id;
+    imgEl.innerHTML = d.svg || "";
+  } catch {
+    imgEl.innerHTML = '<span class="auth-hint">点击重试</span>';
+  }
+}
+const validPhone = (p) => /^1\d{10}$/.test((p || "").trim());
+
+// ---------- 登录/注册 tabs ----------
+function switchAuthTab(tab) {
+  const isLogin = tab === "login";
+  $("tab-login").classList.toggle("active", isLogin);
+  $("tab-register").classList.toggle("active", !isLogin);
+  $("auth-login-form").classList.toggle("hidden", !isLogin);
+  $("auth-register-form").classList.toggle("hidden", isLogin);
+}
+
+// ---------- 登录态渲染 ----------
+/** 手机号中间 4 位打码:185****7193(非手机号原样返回)。 */
+function maskPhone(p) {
+  const s = String(p || "");
+  return /^1\d{10}$/.test(s) ? s.slice(0, 3) + "****" + s.slice(7) : s;
+}
+
+function renderAuthState() {
+  const loggedIn = !!state.token;
+  $("auth-logged-in").classList.toggle("hidden", !loggedIn);
+  $("auth-logged-out").classList.toggle("hidden", loggedIn);
+  $("btn-logout").classList.toggle("hidden", !loggedIn); // 登录后 header 显示退出按钮
+  if (loggedIn && state.user) {
+    const who = state.user.phone ? maskPhone(state.user.phone) : (state.user.email || "D");
+    $("auth-email").textContent = who;
+    $("auth-plan").textContent = state.user.plan ? `套餐: ${state.user.plan}` : "";
+    $("auth-avatar").textContent = who.charAt(0).toUpperCase();
+  }
+}
+
+/**
+ * 登录/注册/会话恢复统一入口:写 dsh_token cookie 后进入设备选择页,
+ * 由 Router 实时设备端点 GET /_devices 列出当前 WebSocket 在线的设备
+ * (不再依赖数据库 online 字段;也不再按台数自动跳转)。
+ *   0 台在线 → 选择页展示安装引导空状态(可刷新);
+ *   1/多台在线 → 展示实时列表,均由用户点选进入。
+ */
+async function enterMirror(token) {
+  const hours = 2;
+  document.cookie = `dsh_token=${encodeURIComponent(token)}; path=/; max-age=${hours * 3600}; SameSite=Lax; Secure`;
+  renderAuthState();
+  if (state.user) setConn(maskPhone(state.user.phone) || state.user.email || "已连接", true);
+  // 0/1/多台在线:一律进设备列表视图,由用户点选进入,不自动跳转
+  setView("devices");
+  refreshDevices();
+}
+
+/** 选定设备:写 dsh_device cookie 后跳根路径(经 router 按 cookie 路由到设备镜像)。 */
+function enterDevice(deviceId) {
+  const hours = 2;
+  document.cookie = `dsh_device=${encodeURIComponent(deviceId)}; path=/; max-age=${hours * 3600}; SameSite=Lax; Secure`;
+  // Phase-4:跳镜像页前写/清一次性 E2EE 交接单(解锁会话→交接;明文/未解锁→清除防串台)
+  dshE2eeHandoverSync(deviceId);
+  window.location.replace("/");
+}
+
+// ---------- v2 设备管理(移除/换机;pro 每月 3 次,pro_max 不限) ----------
+
+let managingDevices = false;
+async function toggleManageDevices() {
+  managingDevices = !managingDevices;
+  const wrap = $("manage-device-list");
+  const btn = $("btn-manage-devices");
+  if (!managingDevices) {
+    wrap.classList.add("hidden");
+    btn.textContent = "管理设备(移除/换机)";
+    return;
+  }
+  btn.textContent = "收起管理";
+  wrap.classList.remove("hidden");
+  wrap.innerHTML = '<div class="empty">加载中...</div>';
+  try {
+    const r = await api("/api/devices", null, "GET");
+    const devices = (Array.isArray(r.data.devices) ? r.data.devices : []).filter(x => x && x.id);
+    if (devices.length === 0) {
+      wrap.innerHTML = '<div class="empty">尚未绑定任何设备。</div>';
+      return;
+    }
+    wrap.innerHTML = "";
+    devices.forEach(d => {
+      const el = document.createElement("div");
+      el.className = "device";
+      el.style.opacity = ".85";
+      el.innerHTML = `
+        <div class="icon">💻</div>
+        <div>
+          <div class="name">${esc(d.device_name || d.id)}</div>
+          <div class="meta">${esc(d.id)} · ${d.online ? "在线" : "离线"}</div>
+        </div>
+        <button class="secondary" style="margin:0;padding:8px 12px;width:auto;flex-shrink:0;" data-remove="${esc(d.id)}">移除</button>`;
+      wrap.appendChild(el);
+    });
+    wrap.querySelectorAll("[data-remove]").forEach(btn2 => {
+      btn2.onclick = async () => {
+        const id = btn2.dataset.remove;
+        btn2.disabled = true; btn2.textContent = "移除中...";
+        try {
+          const res = await api(`/api/devices/${encodeURIComponent(id)}`, null, "DELETE");
+          if (res.status === 200) {
+            toast("设备已移除");
+            await toggleManageDevices();
+            toggleManageDevices();
+          } else {
+            toast(res.data?.error?.message || `移除失败(${res.status})`, 4500);
+            btn2.disabled = false; btn2.textContent = "移除";
+          }
+        } catch (e) {
+          toast("移除失败: " + e.message, 4000);
+          btn2.disabled = false; btn2.textContent = "移除";
+        }
+      };
+    });
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty">获取设备列表失败:${esc(e.message)}</div>`;
+  }
+}
+
+// ---------- 短信验证码(发送 + 倒计时 + 防刷图形验证码) ----------
+function setMsgEl(id, cls, text) { const m = $(id); m.className = "auth-msg " + cls; m.textContent = text; }
+function startCountdown(btn) {
+  let s = 60; btn.disabled = true;
+  const tick = () => {
+    btn.textContent = `${s}s`;
+    if (--s < 0) { btn.disabled = false; btn.textContent = "获取验证码"; return; }
+    setTimeout(tick, 1000);
+  };
+  tick();
+}
+/** 发送短信验证码的场景 UI 映射:登录/注册/重置(忘记密码)共用同一 /api/sms-code 端点。 */
+const SMS_UI = {
+  login:    { phoneId: "login-phone",    msgId: "login-msg",           btnId: "btn-send-login-sms", capRowId: "login-sms-captcha-row",    capInputId: "login-sms-captcha",    capImgId: "login-sms-captcha-img" },
+  register: { phoneId: "reg-phone",      msgId: "reg-msg",             btnId: "btn-send-reg-sms",   capRowId: "reg-sms-captcha-row",      capInputId: "reg-sms-captcha",      capImgId: "reg-sms-captcha-img" },
+  reset:    { phoneId: "reset-phone",    msgId: "reset-msg",           btnId: "btn-send-reset-sms", capRowId: "reset-captcha-row",        capInputId: "reset-captcha",        capImgId: "reset-captcha-img" }
+};
+async function sendSms(kind) {
+  const ui = SMS_UI[kind] || SMS_UI.register;
+  const phone = $(ui.phoneId).value.trim();
+  const msgId = ui.msgId;
+  if (!validPhone(phone)) { setMsgEl(msgId, "err", "请输入正确的手机号"); return; }
+  const btn = $(ui.btnId);
+  const capRow = $(ui.capRowId);
+  const capInput = $(ui.capInputId);
+  const capImg = $(ui.capImgId);
+
+  const payload = { phone };
+  // 防刷:验证码行可见时,需带图形验证码
+  if (!capRow.classList.contains("hidden")) {
+    if (!capImg.dataset.captchaId || !capInput.value.trim()) { setMsgEl(msgId, "err", "请输入图中验证码"); return; }
+    payload.captcha_id = capImg.dataset.captchaId;
+    payload.captcha_answer = capInput.value.trim();
+  }
+  setMsgEl(msgId, "", "发送中...");
+  try {
+    const r = await fetch(API_BASE + "/api/sms-code", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
+    const d = await r.json().catch(() => ({}));
+    if (r.status === 200) {
+      startCountdown(btn);
+      // 测试模式:服务端可能返回 test_code,展示出来方便自测
+      if (d.test_code) setMsgEl(msgId, "ok", `验证码已发送(测试码: ${d.test_code})`);
+      else setMsgEl(msgId, "ok", "验证码已发送");
+      capRow.classList.add("hidden"); capInput.value = "";
+    } else if (r.status === 400 && /验证码|captcha/i.test(d.error?.message || "")) {
+      capRow.classList.remove("hidden");
+      loadCaptchaInto(capImg.id);
+      setMsgEl(msgId, "err", "发送频繁,请先输入图形验证码");
+    } else {
+      setMsgEl(msgId, "err", d.error?.message || `发送失败(${r.status})`);
+    }
+  } catch (e) { setMsgEl(msgId, "err", "发送失败: " + e.message); }
+}
+
+// ---------- 登录(密码 / 短信 / 本地密钥 三选一,密码为默认) ----------
+let loginMode = "pass";
+function toggleLoginMode() {
+  loginMode = loginMode === "pass" ? "sms" : "pass";
+  $("login-mode-pass").classList.toggle("hidden", loginMode !== "pass");
+  $("login-mode-sms").classList.toggle("hidden", loginMode !== "sms");
+  $("login-mode-local").classList.add("hidden");
+  $("btn-toggle-login-sms").textContent = loginMode === "pass" ? "验证码登录" : "密码登录";
+  refreshVisibleCaptchas();
+}
+function toggleLocalLogin() {
+  const show = $("login-mode-local").classList.contains("hidden");
+  $("login-mode-local").classList.toggle("hidden", !show);
+  if (show) {
+    $("login-mode-pass").classList.add("hidden");
+    $("login-mode-sms").classList.add("hidden");
+  } else {
+    $("login-mode-pass").classList.remove("hidden");
+    loginMode = "pass";
+  }
+}
+/** 开源自部署:访问密钥登录(本地认证 POST /_login,免账号体系)。 */
+async function doLocalLogin() {
+  const key = $("login-local-key").value.trim();
+  const msg = $("login-msg");
+  if (!key) { msg.className = "auth-msg err"; msg.textContent = "请输入访问密钥"; return; }
+  msg.className = "auth-msg"; msg.innerHTML = '<span class="loading"></span> 登录中...';
+  try {
+    const r = await fetch("/_login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ key })
+    });
+    const d = await r.json().catch(() => ({}));
+    if (r.status === 200 && d.token) {
+      state.token = d.token;
+      state.user = { phone: "自建服务", plan: d.plan || "pro_max" };
+      localStorage.setItem("dsh_token", state.token);
+      localStorage.setItem("dsh_user", JSON.stringify(state.user));
+      msg.className = "auth-msg ok"; msg.textContent = "✅ 登录成功,正在进入...";
+      enterMirror(d.token);
+    } else {
+      msg.className = "auth-msg err";
+      msg.textContent = d.error?.message || `登录失败(${r.status})`;
+    }
+  } catch (e) {
+    msg.className = "auth-msg err";
+    msg.textContent = "无法连接本地认证服务: " + e.message + "(请确认访问的是自建服务地址)";
+  }
+}
+async function doLogin() {
+  const phone = $("login-phone").value.trim();
+  const msg = $("login-msg");
+  if (!validPhone(phone)) { msg.className = "auth-msg err"; msg.textContent = "请输入正确的手机号"; return; }
+  let res;
+  if (loginMode === "pass") {
+    const password = $("login-pass").value;
+    if (!password) { msg.className = "auth-msg err"; msg.textContent = "请输入密码"; return; }
+    // 渐进式验证码:行可见时才要求输入并随请求提交
+    const capRow = $("login-captcha-row");
+    const payload = { phone, password };
+    if (!capRow.classList.contains("hidden")) {
+      const cid = $("login-captcha-img").dataset.captchaId, ctext = $("login-captcha").value.trim();
+      if (!cid || !ctext) { msg.className = "auth-msg err"; msg.textContent = "请输入图中验证码"; if (!cid) loadCaptchaInto("login-captcha-img"); return; }
+      payload.captcha_id = cid;
+      payload.captcha_answer = ctext;
+    }
+    msg.className = "auth-msg"; msg.innerHTML = '<span class="loading"></span> 登录中...';
+    res = await api("/api/login", payload);
+  } else {
+    const sms = $("login-sms-code").value.trim();
+    if (!sms) { msg.className = "auth-msg err"; msg.textContent = "请输入短信验证码"; return; }
+    msg.className = "auth-msg"; msg.innerHTML = '<span class="loading"></span> 登录中...';
+    res = await api("/api/login-sms", { phone, sms_code: sms });
+  }
+  if (res.status === 200) {
+    state.token = res.data.token; state.user = res.data.user;
+    localStorage.setItem("dsh_token", state.token);
+    localStorage.setItem("dsh_user", JSON.stringify(state.user));
+    // 免二次输密码:密码登录时在内存保留一份(仅本页会话),随即清空输入框(卫生:不再残留 DOM)
+    if (loginMode === "pass") {
+      const pw = $("login-pass").value;
+      if (pw) { e2eePendingPassword = pw; $("login-pass").value = ""; }
+    }
+    msg.className = "auth-msg ok"; msg.textContent = "✅ 登录成功,正在进入...";
+    enterMirror(res.data.token);
+  } else {
+    msg.className = "auth-msg err";
+    // 服务端要求图形验证码(首次提交缺验证码/失败过多):展示验证码行并加载新图
+    if (res.data?.error?.code === "captcha_invalid") {
+      const capRow = $("login-captcha-row");
+      capRow.classList.remove("hidden");
+      loadCaptchaInto("login-captcha-img");
+      msg.textContent = "请输入图形验证码后重试";
+    } else {
+      msg.textContent = res.data?.error?.message || `登录失败(${res.status})`;
+      // 验证码行可见时失败,刷新新图
+      if (loginMode === "pass" && !$("login-captcha-row").classList.contains("hidden")) loadCaptchaInto("login-captcha-img");
+    }
+  }
+}
+
+async function doRegister() {
+  const phone = $("reg-phone").value.trim();
+  const sms = $("reg-sms-code").value.trim();
+  const password = $("reg-pass").value, password2 = $("reg-pass2").value;
+  const msg = $("reg-msg");
+  if (!validPhone(phone)) { msg.className = "auth-msg err"; msg.textContent = "请输入正确的手机号"; return; }
+  if (!sms) { msg.className = "auth-msg err"; msg.textContent = "请输入短信验证码"; return; }
+  if (password.length < 8) { msg.className = "auth-msg err"; msg.textContent = "密码至少 8 位"; return; }
+  if (password !== password2) { msg.className = "auth-msg err"; msg.textContent = "两次输入的密码不一致"; return; }
+  msg.className = "auth-msg"; msg.innerHTML = '<span class="loading"></span> 注册中...';
+  // reg_source:注册来源上报 —— 手机端网页注册固定为 remoteweb_register。
+  // 可选新增字段:服务端旧版本忽略未知字段,无需版本判断;手机端不是安装方,不传安装来源。
+  const payload = { phone, sms_code: sms, password, reg_source: "remoteweb_register" };
+  // 邀请链接携带的邀请码(注册后首次绑设备计有效邀请)
+  if (window.__inviteCode) payload.invite_code = window.__inviteCode;
+  const res = await api("/api/register", payload);
+  if (res.status === 201) {
+    state.token = res.data.token; state.user = res.data.user;
+    localStorage.setItem("dsh_token", state.token);
+    localStorage.setItem("dsh_user", JSON.stringify(state.user));
+    // 注册即登录:同样内存保留密码用于免二次解锁,随即清空密码输入框
+    if (password) { e2eePendingPassword = password; $("reg-pass").value = ""; $("reg-pass2").value = ""; }
+    msg.className = "auth-msg ok"; msg.textContent = "✅ 注册成功,已自动登录,正在进入...";
+    enterMirror(res.data.token);
+  } else {
+    msg.className = "auth-msg err";
+    msg.textContent = res.data?.error?.message || `注册失败(${res.status})`;
+  }
+}
+
+// ---------- 忘记密码(短信重置)→ POST /api/password/reset ----------
+// 企业端契约(body {phone,sms_code,new_password} → 200 {ok:true};错误取 error.message 可读展示)。
+// 手机号 + 图形验证码 + 短信验证码 + 新密码(≥8);成功后全部本地 token/cookie/threads 作废,用新密码重新登录。
+
+/** 打开重置密码小表单(覆盖登录卡):进入即加载图形验证码供发码防刷。 */
+function openResetForm() {
+  const m = $("reset-msg");
+  if (m) { m.className = "auth-msg"; m.textContent = ""; }
+  $("auth-logged-in").classList.add("hidden");
+  $("auth-logged-out").classList.add("hidden");
+  $("auth-reset-form").classList.remove("hidden");
+  loadCaptchaInto("reset-captcha-img");
+  setTimeout(() => { try { $("reset-phone").focus(); } catch {} }, 60);
+}
+
+/** 从重置小表单返回登录卡:恢复 renderAuthState 决定的已登录/未登录显隐。 */
+function closeResetForm() {
+  $("auth-reset-form").classList.add("hidden");
+  renderAuthState();
+  switchAuthTab("login");
+  refreshVisibleCaptchas();
+}
+
+/** 密码重置成功后,服务端已吊销全部旧会话/授权:清同源残留的反馈线程凭据(threads)。 */
+function clearThreadsAfterReset() {
+  try { localStorage.removeItem("dsh-feedback-threads"); } catch {}
+}
+
+async function doPasswordReset() {
+  const phone = $("reset-phone").value.trim();
+  const sms = $("reset-sms-code").value.trim();
+  const pass = $("reset-pass").value;
+  const msg = $("reset-msg");
+  if (!validPhone(phone)) { msg.className = "auth-msg err"; msg.textContent = "请输入正确的手机号"; return; }
+  if (!sms) { msg.className = "auth-msg err"; msg.textContent = "请输入短信验证码"; return; }
+  if (pass.length < 8) { msg.className = "auth-msg err"; msg.textContent = "新密码至少 8 位"; return; }
+  msg.className = "auth-msg"; msg.innerHTML = '<span class="loading"></span> 重置中...';
+  const res = await api("/api/password/reset", { phone, sms_code: sms, new_password: pass });
+  if (res.status === 200 && res.data && res.data.ok === true) {
+    // 成功:本地 token/cookie/threads 全清(旧会话已由服务端吊销),提示用新密码登录
+    clearThreadsAfterReset();
+    logout(true);
+    const lm = $("login-msg");
+    lm.className = "auth-msg ok";
+    lm.textContent = "✅ 密码已重置，请用新密码登录。";
+    toast("密码已重置,旧设备/会话已全部失效", 4000);
+  } else {
+    msg.className = "auth-msg err";
+    msg.textContent = res.data?.error?.message || `重置失败(${res.status})`;
+  }
+}
+
+/** 统一退出:清 localStorage + dsh_token/dsh_device Cookie,并注销服务端 JWT。
+ *  同时清空 E2EE 内存会话与参数缓存(密钥随登录态离开;绝不留驻)。 */
+function logout(clearForm = false) {
+  const token = state.token;
+  state.token = ""; state.user = null;
+  localStorage.removeItem("dsh_token"); localStorage.removeItem("dsh_user");
+  document.cookie = "dsh_token=; path=/; max-age=0; SameSite=Lax; Secure";
+  document.cookie = "dsh_device=; path=/; max-age=0; SameSite=Lax; Secure";
+  if (token) fetch(API_BASE + "/api/logout", { method: "POST", headers: { authorization: `Bearer ${token}` } }).catch(() => {});
+  // E2EE:清空内存会话/参数(协议 §5.1:密钥只存内存,退出即失效)
+  e2eePendingPassword = null; // 内存中的登录密码随退出即失效
+  e2eeMkClear(); e2eeStoredMk = null; // 本机记住的解锁材料(MK)随退出清除
+  try { if (typeof e2eeClient !== "undefined") { e2eeClient.sessions.clear(); e2eeClient.params = null; e2eeClient.paramsT = 0; } } catch {}
+  try { if (typeof e2eeUpdateBadge === "function") e2eeUpdateBadge(); } catch {}
+  try { if (typeof e2eeCloseUnlock === "function") e2eeCloseUnlock(); } catch {}
+  // Phase-4:登出同时清除一次性交接单与「记住本机」持久交接单(镜像页不得残留可复用会话材料)
+  try { if (typeof dshE2eeHandoverClear === "function") dshE2eeHandoverClear(sessionStorage); } catch {}
+  try { if (typeof dshE2eeHandoverClear === "function") dshE2eeHandoverClear(localStorage); } catch {}
+  setConn("未连接");
+  if (clearForm) {
+    ["login-phone", "login-pass", "login-captcha", "login-sms-code", "login-sms-captcha", "reg-phone", "reg-sms-code", "reg-sms-captcha", "reg-pass", "reg-pass2", "reset-phone", "reset-captcha", "reset-sms-code", "reset-pass"].forEach(id => { const el = $(id); if (el) el.value = ""; });
+    switchAuthTab("login");
+  }
+  // 忘记密码小表单:登出/会话失效后一律收起,回到常规登录卡
+  const resetForm = $("auth-reset-form");
+  if (resetForm) resetForm.classList.add("hidden");
+  renderAuthState();
+  setView("login");
+}
+
+// ---------- 一次性扫码登录(/app/?auth=KEY:电脑端生成的访问链接,30 分钟/一次性) ----------
+
+/** UA 关键词简判,随一次性登录请求上报 os/browser(服务端仅作统计,无需精确识别)。
+ *  os 按 iPhone/iPad/Mac/Android/Windows/Linux 关键词粗判;browser 按
+ *  WeChat/MiuiBrowser/Quark/Edge/Chrome/Firefox/Safari 判;取不到统一兜底「手机浏览器」。 */
+function detectClientUA() {
+  const ua = navigator.userAgent || "";
+  let os = "";
+  if (/iPhone|iPad/.test(ua)) os = "iOS";
+  else if (/Android/.test(ua)) os = "Android";
+  else if (/Mac/.test(ua)) os = "macOS";
+  else if (/Windows/.test(ua)) os = "Windows";
+  else if (/Linux/.test(ua)) os = "Linux";
+  else os = "其他";
+  let browser = "";
+  if (/MicroMessenger/i.test(ua)) browser = "WeChat";
+  else if (/MiuiBrowser/i.test(ua)) browser = "MiuiBrowser";
+  else if (/Quark/i.test(ua)) browser = "Quark";
+  else if (/Edg\//i.test(ua)) browser = "Edge";
+  else if (/Chrome\//i.test(ua)) browser = "Chrome";
+  else if (/Firefox\//i.test(ua)) browser = "Firefox";
+  else if (/Safari\//i.test(ua)) browser = "Safari";
+  else browser = "手机浏览器";
+  return { os, browser };
+}
+
+/** 链接失效/失败落地:清登录态 → 登录页常驻展示可读错误(不让页面停在无解释状态)。 */
+function authFailToLogin(message) {
+  logout();
+  switchAuthTab("login");
+  const m = $("login-msg");
+  if (m) { m.className = "auth-msg err"; m.textContent = message; }
+}
+
+/**
+ * 一次性访问链接登录(boot 阶段 location.search 含 auth=KEY 时统一调用,按路由分派):
+ *   无论当前是否已登录,有 auth 就走 exchange(幂等;已用/过期/无效的 key 会被服务端拒绝)。
+ *   成功 → token/user 走与正常登录完全相同的落库路径(localStorage dsh_token/dsh_user
+ *     + dsh_token cookie 由 enterMirror 统一写入)→ 进入设备列表视图;
+ *   失败 → 业务性拒绝(4xx 且带 error)视为链接失效:登出并提示重新扫码/生成;
+ *          网络/超时/5xx 视为暂时不可用:保留原有有效会话(若有),否则留在登录页展示可读错误。
+ *   无论成败:处理完立即用 history.replaceState 隐去地址栏 auth 明文(保留 utm 等其它参数)。
+ */
+async function doAuthExchangeLogin(key) {
+  // 1) 先隐去地址栏明文 key:key 只在内存中使用,后续任何分支/刷新都不会再残留
+  try {
+    history.replaceState(null, "", location.pathname + location.search.replace(/([?&])auth=[^&#]*/, "$1").replace(/[?&]$/, ""));
+  } catch { /* 个别 WebView 限制 replaceState:忽略,不阻断登录流程 */ }
+  const boot = $("boot-status-text");
+  if (boot) boot.innerHTML = '<span class="loading"></span> 正在验证一次性登录链接…';
+
+  // 2) 调用企业端 exchange(公开端点无需登录;os/browser 由 detectClientUA 上报;与 /relay-api 其余请求一致的 6s 超时)
+  let status = 0, data = {}, errMsg = "";
+  try {
+    const ua = detectClientUA();
+    const r = await fetch(API_BASE + "/api/auth-key/exchange", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ key, os: ua.os, browser: ua.browser }),
+      signal: AbortSignal.timeout(6000)
+    });
+    status = r.status;
+    data = await r.json().catch(() => ({}));
+  } catch (e) { errMsg = e.name === "TimeoutError" ? "请求超时" : e.message; }
+
+  // 3) 成功:token/user 落库(localStorage + 同 enterMirror 的 dsh_token cookie 语义)
+  if (status === 200 && data && data.token) {
+    state.token = data.token;
+    // 字段容错:user 缺失/非对象时保留原 user,再不行置空,不阻断登录
+    if (data.user && typeof data.user === "object") state.user = data.user;
+    else if (!state.user) state.user = null;
+    localStorage.setItem("dsh_token", state.token);
+    localStorage.setItem("dsh_user", JSON.stringify(state.user));
+    enterMirror(state.token); // 写 dsh_token cookie → 设备列表(0/多台均由用户点选进入)
+    if (!state.user) setConn("已连接", true);
+    toast("✅ 扫码登录成功,可点选在线设备进入", 3500);
+    return;
+  }
+
+  // 4) 失败分类:业务性拒绝(服务端明确返回 error 的 4xx,含 invalid_auth_key/已用/过期/无效)
+  const err = data && data.error || null;
+  const serverMsg = err && typeof err.message === "string" ? err.message : "";
+  const code = err && err.code ? String(err.code) : "";
+  if (status >= 400 && status < 500 && err) {
+    const invalidKey = code === "invalid_auth_key" || !serverMsg || /失效|无效|已用|过期|invalid|expired|used/i.test(serverMsg);
+    const text = invalidKey
+      ? "链接已失效，请返回电脑端重新生成/登录。"
+      : "链接验证失败: " + serverMsg;
+    authFailToLogin(text);
+    return;
+  }
+  // 网络/超时/服务端异常:错误可读,不静默。仍持有有效会话 → 保留登录并提示;否则常驻可读错误
+  const why = errMsg
+    ? "无法连接服务器: " + errMsg + ",请检查网络后重试。"
+    : (serverMsg || (status ? "服务异常(HTTP " + status + "),请稍后重试。" : "无法连接服务器,请检查网络后重试。"));
+  if (state.token && !tokenExpired(state.token)) {
+    toast("扫码登录未完成(" + why.replace(/[。.]+$/, "") + ")已沿用当前登录", 5000);
+    enterMirror(state.token);
+  } else {
+    authFailToLogin("扫码登录失败: " + why);
+  }
+}
+
+// ---------- 新用户安装引导(空设备状态;后台 public-config 可覆盖) ----------
+
+/** 返回安装引导 HTML:后台配置 app_install_guide 非空时优先展示,否则用内置默认步骤。 */
+function installGuideHTML() {
+  const custom = pubConfig && pubConfig.app_install_guide;
+  if (custom) return custom;
+  const cmdInstall = "npx @mrrisega/dsh-remote";
+  return `
+    <div class="guide">
+      <div class="guide-title">💻 还差最后一步:在电脑上装一下</div>
+      <div class="guide-sub">本页会自动检测——电脑装好并登录后,设备会自己出现在这里,<b>不需要刷新页面</b>。</div>
+      <ol>
+        <li><b>在你要控制的电脑上打开 DeepSeek Harness</b>(就是平时写代码的那个窗口)。</li>
+      </ol>
+      <div class="guide-path">
+        <div class="guide-path-tag">如果你有「插件市场」入口 · 不用敲命令</div>
+        <ol>
+          <li>在 Harness 里打开<b>插件市场 / 插件中心</b>(不同版本位置不同,通常在设置或侧栏)。</li>
+          <li>搜索 <code>dsh-remote</code> → 点<b>安装</b> — 只装一个面板插件,运行环境与开机自启由它自动补齐。</li>
+          <li>按面板提示<b>重启一次 DeepSeek Harness</b>。</li>
+        </ol>
+      </div>
+      <div class="guide-path">
+        <div class="guide-path-tag">没有市场入口?用这条命令 · 一条搞定</div>
+        <ol>
+          <li>在电脑上打开「终端 / Terminal」,把下面这条命令<b>整行复制粘贴</b>进去回车:
+            <div class="guide-cmd"><code>${esc(cmdInstall)}</code><button type="button" class="guide-copy" data-guide-copy="${esc(cmdInstall)}">复制</button></div>
+          </li>
+        </ol>
+      </div>
+      <div class="guide-path">
+        <div class="guide-path-tag">两条路走完后都一样</div>
+        <ol>
+          <li>在电脑上打开「设置 → 📱 远程访问」,用<b>本页注册的手机号</b>登录。</li>
+          <li>回到本页稍等几秒,电脑会自己出现在列表里(不用刷新)。</li>
+        </ol>
+      </div>
+      <details class="guide-more">
+        <summary>安装报错 / 想手动控制?展开看细节</summary>
+        <ol>
+          <li><b>提示找不到 node</b> — 先在电脑上装 Node.js 22+(从 <code>nodejs.org</code> 下载),终端运行 <code>node -v</code> 确认 ≥ v22 后,再重跑上面那条命令。</li>
+          <li><b>想看/改配置</b> — 运行 <code>npx @mrrisega/dsh-remote settings</code> 打开设置页,登录账号、启停 bridge、切换自建服务都在这里。</li>
+          <li><b>服务要常驻</b> — 命令安装会自动创建开机自启(launchd / systemd);插件市场安装时由插件自动补齐。</li>
+        </ol>
+      </details>
+    </div>`;
+}
+
+/**
+ * 上报「用户看到了空设备列表 + 安装引导」。
+ * 这是漏斗里最关键的中间态:生产诊断显示 11 个新用户里 6 人从未在电脑端安装,而此前没有任何数据
+ * 能证明"他看到了引导"。服务端只记首次(guide_shown_at);这里再加 localStorage 去重,避免重复请求。
+ * 失败完全静默:纯统计,绝不影响用户流程。
+ */
+function reportGuideShown() {
+  try {
+    if (!state.token) return;                                   // 未登录不报(服务端要求登录态)
+    if (localStorage.getItem("dsh-guide-shown") === "1") return; // 本机只报一次
+    localStorage.setItem("dsh-guide-shown", "1");
+    api("/api/guide-shown", {}, "POST").catch(() => {});
+  } catch (e) { /* 忽略 */ }
+}
+
+// ---------- 空设备态自动等待(无需用户手动刷新) ----------
+
+/**
+ * 设备轮询:手机端停留在这页时,若一台在线设备都没有,就自动轻量探测(见 probeOnlineDevices),
+ * 一旦电脑上线立即自动切到设备列表——用户不需要点「刷新设备列表」。
+ * 首次 10 次每 5s(等首装最急的那一分钟),之后退到 20s;页面不可见时暂停,回到前台立即探测。
+ */
+let devicePollTimer = null;
+let devicePollTicks = 0;
+function cancelDevicePoll() {
+  if (devicePollTimer) { clearTimeout(devicePollTimer); devicePollTimer = null; }
+}
+function scheduleDevicePoll() {
+  cancelDevicePoll();
+  if (lastOnlineCount > 0) return;                        // 已有在线设备 → 停止轮询
+  if (document.hidden) return;                            // 页面不可见 → 暂停(visibilitychange 恢复)
+  if ($("view-devices").classList.contains("hidden")) return; // 已离开设备页
+  const wait = devicePollTicks < 10 ? 5000 : 20000;
+  devicePollTimer = setTimeout(() => {
+    devicePollTimer = null;
+    devicePollTicks += 1;
+    void probeOnlineDevices();
+  }, wait);
+}
+function resetDevicePoll() { cancelDevicePoll(); devicePollTicks = 0; }
+
+/**
+ * 轻量探测:只问 Router 的实时在线设备(带 dsh_token cookie,不写账号库),
+ * 因此可以放心高频轮询,不会污染 /api/devices 的活跃统计。
+ * 一旦发现设备(数量变化或首次出现)→ 走一次完整刷新,渲染出可点选的设备列表。
+ */
+async function probeOnlineDevices() {
+  try {
+    const r = await fetch("/_devices", { cache: "no-store" });
+    if (r.status === 401) { await refreshDevices(); return; } // 登录态失效:交给完整刷新路径(会提示重新登录)
+    const d = await r.json().catch(() => ({}));
+    const ids = (Array.isArray(d.devices) ? d.devices : []).filter(x => x && x.id).map(x => String(x.id));
+    if (ids.length > 0 && ids.length !== lastOnlineCount) {
+      devicePollTicks = 0;
+      await refreshDevices();
+      return;
+    }
+  } catch { /* 网络抖动:下一轮再试 */ }
+  scheduleDevicePoll();
+}
+
+// 回到前台 / 切到设备页时立即探测一次(不用等下一个轮询周期)
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) { cancelDevicePoll(); return; }
+  if (!$("view-devices").classList.contains("hidden")) {
+    if (lastOnlineCount > 0) void refreshDevices(); else void probeOnlineDevices();
+  }
+});
+
+/** 为引导卡片内的「复制」按钮绑定命令复制。 */
+function bindGuideCopy(root) {
+  root.querySelectorAll("[data-guide-copy]").forEach(btn => {
+    btn.onclick = async () => {
+      const text = btn.dataset.guideCopy || "";
+      try { await navigator.clipboard.writeText(text); toast("安装命令已复制"); }
+      catch { toast(text, 6000); }
+    };
+  });
+}
+
+// ---------- 设备列表(合并:Router 实时在线 /_devices + 账号已绑定设备 /relay-api/api/devices) ----------
+
+/** 拉取账号已绑定设备(GET API_BASE + "/api/devices" = /relay-api/api/devices,Bearer token)。
+ *  失败抛错,由 refreshDevices 统一优雅降级。
+ *  容错:后端字段版本差异 → 名称可能叫 name 或 device_name;在线标记缺失/不一致时,最终以 Router 实时列表交集判定。 */
+async function fetchAccountDevices() {
+  const r = await fetch(API_BASE + "/api/devices", {
+    method: "GET",
+    headers: state.token ? { authorization: `Bearer ${state.token}` } : {},
+    signal: AbortSignal.timeout(6000)
+  });
+  const d = await r.json().catch(() => ({}));
+  if (r.status !== 200) throw new Error("http " + r.status);
+  return (Array.isArray(d.devices) ? d.devices : [])
+    .filter(x => x && x.id)
+    .map(x => ({
+      id: String(x.id),
+      name: String(x.device_name || x.name || x.id),
+      online: x.online === true || x.online === 1
+    }));
+}
+
+/** 单台设备行 HTML:在线 → 绿色徽标,可点进入;离线 → 置灰并标注「离线 · 电脑端未连接」。
+ *  Router /_devices 已透传 caps(Phase-2 §6.2):含 e2ee-v2 且在线 → 显示 🔒 可加密。
+ *  data-caps/data-name 供点选时的 E2EE 门控(e2eeMaybeGateThenEnter)读取。 */
+function deviceRowHTML(d) {
+  const caps = Array.isArray(d.caps) ? d.caps : [];
+  if (d.online) {
+    const capChip = caps.includes("e2ee-v2")
+      ? `<span class="e2ee-chip" title="电脑端声明支持端到端加密">🔒 可加密</span>` : "";
+    return `
+      <div class="device" data-device="${esc(d.id)}" data-name="${esc(d.name || d.id)}" data-caps="${esc(caps.join(","))}">
+        <div class="icon">🟢</div>
+        <div>
+          <div class="name">${esc(d.name || d.id)}${capChip}</div>
+          <div class="meta">${esc(d.id)}</div>
+        </div>
+        <div class="status on">在线</div>
+      </div>`;
+  }
+  return `
+    <div class="device off" data-device="${esc(d.id)}">
+      <div class="icon">💻</div>
+      <div>
+        <div class="name">${esc(d.name || d.id)}</div>
+        <div class="meta">${esc(d.id)} · 离线 · 电脑端未连接</div>
+      </div>
+    </div>`;
+}
+
+/** 列表底部轻提示(离线引导 / 降级说明),样式见 .list-hint。 */
+function listHintHTML(html) { return `<div class="list-hint">${html}</div>`; }
+
+async function refreshDevices() {
+  const list = $("device-list");
+  list.innerHTML = '<div class="empty">加载中...</div>';
+  $("signal-label").textContent = "正在查询设备...";
+  $("dot-signal").classList.remove("on");
+
+  // 1) Router 实时在线设备(权威:决定当前能否点选进入,带 dsh_token cookie)
+  let routerOk = false, routerErr = "", routerDevices = [];
+  try {
+    const r = await fetch("/_devices", { cache: "no-store" });
+    if (r.status === 401) {
+      logout();
+      toast("登录已过期,请重新登录");
+      return;
+    }
+    const d = await r.json().catch(() => ({}));
+    routerDevices = (Array.isArray(d.devices) ? d.devices : [])
+      .filter(x => x && x.id)
+      .map(x => ({ id: String(x.id), name: String(x.name || x.id), caps: Array.isArray(x.caps) ? x.caps.map(String) : [] }));
+    routerOk = true;
+  } catch (e) { routerErr = e.message; }
+
+  // 2) 账号已绑定设备(/relay-api,Bearer)。失败/未登录/非账号体系部署(自建)→ 优雅降级,仅用 Router 在线列表
+  let boundOk = false, boundDevices = [];
+  if (deploymentMode !== "self" && state.token) {
+    try {
+      boundDevices = await fetchAccountDevices();
+      boundOk = true;
+    } catch { /* 降级:只用 Router 在线列表,不报错不打断 */ }
+  }
+
+  // 3) 合并渲染:已绑定设备铺底 + Router 实时在线设备并入(并集,不漏可进入设备);
+  //    能否进入以 Router 实时连接为准 → 在线标记 = 是否出现在 Router /_devices 列表。
+  const byId = new Map();
+  for (const b of boundDevices) byId.set(b.id, { id: b.id, name: b.name || b.id, online: false, caps: [] });
+  for (const rd of routerDevices) {
+    const ex = byId.get(rd.id);
+    if (ex) { ex.online = true; if (ex.name === ex.id) ex.name = rd.name; ex.caps = rd.caps; }
+    else byId.set(rd.id, { id: rd.id, name: rd.name || rd.id, online: true, caps: rd.caps });
+  }
+  const all = [...byId.values()];
+  const online = all.filter(d => d.online);
+  const offline = all.filter(d => !d.online);
+
+  // Router 查询失败:已绑定设备仍照常列出(均视为离线不可点),否则维持原错误提示
+  if (!routerOk) {
+    if (all.length > 0) {
+      $("signal-label").textContent = `已绑定 ${all.length} 台设备`;
+      list.innerHTML = all.map(deviceRowHTML).join("") +
+        listHintHTML(`⚠️ 暂时无法确认实时在线状态${routerErr ? `(${esc(routerErr)})` : ""}。以下为账号已绑定设备,请检查网络后点「刷新设备列表」重试。`);
+      return;
+    }
+    lastOnlineCount = 0;
+    list.innerHTML = `<div class="empty">获取在线设备失败:${esc(routerErr)}。<br>会自动重试,也可以点"刷新"。</div>`;
+    scheduleDevicePoll();
+    return;
+  }
+
+  // 一个已绑定/在线设备都没有 → 展示安装引导 + 自动等待(不再是空白/无解释,也不需要手动刷新)
+  if (all.length === 0) {
+    lastOnlineCount = 0;
+    $("signal-label").textContent = "等待电脑上线…";
+    const emptyText = boundOk ? "还没有绑定任何设备" : "暂无在线设备";
+    list.innerHTML = `<div class="empty" style="padding:12px 0 8px;">${emptyText}</div>` +
+      `<div class="empty guide-wait" style="padding:0 0 8px;"><span class="loading"></span> 正在自动检测:电脑装好后会自己出现在这里,无需刷新本页</div>` +
+      installGuideHTML();
+    bindGuideCopy(list);
+    reportGuideShown(); // 盲区补齐:记录"看到了引导",用于量化「看到引导→真的装上」的转化
+    scheduleDevicePoll();
+    return;
+  }
+
+  // 有设备:在线可点进入,离线置灰 + 底部一行引导
+  list.innerHTML = [...online, ...offline].map(deviceRowHTML).join("");
+  if (offline.length > 0) {
+    list.insertAdjacentHTML("beforeend", listHintHTML(
+      `💡 有 ${offline.length} 台设备离线(电脑端未连接)。请在电脑上打开 dsh web → 设置 → 远程控制,确保 bridge 运行中,然后点「刷新设备列表」。`
+    ));
+  }
+
+  lastOnlineCount = online.length;
+  $("signal-label").textContent = boundOk
+    ? `设备 ${all.length} 台${online.length ? ` · ${online.length} 台在线` : " · 当前均离线"}`
+    : (online.length ? `在线设备 ${online.length} 台` : "暂无在线设备");
+  $("dot-signal").classList.toggle("on", online.length > 0);
+  scheduleDevicePoll(); // 全部离线时继续自动等上线;有在线设备则自动停止
+
+  // 行点击:在线 → E2EE 门控后进入(未启用/无能力 → 原明文流程,零行为变化);离线 → 轻提示引导
+  list.querySelectorAll(".device").forEach(el => {
+    el.onclick = () => {
+      if (el.classList.contains("off")) toast("该设备当前无法进入:请在电脑上确认 bridge 运行中后,点「刷新设备列表」重试", 3500);
+      else {
+        const caps = (el.dataset.caps || "").split(",").filter(Boolean);
+        void e2eeMaybeGateThenEnter(el.dataset.device, el.dataset.name || el.dataset.device, caps);
+      }
+    };
+  });
+  // 进入设备列表时顺带拉取一次账号级 e2ee 参数并刷新徽标(失败静默)
+  void e2eeGetParams(false).then(e2eeUpdateBadge).catch(() => {});
+}
+
+/* ============================================================
+ * E2EE 手机端客户端(Phase-3)——浏览器 WebCrypto 实现
+ *
+ * 依据:
+ *   docs/e2ee-protocol.md §3/§4/§5/§9 与 clients/dsh-remote/e2ee-client.mjs
+ *   文件头「规范化决定 1–6」(桥端 Phase-2 实现,已由 e2ee-bridge.test.mjs 验证)。
+ * 本段 = 手机端与桥端必须**逐字节一致**的部分;测试通过「从本文件抽取
+ * ==DSH-E2EE-WC-CORE== 区间 → 在 node 里与 e2ee-client.mjs 对拍」保证。
+ *
+ * 规范化对照(与桥端 e2ee-client.mjs 相同,不得各自发挥):
+ *   1. 域/info 分隔符 \x00;info 形如 "dsh-e2ee/v1\0<用途>"。
+ *   2. SHK   = HKDF-SHA256(ikm=MK, salt=sha256(a‖b), info="dsh-e2ee/v1\0shk", 32)
+ *      子密钥 = HKDF-SHA256(ikm=SHK, salt=sha256(a‖b), info=域串, 32)
+ *      (WebCrypto deriveBits 与 node hkdfSync 同算法,输出一致。)
+ *   3. 子密钥 info:
+ *        http 请求   "dsh-e2ee/v1\0http\0<reqNonceB64>\0p2b"  (reqNonce=请求信封 n)
+ *        http 响应   "…\0http\0<reqNonceB64>\0b2p"            (响应信封 n 回显请求 n)
+ *        ws 流       "…\0ws\0<wsLabel>\0p2b|b2p"
+ *        ctrl 探针   "…\0ctrl\0p2b|b2p"
+ *   4. AAD = UTF8("dsh-e2ee/v1\0<kind>\0<sessId>\0<dir>\0<counter>")。
+ *   5. 信封 {v:2,k,s,c,n,t,d}:n=base64url(12B nonce),d=base64url(AES-256-GCM 密文‖16B tag)。
+ *   6. ctrl 通道(/_e2ee/ctrl):hello/hello-ack/e2ee-error 为明文 JSON;probe 为 k:"ctrl" AEAD 信封。
+ *
+ * WebCrypto 与 node:crypto 差异说明(唯一语义差异处,均已对齐):
+ *   - PBKDF2/HKDF/AES-GCM 在 subtle 中全部为异步;同步路径(如直接 fetch 组装)改 async。
+ *   - importKey 需要明确用途;deriveBits 返回 ArrayBuffer(以 Uint8Array 承接,32B)。
+ *   - 无 sync randomBytes → crypto.getRandomValues(同强度)。
+ *   - 无 Buffer → Uint8Array;base64url 编解码用 atob/btoa 自实现(wcBytesToB64/wcB64ToBytes)。
+ *   - gzip 解压用 DecompressionStream('gzip')(async,现代浏览器/Node 均可用)。
+ *
+ * 密钥纪律(协议 §5.1/§8 风险 5):MK/SHK/子密钥只存本页内存(e2eeClient.sessions/
+ * WcE2eeSession 字段),绝不写 localStorage/sessionStorage/IndexedDB;刷新/重开需重新解锁。
+ * ============================================================ */
+
+/* ===DSH-E2EE-WC-CORE-START===  (纯原语区间:无 DOM 依赖,node 抽取对拍用) */
+const WC_E2EE_DOMAIN = "dsh-e2ee/v1";
+const WC_MK_LABEL = "dsh-e2ee/v1/mk\x00";
+const WC_SALT_BYTES = 16;
+const WC_MK_BYTES = 32;
+const WC_NONCE_BYTES = 12;
+const WC_TAG_BYTES = 16;
+const WC_SESS_ID_RE = /^[0-9a-f]{32}$/i;
+const WC_E2EE_VERSION = 2;
+const WC_ENVELOPE_CONTENT_TYPE = "application/vnd.dsh.e2ee-v2";
+const WC_ENVELOPE_HEADER = "x-dsh-e2ee";
+const WC_E2EE_CAP = "e2ee-v2";
+const WC_DIR_P2B = "p2b";
+const WC_DIR_B2P = "b2p";
+
+function wcNormalizePassword(pw) { return String(pw ?? "").normalize("NFKC"); }
+function wcUtf8(s) { return new TextEncoder().encode(String(s ?? "")); }
+function wcUtf8Decode(u8) { return new TextDecoder().decode(u8); }
+
+/** base64url(无 padding)解码 → Uint8Array;非法抛错。 */
+function wcB64ToBytes(b64) {
+  if (typeof b64 !== "string" || b64 === "") throw new Error("e2ee: base64url 非法");
+  let s = b64.replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+function wcBytesToB64(bytes) {
+  const u = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  let bin = "";
+  const CH = 0x8000;
+  for (let i = 0; i < u.length; i += CH) bin += String.fromCharCode.apply(null, u.subarray(i, i + CH));
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function wcConcat(...parts) {
+  let total = 0;
+  for (const p of parts) total += p.length;
+  const out = new Uint8Array(total);
+  let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+}
+function wcRandomBytes(n) {
+  const u = new Uint8Array(n);
+  crypto.getRandomValues(u);
+  return u;
+}
+function wcRandomB64(n) { return wcBytesToB64(wcRandomBytes(n)); }
+function wcRandomHex(n) {
+  let s = "";
+  const u = wcRandomBytes(n);
+  for (let i = 0; i < u.length; i++) s += u[i].toString(16).padStart(2, "0");
+  return s;
+}
+function wcNewSessId() { return wcRandomHex(16); } // 128-bit hex,32 字符
+async function wcSha256Bytes(...parts) {
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", wcConcat(...parts)));
+}
+/** decodeSalt:16B base64url → Uint8Array;非法返回 null(协议 §3.1)。 */
+function wcDecodeSalt(saltB64) {
+  if (typeof saltB64 !== "string" || saltB64 === "") return null;
+  let b;
+  try { b = wcB64ToBytes(saltB64); } catch { return null; }
+  return b.length === WC_SALT_BYTES ? b : null;
+}
+/** sha256|sha384|sha512 → WebCrypto 标准 "SHA-256" 风格名(subtle 只认连字符形式)。 */
+function wcHashName(hash) {
+  const m = /^sha(256|384|512)$/i.exec(String(hash || ""));
+  return m ? "SHA-" + m[1] : "SHA-256";
+}
+/** 容错归一 kdf(兼容 iter/iterations 两种下发写法;与 node normalizeKdf 同构)。 */
+function wcNormalizeKdf(kdf) {
+  const D = { alg: "pbkdf2-sha256", iter: 600000, dkLen: WC_MK_BYTES, hash: "sha256" };
+  if (!kdf || typeof kdf !== "object") return D;
+  const iter = Number(kdf.iter ?? kdf.iterations);
+  const dkLen = Number(kdf.dkLen ?? kdf.keyLen ?? kdf.length ?? WC_MK_BYTES);
+  const hash = typeof kdf.hash === "string" && kdf.hash ? kdf.hash : "sha256";
+  if (!Number.isInteger(iter) || iter < 1) throw new Error("e2ee: kdf.iter 非法");
+  if (!Number.isInteger(dkLen) || dkLen < 1 || dkLen > 64) throw new Error("e2ee: kdf.dkLen 非法");
+  if (!/^sha(256|384|512)$/.test(hash)) throw new Error("e2ee: kdf.hash 不受支持: " + hash);
+  return { alg: typeof kdf.alg === "string" && kdf.alg ? kdf.alg : "pbkdf2-sha256", iter, dkLen, hash };
+}
+/**
+ * 派生客户端主密钥 MK(协议 §3.3;node 侧见 deriveMasterKey):
+ *   kdfInput = UTF8("dsh-e2ee/v1/mk\0") ‖ rawSalt(16B)
+ *   MK(32B)  = PBKDF2-HMAC-SHA256(NFKC(password), salt=kdfInput, iter, dkLen)
+ * 参数按服务端下发执行,绝不写死。
+ * @returns {Promise<Uint8Array>} 32B
+ */
+async function wcDeriveMasterKey(password, saltB64, kdf) {
+  const salt = wcDecodeSalt(saltB64);
+  if (!salt) throw new Error("e2ee: salt 非法(须为 16B base64url)");
+  const { iter, dkLen, hash } = wcNormalizeKdf(kdf);
+  const kdfInput = wcConcat(wcUtf8(WC_MK_LABEL), salt);
+  const key = await crypto.subtle.importKey("raw", wcUtf8(wcNormalizePassword(password)), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: wcHashName(hash), salt: kdfInput, iterations: iter }, key, dkLen * 8);
+  return new Uint8Array(bits);
+}
+/** HKDF-SHA256(info 为字符串,内部 UTF8;与 node hkdfSync(ikm,salt,info,len) 同构)。 */
+async function wcHkdf(ikm, salt, infoStr, len) {
+  const key = await crypto.subtle.importKey("raw", ikm, "HKDF", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt, info: wcUtf8(infoStr) }, key, len * 8);
+  return new Uint8Array(bits);
+}
+/**
+ * 由 MK 与握手随机数 a/b 派生 SHK(文件头决定 2;node 侧 deriveShk):
+ *   saltH = sha256(a‖b)(32B); SHK = HKDF-SHA256(ikm=MK, salt=saltH, info="dsh-e2ee/v1\0shk", 32)
+ * @returns {Promise<{shk:Uint8Array, saltH:Uint8Array}>}
+ */
+async function wcDeriveShk(mkBytes, aB64, bB64) {
+  if (!mkBytes || mkBytes.length !== WC_MK_BYTES) throw new Error("e2ee: MK 非法");
+  const a = wcB64ToBytes(aB64);
+  const b = wcB64ToBytes(bB64);
+  if (a.length !== WC_MK_BYTES || b.length !== WC_MK_BYTES) throw new Error("e2ee: 握手随机数须为 32B");
+  const saltH = await wcSha256Bytes(a, b);
+  const shk = await wcHkdf(mkBytes, saltH, `${WC_E2EE_DOMAIN}\x00shk`, WC_MK_BYTES);
+  return { shk, saltH };
+}
+
+/** 会话级错误(带稳定 code;不得携带密钥材料)。 */
+function wcErr(code, message) {
+  const e = new Error(message || code);
+  e.code = code;
+  e.wcE2ee = true;
+  return e;
+}
+
+/**
+ * 一个解锁会话(浏览器版 E2eeSession;密钥仅内存)。
+ * 提供子密钥派生 + 信封加解密原语;不持有密码/MK 明文以外的任何落盘材料。
+ */
+class WcE2eeSession {
+  constructor({ sessId, shk, saltH, profile = "", epoch = 0 }) {
+    if (typeof sessId !== "string" || !WC_SESS_ID_RE.test(sessId)) throw wcErr("bad_session", "e2ee: sessId 非法");
+    if (!shk || shk.length !== WC_MK_BYTES) throw wcErr("bad_session", "e2ee: SHK 非法");
+    if (!saltH || saltH.length !== WC_MK_BYTES) throw wcErr("bad_session", "e2ee: saltH 非法");
+    this.sessId = sessId;
+    this.shk = shk;
+    this.saltH = saltH;
+    this.profile = profile;
+    this.epoch = epoch;
+    this.verified = false;
+  }
+  /** 子密钥(文件头决定 3);kind∈http|http-resp|w|ctrl。 */
+  async keyBytesFor({ kind, dir, reqNonceB64 = "", wsLabel = "" }) {
+    let use;
+    if (kind === "http" || kind === "http-resp") {
+      if (!reqNonceB64) throw wcErr("bad_keyinfo", "e2ee: http 子密钥需要 reqNonceB64");
+      use = `http\x00${reqNonceB64}\x00${dir}`;
+    } else if (kind === "w") {
+      if (!wsLabel) throw wcErr("bad_keyinfo", "e2ee: ws 子密钥需要 wsLabel");
+      use = `ws\x00${wsLabel}\x00${dir}`;
+    } else if (kind === "ctrl") {
+      use = `ctrl\x00${dir}`;
+    } else {
+      throw wcErr("bad_keyinfo", "e2ee: 未知信封 kind: " + kind);
+    }
+    if (dir !== WC_DIR_P2B && dir !== WC_DIR_B2P) throw wcErr("bad_keyinfo", "e2ee: 未知方向: " + dir);
+    return wcHkdf(this.shk, this.saltH, `${WC_E2EE_DOMAIN}\x00${use}`, WC_MK_BYTES);
+  }
+  /** AAD(文件头决定 4)。 */
+  aadBytesOf({ kind, dir, counter }) {
+    return wcUtf8(`${WC_E2EE_DOMAIN}\x00${kind}\x00${this.sessId}\x00${dir}\x00${String(counter ?? 0)}`);
+  }
+  /**
+   * 密封一条消息 → 信封对象(node 侧 seal 的浏览器异步版)。
+   * @returns {Promise<{v:number,k:string,s:string,c:number,n:string,t:number,d:string}>}
+   */
+  async seal({ kind, dir, counter = 0, data, t, reqNonceB64 = "", wsLabel = "", nonceBytes }) {
+    const isText = typeof data === "string";
+    const pt = isText ? wcUtf8(data) : (data instanceof Uint8Array ? data : new Uint8Array(data));
+    const tOut = t !== undefined ? (t === 0 ? 0 : 1) : kind === "w" ? (isText ? 0 : 1) : 0;
+    const n = nonceBytes || wcRandomBytes(WC_NONCE_BYTES);
+    if (!n || n.length !== WC_NONCE_BYTES) throw wcErr("bad_nonce", "e2ee: nonce 须为 12B");
+    // 规范(决定 3):http 请求信封 key-info reqNonce 默认 = 本信封 n(自描述);
+    // http-resp 的 key-info reqNonce 必须为对应请求 n(由调用方显式传入)。
+    const keyNonce = kind === "http-resp" ? reqNonceB64 : reqNonceB64 || wcBytesToB64(n);
+    const keyBytes = await this.keyBytesFor({ kind, dir, reqNonceB64: keyNonce, wsLabel });
+    const key = await crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["encrypt"]);
+    const enc = await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv: n, additionalData: this.aadBytesOf({ kind, dir, counter }), tagLength: 128 },
+      key,
+      pt
+    );
+    return {
+      v: WC_E2EE_VERSION,
+      k: kind,
+      s: this.sessId,
+      c: counter,
+      n: wcBytesToB64(n),
+      t: tOut,
+      d: wcBytesToB64(new Uint8Array(enc)) // AES-GCM 输出 = 密文‖tag
+    };
+  }
+  /**
+   * 打开(解密+认证)一条消息。认证失败/字段不符抛 code=… 的 Error。
+   * @returns {Promise<{data:Uint8Array, t:number}>}
+   */
+  async open({ kind, dir, env, counter, reqNonceB64 = "", wsLabel = "" }) {
+    if (!env || typeof env !== "object") throw wcErr("bad_envelope", "e2ee: 信封缺失");
+    if (env.v !== WC_E2EE_VERSION) throw wcErr("bad_version", "e2ee: 信封版本不受支持: " + env.v);
+    if (env.k !== kind) throw wcErr("bad_kind", "e2ee: 信封 kind 不符");
+    if (env.s !== this.sessId) throw wcErr("bad_session", "e2ee: 信封会话不符");
+    let raw;
+    try { raw = wcB64ToBytes(env.d); } catch { raw = null; }
+    if (!raw || raw.length < WC_TAG_BYTES + 1) throw wcErr("bad_cipher", "e2ee: 密文非法");
+    let n;
+    try { n = wcB64ToBytes(env.n); } catch { n = null; }
+    if (!n || n.length !== WC_NONCE_BYTES) throw wcErr("bad_nonce", "e2ee: nonce 非法");
+    const keyNonce = kind === "http-resp" ? reqNonceB64 : reqNonceB64 || String(env.n || "");
+    const keyBytes = await this.keyBytesFor({ kind, dir, reqNonceB64: keyNonce, wsLabel });
+    const key = await crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["decrypt"]);
+    let out;
+    try {
+      out = new Uint8Array(await crypto.subtle.decrypt(
+        { name: "AES-GCM", iv: n, additionalData: this.aadBytesOf({ kind, dir, counter }), tagLength: 128 },
+        key,
+        raw
+      ));
+    } catch {
+      throw wcErr("auth_failed", "e2ee: AEAD 打开失败(密文被篡改或密钥不一致)");
+    }
+    return { data: out, t: env.t === 1 ? 1 : 0 };
+  }
+}
+
+// ---------- http/ws 明文载荷编解码(node 侧 decode/encodeHttp*Plain 的浏览器版) ----------
+
+function wcParseJsonBytes(u8) {
+  try { return JSON.parse(u8 instanceof Uint8Array ? wcUtf8Decode(u8) : String(u8)); }
+  catch { throw wcErr("bad_plain", "e2ee: 明文不是 JSON"); }
+}
+/** 请求信封明文 {m,p,h,b}(§4.3)。 */
+function wcDecodeHttpRequestPlain(buf) {
+  const pt = wcParseJsonBytes(buf);
+  if (!pt || typeof pt !== "object") throw wcErr("bad_plain", "e2ee: http 请求明文缺失");
+  const method = typeof pt.m === "string" && pt.m ? pt.m.toUpperCase() : "GET";
+  const path = typeof pt.p === "string" && pt.p ? pt.p : "/";
+  const headers = pt.h && typeof pt.h === "object" ? pt.h : {};
+  const b = typeof pt.b === "string" ? pt.b : "";
+  return { method, path, headers, bodyB64: b, hasBody: b !== "" };
+}
+function wcEncodeHttpRequestPlain({ method = "GET", path = "/", headers = {}, bodyB64 = "" } = {}) {
+  return wcUtf8(JSON.stringify({ m: String(method).toUpperCase(), p: path, h: headers, b: String(bodyB64 ?? "") }));
+}
+/** 响应信封明文 {st,h,enc,b}(§4.3)。 */
+function wcDecodeHttpResponsePlain(buf) {
+  const pt = wcParseJsonBytes(buf);
+  if (!pt || typeof pt !== "object") throw wcErr("bad_plain", "e2ee: http 响应明文缺失");
+  return {
+    status: Number(pt.st) || 502,
+    headers: pt.h && typeof pt.h === "object" ? pt.h : {},
+    enc: typeof pt.enc === "string" ? pt.enc : "",
+    bodyB64: typeof pt.b === "string" ? pt.b : ""
+  };
+}
+function wcEncodeHttpResponsePlain({ status = 200, headers = {}, bodyB64 = "", enc } = {}) {
+  const h = {};
+  let encOut = enc || "";
+  for (const [k, v] of Object.entries(headers || {})) {
+    const lk = String(k).toLowerCase();
+    if (["content-length", "content-encoding", "transfer-encoding", "connection", "keep-alive"].includes(lk)) {
+      if (lk === "content-encoding" && !enc) encOut = String(v);
+      continue;
+    }
+    h[k] = Array.isArray(v) ? v.join(", ") : String(v);
+  }
+  return wcUtf8(JSON.stringify({ st: Number(status) || 200, h, enc: encOut, b: String(bodyB64 ?? "") }));
+}
+/** enc=gzip 时解压响应正文(async)。 */
+async function wcGunzip(u8) {
+  try {
+    const ds = new DecompressionStream("gzip");
+    const stream = new Blob([u8]).stream().pipeThrough(ds);
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+  } catch { return null; }
+}
+
+/**
+ * 解析数据 WS 打开路径的 e2ee 标记(node 侧 parseWsE2eeParams 同构):
+ *   upstreamPath: 去掉 e2ee 与 w 两参后的干净上游路径;
+ *   wsLabel:      仅去掉 e2ee 的重组 query(path+query,内含 w → 每流唯一)。
+ */
+function wcParseWsE2eeParams(fullPath) {
+  if (typeof fullPath !== "string" || !fullPath.startsWith("/")) return null;
+  const qIdx = fullPath.indexOf("?");
+  const path = qIdx === -1 ? fullPath : fullPath.slice(0, qIdx);
+  if (qIdx === -1) return null;
+  const params = new URLSearchParams(fullPath.slice(qIdx + 1));
+  const sessId = params.get("e2ee") || "";
+  const w = params.get("w") || "";
+  if (!sessId || !w || !WC_SESS_ID_RE.test(sessId)) return null;
+  params.delete("e2ee");
+  const qsLabel = params.size ? `?${params.toString()}` : "";
+  const labelWithW = `${path}${qsLabel}`; // w 保留其中
+  params.delete("w");
+  const qsUp = params.size ? `?${params.toString()}` : "";
+  return { sessId, w, wsLabel: labelWithW, upstreamPath: `${path}${qsUp}` };
+}
+
+/** 信封标记头(§4.3 头即信号;node 侧 envelopeRequestHeaders)。 */
+function wcEnvelopeHeaders(sessId, kind = "http") {
+  return { "content-type": WC_ENVELOPE_CONTENT_TYPE, [WC_ENVELOPE_HEADER]: `v=${WC_E2EE_VERSION};s=${sessId};k=${kind}` };
+}
+function wcHeaderValueOf(headers, name) {
+  const lk = String(name).toLowerCase();
+  for (const [k, v] of Object.entries(headers || {})) {
+    if (String(k).toLowerCase() === lk) return Array.isArray(v) ? v.join(", ") : String(v);
+  }
+  return "";
+}
+function wcParseEnvelopeMarker(headers = {}) {
+  const val = wcHeaderValueOf(headers, WC_ENVELOPE_HEADER);
+  if (!val) return null;
+  const m = /^v=(\d+);s=([0-9a-f]{32});k=([a-z-]+)$/i.exec(val.trim());
+  return m ? { v: Number(m[1]), s: m[2], k: m[3] } : null;
+}
+function wcHasEnvelopeMarker(headers = {}) {
+  const ct = wcHeaderValueOf(headers, "content-type").split(";")[0].trim().toLowerCase();
+  if (ct === WC_ENVELOPE_CONTENT_TYPE) return true;
+  return wcParseEnvelopeMarker(headers) !== null;
+}
+/* ===DSH-E2EE-WC-CORE-END=== */
+
+/* ===DSH-E2EE-HANDOVER-CORE-START=== */
+// Phase-4 一次性交接单(键 dsh-e2ee-handover;镜像页读后即删)。取舍:只放「已探针互认的
+// 会话材料」{v,s,shk,salt,profile,epoch}(sessId+SHK+saltH 32B b64url),绝不放 MK/密码;
+// 镜像页(side e2ee-shim-script.js)用同 sessId 复用桥端已验证会话(24h TTL)。
+var DSH_E2EE_HANDOVER_KEY = "dsh-e2ee-handover";
+function dshE2eeHandoverEncode(sess) {
+  if (!sess || typeof sess.sessId !== "string" || !/^[0-9a-f]{32}$/i.test(sess.sessId) || !sess.shk || sess.shk.length !== 32 || !sess.saltH || sess.saltH.length !== 32) return null;
+  return JSON.stringify({ v: 2, s: sess.sessId, shk: wcBytesToB64(sess.shk), salt: wcBytesToB64(sess.saltH), profile: String(sess.profile || ""), epoch: Number(sess.epoch) || 0 });
+}
+function dshE2eeHandoverWrite(sess, storage) { try { const raw = dshE2eeHandoverEncode(sess); if (raw) storage.setItem(DSH_E2EE_HANDOVER_KEY, raw); } catch (e) {} }
+function dshE2eeHandoverClear(storage) { try { storage.removeItem(DSH_E2EE_HANDOVER_KEY); } catch (e) {} }
+/* ===DSH-E2EE-HANDOVER-CORE-END=== */
+/** enterDevice 前置(Phase-4):解锁会话→写一次性交接单;明文跳过/未解锁→清(防串台)。 */
+function dshE2eeHandoverSync(deviceId) {
+  try {
+    if (typeof e2eeClient === "undefined") {
+      dshE2eeHandoverClear(sessionStorage);
+      try { dshE2eeHandoverClear(localStorage); } catch (e) {}
+      return;
+    }
+    const ent = e2eeClient.sessions.get(deviceId) || null;
+    if (ent && ent.sess) {
+      dshE2eeHandoverWrite(ent.sess, sessionStorage);
+      // 记住本机(2026-09):同一交接单同时写 localStorage —— 刷新镜像页后可自动恢复加密
+      // (登出时清除;与 localStorage 中的派生 MK 同策略)。
+      try { dshE2eeHandoverWrite(ent.sess, localStorage); } catch (e) {}
+    } else {
+      dshE2eeHandoverClear(sessionStorage);
+      try { dshE2eeHandoverClear(localStorage); } catch (e) {}
+    }
+  } catch (e) {}
+}
+
+// ---------- E2EE 客户端状态(仅内存;密钥不落 localStorage) ----------
+const E2EE_ERR_TEXT = {
+  bad_key: "电脑端保存的账号密码与本次输入不一致。请在电脑端面板重新登录该账号后重试。",
+  auth_failed: "解密校验失败:密码与电脑端不一致或传输被篡改,请重试。",
+  params: "加密参数与电脑端不一致(密码或服务端参数可能已更换),请重新登录账号后重试。",
+  disabled: "电脑端当前未启用端到端加密,已按明文路径继续。",
+  e2ee_disabled: "电脑端未启用端到端加密(请检查账号密码/服务端开关),已按明文路径继续。",
+  no_cap: "电脑端版本过旧或不支持端到端加密,已按明文路径继续。",
+  busy: "电脑端正忙,请稍后重试。",
+  unknown_session: "会话不存在或已过期,请重新解锁。",
+  not_verified: "会话尚未完成探针校验,请重新解锁。",
+  replay: "检测到重放,请重新解锁。",
+  ws_closed: "与电脑端的加密握手连接提前关闭,请检查网络后重试。",
+  ws_timeout: "加密握手超时,请检查网络后重试。",
+  derive_failed: "密钥派生失败,请确认密码后重试。"
+};
+
+// 自动解锁(2026-09,免二次输密码):登录/注册时用户刚输入过密码,在本页内存保留一份,
+// 点选 E2EE 设备时静默解锁。发送给服务端?否。短信/扫码登录无密码 → 自动引导或解锁层。
+let e2eePendingPassword = null;
+
+// 解锁材料持久化(2026-09 用户决策「刷新后仍保持加密」):解锁成功后把派生 MK 存入
+// localStorage(与镜像页同源共用),刷新/重开 /app 后点设备仍自动加密进入,不再要求重输密码。
+// 注意(如实告知):localStorage 与同源页面(含被控的镜像 dsh web)脚本等价可读,此选项≈
+// 「记住本机密码」;退出登录即清除。协议 §5.1 [DECISION-2026-09] 已按产品决策更新该边界。
+var E2EE_MK_STORE_KEY = "dsh-e2ee-mk-v1";
+function e2eeMkLoad() {
+  try { var s = localStorage.getItem(E2EE_MK_STORE_KEY); return s && s.length >= 32 ? s : null; } catch (e) { return null; }
+}
+function e2eeMkSave(mkB64) { try { if (mkB64) localStorage.setItem(E2EE_MK_STORE_KEY, String(mkB64)); } catch (e) {} }
+function e2eeMkClear() { try { localStorage.removeItem(E2EE_MK_STORE_KEY); } catch (e) {} }
+let e2eeStoredMk = e2eeMkLoad(); // 启动即读:刷新/重开后自动解锁可用
+
+const e2eeClient = {
+  params: null,          // {enabled, reason, profile, salt, kdf, epoch, status}
+  paramsT: 0,
+  sessions: new Map(),   // deviceId → { params, sess: WcE2eeSession, unlockedAt }(仅内存)
+  deviceName: new Map()  // deviceId → name(解锁层展示)
+};
+
+/** 拉取并容错解析 GET {apiBase}/api/e2ee-params(Bearer;协议 §3.4/§6.1)。
+ *  任何失败 → {enabled:false, reason}(明文回退,不抛)。缓存 30s,force 时重取。 */
+async function e2eeGetParams(force = false) {
+  const cached = e2eeClient.params;
+  if (cached && !force && Date.now() - e2eeClient.paramsT < 30000) return cached;
+  const miss = (reason, status = 0) => {
+    if (cached && !force) return cached;
+    return { enabled: false, reason, status };
+  };
+  if (!state.token || deploymentMode === "self") return miss("no_token");
+  let r;
+  try {
+    r = await fetch(API_BASE + "/api/e2ee-params", {
+      headers: { authorization: `Bearer ${state.token}`, accept: "application/json" },
+      signal: AbortSignal.timeout(8000)
+    });
+  } catch { return miss("params_unreachable"); }
+  if (r.status !== 200) return miss(r.status === 401 ? "server_unauthorized" : r.status === 404 ? "server_no_params" : "http_" + r.status, r.status);
+  let data;
+  try { data = await r.json(); } catch { return miss("bad_params", 200); }
+  const e2 = data && typeof data === "object" ? data.e2ee : null;
+  if (!e2 || typeof e2 !== "object") return miss("server_no_params", 200);
+  if (e2.enabled !== true) return miss("server_disabled", 200);
+  if (typeof e2.salt !== "string" || !wcDecodeSalt(e2.salt)) return miss("bad_params", 200);
+  let kdf;
+  try { kdf = wcNormalizeKdf(e2.kdf); } catch { return miss("bad_params", 200); }
+  const p = {
+    enabled: true, reason: "ok", status: 200,
+    profile: typeof e2.profile === "string" && e2.profile ? e2.profile : "pbkdf2-sha256-600k",
+    salt: e2.salt,
+    epoch: Number(e2.epoch) || 0,
+    kdf
+  };
+  e2eeClient.params = p;
+  e2eeClient.paramsT = Date.now();
+  return p;
+}
+
+/** 设备是否具备 E2EE 能力(账号 enabled ∧ 设备声明 e2ee-v2 ∧ 非自建)。 */
+function e2eeCapable(params, caps) {
+  return !!(params && params.enabled === true && Array.isArray(caps) && caps.includes(WC_E2EE_CAP));
+}
+
+/** WebCrypto 可用性(subtle 需要安全上下文 https/wss;不可用 → 明文回退 + 提示)。 */
+function e2eeSubtleAvailable() {
+  return !!(globalThis.crypto && globalThis.crypto.subtle && globalThis.crypto.getRandomValues);
+}
+
+/** 控制 WS 地址:device 形态 {origin}/remote/<deviceId>/_e2ee/ctrl(§5.2)。 */
+function e2eeCtrlWsUrl(deviceId) {
+  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${proto}//${window.location.host}/remote/${encodeURIComponent(deviceId)}/_e2ee/ctrl`;
+}
+
+/**
+ * §5.2 手机侧全握手:hello → hello-ack → deriveShk → 探针(ctrl AEAD)→ probe-ok。
+ * @param {string} deviceId
+ * @param {object} o { password?, params, mkBytes? }
+ *   password=账号密码时现场派生 MK;mkBytes(32B,方案A 桌面授权引导下发)=直接用,免输密码。
+ * @returns {Promise<{sessId:string, sess:WcE2eeSession}>} verified 后返回
+ */
+function e2eeUnlockHandshake(deviceId, { password, params, mkBytes }) {
+  return new Promise((resolve, reject) => {
+    const sessId = wcNewSessId();
+    const aB64 = wcRandomB64(32);
+    if (mkBytes && mkBytes.length !== WC_MK_BYTES) {
+      reject(wcErr("derive_failed", E2EE_ERR_TEXT.derive_failed));
+      return;
+    }
+    let ws;
+    let timer = null;
+    let settled = false;
+    const done = (v) => { if (settled) return; settled = true; clearTimeout(timer); try { ws.close(1000); } catch {} resolve(v); };
+    const fail = (e) => { if (settled) return; settled = true; clearTimeout(timer); try { ws.close(); } catch {} reject(e); };
+    try {
+      ws = new WebSocket(e2eeCtrlWsUrl(deviceId));
+    } catch (e) { fail(wcErr("ws_closed", E2EE_ERR_TEXT.ws_closed)); return; }
+    timer = setTimeout(() => fail(wcErr("ws_timeout", E2EE_ERR_TEXT.ws_timeout)), 20000);
+    ws.onerror = () => { /* onclose 统一收尾 */ };
+    ws.onclose = (ev) => {
+      if (!settled) fail(wcErr("ws_closed", E2EE_ERR_TEXT.ws_closed + (ev.reason ? `(${ev.reason})` : "")));
+    };
+    ws.onopen = () => {
+      ws.send(JSON.stringify({
+        v: 2, type: "e2ee-hello", role: "phone", s: sessId,
+        a: aB64, salt: params.salt, profile: params.profile, ts: Date.now()
+      }));
+    };
+    let session = null;
+    ws.onmessage = async (ev) => {
+      let msg;
+      try { msg = JSON.parse(String(ev.data)); } catch { return; }
+      if (!msg || typeof msg !== "object") return;
+      if (msg.type === "e2ee-error") {
+        const code = String(msg.code || "e2ee_failed");
+        const text = E2EE_ERR_TEXT[code] || (msg.message ? String(msg.message) : ("电脑端握手失败(" + code + ")"));
+        fail(wcErr(code, text));
+        return;
+      }
+      if (msg.type === "e2ee-hello-ack") {
+        try {
+          const mk = mkBytes || await wcDeriveMasterKey(password, params.salt, params.kdf);
+          const { shk, saltH } = await wcDeriveShk(mk, aB64, String(msg.b || ""));
+          session = new WcE2eeSession({ sessId, shk, saltH, profile: params.profile, epoch: params.epoch });
+          const probe = await session.seal({
+            kind: "ctrl", dir: WC_DIR_P2B, counter: 0,
+            data: JSON.stringify({ p: "dsh-e2ee-probe-v1", t: Date.now(), c: 0 })
+          });
+          ws.send(JSON.stringify(probe));
+        } catch (e) {
+          fail(e && e.wcE2ee ? e : wcErr("derive_failed", E2EE_ERR_TEXT.derive_failed));
+        }
+        return;
+      }
+      if (session && msg.v === 2 && msg.k === "ctrl") {
+        // probe-ok:开包通过 = 双方 MK 一致;会话 verified
+        try {
+          const opened = await session.open({ kind: "ctrl", dir: WC_DIR_B2P, env: msg, counter: msg.c ?? 0 });
+          const pt = JSON.parse(wcUtf8Decode(opened.data));
+          if (pt && pt.p === "dsh-e2ee-probe-ok") {
+            session.verified = true;
+            done({ sessId, sess: session });
+          } else {
+            fail(wcErr("bad_key", E2EE_ERR_TEXT.bad_key));
+          }
+        } catch (e) {
+          fail(e && e.wcE2ee ? e : wcErr("bad_key", E2EE_ERR_TEXT.bad_key));
+        }
+      }
+    };
+  });
+}
+
+/** 解锁/引导成功后的统一收尾:会话仅存内存 + 刷新徽标。 */
+function e2eeCommitSession(deviceId, params, r) {
+  e2eeClient.sessions.set(deviceId, { params, sess: r.sess, unlockedAt: Date.now() });
+  e2eeClient.deviceName.set(deviceId, e2eeClient.deviceName.get(deviceId) || deviceId);
+  e2eeUpdateBadge();
+  return { ok: true, code: "ok", sessId: r.sessId };
+}
+
+/** 解锁设备:密码 → 派生 MK → ctrl 握手(探针通过即「双方 MK 一致」)。会话仅存内存;
+ *  成功后派生 MK 按用户决策写入 localStorage(刷新后自动解锁用,退出登录清除)。 */
+async function e2eeUnlockDevice(deviceId, password) {
+  if (!e2eeSubtleAvailable()) return { ok: false, code: "no_webcrypto", text: "当前浏览器不支持端到端加密所需的安全环境,请用系统浏览器(HTTPS)重试;已按明文路径继续。" };
+  const params = await e2eeGetParams(true);
+  if (!params.enabled) return { ok: false, code: params.reason, text: E2EE_ERR_TEXT[params.reason] || "服务端未启用端到端加密,已按明文路径继续。" };
+  if (typeof password !== "string" || password.length < 1) return { ok: false, code: "no_password", text: "请输入账号密码" };
+  let mkBytes;
+  try {
+    mkBytes = await wcDeriveMasterKey(password, params.salt, params.kdf);
+  } catch (e) {
+    return { ok: false, code: "derive_failed", text: E2EE_ERR_TEXT.derive_failed };
+  }
+  let r;
+  try {
+    r = await e2eeUnlockHandshake(deviceId, { params, mkBytes });
+  } catch (e) {
+    return { ok: false, code: e && e.code ? e.code : "e2ee_failed", text: (e && e.message) || "解锁失败,请重试" };
+  }
+  const out = e2eeCommitSession(deviceId, params, r);
+  if (out.ok) e2eeMkSave(wcBytesToB64(mkBytes)); // 记住本机解锁(刷新后自动加密)
+  return out;
+}
+
+/**
+ * 桌面授权引导解锁(方案A,2026-09):扫码/一次性链接等「未持有密码」的进入方式,向电脑端
+ * bridge 请求一次性引导(同账号经路由授权);拿到派生 MK 后直接完成同一 hello/probe 握手,
+ * 全程无需输入账号密码。MK 仅在本页内存参与派生,不落盘。信任模型见 docs/e2ee-protocol.md §5.4。
+ */
+async function e2eeIntroUnlockDevice(deviceId, mkB64) {
+  if (!e2eeSubtleAvailable()) return { ok: false, code: "no_webcrypto", text: "当前浏览器不支持端到端加密所需的安全环境,请用系统浏览器(HTTPS)重试;已按明文路径继续。" };
+  const params = await e2eeGetParams(true);
+  if (!params.enabled) return { ok: false, code: params.reason, text: E2EE_ERR_TEXT[params.reason] || "服务端未启用端到端加密,已按明文路径继续。" };
+  let mkBytes;
+  try {
+    mkBytes = wcB64ToBytes(mkB64);
+    if (!mkBytes || mkBytes.length !== WC_MK_BYTES) throw new Error("bad len");
+  } catch {
+    return { ok: false, code: "bad_intro", text: "电脑端引导数据无效,请重试或改用账号密码解锁" };
+  }
+  let r;
+  try {
+    r = await e2eeUnlockHandshake(deviceId, { params, mkBytes });
+  } catch (e) {
+    return { ok: false, code: e && e.code ? e.code : "e2ee_failed", text: (e && e.message) || "引导解锁失败,请重试" };
+  }
+  const out = e2eeCommitSession(deviceId, params, r);
+  if (out.ok) e2eeMkSave(mkB64); // 与密码解锁同策略:记住本机,刷新后自动加密
+  return out;
+}
+
+/** 向电脑端请求一次性 E2EE 引导(方案A)。端点经 relay-router 同账号授权到本设备桥端。 */
+async function e2eeRequestIntro(deviceId) {
+  try {
+    const r = await fetch(`${window.location.origin}/remote/${encodeURIComponent(deviceId)}/_e2ee/intro`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ v: 2, grant: "desktop-intro", ts: Date.now() }),
+      signal: AbortSignal.timeout(8000),
+      cache: "no-store"
+    });
+    const d = await r.json().catch(() => null);
+    if (!d) return { ok: false, code: "bad_intro", text: "电脑端引导响应异常(" + r.status + ")" };
+    if (r.status !== 200 || d.ok !== true || typeof d.mk !== "string") {
+      const code = (d && d.error && d.error.code) || "intro_failed";
+      return { ok: false, code: code, text: (d && d.error && d.error.message) || ("电脑端拒绝引导(" + r.status + ")") };
+    }
+    return { ok: true, mk: d.mk };
+  } catch (e) {
+    return { ok: false, code: "intro_network", text: "电脑端引导请求失败:" + (e && e.message ? e.message : e) };
+  }
+}
+
+/** 会话状态查询(供 Phase-4 插件/徽标读取;字段名即对外约定)。 */
+function e2eeStateFor(deviceId) {
+  const params = e2eeClient.params;
+  const s = deviceId ? e2eeClient.sessions.get(deviceId) : null;
+  return {
+    supported: !!(params && params.enabled === true),
+    enabled: !!(params && params.enabled === true),
+    serverReason: params ? params.reason : "not_checked",
+    unlocked: !!s,
+    deviceId: deviceId || "",
+    sessId: s ? s.sess.sessId : "",
+    profile: s ? s.sess.profile : (params ? params.profile : ""),
+    epoch: s ? s.sess.epoch : (params ? params.epoch : 0)
+  };
+}
+
+/** 更新 header 加密状态徽标(已解锁=绿/仅账号支持=黄/不支持隐藏)。 */
+function e2eeUpdateBadge() {
+  const el = $("dsh-e2ee-badge");
+  if (!el) return;
+  const sessions = [...e2eeClient.sessions.values()];
+  if (sessions.length > 0) {
+    el.className = "ok";
+    el.title = "本页已建立端到端加密会话(密钥仅存内存)";
+    el.textContent = "🔒 已解锁";
+    return;
+  }
+  const p = e2eeClient.params;
+  if (p && p.enabled === true) {
+    el.className = "warn";
+    el.textContent = "🔒 可加密";
+    el.title = "账号已启用端到端加密:点选支持加密的设备时需先解锁";
+  } else {
+    el.className = "hidden";
+    el.textContent = "";
+    el.title = "";
+  }
+}
+
+// ---------- E2EE 解锁层 UI(仅 E2EE 能力设备出现;密钥/口令绝不落盘) ----------
+let unlockCtx = null; // { deviceId, name, after }
+
+function e2eeOpenUnlock(deviceId, name, after) {
+  unlockCtx = { deviceId, name: name || deviceId, after: after || null };
+  $("unlock-device-name").textContent = unlockCtx.name;
+  $("unlock-msg").className = "e2ee-unlock-msg";
+  $("unlock-msg").textContent = "";
+  $("unlock-pass").value = "";
+  $("unlock-modal").classList.remove("hidden");
+  $("unlock-modal").querySelector("#btn-unlock-go").disabled = false;
+  setTimeout(() => { try { $("unlock-pass").focus(); } catch {} }, 60);
+}
+
+function e2eeCloseUnlock() {
+  $("unlock-modal").classList.add("hidden");
+  unlockCtx = null;
+}
+
+async function e2eeDoUnlock() {
+  const go = $("btn-unlock-go");
+  const msg = $("unlock-msg");
+  if (!unlockCtx) return;
+  const deviceId = unlockCtx.deviceId;
+  const pw = $("unlock-pass").value;
+  if (!pw) { msg.className = "e2ee-unlock-msg err"; msg.textContent = "请输入账号密码"; return; }
+  go.disabled = true;
+  msg.className = "e2ee-unlock-msg";
+  msg.innerHTML = '<span class="loading"></span> 正在派生密钥并与电脑端握手…(约 1–2 秒)';
+  const r = await e2eeUnlockDevice(deviceId, pw);
+  $("unlock-pass").value = ""; // 口令用完即清,不留在 DOM
+  if (r.ok) {
+    msg.className = "e2ee-unlock-msg ok";
+    msg.textContent = "✅ 已与电脑端确认密码一致,加密会话就绪(密钥仅存本页内存)。";
+    if (pw) e2eePendingPassword = pw; // 纠正成功后同步内存密码,后续设备不再要求重复输入
+    const after = unlockCtx.after;
+    const name = unlockCtx.name;
+    go.disabled = false;
+    go.textContent = "进入设备";
+    unlockCtx.after = null;
+    setTimeout(() => { e2eeCloseUnlock(); if (after) after(); }, 900);
+    toast(`🔒 ${name} 端到端加密会话已建立`, 2600);
+  } else {
+    msg.className = "e2ee-unlock-msg err";
+    msg.textContent = "解锁失败:" + (r.text || "未知错误");
+    go.disabled = false;
+  }
+}
+
+/** 「暂不加密(明文)」:协议 §7.3 明确二次确认 → 明文进入 + 徽标明示。 */
+function e2eeSkipUnlock() {
+  if (!unlockCtx) return;
+  const id = unlockCtx.deviceId;
+  const name = unlockCtx.name;
+  e2eeCloseUnlock();
+  toast(`⚠ ${name}:本次连接未加密(明文)。点选设备将直接进入镜像页。`, 4200);
+  enterDevice(id);
+}
+
+/** e2eeGetParams 的限时版:超时(默认 1200ms)按「未启用」处理 —— 门控绝不让明文进入被拖慢。 */
+async function e2eeParamsWithin(ms = 1200, force = false) {
+  return Promise.race([
+    e2eeGetParams(force),
+    new Promise((r) => setTimeout(() => r({ enabled: false, reason: "params_slow" }), ms))
+  ]);
+}
+
+/**
+ * 设备点选入口(E2EE 门控):账号启用 e2ee ∧ 设备声明 e2ee-v2 → 弹解锁层;
+ * 否则完全走原明文进入流程(行为零变化,回归保护)。 */
+async function e2eeMaybeGateThenEnter(deviceId, name, caps) {
+  const params = await e2eeParamsWithin(1200, false);
+  e2eeUpdateBadge();
+  if (!e2eeCapable(params, caps)) {
+    enterDevice(deviceId); // 未启用/无能力:与旧版完全一致
+    return;
+  }
+  if (!e2eeSubtleAvailable()) {
+    // 浏览器无 WebCrypto(非安全上下文等):不弹层,明文进入 + 原因提示(协议 §7.1 不回退静默)
+    toast("⚠ 当前环境不支持端到端加密(需 HTTPS 安全上下文),本次连接为明文", 5000);
+    enterDevice(deviceId);
+    return;
+  }
+  e2eeClient.deviceName.set(deviceId, name || deviceId);
+  // 已解锁过(同页内存会话)→ 直接进入;但桥端会话 24h TTL(e2ee-client prune),
+  // 超过 24h 的内存会话视为失效,避免直进撞桥端已过期会话。
+  const prev = e2eeClient.sessions.get(deviceId);
+  if (prev && prev.sess) {
+    const fresh = !prev.unlockedAt || (Date.now() - prev.unlockedAt < 24 * 3600 * 1000);
+    if (fresh) { enterDevice(deviceId); return; }
+    e2eeClient.sessions.delete(deviceId);
+  }
+  // 免二次输密码(2026-09):依次尝试自动解锁候选,失败按语义降级:
+  //   ① 内存密码(本次登录/注册刚输过)→ e2eeUnlockDevice(内部同时落 localStorage);
+  //   ② localStorage 记住的派生 MK(刷新/重开仍加密,2026-09 用户决策);
+  //   ③ 桌面授权引导(扫码/一次性链接等从未持有密码,方案A)。
+  //   密码不一致/会话失效类 → 弹解锁层人工纠正(绝不因 bad_key 静默明文);
+  //   服务端未启用/无能力等 → toast 提示后明文进入(与既有分支语义一致)。
+  const autoResult = async (label, fn, okText) => {
+    try {
+      const r = await fn();
+      if (r.ok) {
+        toast(okText || `🔒 ${name || deviceId} 端到端加密会话已建立`, 2200);
+        enterDevice(deviceId);
+        return "entered";
+      }
+      const needManual = ["bad_key", "auth_failed", "params", "unknown_session", "not_verified", "replay", "ws_closed", "ws_timeout", "derive_failed", "bad_intro", "intro_failed", "intro_network"];
+      if (!needManual.includes(r.code)) {
+        toast((r.text || "已按明文路径继续"), 3500);
+        enterDevice(deviceId);
+        return "plain";
+      }
+      if (label !== "intro") toast(`⚠ ${label}未成功(${r.code})`, 3600);
+    } catch (e) { /* 落到下一候选/模态 */ }
+    return "manual";
+  };
+  if (e2eePendingPassword) {
+    const st = await autoResult("自动解锁", () => e2eeUnlockDevice(deviceId, e2eePendingPassword), `🔒 ${name || deviceId} 端到端加密会话已自动建立`);
+    if (st !== "manual") return;
+  }
+  if (!e2eePendingPassword && e2eeStoredMk) {
+    // 记住本机:用 localStorage 里的派生 MK 直接自动解锁(刷新后仍加密,无需再输密码)
+    const st = await autoResult("记住本机解锁", () => e2eeIntroUnlockDevice(deviceId, e2eeStoredMk), `🔒 ${name || deviceId} 已自动加密进入(记住本机)`);
+    if (st !== "manual") return;
+  }
+  if (!e2eePendingPassword && !e2eeStoredMk) {
+    // 桌面授权引导(扫码/一次性链接等无密码路径,方案A):电脑端 bridge 经同账号授权通道下发 MK
+    const intro = await e2eeRequestIntro(deviceId).catch(() => ({ ok: false, code: "intro_network", text: "引导请求失败" }));
+    if (intro.ok) {
+      const st = await autoResult("intro", () => e2eeIntroUnlockDevice(deviceId, intro.mk), `🔒 ${name || deviceId} 已由电脑端授权自动建立加密会话`);
+      if (st !== "manual") return;
+      toast("⚠ 自动引导未成功,可改用账号密码解锁", 3600);
+    } else if (["no_webcrypto", "disabled", "e2ee_disabled", "no_cap"].includes(intro.code)) {
+      toast((intro.text || "已按明文路径继续"), 3500);
+      enterDevice(deviceId);
+      return;
+    }
+    // 引导不可达/被拒(旧电脑端等):落到下方模态,让用户输密码
+  }
+  e2eeOpenUnlock(deviceId, name, () => enterDevice(deviceId));
+}
+
+// ---------- E2EE 信封 HTTP/WS 传输原语(浏览器侧;Phase-4 镜像页/插件接线用) ----------
+// 语义对照桥端/路由:
+//   - HTTP 信封明文 p =「上游路径」= router resolveRoute 的转发路径(剥 /remote/<deviceId|channel>
+//     前缀、channel 形态剥 device 参数;§6.2)——桥端按该路径 fetch 127.0.0.1:3080;
+//   - 数据 WS 的 wsLabel = 桥端 parseWsE2eeParams 看到的上游 path+query(剥 e2ee、保留 w)。
+
+/** 上游路径(镜像 router resolveRoute:剥 /remote/ 前缀;channel 形态保留首段标记;剥 device 参数)。 */
+function wcUpstreamPathOf(fullPath) {
+  let p = String(fullPath || "");
+  let query = "";
+  const qIdx = p.indexOf("?");
+  if (qIdx !== -1) { query = p.slice(qIdx + 1); p = p.slice(0, qIdx); }
+  const params = new URLSearchParams(query);
+  params.delete("device"); // router 对 channel 形态剥 device 参数(§6.2)
+  let path = p;
+  if (p.startsWith("/remote/")) {
+    const rest = p.slice("/remote/".length);
+    const slash = rest.indexOf("/");
+    const head = slash === -1 ? rest : rest.slice(0, slash);
+    const tail = slash === -1 ? "" : rest.slice(slash);
+    const marker = ["api", "sidebar", "git", "pet", "_e2ee"].includes(head);
+    path = marker ? "/" + head + tail : (tail || "/");
+  }
+  const qs = params.size ? "?" + params.toString() : "";
+  return path + qs;
+}
+
+/** 数据 WS 流标签(e2ee 标记去掉后保留 w 的 path+query;与桥端 parseWsE2eeParams 同构)。 */
+function wcWsLabelOf(fullPath) {
+  const up = wcUpstreamPathOf(fullPath); // 保持 e2ee/w 参数,剥 device
+  const qIdx = up.indexOf("?");
+  const path = qIdx === -1 ? up : up.slice(0, qIdx);
+  const params = new URLSearchParams(qIdx === -1 ? "" : up.slice(qIdx + 1));
+  const sessId = params.get("e2ee") || "";
+  const w = params.get("w") || "";
+  if (!sessId || !WC_SESS_ID_RE.test(sessId)) return null;
+  params.delete("e2ee");
+  return { sessId, w, wsLabel: path + (params.size ? "?" + params.toString() : ""), upstreamPath: path };
+}
+
+/**
+ * 用已解锁会话封装一个 HTTP 请求并解密响应(§4.3)。
+ * 请求:外头 content-type: application/vnd.dsh.e2ee-v2 + x-dsh-e2ee;
+ *       信封明文 {m,p,h,b}(p = 上游路径);响应信封(k=http-resp)解密 → {st,h,enc,b}(enc=gzip 解压)。
+ * 无信封标记的响应(502/x-dsh-e2ee-error、router 403/502/504)→ 原样透传(调用方展示)。
+ * @param {string} deviceId 已解锁设备
+ * @param {string} routerUrl 手机侧 URL(如 `${origin}/remote/<deviceId>/api/...` 或 channel 形态)
+ * @param {object} o { method, path?(显式上游路径,缺省按 routerUrl 推导), headers, body }
+ */
+async function e2eeFetchEnveloped(deviceId, routerUrl, { method = "GET", path, headers = {}, body } = {}) {
+  const ent = e2eeClient.sessions.get(deviceId);
+  if (!ent || !ent.sess) throw new Error("e2ee: 会话未解锁(deviceId=" + deviceId + ")");
+  const sess = ent.sess;
+  const url = new URL(routerUrl, window.location.href);
+  const upstreamPath = path || wcUpstreamPathOf(url.pathname + url.search);
+  const n = wcRandomBytes(WC_NONCE_BYTES);
+  const nonceB64 = wcBytesToB64(n);
+  const reqPlain = wcEncodeHttpRequestPlain({
+    method,
+    path: upstreamPath,
+    headers,
+    bodyB64: body ? wcBytesToB64(typeof body === "string" ? wcUtf8(body) : body) : ""
+  });
+  const envReq = await sess.seal({ kind: "http", dir: WC_DIR_P2B, counter: 0, data: reqPlain, nonceBytes: n });
+  const res = await fetch(url.href, {
+    method: "POST",
+    headers: { ...wcEnvelopeHeaders(sess.sessId, "http"), cookie: document.cookie },
+    body: JSON.stringify(envReq)
+  });
+  const ct = String(res.headers.get("content-type") || "");
+  if (ct.startsWith(WC_ENVELOPE_CONTENT_TYPE) && res.headers.get(WC_ENVELOPE_HEADER)) {
+    const envResp = await res.json();
+    const opened = await sess.open({ kind: "http-resp", dir: WC_DIR_B2P, env: envResp, counter: envResp.c ?? 0, reqNonceB64: nonceB64 });
+    const rp = wcDecodeHttpResponsePlain(opened.data);
+    let bodyBytes = rp.bodyB64 ? wcB64ToBytes(rp.bodyB64) : new Uint8Array(0);
+    if (rp.enc === "gzip" && bodyBytes.length) {
+      const un = await wcGunzip(bodyBytes);
+      if (un) bodyBytes = un;
+    }
+    return { status: rp.status, headers: rp.headers, body: bodyBytes, plain: false };
+  }
+  // 无信封标记:router/bridge 错误页等 → 原样透传(调用方展示 502/403/504 语义)
+  const text = await res.text();
+  return { status: res.status, headers: Object.fromEntries([...res.headers.entries()]), body: text, plain: true, raw: text };
+}
+
+/**
+ * 建一条 E2EE 数据 WS(§4.6):在手机侧 ws URL 上追加 &e2ee=<sessId>&w=<8B hex(=16 hex 字符)>;
+ * 每条消息为 k:"w" 信封;p2b 方向计数自 0 单调;b2p 收到后按信封 c 校验单调。
+ * 事件:{ onOpen({ws, wsLabel}), onEnvelope({data:Uint8Array, t}), onPlain(raw), onError(e), onClose(ev) }。
+ * @param {string} deviceId
+ * @param {string} wsUrl 手机侧 ws 地址(允许相对;device 或 channel 形态)
+ */
+function e2eeOpenDataWs(deviceId, wsUrl, { onOpen, onEnvelope, onPlain, onClose, onError } = {}) {
+  const ent = e2eeClient.sessions.get(deviceId);
+  if (!ent || !ent.sess) throw new Error("e2ee: 会话未解锁(deviceId=" + deviceId + ")");
+  const sess = ent.sess;
+  const u = new URL(wsUrl, window.location.href);
+  u.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const params = new URLSearchParams(u.search);
+  if (!params.get("w")) params.set("w", wcRandomHex(8)); // 8B 随机 = 16 hex
+  params.set("e2ee", sess.sessId);
+  const sentPath = u.pathname + (params.size ? "?" + params.toString() : "");
+  const label = wcWsLabelOf(sentPath);
+  if (!label) throw new Error("e2ee: 数据 WS 缺少 e2ee/w 标记(内部错误)");
+  const wsLabel = label.wsLabel; // 与桥端一致的流标签(含 w)
+  const ws = new WebSocket(u.origin + sentPath);
+  let p2b = 0;
+  let b2pLast = -1;
+  ws.onopen = () => { if (onOpen) onOpen({ ws, wsLabel }); };
+  ws.onmessage = (ev) => {
+    const raw = String(ev.data);
+    void (async () => {
+      let env = null;
+      try { env = JSON.parse(raw); } catch { /* 非 JSON 明文帧 */ }
+      if (env && typeof env === "object" && env.k === "w") {
+        try {
+          if (!Number.isInteger(env.c) || env.c <= b2pLast) throw wcErr("replay", "e2ee: b2p 计数重放/乱序");
+          const opened = await sess.open({ kind: "w", dir: WC_DIR_B2P, env, counter: env.c ?? 0, wsLabel });
+          b2pLast = env.c;
+          if (onEnvelope) onEnvelope({ data: opened.data, t: opened.t, env });
+        } catch (e) {
+          if (onError) onError(e); else try { ws.close(1008, "⚠ e2ee 消息无法解密"); } catch {}
+        }
+        return;
+      }
+      if (onPlain) onPlain(raw);
+    })();
+  };
+  ws.onerror = (e) => { if (onError) onError(e); };
+  ws.onclose = (ev) => { if (onClose) onClose(ev); };
+  return {
+    ws,
+    send(data, { binary = false } = {}) {
+      return (async () => {
+        const env = await sess.seal({ kind: "w", dir: WC_DIR_P2B, counter: p2b++, data, t: binary ? 1 : 0, wsLabel });
+        ws.send(JSON.stringify(env));
+      })();
+    },
+    close(code, reason) { try { ws.close(code, reason); } catch {} }
+  };
+}
+
+
+$("btn-login").onclick = () => doLogin();
+$("btn-register").onclick = () => doRegister();
+$("btn-logout").onclick = () => logout();
+$("btn-logout-inline").onclick = () => logout();
+$("tab-login").onclick = () => switchAuthTab("login");
+$("tab-register").onclick = () => switchAuthTab("register");
+$("login-captcha-img").onclick = () => loadCaptchaInto("login-captcha-img");
+$("login-sms-captcha-img").onclick = () => loadCaptchaInto("login-sms-captcha-img");
+$("reg-sms-captcha-img").onclick = () => loadCaptchaInto("reg-sms-captcha-img");
+$("btn-send-login-sms").onclick = () => sendSms("login");
+$("btn-send-reg-sms").onclick = () => sendSms("register");
+$("btn-toggle-login-sms").onclick = () => toggleLoginMode();
+$("btn-toggle-login-local").onclick = () => toggleLocalLogin();
+$("btn-local-login").onclick = () => doLocalLogin();
+// 忘记密码(短信重置):登录卡 → 重置小表单(往返 + 发码 + 提交)
+$("btn-forgot-pass").onclick = () => openResetForm();
+$("btn-back-to-login").onclick = () => closeResetForm();
+$("btn-send-reset-sms").onclick = () => sendSms("reset");
+$("reset-captcha-img").onclick = () => loadCaptchaInto("reset-captcha-img");
+$("btn-password-reset").onclick = () => doPasswordReset();
+$("reset-pass").addEventListener("keydown", (e) => { if (e.key === "Enter") $("btn-password-reset").onclick(); });
+$("btn-refresh").onclick = () => { resetDevicePoll(); void refreshDevices(); };
+$("btn-manage-devices").onclick = toggleManageDevices;
+$("login-pass").addEventListener("keydown", (e) => { if (e.key === "Enter") $("btn-login").onclick(); });
+$("reg-pass2").addEventListener("keydown", (e) => { if (e.key === "Enter") $("btn-register").onclick(); });
+// E2EE 解锁层(Phase-3):解锁 / 明文跳过 / Enter 提交;遮罩点击不误关(输入中)
+$("btn-unlock-go").onclick = () => void e2eeDoUnlock();
+$("btn-unlock-skip").onclick = () => e2eeSkipUnlock();
+$("unlock-pass").addEventListener("keydown", (e) => { if (e.key === "Enter" && !$("btn-unlock-go").disabled) void e2eeDoUnlock(); });
+
+// ---------- 启动 ----------
+function tokenExpired(token) {
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) return true;
+    const payload = JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")));
+    return typeof payload.exp === "number" && payload.exp < Math.floor(Date.now() / 1000);
+  } catch { return true; }
+}
+(async function init() {
+  await loadPublicConfig();
+  // /app/promo:本版本不含升级/付费页;保留路径兼容 —— 带查询参数原样回应用根路径,
+  // 因此一次性登录(/app/promo?auth=KEY)与邀请链接(?invite=CODE)照旧可用。
+  if (window.location.pathname.endsWith("/promo")) {
+    window.location.replace("/app/" + (window.location.search || ""));
+    return;
+  }
+  // 显式退出意图(/app/?logout=1,Router 错误页「返回登录」带此参数):
+  // 先同步清理本地令牌、用户数据与 dsh_token/dsh_device Cookie,再渲染登录页,
+  // 避免旧令牌残留导致自动重进;随后清理地址栏参数。
+  if (new URLSearchParams(window.location.search).get("logout") === "1") {
+    logout();
+    history.replaceState(null, "", window.location.pathname);
+    setView("login");
+    switchAuthTab("login");
+    return;
+  }
+  // 一次性扫码登录(/app/?auth=KEY,电脑端生成,30 分钟/一次性):
+  // 有 auth 一律走 exchange(无论当前是否已登录),成败去向由 doAuthExchangeLogin 决定
+  const authKey = (new URLSearchParams(window.location.search).get("auth") || "").trim();
+  if (authKey) {
+    await doAuthExchangeLogin(authKey);
+    return;
+  }
+  // 邀请链接(/app/?invite=CODE):预填邀请码到注册流程,并给出可见提示
+  const inviteParam = new URLSearchParams(window.location.search).get("invite");
+  if (inviteParam) {
+    window.__inviteCode = inviteParam.trim().toUpperCase();
+    history.replaceState(null, "", window.location.pathname);
+    const hint = document.createElement("div");
+    hint.className = "auth-msg ok";
+    hint.style.marginBottom = "10px";
+    hint.style.fontSize = "15px";
+    hint.style.fontWeight = "600";
+    hint.textContent = `🎁 已通过好友邀请注册,邀请码 ${window.__inviteCode} 将自动生效`;
+    const form = $("auth-register-form");
+    if (form) form.insertBefore(hint, form.firstChild);
+  }
+  if (state.token && !tokenExpired(state.token)) {
+    enterMirror(state.token); // 会话恢复 → Router 实时设备列表
+  } else {
+    if (state.token) logout();
+    setView("login"); switchAuthTab("login");
+  }
+})();
+</script>
+</body>
+</html>
