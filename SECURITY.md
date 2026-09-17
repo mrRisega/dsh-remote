@@ -37,11 +37,10 @@ Include, when possible:
 | Self-hosted auth | Access keys (`DSH_LOCAL_ACCESS_KEYS`) exchanged for short-lived local JWTs via `POST /_login`; one key governs one instance |
 | Transport | Account API and tunnel must be served over HTTPS/WSS in production; the router proxies between phone and bridge without content inspection |
 | Path safety | `/remote/<deviceId>/<path>` rejects traversal and non-conforming device ids; forwarded headers are sanitized hop-by-hop |
-| Rate limits | Per-IP login throttling, SMS anti-abuse (captcha after 2 requests in 24h), per-plan token-bucket bandwidth and monthly traffic caps |
+| Rate limits | Per-IP login throttling, SMS anti-abuse (captcha after 2 requests in 24h) |
 
 ## Known Design Notes
 
-- Traffic quotas are process-memory state: a router restart resets monthly counters.
 - `/_login` local JWTs are issued with the `pro_max` plan: in self-hosted mode the
   access key is the instance's root credential — keep it secret (0600), rotate it
   like a password.

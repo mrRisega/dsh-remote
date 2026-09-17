@@ -3,18 +3,6 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
-## [0.6.5] - 2026-09-13
-
-### Fixed
-
-- **面板「一键更新」在市场装法（npm / 插件市场安装）下不再空转**。此前该路径只清理由历史
-  include、不动插件包，命令 exit 0、界面显示"安装完成"，插件却始终停在旧版本（实测：装的是
-  0.6.3，更新后仍是 0.6.3，日志写着"已保持市场管理的源码不变"）。现在会按包管理器**主动把插件包
-  升级到最新**，并如实报告三种结果之一：已升级（x.y.z → x.y.z）/ 已是市场最新版 / 升级失败并给出
-  可手动执行的命令。
-- 插件包升级成功后明确提示需要**重启一次 dsh web** —— 市场装法经 `dsh.profile.bundles` 激活，
-  该文件只在启动时读取（与"首次安装可热挂载"的边界一致，见 0.6.4 说明）。
-
 ## [0.6.6] - 2026-09-16
 
 > **正式版**（发表于 npm `latest`）。预发版 beta.1 ~ beta.4 到此收束，内容与 beta.4 一致。
@@ -137,6 +125,18 @@ All notable changes to dsh-remote are documented here. This project follows
 - **失败归因不再全是 `unknown`**：1659 次失败因为归因覆盖不到真实错误而无法定位。
   现在把真实形态拆开（`npx.cmd` 不可用 / 注册表超时 / 包或安装脚本缺失 / 退出码非零 /
   输出乱码），只上报枚举、原始错误文本仍不出机器；客户端与服务端白名单已同步扩展。
+
+## [0.6.5] - 2026-09-13
+
+### Fixed
+
+- **面板「一键更新」在市场装法（npm / 插件市场安装）下不再空转**。此前该路径只清理由历史
+  include、不动插件包，命令 exit 0、界面显示"安装完成"，插件却始终停在旧版本（实测：装的是
+  0.6.3，更新后仍是 0.6.3，日志写着"已保持市场管理的源码不变"）。现在会按包管理器**主动把插件包
+  升级到最新**，并如实报告三种结果之一：已升级（x.y.z → x.y.z）/ 已是市场最新版 / 升级失败并给出
+  可手动执行的命令。
+- 插件包升级成功后明确提示需要**重启一次 dsh web** —— 市场装法经 `dsh.profile.bundles` 激活，
+  该文件只在启动时读取（与"首次安装可热挂载"的边界一致，见 0.6.4 说明）。
 
 ## [0.6.4] - 2026-09-13
 
@@ -382,8 +382,7 @@ All notable changes to dsh-remote are documented here. This project follows
   成因是 dsh web 每次重启都会更换浏览器会话签名密钥，插件用 `?token=` 换来的 Cookie 立即失效
   —— 而这条提示（"reopen the URL printed by dsh web"）**对手机用户不可执行**（他们打不开电脑上打印的 URL）。
   旧实现只在插件启动后重试 20 次（约 60 秒）就放弃、之后 6 小时才刷新一次；一旦启动那一刻 dsh web
-  的 connection 服务还没就绪，Cookie 就会长时间不可用，用户只能自己重启/重扫（真实用户 #53 [redacted-phone]
-  就是遇到这个）。现在四处叠加，把恢复时间压到秒级、且不需要用户做任何事：
+  的 connection 服务还没就绪，Cookie 就会长时间不可用，用户只能自己重启/重扫（有真实用户就是遇到这个）。现在四处叠加，把恢复时间压到秒级、且不需要用户做任何事：
   1. 插件启动后**持续重试 10 分钟**（不再 60 秒后放弃），并改为**每 30 分钟主动刷新**；
   2. 面板每次查状态（`/dsh-remote/status` 与 `/dsh-remote/bridge-status`，2.5~30 秒一次）都会**按需补齐** Cookie（5 秒限频 + 并发去重，不拖慢接口）；
   3. bridge 撞到该 401 时写 `.harness-cookie-revoked` 标记，插件下一次查状态立刻重换；
@@ -420,7 +419,7 @@ All notable changes to dsh-remote are documented here. This project follows
 
 ### Added
 
-- **首次安装来源与版本采集**（供运营定位"哪个版本在哪类机器上装不上"，不含任何隐私内容）：
+- **首次安装来源与版本采集**（用于定位"哪个版本在哪类机器上装不上"，不含任何隐私内容）：
   面板注册上报 `reg_source=panel_register`、手机端网页注册上报 `remoteweb_register`；
   bridge 设备登记与 `POST /api/install-report` 上报 `install_source`（`npx` / `plugin_market`）、
   `install_version`、`host_os`、`host_arch`；一键安装器在 plist / systemd unit / 子进程三处注入安装来源与版本。

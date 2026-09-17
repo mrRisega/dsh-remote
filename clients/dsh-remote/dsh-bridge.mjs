@@ -992,7 +992,7 @@ async function registerDeviceInAccount(token) {
         device_name: os.hostname() || "dsh-bridge",
         pub_key: pubKey,
         machine_fp: MACHINE_FP, // v6 同机识别:服务端据此自动顶替旧设备(重装不再被设备数卡死)
-        // 安装口径(服务端存到设备行,供运营统计「市场安装/自愈补装」vs「安装器 npx」):
+        // 安装口径(服务端存到设备行,用于区分「市场安装/自愈补装」与「安装器 npx」):
         //   install_source: npx(安装器注入) | plugin_market(插件拉起/自愈,默认) | unknown(白名单外)
         install_source: INSTALL_SOURCE,
         install_version: INSTALL_VERSION,

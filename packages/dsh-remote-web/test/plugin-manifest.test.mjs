@@ -122,7 +122,9 @@ test("失败归因：客户端白名单必须与服务端逐字一致，且事�
   for (const c of codes) assert.ok(out.queued.includes(c), `客户端 failCodes 应含 ${c}`);
 
   // ② 与服务端白名单**集合级**一致（少一个码 = 上报被丢弃、多一个 = 服务端拒收）
-  const serverPath = join(REPO, "..", "dsh-relay-enterprise", "relay-enterprise", "src", "api.js");
+  // 可选:把服务端 api.js 的路径通过环境变量给出,即可做「客户端↔服务端白名单」集合级对拍。
+  // 未设置时跳过(跨仓库对拍属于本地/CI 场景,不应把另一仓库的位置硬编码进本仓库)。
+  const serverPath = process.env.DSH_TELEMETRY_SERVER_API || "";
   if (existsSync(serverPath)) {
     const apiSrc = readFileSync(serverPath, "utf8");
     const block = /const TELEMETRY_FAIL_CODES = new Set\(\[([\s\S]*?)\]\);/.exec(apiSrc);

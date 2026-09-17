@@ -21,8 +21,8 @@
  *
  * 注入开关:
  *   - DSH_E2EE_SHIM=0 关闭注入(默认开启);
- *   - 灰度:bridge 端 e2ee.enabled 为 false 时 dsh-bridge 不调用本模块 → 零注入、零行为
- *     (灰度默认关 = 本 shim 默认不出现,镜像页保持既有明文路径)。
+ *   - 开关:bridge 端 e2ee.enabled 为 false 时 dsh-bridge 不调用本模块 → 零注入、零行为
+ *     (默认关 = 本 shim 默认不出现,镜像页保持既有明文路径)。
  *   - 「桌面宽屏/明文零行为」:未交接时数据面不拦截;桌面直连 dsh web 不经 bridge → 无注入。
  *
  * 测试:本模块的纯函数契约 + e2ee-shim-script.js 抽取的
@@ -108,7 +108,7 @@ export function shimScriptText() {
   return cachedScript;
 }
 
-/** 环境开关:DSH_E2EE_SHIM=0 关闭注入(默认开启;叠加桥端 e2ee.enabled 灰度门)。 */
+/** 环境开关:DSH_E2EE_SHIM=0 关闭注入(默认开启;叠加桥端 e2ee.enabled 开关)。 */
 export function e2eeShimEnabled() {
   return process.env.DSH_E2EE_SHIM !== "0";
 }
@@ -134,7 +134,7 @@ export function injectE2eeShim(html) {
 /**
  * 判断上游响应是否应注入 shim(与 mobile-adapter.shouldInjectHtml 同 gate:
  * 仅官方 dsh web 的 text/html,含 </head>、无替换字符)。e2ee.enabled 由调用方(dsh-bridge)
- * 决定,本函数只做类型/特征门 —— 「灰度关 = 不调用 = 零注入」。
+ * 决定,本函数只做类型/特征门 —— 「开关关 = 不调用 = 零注入」。
  */
 export function shouldInjectE2eeShim({ contentType, html }) {
   const ct = String(contentType || "");

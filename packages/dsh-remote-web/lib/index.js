@@ -383,7 +383,7 @@ function launchTarget() {
  * 【0.6.2 关键修复】`launchctl print` 只要成功，它的 `state` 就是权威，**不得**再回退
  * `launchctl list`。原因：plist 指向不存在的入口脚本时，KeepAlive 会让作业陷入
  * 「秒退→立刻重拉」的崩溃循环，而在重拉的瞬间 `launchctl list` 的 PID 列会闪现一个
- * **已经死掉**的 pid（本机实测 `launchctl list` = `40213 1 com.dshremote.bridge`，
+ * **已经死掉**的 pid（实测 `launchctl list` = `40213 1 com.dshremote.bridge`，
  * 同时 `ps -p 40213` 为空、`launchctl print` = `state = spawn scheduled`）。
  * 旧实现据此谎报 running=true，后果有二：
  *   1) 面板显示「运行中」，用户以为 bridge 在跑（实际从未注册成功）；
@@ -1176,7 +1176,7 @@ async function bridgeSecretOf(relayDir, cfgOverride, opts) {
   return secret;
 }
 
-// ---------- v2 账号/配额/邀请代理（我的信息 与 免费额度提示） ----------
+// ---------- 账号 / 用量 / 邀请代理（我的信息、额度提示、邀请记录） ----------
 
 /** token 获取失败的原因（供 UI 区分“未登录”与“中继未就绪”，不再一律谎报“尚未登录”）。 */
 const AUTH_NO_CREDENTIALS = "no_credentials";       // 本机没存账号/自建密钥 → 该去登录
@@ -1392,7 +1392,7 @@ async function relayInviteRecords(relayDir) {
   return { records: r.body.records || [], rewards: r.body.rewards || [] };
 }
 
-// ---------- 交流群二维码（运营配置，公开读取） ----------
+// ---------- 交流群二维码（后台配置，公开读取） ----------
 
 /**
  * 交流群二维码/客服微信：企业端配置经公开配置 /api/public-config 的 community 字段下发
@@ -1709,7 +1709,7 @@ async function composeStatus(relayDir) {
   };
 }
 
-// ---------- 用户反馈代理（反馈 API 由 relay-enterprise 提供，同源 /relay-api/） ----------
+// ---------- 用户反馈代理（反馈 API 与账号服务同源，走 /relay-api/） ----------
 
 /**
  * 反馈 API 基址：feedback_url（自建/兼容实现）> 账号 API 基址（默认生产 relay-api）。
@@ -1736,7 +1736,7 @@ async function readBodyBuffer(req, limit = 64 * 1024) {
 }
 
 /**
- * 把 /dsh-remote/feedback/* 代理到反馈 API（relay-enterprise 同源 /relay-api/）：
+ * 把 /dsh-remote/feedback/* 代理到反馈 API（同源 /relay-api/）：
  *   - 自动附加本机稳定身份 X-Dsh-Device（device_id）与 X-Dsh-Phone（已登录手机号）
  *   - 透传浏览器带的 Authorization（thread_token，存于浏览器 localStorage）
  *   - 不转发 cookie/浏览器标记；反馈服务不可达时降级 502 JSON
@@ -2050,7 +2050,7 @@ function uninstallSelf(relayDir, profileDir, patchFile, pkgFile) {
 // ---------- 登录后自动闭环：连接阶段（运行环境 → bridge 进程 → 设备已在中继注册=online） ----------
 
 /**
- * 生产现场（2026-09，id 42~52 共 11 个真实注册用户）：7 人注册后手机端 /api/devices 一直是空列表，
+ * 现场观察：新用户注册后手机端 /api/devices 常是空列表，
  * 多人反复点「生成访问链接」（auth.key_create 10~23 次）而 device.bind 始终为 0——他们的电脑端
  * bridge 从未连上过中继。典型路径：注册 → 手机端拿不到设备 → 反复轮询 → 放弃。
  *
@@ -2495,7 +2495,11 @@ function telemetryBackoffMs(attempt) {
   const base = TELEMETRY_BACKOFF_MS[Math.min(Math.max(attempt, 0), TELEMETRY_BACKOFF_MS.length - 1)];
   const v = Number(process.env.DSH_REMOTE_TELEMETRY_MS);
   const scale = Number.isFinite(v) && v > 0 ? Math.max(10, v) / TELEMETRY_FLUSH_MS : 1;
-  return Math.max(10, Math.round(base * scale));
+  // 缩放下限 200ms：把整条重试链压到亚秒级时(仅测试/诊断设置该变量),
+  // 若下限低到 10ms,退避窗口会比一次 await 还短,让“窗口内不重试”这类断言变成
+  // 靠调度运气。200ms 既能让 6 次退避在数秒内跑完,又足以稳定观测。
+  // 生产不设该变量(scale=1),base 最小 30s,不受此下限影响。
+  return Math.max(200, Math.round(base * scale));
 }
 
 /** 每个 relayDir 的遥测簿：内存队列 + 心跳句柄 + 退避/去重状态（进程重启即重置）。 */

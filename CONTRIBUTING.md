@@ -64,14 +64,14 @@ non-negotiables, because each of them has already broken something in production
        │
   你的 nginx (HTTPS)
      ├─ /app/            → 静态 PWA (clients/dsh-web/native.html)
-     ├─ /_devices /_quota /_login /remote/ /_bridge → relay-router
+     ├─ /_devices /_login /remote/ /_bridge → relay-router
      └─ /_bridge         → relay-router (WebSocket)
                             └→ bridge (clients/dsh-remote) → 127.0.0.1:3080 (dsh web)
 ```
 
 - `packages/relay-router/` — server-side router: bridge registry, real-time device
-  list, transparent HTTP/WS proxy, per-plan bandwidth/traffic quotas, optional
-  local access-key auth (`/_login`) for self-hosting.
+  list, transparent HTTP/WS proxy, optional local access-key auth (`/_login`)
+  for self-hosting.
 - `clients/dsh-remote/` — the desktop bridge daemon (tunnel mode only).
 - `clients/dsh-web/` — the phone PWA (login / device selection).
 - `packages/dsh-remote-web/` — the dsh web plugin (settings-page panel + bridge

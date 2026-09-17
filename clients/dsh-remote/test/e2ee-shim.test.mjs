@@ -328,11 +328,11 @@ test("fetch 包装:明文响应(无信封标记)→ 原样透传;篡改响应 �
   const peer = bridgePeer(seS.sessId, seS.shk, seS.saltH);
   const ORIGIN = "http://relay.local";
 
-  // 1) 明文响应(如 router 402/502 错误页)
-  const plainTransport = async () => new Response('{"error":"quota"}', { status: 402, headers: { "content-type": "application/json" } });
+  // 1) 明文响应(如 router 的错误页/JSON 错误体)
+  const plainTransport = async () => new Response('{"error":"upstream_error"}', { status: 502, headers: { "content-type": "application/json" } });
   const r1 = await shim.seFetchWrapper(plainTransport, { sess: seS, origin: ORIGIN }, ORIGIN + "/api/x", { method: "GET" });
-  assert.equal(r1.status, 402);
-  assert.equal(await r1.text(), '{"error":"quota"}');
+  assert.equal(r1.status, 502);
+  assert.equal(await r1.text(), '{"error":"upstream_error"}');
 
   // 2) 篡改密文 → 502 + x-dsh-e2ee-error + ⚠(绝不静默/绝不误转发)
   const tamperTransport = async (_input, init) => {

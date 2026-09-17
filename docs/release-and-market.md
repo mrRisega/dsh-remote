@@ -1,18 +1,21 @@
 # 发版与插件市场发布规范
 
-> 本文是**发版 + 上架/更新 DSH 插件市场**的强制规范。改动版本号、发布 npm、维护市场条目之前，
-> 先读完本文对应小节。配套的自动化脚本与工作流在本仓库内，配套的运行手册见本机 skill
-> `dsh-plugin-market-publish`（含各市场收录方式、催办话术、每日核对）。
+> 本文是**发版 + 上架/更新 DSH 插件市场**的规范。改动版本号、发布 npm、维护市场条目之前，
+> 先读完本文对应小节。配套的自动化脚本与工作流都在本仓库内。
 
 ## 1. 版本号三处同步
 
-一次版本升级必须同时改三处，缺一即为不一致：
+一次版本升级必须同时改**四处**，缺一即为不一致：
 
 | 位置 | 说明 |
 |---|---|
 | `package.json` → `version` | 根 CLI 包（`@mrrisega/dsh-remote`），一个命令安装器 |
 | `packages/dsh-remote-web/package.json` → `version` | dsh web 插件包（市场条目指向它） |
 | `packages/dsh-remote-web/lib/index.js` → `PLUGIN_VERSION` | 面板内「版本与更新」用它做自检/更新比较 |
+| `package-lock.json` → `version` 与 `packages[""].version` | 锁文件记录根包版本；漏改会与 `package.json` 脱节 |
+
+> 锁文件那一处最容易漏（0.6.6 发版时就漏了，锁文件停在 `0.6.6-beta.1`，直到 2026-09-17 才发现）。
+> 一条命令即可对齐：`npm install --package-lock-only`。
 
 旧名别名包 `dsh-remote-ui` **已退役**（仓库内已删除、npm 已 deprecate，见 §4）。
 
@@ -64,7 +67,7 @@ bash scripts/release-tarballs.sh        # 或 npm run release:tarballs
 - **改数据必须重生成 README**：任何 `data/plugins/*.yml` 的增删改（含删除条目）后跑
   `node scripts/generate-readme.mjs` 并提交结果，否则 CI 报 "READMEs match data/plugins"。
 - **提交前自查（避免"红盘进审核"）**：PR 的 files 列表只含预期文件（历史上曾因重建分支残留一个
-  「指向仓库根」的多余条目文件，导致 Submission gate 必红）；自己可控的检查全绿后再催办。
+  「指向仓库根」的多余条目文件，导致 Submission gate 必红）；确认自己可控的检查全绿后再提交。
 - **monorepo 必须声明 tarball**：某些市场按仓库推导 `github:owner/repo` 安装，会装到根包（无 `dsh.bundle`）
   而无法激活；声明 `tarball:` 后市场优先使用预构建包。
 - **分支卫生**：不要删除 PR 的 head 分支（GitHub 会自动关闭该 PR，且 reopen 常失败）；fork 与上游分叉后

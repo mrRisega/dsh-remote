@@ -1,7 +1,7 @@
 // 匿名装机/连接遥测（客户端半）回归 —— 契约 + 隐私边界（2026-09）。
 //
-// 现场（2026-09 生产数据）：11 个新注册用户里只有 3 人把设备连上——6 人电脑端从未安装、2 人装了但
-// bridge 没连上；而「装不上」的人没有任何账号、也就没有任何数据，「本地 OK、新机器失败」无法归因。
+// 现场：新注册用户里只有少数把设备连上，多数卡在电脑端安装这一步；而「装不上」的人
+// 往往没有账号、也就没有任何数据，「本地 OK、新机器失败」无法归因。
 // 本用例锁死这条补上的通道：
 //   ① 触发点正确：plugin_loaded / install_started / install_failed(fail_code) / runtime_ready /
 //      bridge_started / bridge_registered / tunnel_disconnected / first_remote_ok(只一次) / panel_opened；

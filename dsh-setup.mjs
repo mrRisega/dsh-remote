@@ -135,6 +135,48 @@ function ensureRuntimeCopy() {
   fs.writeFileSync(verFile, ver);
   console.log(`✅ 运行时: ${CONFIG_DIR}`);
 }
+/** 打印用法（唯一实现：提前退出与末尾分派共用，避免两处漂移）。 */
+function printHelp() {
+  console.log(`dsh-remote — 手机远程控制 dsh web（隧道模式）
+
+用法:
+  dsh-remote              一键安装（默认命令，无需任何参数；含插件与自启动）
+  dsh-remote settings     显示登录/连接配置指引（独立设置页已移除）
+  dsh-remote run          前台运行 bridge（调试）
+  dsh-remote status       查看配置与服务状态
+  dsh-remote plugin       手动安装 dsh web 远程控制插件（--uninstall 卸载）
+  dsh-remote --help       显示本用法（等同 dsh-remote help）
+
+自建模式（可选）:
+  dsh-remote setup --server wss://你的域名:端口 --key 访问密钥
+
+登录/连接配置: 打开 dsh web → 设置 → 「远程控制」→ 注册或登录手机号即可
+（自建用户切「自建服务」标签或直接用上方 setup 命令，无需另开页面）。
+文档: ${REPO_URL}
+`);
+}
+
+// 认识的参数（只给 flag 也要能装上去，所以不认识时才拦）。
+const KNOWN_FLAGS = new Set([
+  "--api", "--server", "--key", "--profile",
+  "--no-autostart", "--no-plugin", "--no-restart", "--uninstall"
+]);
+
+// ⚠️ 这一整块必须挡在 ensureRuntimeCopy() **之前**：它会往 ~/.dsh-remote 同步运行时脚本。
+// 看用法、或参数拼错，都不该改动用户磁盘 —— 此前 `dsh-remote --help` 会一路走到 setup，
+// 什么都不问就开始安装。
+{
+  const first = process.argv[2];
+  if (first === "-h" || first === "--help" || first === "help") {
+    printHelp();
+    process.exit(0);
+  }
+  if (first && first.startsWith("-") && !KNOWN_FLAGS.has(first)) {
+    console.error(`❌ 未知参数: ${first}`);
+    console.error("   直接安装就用 dsh-remote（不带参数）；查看用法用 dsh-remote --help。");
+    process.exit(1);
+  }
+}
 try { ensureRuntimeCopy(); } catch (e) { console.warn(`⚠️ 运行时固化跳过: ${e.message}`); }
 
 /** 自启动服务应指向的 dsh-setup.mjs：优先配置目录内的固化副本，否则当前执行文件。 */
@@ -188,7 +230,7 @@ const NODE_BIN = preferredNode();
  */
 const SERVICE_PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
-// ---------- 安装口径（随 bridge 环境变量注入；服务端存到设备行，供运营统计） ----------
+// ---------- 安装口径（随 bridge 环境变量注入；服务端存到设备行，用于区分安装来源） ----------
 /**
  * install_source：本文件即「一键安装器」→ 默认 npx（用户自己跑 `npx @mrrisega/dsh-remote` 的那条路径）。
  * 插件市场那条路径由插件半自愈补装：插件 spawn 本安装器时显式传入
@@ -1415,7 +1457,12 @@ async function pluginCmd(argv) {
 }
 
 // ---------- main ----------
-// 无命令名（或首个参数以 - 开头）时默认执行 setup
+// 无命令名（或首个参数以 - 开头）时默认执行 setup —— 这样 `dsh-remote --no-autostart`
+// 这类「只给 flag」的用法才能装上去。
+//
+// 但有两个例外必须挡在前面：
+//   ① -h/--help：用户想先看用法,绝不该顺手把东西装上(此前会走 setup,直接安装);
+//   ② 不认识的 flag：拼错参数时静默安装比报错更糟,宁可停下来说清楚。
 const raw = process.argv[2];
 const cmd = raw && !raw.startsWith("-") ? raw : "setup";
 const args = raw && !raw.startsWith("-") ? process.argv.slice(3) : process.argv.slice(2);
@@ -1431,21 +1478,6 @@ else if (cmd === "status") {
   console.log("API:", cfg.api_url || (local ? "（自建模式无需账号 API）" : DEFAULT_API));
   console.log("远程地址/登录: 打开 dsh web → 设置 → 「远程控制」查看与操作");
 } else {
-  console.log(`dsh-remote — 手机远程控制 dsh web（隧道模式）
-
-用法:
-  dsh-remote              一键安装（默认命令，无需任何参数；含插件与自启动）
-  dsh-remote settings     显示登录/连接配置指引（独立设置页已移除）
-  dsh-remote run          前台运行 bridge（调试）
-  dsh-remote status       查看配置与服务状态
-  dsh-remote plugin       手动安装 dsh web 远程控制插件（--uninstall 卸载）
-
-自建模式（可选）:
-  dsh-remote setup --server wss://你的域名:端口 --key 访问密钥
-
-登录/连接配置: 打开 dsh web → 设置 → 「远程控制」→ 注册或登录手机号即可
-（自建用户切「自建服务」标签或直接用上方 setup 命令，无需另开页面）。
-文档: ${REPO_URL}
-`);
-  process.exit(cmd === "help" ? 0 : 1);
+  printHelp();
+  process.exit(1);
 }

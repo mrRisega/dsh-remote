@@ -19,7 +19,7 @@
   2. **客户端 MK 派生采用 PBKDF2-SHA256(600k)**（§3.3），而非 scrypt：两端（Node bridge 与手机浏览器 WebCrypto）必须能算出**相同** MK，WebCrypto 无原生 scrypt；scrypt 保留给服务端 verifier（服务器 CPU 可负担）。profile 随参数下发改版，见 §3.3 说明。
   3. **E2EE 会话 = “隧道页 × 设备”的显式握手会话**（§5.1）：解锁（输密码）发生在被控 dsh web 的隧道页内；密钥**只存内存**，刷新/重启需重新解锁；与登录 cookie 的 30 天/2 小时存续完全解耦。
   4. **线缆形态 v2 = “信封即信号”**（§4.3）：请求带 `application/vnd.dsh.e2ee-v2` + `x-dsh-e2ee` 头即说明此请求已加密；没有该标记的请求走现有 v1 明文路径。router **几乎零协议改动**（透明转发 + 通道标记 + caps 透传），旧 bridge/旧手机天然明文回退。
-  5. **路由元数据保持可见并如实告知**（§2.3）：路径前缀/方法/字节大小/时间/会话 id 为路由与配额所需；正文、头部明细、WS 消息内容不可见。
+  5. **路由元数据保持可见并如实告知**（§2.3）：路径前缀/方法/字节大小/时间/会话 id 为路由所需；正文、头部明细、WS 消息内容不可见。
 - 范围边界（诚实声明）：静态资源/HTML 外壳与首屏 bootstrap 明文（代码本身无用户内容且需先行加载加密 shim）；SSE/流式端点 v1 不加密（§4.5 策略表）；自建模式（无账号）v1 不启用 E2EE（§6.5）。
 
 ---
@@ -47,7 +47,7 @@
  └─ /remote/<deviceId>/<path>（或 channel 形态 /remote/{api|sidebar|git|pet}/… + x-dsh-remote-device 头）
         │  HTTP 或 WS upgrade（nginx 终止 TLS）
    nginx(13443)
-        ├─ /relay-api/* → enterprise；/_devices|_quota|_login → router
+        ├─ /relay-api/* → 账号服务；/_devices|/_login → router
         └─ /remote/* /_bridge → router(13444)
              │  bridge WS 隧道，JSON 帧（http / ws-open / ws-msg / ws-close，超大帧 __chunk 信封）
         bridge（Mac）→ fetch / ws → 127.0.0.1:3080 (dsh web)
@@ -61,7 +61,7 @@
 
 1. **保密性**：router/enterprise/网络侧窥探者在**不知密码**的情况下，读不到经隧道传输的用户内容（消息、工具执行、审批/凭据等 `/api`、`/sidebar`、`/git`、`/pet` 正文与 WS 消息）。
 2. **端到端完整性**：中继篡改正文会被 AEAD 打开失败检出（§8 诚实说明“活跃攻击可做删除/阻断/降级”的边界）。
-3. **兼容与灰度**：无 E2EE 能力/未解锁/协商失败的旧链路**完整可用**（明文回退 + 状态明示），不破坏现有配额、限速、错误页、扫码/授权、多设备逻辑。
+3. **兼容与灰度**：无 E2EE 能力/未解锁/协商失败的旧链路**完整可用**（明文回退 + 状态明示），不破坏现有错误页、扫码/授权、多设备逻辑。
 4. **最小服务端改动**：router 只做“透传 + 能力通告”，enterprise 负责盐/verifier/参数/吊销。
 5. 不给用户新增“额外口令”：解锁输入的就是登录密码。
 
@@ -99,9 +99,9 @@
 | 中继（router/nginx/enterprise 转发层）可见 | 中继不可见 |
 |---|---|
 | 账号/JWT 关系、设备列表与在线状态（既有） | 所有被包裹正文（请求体/响应体、WS 消息载荷） |
-| 目标路径前缀与方法（路由/配额需要）：如 `/api/session/…`、`/remote/<dev>/…` | 被包裹的头部明细（`x-…`、原始 content-type 等放信封密文内） |
+| 目标路径前缀与方法（路由需要）：如 `/api/session/…`、`/remote/<dev>/…` | 被包裹的头部明细（`x-…`、原始 content-type 等放信封密文内） |
 | 字节大小、时间/频次、是否启用 E2EE（`x-dsh-e2ee` 标记）、会话/流 id | 消息内容语义、用户输入、凭据、文件内容 |
-| 配额用量（密文长度与明文基本一致，见 §4.7） | 解密后的任何内容 |
+| 密文长度（与明文基本一致，见 §4.7） | 解密后的任何内容 |
 
 **信任文案（用户可见，中文）**——三处：
 
@@ -220,7 +220,7 @@ SHK ──HKDF(info="…/http|" + reqNonce + "|p2b"|"b2p")──▶ 每个 HTTP 
 ### 4.3 HTTP 信封（请求/响应正文加密）
 
 **手机 → router → bridge（请求）**：shim 把符合条件的请求改写为——外 HTTP 头 `content-type: application/vnd.dsh.e2ee-v2`、
-`x-dsh-e2ee: v=2;s=<sessId>;k=http`（路径/方法/查询**不变**，router 照常路由/配额/剥离 cookie）；原请求的方法、路径、剥离 hop-by-hop 后的头部、正文放入**信封明文**：
+`x-dsh-e2ee: v=2;s=<sessId>;k=http`（路径/方法/查询**不变**，router 照常路由/剥离 cookie）；原请求的方法、路径、剥离 hop-by-hop 后的头部、正文放入**信封明文**：
 
 ```
 plaintext(http 请求) = { "m":"POST", "p":"/api/session/x/messages", "h":{...原头部, 去 cookie/host/content-length/encoding...},
@@ -238,7 +238,7 @@ plaintext(http 响应) = { "st":200, "h":{...原响应头, 去 content-length/co
 ```
 
 手机 shim 解密后重建真实 status/headers/body 交给被 patch 的 fetch/XHR。
-**router 层的真实错误不隐藏**：401/403/402/502/504 等由 router 直接产出（无信封标记），shim 透传并保留配额/升级引导语义不变。
+**router 层的真实错误不隐藏**：401/403/502/504 等由 router 直接产出（无信封标记），shim 透传并保留原有语义不变。
 
 **AAD 绑定**：AAD 含路径与查询串摘要，防止“同一密文被改贴到另一路径”的转发层花招（路径篡改本就会破坏路由，此为纵深）。
 
@@ -272,9 +272,9 @@ plaintext(http 响应) = { "st":200, "h":{...原响应头, 去 content-length/co
 
 **帧/信封分块**：信封 JSON 超过既有 `CHUNK_SIZE`(200KB) 时，沿用 `__chunk` 信封重装——两端现有代码不变。
 
-### 4.7 对配额/限速的影响
+### 4.7 对隧道传输的影响
 
-- router 按月流量/令牌桶计量的对象是**帧体字节**（现状）。密文长度 ≈ 明文 + 28B（tag/nonce 摊销）→ 用量口径基本不变，仅需在文档注明“计量含 AEAD 开销”。
+- 密文长度 ≈ 明文 + 28B（tag/nonce 摊销）；按字节统计的观测口径基本不变，只需注明“含 AEAD 开销”。
 - bridge 现有响应 gzip（隧道省带宽）迁移到“压缩先于加密”，中继仍只见不可压缩密文——带宽收益在 phone↔bridge 的**解密后**由 shim 解压还原，逻辑等价。
 - `content-encoding` 等实体头进入信封密文，**外层不再携带**（shim 解密后重建），router/nginx 不会对密文误判 gzip。
 
@@ -364,7 +364,7 @@ plaintext(http 响应) = { "st":200, "h":{...原响应头, 去 content-length/co
 | `index.mjs` 注册通道 | `tunnel-register` 帧新增可选 `caps`（bridge 上报 `["e2ee-v2"]`），router 原样记录 |
 | `GET /_devices` | 条目附加 `caps`（手机据此判断“可加密”）——**纯透传，不校验不解释** |
 | `resolveRoute` 的 `CHANNEL_MARKERS` | 加入 `"_e2ee"`（控制通道 channel 形态 `/remote/_e2ee/ctrl` + 设备头） |
-| 转发逻辑 | **无正文改动**：http/ws-* 帧、`__chunk`、配额、402/502 错误页全部照旧；信封密文就是普通帧体 |
+| 转发逻辑 | **无正文改动**：http/ws-* 帧、`__chunk`、502 错误页全部照旧；信封密文就是普通帧体 |
 | 头处理 | 外层 `x-dsh-e2ee`、`content-type: application/vnd.dsh.e2ee-v2` 属透传头：确认不被 `STRIP_*` 剥除、不误判 gzip |
 | 文档/注释 | 顶部帧协议注释标注 v2 信封为“body/data 载荷形态”，透明转发语义不变 |
 
@@ -442,13 +442,13 @@ plaintext(http 响应) = { "st":200, "h":{...原响应头, 去 content-length/co
 
 ## 8. 风险与限制清单
 
-1. **元数据可见（如实告知）**：路径/方法/大小/时间/是否加密对中继可见（路由配额所需），存在流量分析面（§2.3）。v1 不加密静态壳与 SSE（§4.5）。
+1. **元数据可见（如实告知）**：路径/方法/大小/时间/是否加密对中继可见（路由所需），存在流量分析面（§2.3）。v1 不加密静态壳与 SSE（§4.5）。
 2. **引导代码明文**：加密 shim 随被控 dsh web 的 HTML 壳下发；**主动作恶的中继**可改写该页移除 shim（降级攻击）。检出手段：AEAD 打开失败/徽标缺失提示用户；根治需“代码先于中继可信交付”（原生 App/内容签名），vNext。
 3. **密码强度直接决定安全性**：密钥=密码，弱密码可被离线猜测（猜测成本=§3.3 KDF 成本；服务端另有 scrypt verifier）。注册策略保留 ≥8 位，面板/登录页提示高强度密码；不承诺对弱密码的绝对保护。
 4. **离线猜测面**：任何捕获密文/探针都可做密码离线验证（代价=客户端 KDF 一次）。v1 采用 PBKDF2-600k（浏览器可算），与 verifier（scrypt）为两套成本面；升级路径=内存困难 profile / PAKE / OPAQUE（§8.5）。
 5. **本地存储安全**：会话密钥仅内存（页面/进程）；密码明文仅存 bridge 本机 0600 配置（现状）——本机被攻破=内容可解密（§3.5）；页面 XSS 可读内存密钥（与 dsh web 同风险面）。`[DECISION-2026-09-2]` 手机端“记住本机”会把**派生 MK** 写 localStorage（等同“记住密码”，XSS 可读 → 该账号全部内容可解密），用户已按产品决策知情接受；退出登录清除、无痕浏览可避免；日志仍绝不记录 MK/密码。若后期切换到 WebAuthn 封存（§8.5）可将 MK 落盘暴露降到最低。
-6. **登录服务器天然可见密码**（一次）：enterprise 必须在登录/改密时收到密码做 verifier 校验——这是既有登录协议，E2EE 只防“内容”不防“登录”本身；运营方可假冒任意会话（§2.1）。如需服务端不可见密码的登录，需引入 PAKE/OPAQUE（服务端只存 verifier 参与协议），列 vNext。
-7. **配额/计量口径**：密文长度=明文+AEAD 开销，用量计量含开销（影响可忽略），gzip 迁移到加密前（§4.7）。
+6. **登录服务器天然可见密码**（一次）：enterprise 必须在登录/改密时收到密码做 verifier 校验——这是既有登录协议，E2EE 只防“内容”不防“登录”本身；服务端可假冒任意会话（§2.1）。如需服务端不可见密码的登录，需引入 PAKE/OPAQUE（服务端只存 verifier 参与协议），列 vNext。
+7. **字节口径**：密文长度 = 明文 + AEAD 开销（影响可忽略），gzip 迁移到加密前（§4.7）。
 8. **监管/合规一句话**：端到端加密与“服务端不存内容”意味着**依法协助调查无法提供用户内容**（与主流 E2EE 产品一致），请在服务条款/隐私政策明示；本设计不提供任何后门/主密钥托管，用户内容恢复责任在用户侧。
 9. **会话吊销的残余窗口**：改密 revoke 到手机下次校验之间 ≤1 次 JWT 生命周期；bridge 长连在 `bad_key`/401 前可能短暂存续（其内存 MK 随旧盐无法解密新流量，不扩大泄露）。
 
@@ -502,13 +502,13 @@ WS 消息帧（现状帧结构不变，载荷=信封或原文）：`{ "id":"…"
 
 ### 9.3 实现里程碑（供排期，非本文改动）
 
-1. enterprise：盐列/参数端点/改密轮换+revoke（§6.1）→ 2. bridge：MK+握手+信封收发+HTML 注入（§6.3）→ 3. router：caps/_e2ee 标记（§6.2）→ 4. 手机 shim+PWA 文案（§6.4）→ 5. 灰度与回归（旧 bridge/旧手机/自建/配额/错误页）。
+1. enterprise：盐列/参数端点/改密轮换+revoke（§6.1）→ 2. bridge：MK+握手+信封收发+HTML 注入（§6.3）→ 3. router：caps/_e2ee 标记（§6.2）→ 4. 手机 shim+PWA 文案（§6.4）→ 5. 分阶段放量与回归（旧 bridge/旧手机/自建/错误页）。
 
 ### 9.4 本文不影响（不改动）的现有接口清单
 
-- router：`/_login`、`/_devices`、`/_quota`、`/remote/`、`/_bridge` 帧协议、`__chunk`、配额桶（除 §6.2 增量）；错误页 401/403/402/502/504 语义不变。
+- router：`/_login`、`/_devices`、`/remote/`、`/_bridge` 帧协议、`__chunk`（除 §6.2 增量）；错误页 401/403/502/504 语义不变。
 - bridge：注册/心跳/重连、`handleLegacyFrame`、gzip/移动适配管线、device 登记、`.dsh-config.json` 0600。
-- PWA：登录/注册/短信/扫码 auth-key、`/_devices` 选设备、退出清理、promo 页。
+- PWA：登录/注册/短信/扫码 auth-key、`/_devices` 选设备、退出清理。
 - 插件：`/dsh-remote/*` 代理、access-key/mobile-sessions revoke、自管理/更新/卸载。
 - enterprise（除 §6.1 新增列与端点）：login/register/devices/auth-key/mobile-sessions/jwt_blacklist 语义与响应字段保持兼容（新增字段须向后兼容）。
 

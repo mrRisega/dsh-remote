@@ -359,7 +359,7 @@ window.__ModuleLoader__.load({
       return api(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(data || {}) });
     };
 
-    // ── 交流群（运营二维码;管理后台统一上传,node 半经公开配置下发） ─────────
+    // ── 交流群（二维码由图层面板上传统一配置,node 半经公开配置下发） ─────────
     // 设置面板「加入交流群」按钮与用户反馈页都展示同一张码;未配置(qrcode 为空)→ 不展示任何入口。
     var COMMUNITY_TTL_MS = 5 * 60 * 1000; // 面板/反馈卡共用缓存:5 分钟内不重复请求
     var communityCache = { at: 0, data: null };
@@ -1970,7 +1970,20 @@ window.__ModuleLoader__.load({
         var endsAt = a && (a.plan_ends_at || a.trial_expires_at) ? Number(a.plan_ends_at || a.trial_expires_at) : 0;
         var quotaPct = quota && quota.limit_enabled ? quota.percent : null;
         var planText;
-        if (!isMember) planText = "免费额度: 带宽 ≈1Mbps" + (quotaPct !== null ? " · 本月流量已用 " + quotaPct + "%" : " · 本月流量限额 1GB");
+        // 免费档文案只依据**服务端实际下发的额度数据**，不猜具体数值：
+        //   · 中继压根不限制（自建）→ 只说“免费用户”，不显示任何限制
+        //   · 中继报告不限量         → 如实说明
+        //   · 中继报告限量           → 显示用量；带宽值服务端有下发才写
+        if (!isMember) {
+          if (quota && quota.limit_enabled) {
+            var speedText = quota.max_mbps ? "带宽 ≈" + quota.max_mbps + "Mbps" : "已限速";
+            planText = "免费额度: " + speedText + (quotaPct !== null ? " · 本月流量已用 " + quotaPct + "%" : "");
+          } else if (quota) {
+            planText = "免费用户 · 当前不限速、不限流量";
+          } else {
+            planText = "免费用户";
+          }
+        }
         else if (source === "trial") planText = "试用 PRO 会员 · 到期 " + fmtDate(a.trial_expires_at);
         else if (endsAt) planText = plan === "pro_max" ? "Pro Max 会员 · 到期 " + fmtDate(endsAt) : "PRO 会员 · 到期 " + fmtDate(endsAt);
         else planText = plan === "pro_max" ? "Pro Max 长期会员" : "PRO 长期会员";
@@ -2431,7 +2444,7 @@ window.__ModuleLoader__.load({
           card("📖 关于 dsh-remote", [
             h("div", { className: "dru-hint", style: { marginBottom: 6 } }, "📱 远程访问：用手机或另一台电脑的浏览器，随时随地使用同一份 dsh web——人在哪都能用（免公网 IP、免内网穿透）；官方托管中继，4G/5G 即用，也可自建服务。"),
             h("div", { className: "dru-hint", style: { marginBottom: 6 } }, "🛠 电脑端一键安装：bridge 与「远程访问」面板一次到位——云端/自建切换、账号登录、bridge 启停、一次性扫码访问、已授权设备管理、意见反馈都在这里。"),
-            h("div", { className: "dru-hint", style: { marginBottom: 6 } }, "🔒 安全与通道：HTTP / WebSocket 全量透传，一次性访问密钥认证，面板实时显示设备与已授权设备列表；服务端可配置流量配额。"),
+            h("div", { className: "dru-hint", style: { marginBottom: 6 } }, "🔒 安全与通道：HTTP / WebSocket 全量透传，一次性访问密钥认证，面板实时显示设备与已授权设备列表。"),
             h("div", { className: "dru-hint" }, "🛡 端到端加密：手机↔电脑之间的消息内容用「你的账号密码派生密钥」端到端加密——密钥与密码不落服务端（仅存校验值），中继只可见路径/大小/时间（详见 README「安全与隐私」）。"),
             // 匿名装机统计（隐私披露）：开源项目必须把「采什么 / 不采什么 / 怎么关」写在用户看得到的地方。
             // 只保留结论式的说明句:不再单列「隐私说明: README… · docs/telemetry.md」那一行文档链接
@@ -2603,6 +2616,10 @@ window.__ModuleLoader__.load({
       dotWatch();
       // 侧栏「远程访问」快捷入口（2026-09 恢复注入：与官方「设置」按钮共存不遮挡）
       navEnsureStart();
+
+      // 满意度弹窗已停用（不再调度）；组件与调度代码保留，便于日后恢复。
+      var FB_POPUP_RETIRED = true;
+      if (FB_POPUP_RETIRED) return; // 改回 false 即恢复原行为
 
       // 满意度弹窗调度：首次观察到 bridge 运行（即“安装完成并体验”）后约 10 分钟弹出；
       // 每 60 秒复查一次，避免 dsh web 启动晚于到点时间。
