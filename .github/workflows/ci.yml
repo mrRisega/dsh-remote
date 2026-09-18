@@ -30,6 +30,39 @@ jobs:
       - name: Run tests
         run: npm test
 
+  # Windows 专项：0.6.7-beta.1 的插件挂载缺陷（symlinkSync(...,'dir') 在非特权进程下
+  # 既不抛错也产不出可用链接 → dsh web 起不来）**只能在 Windows 上暴露**，
+  # 而我们之前的 CI 全是 ubuntu —— 这就是它出厂的原因。
+  # windows-latest 默认是非提权、开发者模式关闭，正是普通用户的状态。
+  # 说明：这里只跑平台敏感的用例（shell: bash 是为了让带 `VAR=x cmd` 的 npm 脚本可用）；
+  # 全量 test:plugin 尚未在 Windows 上验过，等这组稳定后再逐步纳入。
+  windows:
+    name: Windows 专项（非提权链接/平台分支）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: 环境事实（定位环境差异用）
+        shell: pwsh
+        run: |
+          node -e "const os=require('os'),fs=require('fs'),p=require('path'),t=os.tmpdir();console.log('platform',process.platform,process.arch,'node',process.version);console.log('管理员',process.env.__CI_ADMIN||'未知');let ok=null;try{fs.symlinkSync(t,p.join(t,'__probe_link'),'dir');ok='成功'}catch(e){ok='失败 '+e.code}finally{try{fs.rmSync(p.join(t,'__probe_link'),{force:true})}catch{}}console.log('symlinkSync(dir) 非提权:',ok);let j=null;try{fs.symlinkSync(t,p.join(t,'__probe_junction'),'junction');j='成功'}catch(e){j='失败 '+e.code}finally{try{fs.rmSync(p.join(t,'__probe_junction'),{force:true})}catch{}}console.log('symlinkSync(junction) 非提权:',j)"
+
+      - name: 插件挂载回归（断言"裸包名能解析到"，不是"函数没抛错"）
+        shell: bash
+        run: DSH_REMOTE_TELEMETRY=0 DSH_RELAY_SKIP_SERVICE=1 node --test packages/dsh-remote-web/test/plugin-link.test.mjs
+
+      - name: Windows 平台分支回归
+        shell: bash
+        run: DSH_REMOTE_TELEMETRY=0 DSH_RELAY_SKIP_SERVICE=1 node --test packages/dsh-remote-web/test/windows-compat.test.mjs
+
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest

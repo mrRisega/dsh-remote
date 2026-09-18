@@ -161,6 +161,7 @@ function printHelp() {
   dsh-remote run          前台运行 bridge（调试）
   dsh-remote status       查看配置与服务状态
   dsh-remote plugin       手动安装 dsh web 远程控制插件（--uninstall 卸载）
+  dsh-remote repair       修复插件挂载（dsh web 起不来时用；只碰 profile，不联网）
   dsh-remote --help       显示本用法（等同 dsh-remote help）
 
 自建模式（可选）:
@@ -1473,34 +1474,143 @@ function copyPluginIntoProfile(profileDir, pluginDir) {
 }
 
 /** 把插件挂到 <profile>/node_modules/<PLUGIN_ID>(裸包名解析需要),指向拷贝目录;缺失/指错时重建。 */
+/**
+ * 判定 `node_modules/<PLUGIN_ID>` 是否**真的可用**。
+ *
+ * 判据绝不是"函数有没有抛错" —— 这是 0.6.7-beta.1 在 Windows 上翻车的根因：
+ * 非特权进程 + 开发者模式关闭时，`fs.symlinkSync(target, path, "dir")` 会**既不抛错也产不出可用链接**
+ * （实测：用户目录下留下一个空目录；%TEMP% 下什么都不留；同一位置两次运行一次报成功一次抛 UNKNOWN）。
+ * 于是"用 try/catch 探测能力"这个前提在 Windows 上根本不成立，写在其 catch 里的 junction 兜底永不执行。
+ *
+ * 这里只认 dsh 自己那条解析路径能不能走通：
+ *   ① 读得到 package.json 且 name 正确（cordis 加载器 + @deepseek-ai/dsh-client-modules 靠它读 dsh.client）；
+ *   ② 读得到 lib/index.js（节点半入口）；
+ *   ③ 要么 realpath 指回本地拷贝目录（链接形态），要么入口内容与本地拷贝逐字节一致（整目录拷贝形态）。
+ */
+function pluginLinkUsable(nmPlugin, pluginLocalDir) {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(nmPlugin, "package.json"), "utf8"));
+    if (pkg.name !== PLUGIN_ID) return false;
+    if (!fs.existsSync(path.join(nmPlugin, "lib", "index.js"))) return false;
+  } catch { return false; }
+
+  let real = "";
+  try { real = fs.realpathSync(nmPlugin); } catch { /* 悬空链接 */ }
+  if (real) {
+    try { if (real === fs.realpathSync(pluginLocalDir)) return true; } catch { /* 本地目录不在 → 看内容 */ }
+  }
+  try {
+    return fs.readFileSync(path.join(nmPlugin, "lib", "index.js"), "utf8")
+      === fs.readFileSync(path.join(pluginLocalDir, "lib", "index.js"), "utf8");
+  } catch { return false; }
+}
+
+/**
+ * 把插件挂到 `<profile>/node_modules/<PLUGIN_ID>`。
+ *
+ * 规格：已就绪返回 false（幂等）、重建成功返回 true、**任何情况下都没能挂好就抛错**。
+ * 抛错是刻意的 —— 调用方必须据此中止安装：写进 patch 的激活行会让 dsh web 按裸包名解析这个目录，
+ * 解析不到就 `Cannot find package '...\node_modules\dsh-remote-web\index.js'`，
+ * 而 cordis 的插件树加载失败 = **整个 dsh web 起不来**（用户连面板都打不开，没有自助修复入口）。
+ * 宁可不装，也不能写出一个起不来的 profile。
+ */
 function ensurePluginLinked(profileDir, pluginLocalDir) {
   const nmDir = path.join(profileDir, "node_modules");
   const nmPlugin = path.join(nmDir, PLUGIN_ID);
+  if (!fs.existsSync(path.join(pluginLocalDir, "package.json"))) {
+    throw new Error(`本地插件拷贝缺失或不完整：${pluginLocalDir}（应含 package.json）`);
+  }
   fs.mkdirSync(nmDir, { recursive: true });
   // 清理历史名链接（node_modules/dsh-remote-ui），避免解析到旧拷贝
   for (const id of PLUGIN_LEGACY_IDS) {
     try { fs.rmSync(path.join(nmDir, id), { recursive: true, force: true }); } catch { /* ignore */ }
   }
-  try {
-    if (fs.realpathSync(nmPlugin) === pluginLocalDir) return false;
-  } catch { /* 缺失/悬空 → 重建 */ }
-  try { fs.rmSync(nmPlugin, { recursive: true, force: true }); } catch { /* ignore */ }
-  try {
-    fs.symlinkSync(pluginLocalDir, nmPlugin, "dir");
-  } catch {
-    // Windows：普通目录符号链接需要管理员或"开发者模式"，非管理员时直接 EPERM。
-    // junction（目录联接）**不需要任何特权**，且 realpath 同样解析到目标，
-    // 所以放在符号链接与整目录拷贝之间——能让 Windows 用户也拿到"链接"语义（改一处即生效）。
-    let linked = false;
-    if (process.platform === "win32") {
-      try {
-        fs.symlinkSync(path.resolve(pluginLocalDir), nmPlugin, "junction"); // junction 只接受绝对路径
-        linked = true;
-      } catch { /* 退化到拷贝 */ }
-    }
-    if (!linked) fs.cpSync(pluginLocalDir, nmPlugin, { recursive: true });
+  if (pluginLinkUsable(nmPlugin, pluginLocalDir)) return false; // 已就绪（拷贝形态也算就绪）
+
+  // ⚠️ Windows 上**不要用 symlinkSync(...,'dir')**：非特权进程下它产不出可用链接，
+  //    而且抛不抛错不确定、失败时还会留下空目录残留 —— 兜底链会因此整条失效（实测）。
+  //    junction（目录联接）免特权、realpath 正确、require.resolve 与 ESM 裸包名解析都正常。
+  const attempts = process.platform === "win32"
+    ? [
+        ["junction", () => fs.symlinkSync(path.resolve(pluginLocalDir), nmPlugin, "junction")], // junction 只接受绝对路径
+        ["copy", () => fs.cpSync(pluginLocalDir, nmPlugin, { recursive: true })],
+      ]
+    : [
+        ["dir", () => fs.symlinkSync(pluginLocalDir, nmPlugin, "dir")],
+        ["copy", () => fs.cpSync(pluginLocalDir, nmPlugin, { recursive: true })],
+      ];
+
+  const failures = [];
+  for (const [how, run] of attempts) {
+    // 每支开始前先清残留：上一支"没抛错但留了个空目录"时，不清就会让下一支撞 EEXIST 而失败
+    //（这正是原实现三级兜底退化成一级的原因）。
+    try { fs.rmSync(nmPlugin, { recursive: true, force: true }); } catch { /* ignore */ }
+    let err = null;
+    try { run(); } catch (e) { err = e; }
+    if (pluginLinkUsable(nmPlugin, pluginLocalDir)) return true;
+    failures.push(`${how}: ${err ? err.message : "未抛错但落盘结果不可用（读不到 package.json / lib/index.js）"}`);
   }
-  try { return fs.realpathSync(nmPlugin) === pluginLocalDir; } catch { return false; }
+  throw new Error(`插件挂载失败：${nmPlugin}\n   ${failures.join("\n   ")}`);
+}
+
+
+/**
+ * 独立验收：复刻 dsh 客户端模块系统的真实动作 —— 从 profile 目录按**裸包名**解析到本插件。
+ *
+ * 与 pluginLinkUsable 是两道独立的闸门：前者看文件在不在、是不是真指向目标；
+ * 这条走 Node 的解析器（exports 字段、symlink 跟随、pnpm 布局），是"面板能不能被注入"的前提
+ * （@deepseek-ai/dsh-client-modules 就是 require.resolve('<name>/package.json') 读 dsh.client）。
+ */
+function probePluginResolve(profileDir) {
+  const base = path.join(profileDir, "__dsh_resolve_probe.cjs");
+  // 必须**另起一个 node 进程**做这次解析，不能在本进程里 require.resolve：
+  // 实测（Node 25 / macOS）：本进程里只要先失败过一次裸包名解析（例如"修复前诊断"那次），
+  // 链接随后修好了，同一个进程里的裸包名解析**仍会持续失败**（子路径却正常）——
+  // 进程内的解析缓存会把假阴性一直带下去，让"修复后验收"误判成没修好、拒绝恢复激活。
+  // 另起进程同时也更忠实：dsh 启动时就是在一个全新进程里解析这些裸包名的。
+  const script = [
+    'const { createRequire } = require("node:module");',
+    `const req = createRequire(${JSON.stringify(base)});`,
+    "process.stdout.write(JSON.stringify({",
+    `  pkgPath: req.resolve(${JSON.stringify(`${PLUGIN_ID}/package.json`)}),`,
+    `  entry: req.resolve(${JSON.stringify(PLUGIN_ID)})`,
+    "}));",
+  ].join("\n");
+  try {
+    const r = spawnSync(process.execPath, ["-e", script], { encoding: "utf8", timeout: 30_000, windowsHide: true });
+    if (r.error) return { ok: false, reason: `无法启动解析探测进程：${r.error.message}` };
+    if (r.status !== 0) {
+      const line = String(r.stderr || "").split("\n").find((l) => /MODULE_NOT_FOUND|ERR_|Error/.test(l)) || "解析失败";
+      return { ok: false, reason: line.trim().slice(0, 200) };
+    }
+    const out = JSON.parse(String(r.stdout || "{}"));
+    const pkg = JSON.parse(fs.readFileSync(out.pkgPath, "utf8"));
+    return {
+      ok: true,
+      pkgPath: out.pkgPath,
+      entry: out.entry,
+      name: pkg.name,
+      clientPlatform: (pkg.dsh && pkg.dsh.client && pkg.dsh.client.platform) || "",
+    };
+  } catch (e) {
+    return { ok: false, reason: `${e.code || e.name}: ${e.message}` };
+  }
+}
+
+/**
+ * 描述插件在 profile 里的挂载形态（供 status / repair 输出）。
+ * 用户报障时这三行就能区分"链接坏了"与"别的毛病"——不必再靠猜。
+ * @returns {{localExists:boolean, exists:boolean, usable:boolean, kind:"missing"|"broken"|"linked"|"copy"|"no-local-copy"}}
+ */
+function describePluginLink(profileDir) {
+  const nmPlugin = path.join(profileDir, "node_modules", PLUGIN_ID);
+  const localDir = path.join(profileDir, PLUGIN_LOCAL_DIR);
+  const localExists = fs.existsSync(path.join(localDir, "package.json"));
+  if (!fs.existsSync(nmPlugin)) return { localExists, exists: false, usable: false, kind: localExists ? "missing" : "no-local-copy" };
+  const usable = pluginLinkUsable(nmPlugin, localDir);
+  let isLink = false;
+  try { isLink = fs.lstatSync(nmPlugin).isSymbolicLink(); } catch { /* ignore */ }
+  return { localExists, exists: true, usable, kind: usable ? (isLink ? "linked" : "copy") : "broken" };
 }
 
 /** package.json 写入 file: 依赖(让后续任何 pnpm/npm install 也认可该插件,不会删链接)。 */
@@ -1564,8 +1674,26 @@ function activateLocalCopy(profileDir, pkgFile, patchFile, pluginDir, patch, pkg
     console.error(`❌ 插件入口缺失：${entryFile}（本包不完整？请用官方源重装：npx --registry=https://registry.npmjs.org @mrrisega/dsh-remote@latest）`);
     process.exit(1);
   }
+  // ⚠️ 顺序与"失败即中止"都是刻意的（0.6.7-beta.1 Windows 实测事故）：
+  //   老代码把 ensurePluginLinked 的返回值丢掉、patch 照写、还打印「✅ 插件已就绪」，
+  //   于是用户拿到的是**起不来的 dsh web**（cordis 按裸包名解析到空目录 → plugin tree failed to load，
+  //   整个 dsh web 启动失败，而面板/插件市场都在那个进程里 → 用户没有任何自助修复入口）。
+  //   现在：先挂载 → 独立验收 → 才写依赖与激活行；任何一步不过就中止，绝不留下坏 profile。
+  try {
+    ensurePluginLinked(profileDir, pluginLocalDir);   // node_modules 链接(name 才能被解析)
+  } catch (e) {
+    console.error(`❌ ${e.message}`);
+    console.error("   已中止安装：继续写 patch 会让 dsh web 因插件树加载失败而完全无法启动。");
+    console.error("   请把上面的错误整段反馈给作者（含平台 / 是否管理员 / 开发者模式是否开启）。");
+    process.exit(1);
+  }
+  const probe = probePluginResolve(profileDir);
+  if (!probe.ok) {
+    console.error(`❌ 验收失败：dsh 无法从 profile 按裸包名解析 ${PLUGIN_ID}（${probe.reason}）`);
+    console.error("   已中止安装（未写 patch）：否则 dsh web 会因插件树加载失败而完全无法启动。");
+    process.exit(1);
+  }
   declarePluginDep(pkgFile);                        // file: 依赖(包管理器 install 不误删)
-  ensurePluginLinked(profileDir, pluginLocalDir);    // node_modules 链接(name 才能被解析)
   const r = ensurePatchActivation(patchFile, pluginLocalDir, pkgFile, { forcePatch: !!opts.forcePatch });
   if (r.ok) {
     console.log(`✅ 插件已就绪: ${pluginLocalDir}${opts.forcePatch ? "（激活点已转为 patch 行，装完即热加载）" : ""}`);
@@ -1603,6 +1731,34 @@ function readInstalledPluginVersion(profileDir, name) {
 }
 
 /**
+ * 识别 profile 用哪个包管理器（市场装法「一键更新」要用它改源码）。
+ *
+ * ⚠️ 不能用 `sh("command -v pnpm && echo pnpm || echo npm")`：`sh()` 走 execSync，
+ * Windows 下是 cmd.exe，而 `command` 是 POSIX 内建 → 永远命中 `||` 分支，
+ * **Windows 上永远选 npm**。而 dsh profile 是 pnpm 管理的（pnpm-workspace.yaml + 虚拟 store），
+ * 用 npm 去改同一个 node_modules 会写出与 pnpm 不同的布局（污染/冲突风险）。
+ * 现在：先用**声明文件**判断（最可靠、零子进程），再用 where/which 探测可执行文件；
+ * 兜底选 pnpm 而不是 npm —— dsh profile 默认就是 pnpm，选错方向的代价不对称。
+ */
+function detectPackageManager(profileDir) {
+  try {
+    if (fs.existsSync(path.join(profileDir, "pnpm-lock.yaml"))
+      || fs.existsSync(path.join(profileDir, "pnpm-workspace.yaml"))) return "pnpm";
+    if (fs.existsSync(path.join(profileDir, "package-lock.json"))) return "npm";
+  } catch { /* 读不到就往下探测 */ }
+  const has = (bin) => {
+    try {
+      return process.platform === "win32"
+        ? spawnSync("where", [bin], { stdio: "ignore", windowsHide: true }).status === 0
+        : spawnSync("sh", ["-c", `command -v ${bin}`], { stdio: "ignore" }).status === 0;
+    } catch { return false; }
+  };
+  if (has("pnpm")) return "pnpm";
+  if (has("npm")) return "npm";
+  return "pnpm";
+}
+
+/**
  * 市场装法下把插件包升到最新。
  *
  * 2026-09-13 实测的坑：用户在插件面板点「一键更新」时，本函数原先的调用方（marketManaged 分支）
@@ -1615,7 +1771,7 @@ function readInstalledPluginVersion(profileDir, name) {
 function upgradeMarketManagedPlugin(profileDir, name, dep) {
   const spec = String(dep ?? "").trim();
   const isRegistryRange = /^[\^~><=v\d]/.test(spec);
-  const pm = sh("command -v pnpm >/dev/null 2>&1 && echo pnpm || echo npm").stdout.trim() || "npm";
+  const pm = detectPackageManager(profileDir);
   const args = isRegistryRange ? `add ${name}@latest` : `update ${name}`;
   const cmd = `${pm} ${args}`;
   const r = sh(cmd, 180000, profileDir);
@@ -1734,6 +1890,83 @@ async function pluginCmd(argv) {
   // 引导语只在 setup 汇总里打印一次(这里不再重复;单独跑 `dsh-remote plugin` 也无需引导)
 }
 
+/**
+ * 打印插件挂载诊断三行（供 status / repair 共用）。
+ * 用户报障时这三行就能区分「链接坏了」与「别的毛病」，不必靠猜：
+ *   link = 有没有真挂上（junction / 符号链接 / 整目录拷贝 / BROKEN）
+ *   resolve = dsh 的裸包名解析能不能走通（浏览器半注入面板就靠它）
+ *   client = dsh.client.platform 声明在不在
+ */
+function printPluginDiagnostics(profileDir) {
+  const nmPlugin = path.join(profileDir, "node_modules", PLUGIN_ID);
+  const link = describePluginLink(profileDir);
+  const probe = probePluginResolve(profileDir);
+  const kindText = { linked: "已挂载（链接）", copy: "已挂载（整目录拷贝）", broken: "BROKEN（存在但读不到内容）", missing: "缺失", "no-local-copy": "缺失（本地插件目录也没有）" }[link.kind] || link.kind;
+  console.log(`   [link]    ${nmPlugin}\n             → ${kindText}`);
+  console.log(`   [resolve] ${PLUGIN_ID}/package.json → ${probe.ok ? probe.pkgPath : `失败（${probe.reason}）`}`);
+  console.log(`   [client]  dsh.client.platform = ${probe.ok ? (probe.clientPlatform || "缺失") : "（解析失败，无法确认）"}`);
+  return { link, probe };
+}
+
+/**
+ * `dsh-remote repair` —— 只修 profile 里的插件挂载，不碰运行环境 / 不联网 / 不碰自启动。
+ *
+ * 为什么需要这个独立入口：插件挂载坏掉时 dsh web **整个起不来**（cordis 插件树加载失败），
+ * 而设置面板与插件市场都在那个进程里 —— 用户没有任何自助修复入口，只剩命令行。
+ * 执行顺序刻意是"先保命、再修复、最后恢复激活"：
+ *   ① patch 里引用了本插件但挂载不可用 → **先把 include 摘掉**（profile 立刻恢复可启动）；
+ *   ② 再重建挂载（失败会抛错，但①的结果保留 → 用户至少能打开 dsh web）；
+ *   ③ 只有①②都成功，才把激活行写回去。
+ */
+function repairProfile(argv = []) {
+  const profileDir = resolveProfileDir(argv);
+  const pkgFile = path.join(profileDir, "package.json");
+  const patchFile = path.join(profileDir, "cordis.patch.yml");
+  const localDir = path.join(profileDir, PLUGIN_LOCAL_DIR);
+  if (!fs.existsSync(pkgFile) || !fs.existsSync(patchFile)) {
+    console.error(`❌ 未找到 dsh web profile（${profileDir}）。`);
+    console.error("   先确认 dsh web 装好并初始化过 profile，或用 --profile <目录> 指定。");
+    process.exit(1);
+  }
+  console.log(`dsh-remote repair — ${profileDir}`);
+  const before = printPluginDiagnostics(profileDir);
+  if (!before.link.localExists) {
+    console.error(`❌ 本地插件目录缺失（${localDir}）：无法就地修复。`);
+    console.error("   请重新安装：npx @mrrisega/dsh-remote@latest");
+    process.exit(1);
+  }
+
+  const patch = fs.readFileSync(patchFile, "utf8");
+  const referenced = parsePatchInsertIds(patch).ids.some((id) => PLUGIN_ALL_IDS.includes(id));
+  if (referenced && !before.link.usable) {
+    // 保命动作：先摘掉激活行，让 dsh web 至少能启动（此时插件不可用，但用户进得去、能重装）
+    stripIncludeEntries(patchFile, patch, "挂载不可用，先摘掉 include 保命");
+    try { removeBundleEntry(pkgFile); } catch { /* ignore */ }
+    console.log("🛟 挂载不可用 → 已先摘掉插件激活行（dsh web 现在应该能启动了）。");
+  }
+
+  try {
+    ensurePluginLinked(profileDir, localDir);
+  } catch (e) {
+    console.error(`❌ 重建挂载失败：${e.message}`);
+    console.error("   profile 已处于「能启动、插件未激活」状态；请把上面错误反馈给作者。");
+    process.exit(1);
+  }
+  const after = printPluginDiagnostics(profileDir);
+  if (!after.probe.ok) {
+    console.error("❌ 挂载已重建，但 dsh 仍解析不到本插件 —— 请把上面的输出反馈给作者。");
+    process.exit(1);
+  }
+  const srcPluginDir = path.join(THIS_DIR, "packages", PLUGIN_ID);
+  if (!fs.existsSync(srcPluginDir)) {
+    console.error(`❌ 本包缺少 packages/${PLUGIN_ID}，无法就地恢复激活行。`);
+    console.error("   请重新安装：npx @mrrisega/dsh-remote@latest");
+    process.exit(1);
+  }
+  convergePluginActivation(profileDir, pkgFile, patchFile, srcPluginDir, fs.readFileSync(patchFile, "utf8"));
+  console.log("✅ 挂载与激活已修复 —— 重启一次 dsh web 生效。");
+}
+
 // ---------- main ----------
 // 无命令名（或首个参数以 - 开头）时默认执行 setup —— 这样 `dsh-remote --no-autostart`
 // 这类「只给 flag」的用法才能装上去。
@@ -1748,6 +1981,7 @@ if (cmd === "setup" || cmd === "install") await setup(args);
 else if (cmd === "settings") settingsHint();
 else if (cmd === "run") await runBridge();
 else if (cmd === "plugin") await pluginCmd(process.argv.slice(3));
+else if (cmd === "repair") repairProfile(process.argv.slice(3));
 else if (cmd === "status") {
   const cfg = loadConfig();
   const local = Boolean(cfg.local_key);
@@ -1755,6 +1989,14 @@ else if (cmd === "status") {
   console.log("连接模式:", local ? `自建服务（${cfg.tunnel_url || "未设置服务器地址"}）` : `SaaS 云端服务（${cfg.phone || "未配置账号"}）`);
   console.log("API:", cfg.api_url || (local ? "（自建模式无需账号 API）" : DEFAULT_API));
   console.log("远程地址/登录: 打开 dsh web → 设置 → 「远程控制」查看与操作");
+  // 插件挂载诊断：报障时一眼看出是"链接坏了"还是"别的毛病"
+  const profileDir = resolveProfileDir([]);
+  if (fs.existsSync(path.join(profileDir, "package.json"))) {
+    console.log("插件挂载:");
+    printPluginDiagnostics(profileDir);
+  } else {
+    console.log(`插件挂载: 未找到 profile（${profileDir}）`);
+  }
 } else {
   printHelp();
   process.exit(1);

@@ -3,7 +3,59 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.7-beta.2] - 2026-09-18
+
+> **修复 beta.1 引入/暴露的插件挂载缺陷（Windows 致命）**。beta.1 及更早版本在
+> **Windows 非特权进程 + 开发者模式关闭**（= 普通用户默认状态）下安装，可能写出一份
+> **起不来的 dsh web**：`node_modules/dsh-remote-web` 是个空壳，cordis 按裸包名解析不到，
+> 整个插件树加载失败 → `dsh web` 完全无法启动，而设置面板与插件市场都在那个进程里，
+> 用户**没有任何自助修复入口**。安装器与插件半的 Windows 修复见 beta.1 小节，本版修挂载。
+
+### Fixed
+
+- **插件挂载：不再相信"函数没抛错"**。`ensurePluginLinked` 原来用
+  `fs.symlinkSync(target, path, "dir")`，并把 junction / 整目录拷贝两级兜底写在它的 `catch` 里。
+  而在 Windows 非特权进程下，`'dir'` **既不抛错也产不出可用链接**（实测：用户目录下留一个空目录，
+  `%TEMP%` 下什么都不留；同一位置两次运行一次报成功、一次抛 `UNKNOWN`），于是：
+  报成功 → catch 不进入 → 两级兜底永不执行；报错 → 上一支已留空目录 → junction 撞 `EEXIST`
+  只剩拷贝一支。三级兜底实际退化成一级，且**时灵时不灵**（重跑一次可能自愈，极难归因）。
+  现在：Windows **首选 junction**（免特权、`realpath` 正确、裸包名解析正常），
+  每支之后**验证落盘结果**（读得到 `package.json` 且 name 正确 + 读得到 `lib/index.js`），
+  每支之前**清理上一支的残留**，全部失败则**抛错**。
+- **调用方失败即中止，且写入前独立验收**。原来 `ensurePluginLinked` 的返回值被直接丢弃，
+  patch 照写、还打印「✅ 插件已就绪」。现在顺序是「挂载 → 独立验收 → 才写依赖与激活行」，
+  任何一步不过就 `process.exit(1)` —— 宁可不装，也不能写出一个起不来的 profile。
+  独立验收复刻 dsh 的真实动作（从 profile 目录按**裸包名** `require.resolve`），
+  与"文件在不在"是两道互不依赖的闸门。
+- **验收探测改用独立子进程**。实测（Node 25）：同一进程里只要先失败过一次裸包名解析
+  （例如"修复前诊断"那次），链接随后修好了，**同一个进程里的裸包名解析仍会持续失败**
+  （子路径却正常）——进程内解析缓存会把假阴性一直带下去，让"修复后验收"误判成没修好。
+  另起一个 node 进程探测同时也更忠实：dsh 启动时就是在一个全新进程里解析这些裸包名的。
+- **`command -v pnpm` 在 Windows 上恒失效**（中危）：`sh()` 走 `execSync` → Windows 下是 `cmd.exe`，
+  而 `command` 是 POSIX 内建 → 永远命中 `||` 分支 → **永远选 npm**。而 dsh profile 是 pnpm 管理的
+  （`pnpm-workspace.yaml` + 虚拟 store），用 npm 改同一个 `node_modules` 会写出不同布局。
+  现在按**声明文件**（pnpm-lock/pnpm-workspace → pnpm；package-lock → npm）识别，
+  再用 `where`/`command -v` 探测可执行文件，兜底选 pnpm（选错方向的代价不对称）。
+
+### Added
+
+- **`dsh-remote repair`**：挂载坏掉时 dsh web 起不来、面板与市场都在那个进程里，
+  用户只剩命令行。该命令**只碰 profile**（不联网、不碰运行环境/自启动），顺序刻意是
+  「先保命（摘掉激活行让 dsh web 至少能启动）→ 再重建挂载 → 最后恢复激活」。
+- **`dsh-remote status` 增加挂载诊断三行**：`[link]`（junction/符号链接/整目录拷贝/BROKEN）、
+  `[resolve]`（裸包名解析结果）、`[client]`（`dsh.client.platform`）。报障时一眼区分
+  "链接坏了"与"别的毛病"。
+- **CI 增加 Windows 专项 job**（`windows-latest`，默认非提权 + 开发者模式关闭）：
+  这个缺陷**只能在 Windows 上暴露**，而此前 CI 全是 ubuntu —— 这正是它出厂的原因。
+  job 会先打印 `symlinkSync('dir')` / `symlinkSync('junction')` 的实测能力，再跑平台敏感用例。
+- **新增 `test/plugin-link.test.mjs`（13 个用例）**：用注入式 fs 代理**复现**了 Windows 那种
+  "不抛错但落盘是空壳"的形态，断言对象是**通过 `node_modules/<id>` 这条路径到底能不能读到东西**
+  （而不是"函数没抛错/返回 true"——上一版正是因此漏测），并真起进程做端到端安装/自愈/中止/repair 验收。
+
 ## [0.6.7-beta.1] - 2026-09-18
+
+> ⚠️ **本版已被 [0.6.7-beta.2] 取代，请勿使用**：它在 Windows 非特权进程下可能写出一份
+> **起不来的 dsh web**（插件挂载空壳）。下面的 Windows 修复本身有效，缺陷在挂载环节，见 beta.2。
 
 > **Windows 可用版（预发）**。0.6.6 及更早的插件半整套「服务状态 / 启停 / 重启」按 macOS/Linux 写死
 > （launchctl / systemd / pgrep / ps / /bin/sh），在 Windows 上**安装一切正常、运行期必死**。
