@@ -733,8 +733,8 @@ function handleEntryReason(reason) {
   }[reason];
   try { history.replaceState(null, "", "/app/"); } catch { /* 忽略 */ }
   if (!text) return;
-  const loggedIn = !!(state.token && !tokenExpired(state.token));
-  if (!loggedIn) { toast(reason === "expired" ? "登录已过期，请重新登录" : text, 6000); return; }
+  // 提示条挂在 <main> 顶部 → 登录视图（令牌真失效时）与设备列表视图都能看到，
+  // 不依赖 toast 那几秒；toast 只在提示条元素缺失时兜底。
   const box = $("entry-hint"), msg = $("entry-hint-msg"), ico = $("entry-hint-ico");
   if (!box || !msg) { toast(text, 6000); return; }
   if (ico) ico.textContent = reason === "offline" ? "💤" : reason === "expired" ? "🔐" : "ℹ️";

@@ -87,7 +87,11 @@ async function plantProfile(home, { extraPatch = "", unmarked = false } = {}) {
   fs.writeFileSync(path.join(local, "lib", "index.js"), "export const x = 1;\n");
   fs.symlinkSync(local, path.join(profile, "node_modules", PLUGIN_ID), "dir");
   fs.mkdirSync(path.join(home, "relay"), { recursive: true });
-  fs.writeFileSync(path.join(home, "relay", ".dsh-config.json"), JSON.stringify({ phone: "13800000000", password: "pw" }));
+  // ⚠️ api_url 必须指向本地死端口：这些是**假账号**，一旦按默认地址请求生产，
+  //    /api/device-login 会带着假密码失败，而服务端登录限流是按出口 IP 计的（5 次/15 分钟）——
+  //    实测结果是把**本机真实的 bridge** 连坐进限流（2026-09-19 事故）。
+  fs.writeFileSync(path.join(home, "relay", ".dsh-config.json"),
+    JSON.stringify({ phone: "13800000000", password: "pw", api_url: "http://127.0.0.1:1" }));
   return { profile, patchFile: path.join(profile, "cordis.patch.yml") };
 }
 

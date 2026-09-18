@@ -58,6 +58,13 @@ All notable changes to dsh-remote are documented here. This project follows
 
 ### Added
 
+- **测试期网络护栏 `scripts/test-net-guard.cjs`**（注入到 `test:router/plugin/bridge` 三个脚本）：
+  测试期**一律阻断**非本地请求并打印被拦地址。起因是本轮新增的用例在配置里写了**假账号**却没覆盖
+  `api_url`，于是按默认地址请求**生产中继**的 `/api/device-login`（假密码必然失败），
+  而服务端登录限流按**出口 IP** 计（5 次失败 / 15 分钟）——
+  结果既污染生产审计，又让**本机自己的 bridge 被连坐**拿不到 JWT（真机表现为"切换账号后设备
+  一直登记不上去"，把排查方向彻底带偏）。护栏已把该用例的 `api_url` 修正为本地死端口，
+  并保证今后任何用例都不能再碰外部服务。
 - **`test/account-switch-device.test.mjs`（9 个用例）**：锁死"旧账号的 online 状态不得当作注册证据"、
   "账号一致时行为不变（回归）"、"切换账号要停旧 bridge + 清过期状态"、"退出登录要作废身份"、
   "launchd 作业在 user 域时必须被认成运行中"（旧实现只看 gui）、以及 429 的如实报错与退避。

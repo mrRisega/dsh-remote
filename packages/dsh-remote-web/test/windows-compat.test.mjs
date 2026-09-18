@@ -460,6 +460,24 @@ test("前端：bridge-status 轮询失败不再静默（旧版让面板永久停
   assert.ok(/connFailRef\.v = 0/.test(CLIENT_SRC), "成功必须清零（一次抖动不该把面板染红）");
 });
 
+test("测试隔离：套件不得访问任何外部地址（生产限流会被测试污染）", () => {
+  // 事故（2026-09-19）：有用例在配置里写了假账号却没覆盖 api_url → 按默认地址请求**生产中继**，
+  // 其中 /api/device-login 带假密码必然失败，而服务端登录限流按**出口 IP** 计（5 次/15 分钟）——
+  // 结果不仅污染生产审计，还让**本机自己的 bridge 被连坐**（拿不到 JWT），
+  // 真机表现成"切换账号后设备一直登记不上去"，排查方向被彻底带偏。
+  const repoRoot = path.join(HERE, "..", "..", "..");
+  const guard = path.join(repoRoot, "scripts", "test-net-guard.cjs");
+  assert.ok(existsSync(guard), "必须有测试期网络护栏脚本");
+  const pkg = JSON.parse(readFileSync(path.join(repoRoot, "package.json"), "utf8"));
+  for (const name of ["test:router", "test:plugin", "test:bridge"]) {
+    assert.match(String(pkg.scripts[name]), /test-net-guard\.cjs/, `${name} 必须注入网络护栏`);
+  }
+  // 护栏本体：只放行本地地址，其余一律阻断
+  const src = readFileSync(guard, "utf8");
+  assert.ok(/ENETUNREACH/.test(src), "护栏应阻断外部请求");
+  assert.ok(/LOCAL_HOST/.test(src), "护栏应只放行本地地址");
+});
+
 test("前端：平台文案不再默认 macOS（Windows 用户看不懂「自启动服务」）", () => {
   assert.ok(/serviceManager === "detached"/.test(CLIENT_SRC), "面板应识别 Windows 的 detached 模式");
   assert.match(CLIENT_SRC, /Windows 任务计划程序 dsh-remote-bridge/, "卸载说明要写明 Windows 侧会删掉什么");
