@@ -3,6 +3,29 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+> **自建版对齐**：把闭源版这一轮的「镜像页退路与引导」同步到开源仓库
+> （部署在服务器上的那半边在闭源仓库，跑在用户本机的这半边在这里）。
+
+### Fixed
+
+- **点进设备后地址栏只剩端口，刷新还可能白屏**。手机端外壳以前跳根路径 `/`：地址栏看不出在哪台设备上；
+  而 `dsh_device` cookie 2 小时就过期，刷新根路径时中继解析不到设备 → 只剩一句纯文本 404。
+  现在跳 `/remote/<deviceId>/`：刷新 / 收藏 / 返回都指向同一台设备，cookie 失效也有路径兜底。
+- **会话"过一段时间就报错"**：会话 cookie 写死 2 小时，而令牌有效期是可配的（自签可更长），
+  "令牌还有效、cookie 先死" → 设备列表与镜像页必然 401。现在 cookie 的 `max-age` 由 JWT 自己的
+  `exp` 推导，两边同生共死。
+- **会话过期 / 设备离线时不再甩报错页**：中继对**页面导航**一律 302 回 `/app/?reason=…`
+  （expired / offline / forbidden / unknown_device），接口与子资源保持 JSON 状态码语义
+  （以前未登录一律 302 到 `/login/`，客户端拿 HTML 当 JSON 解析，报的错与真实原因无关）。
+  外壳接住后给一句话说明并落在正确视图，提示条可手动关闭。
+
+### Added
+
+- `packages/relay-router/test/native-app-entry.test.mjs`：手机端外壳的进设备路径 / 会话寿命 /
+  引导回跳契约（与闭源仓库同名用例同源同断言，两边行为必须一致）。
+
 ## [0.6.7-beta.4] - 2026-09-19
 
 > **修「切换账号后设备没登记到新账号」**。现场（用户实测、本机复现）：退出账号 A（尾号 7541）→

@@ -407,6 +407,50 @@ function sendToBridge(dev, obj) {
 
 // ---------- 错误页 ----------
 
+/**
+ * 判定「这是用户点进来的页面导航」——只有页面导航才做 302 引导回 APP 外壳。
+ *
+ * 依据（按可靠性排序）：
+ *   ① Fetch Metadata（Chrome/Safari 新版）sec-fetch-mode=navigate + sec-fetch-dest=document/iframe；
+ *   ② 回退到 Accept: text/html（老浏览器）。
+ * 子资源（/assets/*.js、/plugins/*、图片）与 XHR 一律不走引导 —— 否则客户端会把一张
+ * HTML 页面当成 JS/JSON 解析，表现成"界面白屏/报一堆解析错误"。
+ */
+function isDocNavigation(req) {
+  const mode = String(req.headers["sec-fetch-mode"] || "").toLowerCase();
+  const dest = String(req.headers["sec-fetch-dest"] || "").toLowerCase();
+  if (mode || dest) {
+    if (mode && mode !== "navigate") return false;
+    if (dest && dest !== "document" && dest !== "iframe") return false;
+    return true;
+  }
+  return /html/i.test(req.headers.accept || "");
+}
+
+/**
+ * 会话/设备出问题时的**统一引导**：把用户送回 APP 外壳（设备列表或登录页），
+ * 而不是甩一张报错页或一句纯文本 404（2026-09-19 用户反馈：
+ * 「会话过期/设备离线时状态不对，应该跳回设备拉取的那个界面」「不能让用户直接遇到白屏报错」）。
+ *
+ * 为什么带上 reason / device：外壳页据此给出**能照做的一句话**（会话过期→去重新登录；
+ * 设备离线→提醒电脑端 bridge 没在跑），而不是默默回到列表让用户猜发生了什么。
+ * 为什么顺手清 dsh_device cookie：这台设备已经不可用（离线/不属于本账号/已删除），
+ * 留着它会让"回到列表再点一次"又被打回同一个错误，形成打转。
+ */
+function guideToApp(res, reason, extra = {}) {
+  const q = new URLSearchParams();
+  q.set("reason", reason);
+  for (const [k, v] of Object.entries(extra)) {
+    if (v !== undefined && v !== null && String(v) !== "") q.set(k, String(v));
+  }
+  res.writeHead(302, {
+    Location: `/app/?${q.toString()}`,
+    "Cache-Control": "no-store",
+    "Set-Cookie": "dsh_device=; Path=/; Max-Age=0; SameSite=Lax; Secure"
+  });
+  res.end();
+}
+
 function errorPage(req, res, status, title, detail, extraHtml = "") {
   const wantHtml = /html/i.test(req.headers.accept || "");
   if (!wantHtml) {
@@ -607,22 +651,43 @@ const server = http.createServer(async (req, res) => {
 
   const parsed = resolveRoute(req, url);
   if (!parsed) {
-    res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
-    res.end("not found (router: 请使用 /remote/<deviceId>/<path>)");
+    // 根路径没有可用的设备凭据（dsh_device cookie 过期/被清）、或 /remote/<未知设备>：
+    // 过去是一句纯文本 404 —— 用户在手机上看就是白屏。现在页面导航一律引导回设备列表。
+    if (isDocNavigation(req)) {
+      guideToApp(res, "unknown_device");
+      return;
+    }
+    const r = jsonBody(404, { error: { code: "not_found", message: "未指定设备：请使用 /remote/<deviceId>/<path>，或先在 APP 里选择设备" } });
+    res.writeHead(r.status, r.headers);
+    res.end(r.body);
     return;
   }
   const { deviceId, path } = parsed;
   const auth = authorizeRemote(req, deviceId);
   if (auth.error === "unauthorized") {
-    res.writeHead(302, { Location: "/login/", "Cache-Control": "no-store" });
-    res.end();
+    // 页面导航 → 回 APP 外壳（设备列表或登录页）；接口/子资源 → JSON 401（不再 302 成 HTML）
+    if (isDocNavigation(req)) {
+      guideToApp(res, "expired");
+      return;
+    }
+    const r = jsonBody(401, { error: { code: "unauthorized", message: "登录状态无效或已过期" } });
+    res.writeHead(r.status, r.headers);
+    res.end(r.body);
     return;
   }
   if (auth.error === "offline") {
+    if (isDocNavigation(req)) {
+      guideToApp(res, "offline", { device: deviceId, name: devices.get(deviceId)?.name || "" });
+      return;
+    }
     errorPage(req, res, 502, "电脑端未连接", `设备 ${deviceId} 的 bridge 当前离线。请先在电脑上运行 dsh-bridge 隧道模式,再刷新本页。`);
     return;
   }
   if (auth.error === "forbidden") {
+    if (isDocNavigation(req)) {
+      guideToApp(res, "forbidden", { device: deviceId });
+      return;
+    }
     errorPage(req, res, 403, "无权访问", "该设备不属于当前账号。");
     return;
   }

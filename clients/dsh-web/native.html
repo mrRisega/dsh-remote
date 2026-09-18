@@ -175,6 +175,13 @@
     .auth-link:hover { text-decoration: underline; }
     .auth-hint { font-size: 14px; color: #57606a; margin-top: 6px; line-height: 1.7; }
     .auth-msg { font-size: 14px; margin-top: 10px; min-height: 18px; }
+    /* Router 引导回跳提示条(会话过期/设备离线/设备不可用) */
+    .entry-hint { display: flex; align-items: flex-start; gap: 10px; font-size: 14px; line-height: 1.7; }
+    .entry-hint.hidden { display: none; }
+    .entry-hint.warn { border-left: 3px solid var(--warn, #9a6700); }
+    .entry-hint-ico { flex: none; }
+    .entry-hint-msg { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+    .entry-hint-close { flex: none; border: none; background: none; color: var(--muted, #6b7280); font-size: 16px; line-height: 1; cursor: pointer; padding: 2px 4px; }
     .auth-msg.err { color: #cf222e; }
     .auth-msg.ok { color: #1a7f37; }
     .auth-user { display: flex; align-items: center; gap: 10px; margin: 12px 0 16px; }
@@ -341,6 +348,12 @@ var _hmt = _hmt || [];
 </header>
 
 <main id="view-main">
+  <!-- Router 引导回跳提示(/app/?reason=expired|offline|forbidden|unknown_device,2026-09-19) -->
+  <div class="card entry-hint hidden" id="entry-hint" role="status">
+    <span class="entry-hint-ico" id="entry-hint-ico">ℹ️</span>
+    <span class="entry-hint-msg" id="entry-hint-msg"></span>
+    <button type="button" class="entry-hint-close" id="entry-hint-close" aria-label="关闭提示">✕</button>
+  </div>
   <!-- 首屏读取态:会话判定完成前不渲染登录或设备界面,消除闪烁 -->
   <div id="view-boot">
     <div class="card" style="text-align:center;">
@@ -655,8 +668,7 @@ function renderAuthState() {
  *   1/多台在线 → 展示实时列表,均由用户点选进入。
  */
 async function enterMirror(token) {
-  const hours = 2;
-  document.cookie = `dsh_token=${encodeURIComponent(token)}; path=/; max-age=${hours * 3600}; SameSite=Lax; Secure`;
+  writeSessionCookie("dsh_token", token);
   renderAuthState();
   if (state.user) setConn(maskPhone(state.user.phone) || state.user.email || "已连接", true);
   // 0/1/多台在线:一律进设备列表视图,由用户点选进入,不自动跳转
@@ -664,13 +676,70 @@ async function enterMirror(token) {
   refreshDevices();
 }
 
-/** 选定设备:写 dsh_device cookie 后跳根路径(经 router 按 cookie 路由到设备镜像)。 */
+/**
+ * 会话 cookie 的有效期 = **令牌自己的 exp**（2026-09-19 修复）。
+ * 旧实现写死 2 小时：自建部署的令牌有效期可配（默认 2h，自签可更长），
+ * cookie 一旦先失效，设备列表 /_devices 与镜像页就全部 401 ——
+ * 用户看到的是"过一段时间就失效、还报错"。现在两者同生共死。
+ */
+function sessionMaxAgeSeconds(token, fallbackSeconds = 2 * 3600) {
+  try {
+    const parts = String(token || "").split(".");
+    if (parts.length !== 3) return fallbackSeconds;
+    const payload = JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")));
+    if (typeof payload.exp !== "number") return fallbackSeconds;
+    const left = payload.exp - Math.floor(Date.now() / 1000);
+    return left > 0 ? left : 0;
+  } catch { return fallbackSeconds; }
+}
+
+/** 写 dsh_token cookie（router 校验它；有效期随令牌 exp）。 */
+function writeSessionCookie(name, token) {
+  const maxAge = sessionMaxAgeSeconds(token);
+  document.cookie = `${name}=${encodeURIComponent(token)}; path=/; max-age=${maxAge}; SameSite=Lax; Secure`;
+}
+
+/** 写 dsh_device cookie（标明"当前选的是哪台设备"，供绝对路径请求兜底）；有效期与令牌对齐。 */
+function writeDeviceCookie(deviceId) {
+  document.cookie = `dsh_device=${encodeURIComponent(deviceId)}; path=/; max-age=${sessionMaxAgeSeconds(state.token)}; SameSite=Lax; Secure`;
+}
+
+/** 选定设备:写 dsh_device cookie 后进该设备的镜像页(经 router 的 /remote/<id>/ 路由)。 */
 function enterDevice(deviceId) {
-  const hours = 2;
-  document.cookie = `dsh_device=${encodeURIComponent(deviceId)}; path=/; max-age=${hours * 3600}; SameSite=Lax; Secure`;
+  writeDeviceCookie(deviceId);
   // Phase-4:跳镜像页前写/清一次性 E2EE 交接单(解锁会话→交接;明文/未解锁→清除防串台)
   dshE2eeHandoverSync(deviceId);
-  window.location.replace("/");
+  // 2026-09-19 起跳 /remote/<deviceId>/ 而不是根路径 "/"：
+  //   ① 以前地址栏里只剩端口，看不出在哪台设备上（用户反馈"点进去之后路径没有了"）；
+  //   ② 刷新时若 dsh_device cookie 已过期，根路径只剩一句纯文本 404（白屏）。
+  window.location.replace("/remote/" + encodeURIComponent(deviceId) + "/");
+}
+
+/**
+ * 处理 Router 的引导回跳（/app/?reason=…，2026-09-19）。
+ * 用户反馈：「会话过期/设备不在线时应该回到设备拉取的那个界面」「不能让用户直接遇到白屏报错」。
+ * Router 不再渲染报错页，而是把用户送回这里 —— 本函数负责说清"发生了什么"和"该做什么"。
+ */
+function handleEntryReason(reason) {
+  if (!reason) return;
+  const p = new URLSearchParams(window.location.search);
+  const device = p.get("device") || "";
+  const name = p.get("name") || device;
+  const text = {
+    expired: "登录状态已过期，已为你返回设备列表。请重新点选设备进入；若仍提示过期，请重新登录。",
+    offline: `「${name || "该设备"}」当前离线：电脑端的 dsh-bridge 没有在运行，或网络不通。请在电脑上确认 dsh-remote 正在运行后重试。`,
+    forbidden: "该设备不属于当前账号（或访问密钥已更换），已返回设备列表，请重新选择。",
+    unknown_device: "设备不存在或已被移除，已返回设备列表，请重新选择。"
+  }[reason];
+  try { history.replaceState(null, "", "/app/"); } catch { /* 忽略 */ }
+  if (!text) return;
+  const loggedIn = !!(state.token && !tokenExpired(state.token));
+  if (!loggedIn) { toast(reason === "expired" ? "登录已过期，请重新登录" : text, 6000); return; }
+  const box = $("entry-hint"), msg = $("entry-hint-msg"), ico = $("entry-hint-ico");
+  if (!box || !msg) { toast(text, 6000); return; }
+  if (ico) ico.textContent = reason === "offline" ? "💤" : reason === "expired" ? "🔐" : "ℹ️";
+  box.className = "card entry-hint warn";
+  msg.textContent = text;
 }
 
 // ---------- v2 设备管理(移除/换机;pro 每月 3 次,pro_max 不限) ----------
@@ -2382,6 +2451,8 @@ $("btn-password-reset").onclick = () => doPasswordReset();
 $("reset-pass").addEventListener("keydown", (e) => { if (e.key === "Enter") $("btn-password-reset").onclick(); });
 $("btn-refresh").onclick = () => { resetDevicePoll(); void refreshDevices(); };
 $("btn-manage-devices").onclick = toggleManageDevices;
+// Router 引导提示条(会话过期/设备离线):可手动关闭
+if ($("entry-hint-close")) $("entry-hint-close").onclick = () => $("entry-hint").classList.add("hidden");
 $("login-pass").addEventListener("keydown", (e) => { if (e.key === "Enter") $("btn-login").onclick(); });
 $("reg-pass2").addEventListener("keydown", (e) => { if (e.key === "Enter") $("btn-register").onclick(); });
 // E2EE 解锁层(Phase-3):解锁 / 明文跳过 / Enter 提交;遮罩点击不误关(输入中)
@@ -2418,6 +2489,8 @@ function tokenExpired(token) {
   }
   // 一次性扫码登录(/app/?auth=KEY,电脑端生成,30 分钟/一次性):
   // 有 auth 一律走 exchange(无论当前是否已登录),成败去向由 doAuthExchangeLogin 决定
+  // Router 的引导回跳(/app/?reason=…)：镜像页出问题时不再甩报错页，而是把用户送回这里。
+  const entryReason = (new URLSearchParams(window.location.search).get("reason") || "").trim();
   const authKey = (new URLSearchParams(window.location.search).get("auth") || "").trim();
   if (authKey) {
     await doAuthExchangeLogin(authKey);
@@ -2439,9 +2512,11 @@ function tokenExpired(token) {
   }
   if (state.token && !tokenExpired(state.token)) {
     enterMirror(state.token); // 会话恢复 → Router 实时设备列表
+    handleEntryReason(entryReason); // Router 引导提示（会话过期/设备离线/设备不可用）
   } else {
     if (state.token) logout();
     setView("login"); switchAuthTab("login");
+    if (entryReason) handleEntryReason(entryReason === "expired" ? "expired" : entryReason);
   }
 })();
 </script>
