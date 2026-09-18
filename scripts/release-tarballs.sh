@@ -22,13 +22,19 @@ echo "版本: ${VERSION}  标签: ${TAG}"
 
 
 # 从 CHANGELOG.md 提取本版本小节作为 Release 正文（插件市场的「更新说明」直接读它）
+#
+# ⚠️ 2026-09-19 修：原来尾部的 `sed -e :a -e '/^\n*$/{$d;N;ba}'` 是 **GNU sed 专用写法**，
+#    在 macOS（BSD sed）上直接报 `unexpected EOF (pending }'s)` 并中止脚本 —— 实测就是发 0.6.7
+#    时踩到的：Release 没建成、资产没上传，插件市场的 latest/download 会 404。
+#    现在首尾空行裁剪都用 awk 完成，BSD / GNU 通吃。
 extract_notes() {
   local ver="$1" out="$2"
   awk -v ver="$ver" '
     index($0, "## [" ver "]") == 1 { f = 1; next }
     f && index($0, "## [") == 1 { exit }
     f { print }
-  ' "$ROOT/CHANGELOG.md" | awk 'NF {p=1} p' | sed -e :a -e '/^\n*$/{$d;N;ba}' > "$out"
+  ' "$ROOT/CHANGELOG.md" \
+    | awk 'NF { p = 1 } p { lines[NR] = $0; if (NF) last = NR } END { for (i = 1; i <= last; i++) print lines[i] }' > "$out"
   [ -s "$out" ] || printf '维护性发布：%s。详见仓库 CHANGELOG。\n' "$ver" > "$out"
 }
 
