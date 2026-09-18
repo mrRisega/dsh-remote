@@ -2,8 +2,12 @@
 // 背景：用户反馈卸载不干净——bridge 自启动服务（launchd com.dshremote.bridge / Linux dsh-bridge）
 //       仍在运行、自启动 plist/unit 仍在、配置目录 ~/.dsh-remote（账号/设备密钥/.dsh-config.json/
 //       .harness-cookie.json/固化运行时 dsh-setup.mjs + clients 等）也还在。
-// 卸载路由现在依次执行：profile 插件清理（uninstallSelf，原逻辑）+ 运行时清理（uninstallRuntime：
-// 停自启动服务 → 删自启动文件 → 杀残留进程 → rm -rf 配置目录），全部幂等、单项失败不致命。
+// 0.6.7-beta.3 起卸载**分两段**（顺序是刻意的，见 uninstall 路由注释）：
+//   ① 同步段：uninstallSelf（纯 fs、快）→ markUninstalled → 立刻回响应；
+//   ② 异步段：运行时清理（停自启动/杀残留/清配置目录）交给**独立子进程**执行。
+// 为什么必须这样：同步段里任何一次 spawnSync 卡住（Windows 沙箱拦 schtasks，而 spawnSync 的
+// timeout 在 Windows 上并不可靠），旧实现会让 uninstallSelf 永远不执行、整个 dsh web 僵死
+// （端口在听、无响应）。因此这些用例改为：断言响应契约（runtimeCleanup）+ 轮询等待子进程的物理结果。
 // 测试隔离（绝不触碰本机真实 launchd/systemd/进程）：
 //   - 大多数用例设 DSH_RELAY_SKIP_SERVICE=1 → 跳过一切系统级操作，只验证配置目录清理与 profile 清理；
 //   - 「自然跳过」用例把 PATH 指向假 launchctl/pgrep/ps，完全接管系统命令后走无开关路径。
@@ -22,6 +26,18 @@ const PLUGIN_BLOCK = `# >>> dsh-remote-ui (managed by dsh-remote plugin; do not 
   apply: dsh-remote-ui
 # <<< dsh-remote-ui
 `;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** 等待条件成立：运行时清理现在是独立子进程，物理结果要等它跑完（而不是同步返回）。 */
+async function waitFor(fn, { timeout = 10000, step = 50 } = {}) {
+  const deadline = Date.now() + timeout;
+  for (;;) {
+    if (await fn()) return true;
+    if (Date.now() > deadline) return false;
+    await sleep(step);
+  }
+}
 
 /** 加载插件（要求调用方已把 process.env.HOME 指向 tempHome；profile 推导才落在 temp 而非真实 ~/.dsh）。 */
 function boot(relayDir) {
@@ -96,14 +112,11 @@ test("彻底卸载：配置目录整目录清空（含账号/密钥/固化运行
       assert.equal(r.removedDep, true);
       assert.equal(r.removedBundle, true);
       assert.equal(r.removedDir, true, "profile 插件目录与 node_modules 链接应删除");
-      // 运行时清理标志位
-      assert.equal(r.relayDirRemoved, true, "relayDir 应被整目录清空");
-      assert.equal(r.servicePlatform, "launchd", "macOS 下 servicePlatform=launchd");
-      assert.equal(r.stoppedService, false, "DSH_RELAY_SKIP_SERVICE=1 → 不触碰真实 launchd 服务");
-      assert.equal(r.removedPlist, false);
-      assert.deepEqual(r.killedPids, []);
-      // 物理断言：relayDir 与其中全部残留都消失
-      assert.equal(existsSync(relayDir), false, "relayDir 目录应整体不存在");
+      // 运行时清理交给独立子进程（响应先回，慢活不再钉住事件循环）
+      assert.equal(r.runtimeCleanup, "deferred", "运行时清理必须由子进程接管（不得同步阻塞）");
+      assert.ok(r.cleanupLog, "应给出清理日志路径");
+      // 物理断言：等子进程跑完，relayDir 与其中全部残留都应消失
+      assert.ok(await waitFor(() => !existsSync(relayDir)), "relayDir 应被整目录清空（子进程执行）");
       assert.equal(existsSync(path.join(relayDir, ".dsh-config.json")), false);
       assert.equal(existsSync(path.join(relayDir, "dsh-setup.mjs")), false);
       assert.equal(existsSync(path.join(relayDir, "clients")), false);
@@ -117,7 +130,7 @@ test("彻底卸载：配置目录整目录清空（含账号/密钥/固化运行
       assert.equal(existsSync(profile), true, "dsh web profile 目录整体不得被删");
       // 人类可读 detail
       assert.match(String(r.detail), /插件引用与本地文件已移除/);
-      assert.match(String(r.detail), /配置目录已清空/);
+      assert.match(String(r.detail), /正在后台清理/);
       assert.match(String(r.detail), /请重启 dsh web/);
     } finally {
       host.close();
@@ -145,13 +158,12 @@ test("彻底卸载边界：只装了插件、从未跑过 bridge → relayDir �
       const r = await (await fetch(`${base}/dsh-remote/self/uninstall`, { method: "POST" })).json();
       assert.equal(r.ok, true);
       assert.equal(r.removedPatch, true, "profile 里的插件引用应照常清理");
-      assert.equal(r.relayDirRemoved, false, "目录本就不存在 → 不声称已清空");
-      assert.equal(r.stoppedService, false);
-      assert.equal(r.removedPlist, false);
-      assert.deepEqual(r.killedPids, []);
+      assert.equal(r.runtimeCleanup, "deferred");
       const detail = String(r.detail);
       assert.ok(!detail.includes("配置目录已清空"), "目录不存在时不应谎报已清空，实际: " + detail);
       assert.match(detail, /请重启 dsh web/);
+      await sleep(800); // 等清理子进程跑完
+      assert.equal(existsSync(relayDir), false, "relayDir 本来就不存在 → 不得被凭空创建");
     } finally {
       host.close();
     }
@@ -174,12 +186,13 @@ test("彻底卸载边界：什么都没有安装 → 全链路幂等返回 ok，
     try {
       const r = await (await fetch(`${base}/dsh-remote/self/uninstall`, { method: "POST" })).json();
       assert.equal(r.ok, true);
-      assert.equal(r.relayDirRemoved, false);
+      assert.equal(r.runtimeCleanup, "deferred");
       assert.equal(r.removedPatch, false);
       assert.equal(r.removedDep, false);
       assert.equal(r.removedBundle, false);
-      assert.deepEqual(r.killedPids, []);
       assert.match(String(r.detail), /请重启 dsh web/);
+      await sleep(800);
+      assert.equal(existsSync(relayDir), false, "什么都没有也不该凭空创建目录");
     } finally {
       host.close();
     }
@@ -206,10 +219,9 @@ test("DSH_RELAY_SKIP_SERVICE 开关：置位时即便存在自启动 plist 也�
     try {
       const r = await (await fetch(`${base}/dsh-remote/self/uninstall`, { method: "POST" })).json();
       assert.equal(r.ok, true);
-      assert.equal(r.removedPlist, false, "开关置位 → plist 不得被删");
-      assert.equal(existsSync(fakePlist), true, "plist 应原样保留（开关只放行配置目录清理）");
-      assert.equal(r.relayDirRemoved, true, "配置目录清理不受开关影响");
-      assert.equal(existsSync(relayDir), false);
+      assert.equal(r.runtimeCleanup, "deferred");
+      assert.ok(await waitFor(() => !existsSync(relayDir)), "配置目录清理不受开关影响");
+      assert.equal(existsSync(fakePlist), true, "开关置位 → plist 不得被删（子进程同样受开关约束）");
     } finally {
       host.close();
     }
@@ -220,7 +232,7 @@ test("DSH_RELAY_SKIP_SERVICE 开关：置位时即便存在自启动 plist 也�
   }
 });
 
-test("自然跳过（无开关）：HOME 有 plist 但服务未运行 → 删除 plist 但不发 launchctl bootout（PATH 假命令接管）", { skip: process.platform !== "darwin" }, async () => {
+test("无开关（真实分支）：自启动清理由独立子进程执行，且走 PATH 上的假 launchctl（不碰真实服务）", { skip: process.platform !== "darwin" }, async () => {
   const tempHome = await mkdtemp(path.join(os.tmpdir(), "dsh-ui-rt-natural-"));
   const prevHome = process.env.HOME;
   const prevPath = process.env.PATH;
@@ -254,15 +266,13 @@ exit 0
     try {
       const r = await (await fetch(`${base}/dsh-remote/self/uninstall`, { method: "POST" })).json();
       assert.equal(r.ok, true);
-      assert.equal(r.removedPlist, true, "plist 存在于当前 HOME → 应被删除");
-      assert.equal(existsSync(plist), false);
-      assert.equal(r.stoppedService, false, "服务未运行 → 无需 bootout，不虚报已停止");
-      assert.deepEqual(r.killedPids, [], "无残留进程可杀");
-      assert.equal(r.relayDirRemoved, true);
-      assert.equal(existsSync(relayDir), false);
-      // 关键：全程不得发出 bootout（避免任何真实/假服务被停）
-      const log = readFileSync(launchLog, "utf8");
-      assert.ok(!log.includes("bootout"), "未运行的服务不应触发 bootout，实际调用: " + log);
+      assert.equal(r.runtimeCleanup, "deferred", "无开关时同样走子进程");
+      // 等清理子进程跑完（它继承 HOME/PATH → plist 路径与 launchctl 都落在测试环境里）
+      assert.ok(await waitFor(() => !existsSync(plist)), "plist 应被清理子进程删除");
+      assert.ok(await waitFor(() => !existsSync(relayDir)), "配置目录应被清空");
+      // 关键安全性质：清理用的是 PATH 上的**假** launchctl —— 证明没有触碰任何真实服务
+      const log = existsSync(launchLog) ? readFileSync(launchLog, "utf8") : "";
+      assert.ok(log.includes("com.dshremote.bridge"), "应通过（假）launchctl 清理自启动，实际: " + log);
     } finally {
       host.close();
     }
@@ -289,8 +299,9 @@ test("保护参数：relayDir 误配置成 dsh web profile 目录 → 绝不整�
     try {
       const r = await (await fetch(`${base}/dsh-remote/self/uninstall`, { method: "POST" })).json();
       assert.equal(r.ok, true);
-      assert.equal(r.relayDirRemoved, false, "profile 目录受保护 → 不得整目录删除");
-      assert.equal(existsSync(profile), true, "dsh web profile 必须存活");
+      assert.equal(r.runtimeCleanup, "deferred");
+      await sleep(1000); // 等清理子进程跑完：它必须自己判断出"这是 profile，不许删"
+      assert.equal(existsSync(profile), true, "dsh web profile 必须存活（子进程也受同一条护栏约束）");
       assert.equal(existsSync(path.join(profile, "package.json")), true);
       assert.equal(existsSync(path.join(profile, "dsh-remote-ui-plugin")), false, "插件子目录应被 uninstallSelf 单独移除");
       assert.equal(existsSync(path.join(profile, "node_modules", "dsh-remote-ui")), false);

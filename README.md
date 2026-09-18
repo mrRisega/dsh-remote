@@ -30,6 +30,12 @@ dsh-remote 是一个轻量的**隧道模式**远程控制方案：电脑端运�
 
 ## 0.6.7 速览（Windows 可用版）
 
+> **预发中**：先以 `0.6.7-beta.x` 发布在 npm `beta` 通道（`latest` 仍是 0.6.6），
+> 待 Windows 真机验证通过后转正式版。安装预发版：
+> `npx @mrrisega/dsh-remote@0.6.7-beta.3`；若 dsh web 已起不来，用
+> `npx @mrrisega/dsh-remote@0.6.7-beta.3 repair`（只修 profile，不联网）。
+
+
 0.6.6 及更早的插件半整套「服务状态 / 启停 / 重启」是按 macOS/Linux 写死的
 （launchctl / systemd / pgrep / ps / /bin/sh），**在 Windows 上安装一切正常、运行期必死**：
 面板红字「读取状态失败: process.getuid is not a function」、状态永远停在「查询中…」、
@@ -154,8 +160,16 @@ npx @mrrisega/dsh-remote setup --server wss://<你的域名>:端口 --key <访�
   校验值用于登录，与加密密钥域分离（详见 [docs/e2ee-protocol.md](docs/e2ee-protocol.md)）。
 - 请**牢记账号密码**：修改/重置密码会使全部旧设备会话失效，且服务端不保存你的内容、
   无法代为解密旧会话；改密后需在电脑端面板重新登录并重启 bridge，手机端重新解锁。
-- 电脑端本机配置（`.dsh-config.json`，0600）会保存账号密码用于自动登录，等于该账号
+- 电脑端本机配置（`.dsh-config.json`）会保存账号密码用于自动登录，等于该账号
   内容的“解密权”，请妥善保护电脑；电脑被他人使用期间请退出登录。
+  - macOS / Linux：文件权限 **0600**（仅本人可读写）。
+  - Windows：**`0600` 在 Windows 上无效**（Windows 用 ACL，不是 POSIX 权限位）——
+    早期版本只写了 `mode: 0o600`，实测该文件拿到的仍是用户目录的**默认继承 ACL**，
+    等于没有这层保护。0.6.7-beta.3 起安装器/插件/bridge 都会显式收紧：`icacls` 断开继承、
+    只授予当前用户。若收紧失败（无 icacls / 权限异常），安装日志会明确告警，不会假装成功。
+  - 无论哪个平台：**不要把 `.dsh-remote` 目录交给备份/同步盘/他人排查**——
+    里面的 `.dsh-config.json`（明文账号密码）与 `.harness-cookie.json`（dsh web 会话 Cookie，
+    等于该会话的完整访问权）被复制走就等于把钥匙一起给了对方。发支持包前请先删除这两项。
 
 **边界与建议（如实告知）**
 

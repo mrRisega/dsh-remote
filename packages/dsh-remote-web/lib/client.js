@@ -340,8 +340,35 @@ window.__ModuleLoader__.load({
     }
 
     // ── 宿主 API ────────────────────────────────────────────────────────────
-    function api(path, options) {
-      return fetch(path, options).then(function (res) {
+    /**
+     * 默认请求超时（0.6.7-beta.3 新增）。
+     * 背景（用户实测）：node 半一旦被同步子进程调用钉死（卸载时 spawnSync 卡在 schtasks 上），
+     * 请求**永远不会返回**，面板就对着一个永不结束的 spinner —— 用户只能猜。
+     * 现在超时后给出明确报错（并提示"这一步可能已经在后台完成了"），而不是无限转圈。
+     * 30s 足够覆盖最慢的正常路径（relay 6s + Windows 进程扫描 8s）。
+     */
+    var API_TIMEOUT_MS = 30000;
+    function api(path, options, timeoutMs) {
+      var opts = options || {};
+      var timer = null;
+      try {
+        if (typeof AbortController === "function") {
+          var ctrl = new AbortController();
+          var ms = typeof timeoutMs === "number" && timeoutMs > 0 ? timeoutMs : API_TIMEOUT_MS;
+          timer = setTimeout(function () { try { ctrl.abort(); } catch (e) { /* 忽略 */ } }, ms);
+          opts = Object.assign({}, opts, { signal: ctrl.signal });
+        }
+      } catch (e) { /* 无 AbortController 的旧环境：退化为无超时（不阻断使用） */ }
+      var done = function () { if (timer) { clearTimeout(timer); timer = null; } };
+      return fetch(path, opts).catch(function (e) {
+        // AbortError → 换成用户能看懂的话（并说明服务端可能已经做完了）
+        if (e && (e.name === "AbortError" || /abort/i.test(String(e.message || "")))) {
+          var te = new Error("请求超时（面板等不到本机响应）。这一步可能已经在后台完成了 —— 请刷新页面查看；若 dsh web 无响应，重启一次 dsh web 即可。");
+          te.timeout = true;
+          throw te;
+        }
+        throw e;
+      }).finally(done).then(function (res) {
         return res.text().then(function (text) {
           var body = null;
           try { body = JSON.parse(text); } catch (e) { body = null; }
@@ -357,6 +384,10 @@ window.__ModuleLoader__.load({
     }
     var post = function (path, data) {
       return api(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(data || {}) });
+    };
+    /** 带自定义超时的 POST（用于卸载这类"可能拖住"的操作）。 */
+    var postWithTimeout = function (path, data, timeoutMs) {
+      return api(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(data || {}) }, timeoutMs);
     };
 
     // ── 交流群（二维码由图层面板上传统一配置,node 半经公开配置下发） ─────────
@@ -1066,7 +1097,9 @@ window.__ModuleLoader__.load({
         if (!armed) { setArmed(true); return; }
         setUnBusy(true);
         setSelfMsg(null);
-        post("/dsh-remote/self/uninstall", {}).then(function (b) {
+        // 卸载：服务端现在"先卸插件、先回响应、慢活交子进程"，正常应在 1 秒内返回；
+        // 给 20s 上界，超时也要给用户一句能照做的话（而不是永久转圈）。
+        postWithTimeout("/dsh-remote/self/uninstall", {}, 20000).then(function (b) {
           if (b && b.ok) {
             setArmed(false);
             // 优先展示服务端 detail（含 bridge 自启动/配置目录的逐项清理结果与重启提示）；
@@ -1079,7 +1112,7 @@ window.__ModuleLoader__.load({
           }
         }).catch(function (e) {
           setArmed(false);
-          setSelfMsg({ kind: "err", text: "卸载失败：" + e.message });
+          setSelfMsg({ kind: e && e.timeout ? "warn" : "err", text: (e && e.timeout ? "" : "卸载失败：") + e.message });
         }).finally(function () { setUnBusy(false); });
       };
 

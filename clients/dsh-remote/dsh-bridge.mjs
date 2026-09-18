@@ -65,7 +65,7 @@ import WebSocket from "ws";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execSync } from "node:child_process";
+import { execSync, spawnSync } from "node:child_process";
 import { randomBytes, generateKeyPairSync, createHash } from "node:crypto";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -200,10 +200,40 @@ function loadLocalConfig() {
   try { return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8")); } catch { return {}; }
 }
 
+/**
+ * 把文件权限收紧到「只有本人可读写」。
+ *
+ * ⚠️ Windows 上 `{ mode: 0o600 }` 是**空操作**（Windows 用 ACL，不是 POSIX mode 位）：
+ * 实测 .dsh-config.json 拿到的是用户目录的默认**继承 ACL**（AreAccessRulesProtected=False），
+ * 也就是说代码里那句 0600 对 Windows 用户完全没效果 —— 而文件里是**明文账号密码**。
+ * 风险不在"同机他人可读"（默认 ACL 下其实读不到），而在**任何按文件复制的场景**
+ * （备份/同步盘/杀软上报/崩溃转储/用户发给作者的支持包）都会连钥匙一起被带走，
+ * 而文档里的"0600 请妥善保护"会让用户误以为 Windows 上已有这层保护。
+ * 这里显式断开继承、只授予当前用户；失败只警告一次，绝不影响主流程。
+ */
+let hardenWarned = false;
+function hardenFile(file) {
+  try { fs.chmodSync(file, 0o600); } catch { /* POSIX 上失败不致命 */ }
+  if (process.platform !== "win32") return;
+  const who = [process.env.USERDOMAIN, process.env.USERNAME].filter(Boolean).join("\\");
+  if (!who) return;
+  let r;
+  try {
+    r = spawnSync("icacls", [file, "/inheritance:r", "/grant:r", `${who}:F`],
+      { windowsHide: true, encoding: "utf8", timeout: 8000 });
+  } catch (e) { r = { status: -1, stderr: e.message }; }
+  if (r.status !== 0 && !hardenWarned) {
+    hardenWarned = true;
+    console.warn(`⚠️ 收紧文件权限失败（${who}）：${String(r.stderr || "").trim() || `icacls 退出码 ${r.status}`}`);
+    console.warn("   配置文件可能仍可被其它账户/备份工具读取，请自行确认其存放位置。");
+  }
+}
+
 function saveLocalConfig(cfg) {
   try {
     fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
     fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2), { mode: 0o600 });
+    hardenFile(CONFIG_PATH); // Windows 上 mode 是空操作 → 显式收紧 ACL（内含明文账号密码）
   } catch (e) {
     console.warn(`[bridge] 无法写配置 ${CONFIG_PATH}: ${e.message}`);
   }

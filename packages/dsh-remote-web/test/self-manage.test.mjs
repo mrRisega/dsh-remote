@@ -155,6 +155,16 @@ test("残留 marker 自愈：记录进程已死的 marker 在插件启动时立�
   }
 });
 
+/** 等待条件成立：运行时清理现在是独立子进程，物理结果要等它跑完。 */
+async function waitFor(fn, { timeout = 10000, step = 50 } = {}) {
+  const deadline = Date.now() + timeout;
+  for (;;) {
+    if (await fn()) return true;
+    if (Date.now() > deadline) return false;
+    await new Promise((r) => setTimeout(r, step));
+  }
+}
+
 test("uninstall 路由：移除 include 块 + package.json 依赖/bundle + 本地目录（解锁市场卸载）", async () => {
   const tempHome = await mkdtemp(path.join(os.tmpdir(), "dsh-ui-home-"));
   const relayDir = path.join(tempHome, "relay");
@@ -189,13 +199,12 @@ test("uninstall 路由：移除 include 块 + package.json 依赖/bundle + 本�
       assert.equal(r.removedBundle, true, "应移除 dsh.profile.bundles 条目");
       assert.equal(r.removedDir, true, "应删除本地插件目录与 node_modules 链接");
 
-      // 运行时/bridge 清理（隔离模式下只清空配置目录，绝不触碰真实 launchd 服务）
-      assert.equal(r.relayDirRemoved, true, "配置目录 relayDir 应被整目录清空");
-      assert.equal(r.stoppedService, false, "DSH_RELAY_SKIP_SERVICE=1 → 不做真实服务操作");
-      assert.equal(r.removedPlist, false, "DSH_RELAY_SKIP_SERVICE=1 → 不删自启动 plist");
-      assert.deepEqual(r.killedPids, [], "DSH_RELAY_SKIP_SERVICE=1 → 不杀进程");
-      assert.equal(existsSync(relayDir), false, "relayDir 物理上应已不存在");
-      assert.match(String(r.detail), /配置目录已清空/, "detail 应说明配置目录已清空");
+      // 运行时/bridge 清理：0.6.7-beta.3 起交给**独立子进程**（先回响应，慢活不阻塞事件循环），
+      // 所以这里断言响应契约 + 轮询等它的物理结果（隔离模式下只清空配置目录，绝不触碰真实 launchd 服务）
+      assert.equal(r.runtimeCleanup, "deferred", "运行时清理应由子进程接管");
+      const gone = await waitFor(() => !existsSync(relayDir));
+      assert.equal(gone, true, "relayDir 物理上应已不存在（子进程执行）");
+      assert.match(String(r.detail), /正在后台清理/, "detail 应说明后台清理");
       assert.match(String(r.detail), /请重启 dsh web/, "detail 应提示重启生效");
 
       const patch = await readFile(patchFile, "utf8");

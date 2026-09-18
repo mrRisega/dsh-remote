@@ -20,11 +20,11 @@
 //   - 0.1.2+ ?token 浏览器鉴权会话代持（0.4.1 起）
 //
 // 不依赖任何第三方包：只使用 node 内置模块与 cordis 注入的 webServer 服务。
-import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync, accessSync, chmodSync, openSync, closeSync, readSync, fstatSync, rmSync, statSync, constants as fsConstants } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync, accessSync, chmodSync, openSync, closeSync, readSync, fstatSync, rmSync, renameSync, statSync, constants as fsConstants } from "node:fs";
 import { join, dirname, sep, delimiter } from "node:path";
 import { execSync, spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 /** 本插件在 host 侧的服务依赖。 */
@@ -85,6 +85,35 @@ const DEFAULT_RELAY_DIR = process.env.DSH_RELAY_DIR || join(homedir(), ".dsh-rem
 // 默认云端服务地址（SaaS 入口；自建用户在设置页/面板切换）
 const DEFAULT_API = "https://n.risegao.cn:13443/relay-api";
 const DEFAULT_APP_URL = "https://n.risegao.cn:13443/app/";
+
+/**
+ * 把文件权限收紧到「只有本人可读写」。
+ *
+ * ⚠️ Windows 上 `{ mode: 0o600 }` 是**空操作**（Windows 用 ACL，不是 POSIX mode 位）：
+ * 实测 .dsh-config.json 拿到的是用户目录的默认**继承 ACL**（AreAccessRulesProtected=False），
+ * 也就是说代码里那句 0600 对 Windows 用户完全没效果 —— 而文件里是**明文账号密码**。
+ * 风险不在"同机他人可读"（默认 ACL 下其实读不到），而在**任何按文件复制的场景**
+ * （备份/同步盘/杀软上报/崩溃转储/用户发给作者的支持包）都会连钥匙一起被带走，
+ * 而文档里的"0600 请妥善保护"会让用户误以为 Windows 上已有这层保护。
+ * 这里显式断开继承、只授予当前用户；失败只警告一次，绝不影响主流程。
+ */
+let hardenWarned = false;
+function hardenFile(file) {
+  try { fs.chmodSync(file, 0o600); } catch { /* POSIX 上失败不致命 */ }
+  if (process.platform !== "win32") return;
+  const who = [process.env.USERDOMAIN, process.env.USERNAME].filter(Boolean).join("\\");
+  if (!who) return;
+  let r;
+  try {
+    r = spawnSync("icacls", [file, "/inheritance:r", "/grant:r", `${who}:F`],
+      { windowsHide: true, encoding: "utf8", timeout: 8000 });
+  } catch (e) { r = { status: -1, stderr: e.message }; }
+  if (r.status !== 0 && !hardenWarned) {
+    hardenWarned = true;
+    console.warn(`⚠️ 收紧文件权限失败（${who}）：${String(r.stderr || "").trim() || `icacls 退出码 ${r.status}`}`);
+    console.warn("   配置文件可能仍可被其它账户/备份工具读取，请自行确认其存放位置。");
+  }
+}
 
 // ---------- 小工具 ----------
 
@@ -334,6 +363,7 @@ function saveConfig(relayDir, cfg) {
   mkdirSync(dirname(configPathOf(relayDir)), { recursive: true });
   // mode 0o600：与 dsh-setup.mjs 一致（文件已存在时 writeFileSync 不改权限，显式 chmod 兜底）
   writeFileSync(configPathOf(relayDir), JSON.stringify(cfg, null, 2), { mode: 0o600 });
+  hardenFile(configPathOf(relayDir)); // Windows 上 mode 是空操作 → 显式收紧 ACL（内含明文账号密码）
   try {
     chmodSync(configPathOf(relayDir), 0o600);
   } catch {
@@ -412,6 +442,7 @@ async function mintHarnessCookie(ctx, relayDir) {
     const out = { authority: `127.0.0.1:${port}`, cookie, mintedAt: Date.now() };
     mkdirSync(dirname(configPathOf(relayDir)), { recursive: true });
     writeFileSync(join(relayDir, HARNESS_COOKIE_FILE), JSON.stringify(out, null, 2), { mode: 0o600 });
+    hardenFile(join(relayDir, HARNESS_COOKIE_FILE)); // 会话 Cookie ≈ dsh web 的完整访问权，同样要收紧
     return true;
   } catch {
     return false;
@@ -1459,7 +1490,7 @@ const deadline = Date.now() + 30000;
 while (Date.now() < deadline && alive(PLAN.pid)) await delay(200);
 if (alive(PLAN.pid)) {
   logLine("旧进程 30s 未退出，改用 taskkill /T /F");
-  spawnSync("taskkill", ["/PID", String(PLAN.pid), "/T", "/F"], { windowsHide: true });
+  spawnSync("taskkill", ["/PID", String(PLAN.pid), "/T", "/F"], { windowsHide: true, timeout: 8000 });
   await delay(500);
 }
 
@@ -2302,7 +2333,7 @@ const PLUGIN_ID = "dsh-remote-web";
 const PLUGIN_LEGACY_IDS = ["dsh-remote-ui"];
 const PLUGIN_ALL_IDS = [PLUGIN_ID, ...PLUGIN_LEGACY_IDS];
 /** 插件自身发布版本（与 dsh-remote 根包同步递增）。 */
-const PLUGIN_VERSION = "0.6.7-beta.2";
+const PLUGIN_VERSION = "0.6.7-beta.3";
 const UPDATE_LOG = ".dsh-update.log";
 const UPDATE_MARKER = ".dsh-update-running";
 
@@ -2507,17 +2538,204 @@ function tailOf(filePath, lines = 24) {
   } catch { return ""; }
 }
 
+/**
+ * 判断 patch 文本是否是「合法的顶层 YAML 数组文档」。
+ *
+ * 为什么必须判（2026-09-18 Windows 用户实测的致命事故）：dsh 解析 cordis.patch.yml 时
+ * **要求顶层是数组**，而**纯注释文档的 YAML 解析结果是 `null` 而不是空数组**，于是 dsh 直接：
+ *   `Error: dsh: overlay …/cordis.patch.yml must be a top-level YAML array of loader patch entries`
+ * 官方空 profile 模板是「注释 + `[]`」——`[]` 这个占位符不能省。
+ * 卸载把插件条目摘掉后若只剩注释，用户就再也起不来 dsh web（面板也进不去，只能靠 CLI 自救）。
+ */
+/** 顶层（无缩进）非注释行 = YAML 的结构行；缩进行属于上一条目。 */
+function patchStructuralLines(text) {
+  return String(text ?? "")
+    .split(/\r?\n/)
+    .map((l) => l.replace(/\s+$/, ""))
+    .filter((l) => l.trim() !== "" && !/^\s*#/.test(l) && !/^[ \t]/.test(l));
+}
+
+/** 是否是合法的顶层数组文档（`[]` 占位，或若干 `-` 开头的顶层条目）。 */
+function isPatchArrayDocument(text) {
+  const roots = patchStructuralLines(text);
+  return roots.length > 0 && roots.every((l) => l === "[]" || l.startsWith("-"));
+}
+
+/** 只有注释/空行 → YAML 解析成 null（不是空数组），必须补 `[]` 占位，否则 dsh 起不来。 */
+function needsArrayPlaceholder(text) {
+  return patchStructuralLines(text).length === 0;
+}
+
+/** 摘掉本插件的 patch 条目：管理标记块 + 无标记的 `- insert:` 块（当前名与历史名都清）。 */
+function stripOwnEntriesFromPatch(patch) {
+  // ① 管理标记块（dsh-setup 写入的形式）
+  // 结尾标记后面可能还有残留文字（历史变体），用 [^\n]* 吃掉整行，避免留下半截内容
+  const out = String(patch ?? "").replace(/\n?# >>> dsh-remote-(?:web|ui)[^\n]*\n[\s\S]*?# <<< dsh-remote-(?:web|ui)[^\n]*\n?/g, "\n");
+  // ② 无标记的 insert 块（旧版 / 其它工具写入的形式，历史事故里出现过）。
+  //    只摘标记块是不够的：目录已删而 patch 仍引用 → dsh 插件树加载失败 → 整个 dsh web 起不来。
+  const lines = out.split("\n");
+  const kept = [];
+  let i = 0;
+  while (i < lines.length) {
+    if (/^- insert:\s*$/.test(lines[i])) {
+      const block = [lines[i]];
+      let j = i + 1;
+      while (j < lines.length && (lines[j].startsWith(" ") || lines[j].startsWith("\t"))) { block.push(lines[j]); j += 1; }
+      if (PLUGIN_ALL_IDS.some((id) => new RegExp(`\\b${id}\\b`).test(block.join("\n")))) {
+        while (kept.length && /^\s*#/.test(kept[kept.length - 1])) kept.pop(); // 连带条目上方的说明注释
+        i = j;
+        continue;
+      }
+      kept.push(...block);
+      i = j;
+      continue;
+    }
+    kept.push(lines[i]);
+    i += 1;
+  }
+  return kept.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd() + "\n";
+}
+
+/**
+ * 原子写回 patch，并保证结果仍是合法顶层数组：条目被删光时补回 `[]` 占位。
+ * ⚠️ 只在「一个结构行都不剩」时补 —— 不能因为"看起来不像数组"就乱补，
+ *    那会把本来好的文件写坏（例如把 `[]` 追加到已有 insert 块后面 → YAML 直接报错）。
+ */
+function writePatchDocument(patchFile, text) {
+  const body = String(text ?? "").replace(/\s+$/, "") + "\n";
+  const fixed = needsArrayPlaceholder(body) ? `${body}[]\n` : body;
+  const tmp = `${patchFile}.dsh-remote.tmp`;
+  writeFileSync(tmp, fixed);
+  renameSync(tmp, patchFile);
+  return fixed;
+}
+
+/**
+ * 「运行时清理助手」源码（卸载用；由插件生成、detached 执行）。
+ *
+ * 为什么必须是独立进程（2026-09-18 用户实测的僵死事故）：
+ *   uninstallRuntime() 里有 spawnSync("schtasks"/"powershell"/"taskkill")，同步子进程调用会把
+ *   **dsh web 的事件循环整个钉死** —— 不只是这一个请求不返回，手机端隧道、其它页面、所有 API
+ *   一起停摆，表现为「端口在听、连接建立、但永不响应」。而 spawnSync 的 timeout 在 Windows 上
+ *   **并不可靠**（实测被策略拦截的进程 18s+ 仍未返回），所以不能把 timeout 当设计依据：
+ *   真正的解法是不要把同步子进程调用留在宿主进程里。
+ *
+ * 助手做的是「宁可少做也不卡住」的有界清理：杀残留进程 → 删自启动 → 清配置目录，每步独立 try/catch。
+ */
+function buildRuntimeCleanupHelper(relayDir, protectedPath) {
+  const plan = JSON.stringify({
+    relayDir,
+    protectedPath: protectedPath || "",
+    platform: osPlatform(),
+    taskName: WIN_TASK_NAME,
+    pidFiles: [WATCHER_PID_FILE, BRIDGE_PID_FILE],
+    plistPath: join(homedir(), "Library", "LaunchAgents", "com.dshremote.bridge.plist"),
+    unitPath: join(homedir(), ".config", "systemd", "user", "dsh-bridge.service"),
+    log: join(tmpdir(), "dsh-remote-uninstall.log"),
+  });
+  return `// dsh-remote 自动生成：彻底卸载的「运行时清理」部分（独立进程执行，避免阻塞 dsh web）
+import { spawnSync } from "node:child_process";
+import { appendFileSync, existsSync, readFileSync, rmSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join, sep } from "node:path";
+
+const PLAN = ${plan};
+// 与主进程一致的测试隔离开关：置位时**绝不做任何真实系统操作**（不碰 launchctl/systemctl/schtasks/taskkill），
+// 但仍清空配置目录 —— 否则用例会去动开发者本机真实的自启动服务（历史事故，见 setup-output 用例的护栏）。
+const SKIP_SYSTEM_OPS = process.env.DSH_RELAY_SKIP_SERVICE === "1";
+function log(m) { try { appendFileSync(PLAN.log, "\\n[" + new Date().toISOString() + "] " + m + "\\n"); } catch (e) { /* 日志失败不阻断清理 */ } }
+function run(cmd, args, timeout) {
+  try { const r = spawnSync(cmd, args, { windowsHide: true, encoding: "utf8", timeout }); return r.status === 0; }
+  catch (e) { log("命令失败 " + cmd + ": " + e.message); return false; }
+}
+function alive(pid) { try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } }
+function readPid(name) {
+  try { const n = Number(String(readFileSync(join(PLAN.relayDir, name), "utf8")).trim()); return Number.isInteger(n) && n > 0 ? n : null; }
+  catch (e) { return null; }
+}
+log("运行时清理开始（platform=" + PLAN.platform + "，relayDir=" + PLAN.relayDir + "）");
+if (SKIP_SYSTEM_OPS) log("测试隔离（DSH_RELAY_SKIP_SERVICE=1）：跳过一切真实系统操作");
+
+// ① 结束 watcher / bridge 残留进程
+for (const name of (SKIP_SYSTEM_OPS ? [] : PLAN.pidFiles)) {
+  const pid = readPid(name);
+  if (!pid || pid === process.pid) continue;
+  if (!alive(pid)) { log(name + " 里的 pid " + pid + " 已不在"); continue; }
+  if (PLAN.platform === "win32") run("taskkill", ["/PID", String(pid), "/T", "/F"], 8000);
+  else { try { process.kill(pid, "SIGTERM"); } catch (e) { /* 已退出 */ } }
+  log("已结束 " + name + " 的进程 pid=" + pid);
+}
+
+// ② 移除自启动（按平台）
+if (SKIP_SYSTEM_OPS) {
+  log("跳过自启动清理（测试隔离）");
+} else if (PLAN.platform === "win32") {
+  run("schtasks", ["/Delete", "/TN", PLAN.taskName, "/F"], 15000);
+  log("已请求删除登录任务 " + PLAN.taskName);
+} else if (PLAN.platform === "darwin") {
+  if (existsSync(PLAN.plistPath)) {
+    run("launchctl", ["bootout", "gui/" + (typeof process.getuid === "function" ? process.getuid() : 0) + "/com.dshremote.bridge"], 8000);
+    try { rmSync(PLAN.plistPath, { force: true }); } catch (e) { /* 非关键 */ }
+    log("已移除自启动 plist");
+  }
+} else if (PLAN.platform === "linux") {
+  run("systemctl", ["--user", "stop", "dsh-bridge"], 8000);
+  run("systemctl", ["--user", "disable", "dsh-bridge"], 8000);
+  try { if (existsSync(PLAN.unitPath)) rmSync(PLAN.unitPath, { force: true }); } catch (e) { /* 非关键 */ }
+  log("已移除 systemd 用户服务");
+}
+
+// ③ 清空配置目录（账号/密钥/会话 cookie/固化运行时）——安全护栏与主进程一致
+try {
+  const isRoot = dirname(PLAN.relayDir) === PLAN.relayDir;
+  const isHome = PLAN.relayDir === homedir();
+  const hitsProfile = Boolean(PLAN.protectedPath) && (
+    PLAN.relayDir === PLAN.protectedPath
+    || PLAN.relayDir.startsWith(PLAN.protectedPath + sep)
+    || PLAN.protectedPath.startsWith(PLAN.relayDir + sep));
+  if (PLAN.relayDir && !isRoot && !isHome && !hitsProfile && existsSync(PLAN.relayDir)) {
+    rmSync(PLAN.relayDir, { recursive: true, force: true });
+    log("已清空配置目录");
+  } else {
+    log("跳过配置目录清理（护栏命中或目录不存在）");
+  }
+} catch (e) { log("配置目录清理失败: " + e.message); }
+log("运行时清理结束");
+`;
+}
+
+/**
+ * 把「运行时清理」交给一个 detached 子进程（不阻塞宿主事件循环）。
+ * @returns {{ok:boolean, pid:number|null, log:string, detail:string}}
+ */
+function spawnRuntimeCleanupDetached(relayDir, protectedPath) {
+  const logPath = join(tmpdir(), "dsh-remote-uninstall.log");
+  try {
+    // 助手放**系统临时目录**而不是 relayDir：它自己就要删 relayDir，
+    // 把正在运行的脚本放在待删目录里既别扭又可能在 Windows 上因文件占用而失败。
+    const helperPath = join(tmpdir(), `dsh-remote-uninstall-${process.pid}-${Date.now()}.mjs`);
+    writeFileSync(helperPath, buildRuntimeCleanupHelper(relayDir, protectedPath));
+    const { child, error } = safeSpawn(process.execPath, [helperPath], {
+      detached: true, cwd: homedir(), stdio: "ignore", windowsHide: true,
+      onError: (e) => console.warn(`[dsh-remote-web] 运行时清理子进程启动失败: ${e.message}`),
+    });
+    if (error || !child) {
+      return { ok: false, pid: null, log: logPath, detail: (error || new Error("spawn 未返回子进程")).message };
+    }
+    child.unref();
+    return { ok: true, pid: child.pid, log: logPath, detail: "已在后台清理" };
+  } catch (e) {
+    return { ok: false, pid: null, log: logPath, detail: e.message };
+  }
+}
+
 /** 彻底卸载第 2 步 —— profile 插件清理（兼容市场“拒绝改写用户补丁”）：移除 include、依赖、bundle、本地目录与链接。 */
 function uninstallSelf(relayDir, profileDir, patchFile, pkgFile) {
   const out = { removedPatch: false, removedDep: false, removedDir: false, removedBundle: false };
   try {
     const patch = readFileSync(patchFile, "utf8");
-    // 兼容当前与历史（dsh-remote-ui）两种管理标记
-    const cleaned = patch
-      .replace(/\n?# >>> dsh-remote-(?:web|ui) .*?# <<< dsh-remote-(?:web|ui)\s*/s, "\n")
-      .replace(/\n{3,}/g, "\n\n")
-      .trimEnd() + "\n";
-    if (cleaned !== patch) { writeFileSync(patchFile, cleaned); out.removedPatch = true; }
+    const cleaned = stripOwnEntriesFromPatch(patch); // 兼容当前与历史（dsh-remote-ui）两种名
+    if (cleaned !== patch) { writePatchDocument(patchFile, cleaned); out.removedPatch = true; }
   } catch { /* 无 patch 忽略 */ }
   try {
     const pkg = JSON.parse(readFileSync(pkgFile, "utf8"));
@@ -3571,30 +3789,47 @@ function registerRoutes(ctx, relayDir) {
       method: "POST",
       path: "/dsh-remote/self/uninstall",
       handler: async (_req, res) => {
-        // 彻底卸载 = ① 运行时/bridge 清理（停自启动 → 杀残留 → 清空配置目录，顺序防 KeepAlive 复活）
-        //           + ② 插件 profile 清理（include 块/依赖/bundle/本地目录与链接，解锁市场卸载）
-        const rt = uninstallRuntime(relayDir, profileDir);
-        const prof = uninstallSelf(relayDir, profileDir, join(profileDir, "cordis.patch.yml"), join(profileDir, "package.json"));
-        // 卸载后本进程内（直到重启）自愈/代持调度一律停摆，不再重建配置目录或拉起 bridge
+        // 彻底卸载 = ① 插件 profile 清理（快、纯 fs、可预期）② 运行时/bridge 清理（慢、要调外部命令）
+        //
+        // ⚠️ 顺序是刻意的，别改回去（2026-09-18 用户实测的僵死事故）：
+        //   旧实现把**慢的** uninstallRuntime 排在最前、uninstallSelf 排在其后，于是
+        //   uninstallRuntime 里任何一次 spawnSync 卡住（Windows 沙箱拦 schtasks，而 spawnSync 的
+        //   timeout 在 Windows 上并不可靠，实测 18s+ 未返回），uninstallSelf 就**永远不执行**
+        //   → 用户看到「点了卸载、插件纹丝不动」，而且整个 dsh web 僵死（端口在听、无响应）。
+        //   现在：先做真正"卸载掉插件"的部分 → 立刻关掉自愈 → 立刻回响应 → 慢步骤交独立子进程。
+        let prof = { removedPatch: false, removedDep: false, removedBundle: false, removedDir: false };
+        try {
+          prof = uninstallSelf(relayDir, profileDir, join(profileDir, "cordis.patch.yml"), join(profileDir, "package.json"));
+        } catch (e) {
+          console.warn(`[dsh-remote-web] 卸载插件引用失败: ${e.message}`);
+        }
+        // 必须在慢步骤之前置位：否则慢步骤期间自愈有机会把 bridge / 配置目录再拉回来
         markUninstalled(relayDir);
+        // 运行时清理交给独立进程：宿主事件循环绝不做同步子进程调用
+        const cleanup = spawnRuntimeCleanupDetached(relayDir, profileDir);
+        const cleanupMode = cleanup.ok ? "deferred" : "in-process";
         const bits = [];
         if (prof.removedPatch || prof.removedDep || prof.removedBundle || prof.removedDir) bits.push("插件引用与本地文件已移除");
-        if (rt.stoppedService) bits.push("bridge 自启动服务已停止");
-        if (rt.removedPlist) bits.push("自启动项已删除");
-        if (rt.killedPids.length) bits.push(`已结束 ${rt.killedPids.length} 个残留进程`);
-        if (rt.removedDir) bits.push("配置目录已清空（账号/密钥/固化运行时等）");
+        bits.push(cleanup.ok
+          ? "bridge 自启动项与本地配置目录（账号/密钥/固化运行时等）正在后台清理"
+          : `bridge 自启动项与配置目录的后台清理未能启动（${cleanup.detail}），已改在本进程内清理`);
         bits.push("请重启 dsh web 后完全卸载生效（本插件与「远程访问」面板将消失）；如需再次使用，在插件市场重新安装即可。");
         sendJson(res, 200, {
           ok: true,
           ...prof, // removedPatch / removedDep / removedBundle / removedDir(profile 插件目录)
-          servicePlatform: rt.servicePlatform,
-          stoppedService: rt.stoppedService,
-          removedPlist: rt.removedPlist,
-          killedPids: rt.killedPids,
-          relayDirRemoved: rt.removedDir, // 配置目录 relayDir 已整目录清空
+          runtimeCleanup: cleanupMode,
+          cleanupLog: cleanup.log,
           relayDir,
           detail: bits.join("；"),
         });
+        // 兜底：助手起不来（relayDir 不可写 / node 起不来）时才在进程内清理。
+        // **必须放在响应之后**：这条路径会阻塞事件循环，绝不能让用户先等它。
+        if (!cleanup.ok) {
+          setTimeout(() => {
+            try { uninstallRuntime(relayDir, profileDir); }
+            catch { /* 非致命：残留可由用户手动清理 */ }
+          }, 50).unref?.();
+        }
       },
     },
     {

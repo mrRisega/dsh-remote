@@ -257,6 +257,35 @@ const SERVICE_PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/
 const INSTALL_SOURCE = String(process.env.DSH_BRIDGE_INSTALL_SOURCE || "").trim() || "npx";
 const INSTALL_VERSION = String(process.env.DSH_BRIDGE_INSTALL_VERSION || "").trim() || pkgVersion();
 
+/**
+ * 把文件权限收紧到「只有本人可读写」。
+ *
+ * ⚠️ Windows 上 `{ mode: 0o600 }` 是**空操作**（Windows 用 ACL，不是 POSIX mode 位）：
+ * 实测 .dsh-config.json 拿到的是用户目录的默认**继承 ACL**（AreAccessRulesProtected=False），
+ * 也就是说代码里那句 0600 对 Windows 用户完全没效果 —— 而文件里是**明文账号密码**。
+ * 风险不在"同机他人可读"（默认 ACL 下其实读不到），而在**任何按文件复制的场景**
+ * （备份/同步盘/杀软上报/崩溃转储/用户发给作者的支持包）都会连钥匙一起被带走，
+ * 而文档里的"0600 请妥善保护"会让用户误以为 Windows 上已有这层保护。
+ * 这里显式断开继承、只授予当前用户；失败只警告一次，绝不影响主流程。
+ */
+let hardenWarned = false;
+function hardenFile(file) {
+  try { fs.chmodSync(file, 0o600); } catch { /* POSIX 上失败不致命 */ }
+  if (process.platform !== "win32") return;
+  const who = [process.env.USERDOMAIN, process.env.USERNAME].filter(Boolean).join("\\");
+  if (!who) return;
+  let r;
+  try {
+    r = spawnSync("icacls", [file, "/inheritance:r", "/grant:r", `${who}:F`],
+      { windowsHide: true, encoding: "utf8", timeout: 8000 });
+  } catch (e) { r = { status: -1, stderr: e.message }; }
+  if (r.status !== 0 && !hardenWarned) {
+    hardenWarned = true;
+    console.warn(`⚠️ 收紧文件权限失败（${who}）：${String(r.stderr || "").trim() || `icacls 退出码 ${r.status}`}`);
+    console.warn("   配置文件可能仍可被其它账户/备份工具读取，请自行确认其存放位置。");
+  }
+}
+
 // ---------- 配置读写 ----------
 function loadConfig() {
   try { return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8")); }
@@ -265,6 +294,7 @@ function loadConfig() {
 function saveConfig(cfg) {
   fs.mkdirSync(CONFIG_DIR, { recursive: true });
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2), { mode: 0o600 });
+  hardenFile(CONFIG_PATH); // Windows 上 mode 是空操作 → 必须显式收紧 ACL（内含明文账号密码）
 }
 
 // ---------- 公共配置（从服务端取域名，服务商可随时更换） ----------
@@ -754,7 +784,7 @@ await delay(1000);
 try { process.kill(PLAN.pid); } catch (e) {}
 const deadline = Date.now() + 30000;
 while (Date.now() < deadline && alive(PLAN.pid)) await delay(200);
-if (alive(PLAN.pid)) spawnSync("taskkill", ["/PID", String(PLAN.pid), "/T", "/F"], { windowsHide: true });
+if (alive(PLAN.pid)) spawnSync("taskkill", ["/PID", String(PLAN.pid), "/T", "/F"], { windowsHide: true, timeout: 8000 });
 let out = "ignore";
 try { out = openSync(PLAN.log, "a"); } catch (e) {}
 const child = spawn(PLAN.argv[0], PLAN.argv.slice(1), { detached: true, stdio: ["ignore", out, out], windowsHide: true });
@@ -1328,6 +1358,48 @@ function validatePatchBase(text) {
   return { ok: true, cleaned, insertedIds: ids };
 }
 
+/**
+ * patch 文本是否是「合法的顶层 YAML 数组文档」。
+ *
+ * 为什么必须判：dsh 侧解析 cordis.patch.yml 时**要求顶层是数组**，而
+ * **纯注释文档的 YAML 解析结果是 `null`（不是空数组）**，于是 dsh 直接启动失败：
+ *   `Error: dsh: overlay …/cordis.patch.yml must be a top-level YAML array of loader patch entries`
+ * 官方空 profile 模板（dsh-app-boot）正是「注释 + `[]`」——`[]` 这个占位符不能省。
+ * 现场（2026-09-18 Windows 用户实测）：卸载把插件条目摘掉后只剩顶部注释，dsh web 再也起不来。
+ */
+/** 顶层（无缩进）非注释行 = YAML 的结构行；缩进行属于上一条目。 */
+function patchStructuralLines(text) {
+  return String(text ?? "")
+    .split(/\r?\n/)
+    .map((l) => l.replace(/\s+$/, ""))
+    .filter((l) => l.trim() !== "" && !/^\s*#/.test(l) && !/^[ \t]/.test(l));
+}
+
+/** 是否是合法的顶层数组文档（`[]` 占位，或若干 `-` 开头的顶层条目）。 */
+function isPatchArrayDocument(text) {
+  const roots = patchStructuralLines(text);
+  return roots.length > 0 && roots.every((l) => l === "[]" || l.startsWith("-"));
+}
+
+/** 只有注释/空行 → YAML 解析成 null（不是空数组），必须补 `[]` 占位，否则 dsh 起不来。 */
+function needsArrayPlaceholder(text) {
+  return patchStructuralLines(text).length === 0;
+}
+
+/**
+ * 写回 patch 文档，并**保证结果仍是合法顶层数组**：条目被删光时补回 `[]` 占位。
+ * 卸载、摘 include、回滚都必须走这里 —— 任何一条写路径漏了这步，用户就会拿到
+ * 一个「dsh web 起不来且面板也进不去」的 profile（只能靠 CLI 自救）。
+ */
+function writePatchDocument(patchFile, text) {
+  const body = String(text ?? "").replace(/\s+$/, "") + "\n";
+  // ⚠️ 只在「一个结构行都不剩」时补 —— 不能因为"看起来不像数组"就乱补，
+  //    那会把本来好的文件写坏（把 `[]` 追加到已有 insert 块后面 → YAML 直接报错）。
+  const fixed = needsArrayPlaceholder(body) ? `${body}[]\n` : body;
+  writePatchAtomic(patchFile, fixed);
+  return fixed;
+}
+
 /** 安全写回 patch（原子：先写同目录临时文件再 rename，避免中途被打断留下半截文件）。 */
 function writePatchAtomic(patchFile, text) {
   const tmp = `${patchFile}.dsh-remote.tmp`;
@@ -1384,7 +1456,7 @@ function ensurePatchActivation(patchFile, pluginLocalDir, pkgFile, opts = {}) {
         const merged2 = `${base2.cleaned ? base2.cleaned + "\n" : ""}\n${want}\n`;
         const chk = parsePatchInsertIds(merged2);
         if (!chk.badLines.length && chk.ids.filter((id) => id === PLUGIN_ID).length === 1) {
-          writePatchAtomic(patchFile, merged2);
+          writePatchDocument(patchFile, merged2);
           console.log(`✅ 已同步激活行的 relayDir → ${wantDir}`);
           return { ok: true, changed: true, basePatch: original };
         }
@@ -1407,18 +1479,18 @@ function ensurePatchActivation(patchFile, pluginLocalDir, pkgFile, opts = {}) {
   if (check.badLines.length || check.ids.filter((id) => id === PLUGIN_ID).length !== 1) {
     return { ok: false, reason: "合并后的 patch 校验未通过（未做改动）", changed: false, basePatch: original };
   }
-  writePatchAtomic(patchFile, merged);
+  writePatchDocument(patchFile, merged);
   const after = fs.readFileSync(patchFile, "utf8");
   const verify = parsePatchInsertIds(after);
   if (verify.badLines.length || verify.ids.filter((id) => id === PLUGIN_ID).length !== 1) {
-    writePatchAtomic(patchFile, original); // 回滚
+    writePatchDocument(patchFile, original); // 回滚
     return { ok: false, reason: "写入后校验失败，已回滚", changed: false, basePatch: original };
   }
   removeBundleEntry(pkgFile); // 单一激活点：bundles 里不能再有本插件
   // 双保险：上面那次移除若没生效（并发写 package.json / 解析失败），**回滚本次 patch 行**，
   // 宁可退回 bundles 形态（需重启）也绝不留"两处激活"→ dsh web 启动会 duplicate id 崩掉。
   if (pkgBundles().length) {
-    writePatchAtomic(patchFile, original);
+    writePatchDocument(patchFile, original);
     return { ok: false, reason: "bundles 条目未能移除，已回滚 patch 行以免重复激活", changed: false, bundleOnly: true, basePatch: original };
   }
   return { ok: true, changed: true, basePatch: original };
@@ -1428,7 +1500,7 @@ function ensurePatchActivation(patchFile, pluginLocalDir, pkgFile, opts = {}) {
 function stripIncludeEntries(patchFile, patch, reason) {
   const next = stripPluginEntries(patch);
   if (next === patch) return false;
-  writePatchAtomic(patchFile, next);
+  writePatchDocument(patchFile, next);
   console.log(`✅ 已移除 ${patchFile} 中的冗余 include（${reason}；激活点必须唯一，避免重复 ID 崩溃）`);
   return true;
 }

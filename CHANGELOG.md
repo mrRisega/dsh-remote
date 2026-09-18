@@ -3,6 +3,51 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.7-beta.3] - 2026-09-18
+
+> **修两个「卸载把 dsh web 弄坏」的致命缺陷 + Windows 文件权限的如实交付**。
+> beta.2 的挂载修复已在真机复测通过（链接形态正确、裸包名可解析、重启后正常启动）。
+
+### Fixed
+
+- **卸载后 `dsh web` 起不来（致命）**。`cordis.patch.yml` 被摘成**只剩注释**，而 dsh 要求该文件
+  顶层是**数组**、纯注释文档的 YAML 解析结果是 `null`（不是空数组），于是启动直接失败：
+  `Error: dsh: overlay …/cordis.patch.yml must be a top-level YAML array of loader patch entries`。
+  官方空 profile 模板正是「注释 + `[]`」——占位符不能省。
+  现在**所有 patch 写回路径**统一走 `writePatchDocument()`：只在「一个结构行都不剩」时补回 `[]`
+  （不会把还有条目的文件写坏），并且卸载时同时摘掉**无标记的 `- insert:` 块**（旧版/其它工具写入的
+  形式，只摘标记块会留下"目录已删但 patch 仍引用"→ 插件树加载失败）。
+- **点卸载会让整个 dsh web 僵死（致命）**。旧实现把**慢的** `uninstallRuntime` 排在
+  `uninstallSelf` 之前，且两者都是同步执行在 dsh web 的事件循环里：一次 `spawnSync` 卡住
+  （Windows 沙箱拦 `schtasks`；`spawnSync` 的 timeout 在 Windows 上**并不可靠**，实测 18s+ 未返回）
+  就同时造成 ①插件纹丝不动（用户以为卸载无效）②端口在听、连接建立、但永不响应。
+  现在顺序是：**先卸插件（纯 fs、快）→ 立刻关掉自愈 → 立刻回响应 → 慢活交独立子进程**；
+  子进程仍受同一套护栏约束（不删 profile、受 `DSH_RELAY_SKIP_SERVICE` 隔离）。
+  助手起不来时才退回进程内清理，且**放在响应之后**执行。
+- **`spawnSync("taskkill", …)` 缺 timeout**（生成的 Windows 助手与 dsh web 助手各一处）——补齐。
+  但要清楚：timeout 不是设计依据，真正的修法是**不要在请求路径上做同步子进程调用**。
+- **前端请求没有任何超时（中危）**：node 半一僵死，面板就对着永不结束的 spinner。
+  现在 `api()` 默认 30s 超时（卸载 20s），超时给一句能照做的话（"这一步可能已在后台完成，刷新看看"）。
+
+### Security
+
+- **`{ mode: 0o600 }` 在 Windows 上是空操作（高危）**。Windows 用 ACL 而不是 POSIX 权限位，
+  实测 `.dsh-config.json` 拿到的是用户目录的**默认继承 ACL** —— 也就是说文档里那句
+  "0600 请妥善保护"会让 Windows 用户**误以为已经有这层保护**，而文件里是**明文账号密码**。
+  风险不在"同机他人可读"（默认 ACL 下其实读不到），而在任何按文件复制的场景
+  （备份/同步盘/杀软上报/支持包）都会连钥匙一起被带走。
+  现在安装器、插件半、bridge 三处写入 `.dsh-config.json` / `.harness-cookie.json` 后都会调用
+  `hardenFile()`：POSIX 上 `chmod 600`，Windows 上 `icacls <file> /inheritance:r /grant:r <当前用户>:F`；
+  失败只告警一次、绝不影响主流程。README 也改成按平台分别说明（`.e2ee-state.json` 不含密钥，未做处理）。
+
+### Added
+
+- **`test/uninstall-safety.test.mjs`（13 个用例）**：断言对象落在**可用性**上 ——
+  卸载后 patch 仍能被解析成顶层数组（用独立判据 + 纯注释反例对照）、别人的条目不受伤、
+  清理助手真跑一遍会结束 pid 文件里的进程并清空配置目录、护栏命中时不删 profile、
+  三处机密写入都有 ACL 收紧。
+- 卸载响应新增 `runtimeCleanup`（`deferred` / `in-process`）与 `cleanupLog`（清理日志路径）字段。
+
 ## [0.6.7-beta.2] - 2026-09-18
 
 > **修复 beta.1 引入/暴露的插件挂载缺陷（Windows 致命）**。beta.1 及更早版本在
