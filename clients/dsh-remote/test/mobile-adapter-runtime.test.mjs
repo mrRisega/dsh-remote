@@ -91,8 +91,16 @@ class El {
   get isConnected() { return true; }
 }
 
-/** 搭一个最小 dsh web 环境：frame（带官方 data 属性）内含 sidebar/center 两列 + 可选官方 toggle。 */
-function harness({ collapsedAttr = undefined, detailsAttr = undefined, sidebarRect = null, width = 390, withToggle = true } = {}) {
+/**
+ * 搭一个最小 dsh web 环境：frame（带官方 data 属性）内含 sidebar/center 两列 + 可选官方 toggle。
+ *
+ * `variant: "rc2"` 复刻**官方 0.1.5-rc.2 起**的 DOM：第三列由 `details` 改名 `rightbar`
+ * （`data-details-collapsed` → `data-rightbar-collapsed`、`pI_x6G_detailsCol` → `pI_x6G_rightbarCol`），
+ * 且 `overlayLayer`（官方 shell.overlay 宿主，`inset:0` 全屏、`data-shell-overlay`）留在 frame 末尾、
+ * 折叠时**没有拖拽把手**——这正是 2026-09-19 线上"整屏遮罩"的现场结构。
+ */
+function harness({ collapsedAttr = undefined, detailsAttr = undefined, sidebarRect = null, width = 390, withToggle = true,
+  variant = "rc1", rightbarAttr = undefined, overlayRect = null, rightbarRect = null } = {}) {
   const html = new El("html");
   // HOSTISH 门禁会读 documentElement.outerHTML 找官方特征（__ModuleLoader__ / DeepSeek Harness）
   html.outerHTML = '<html><head><script>window.__ModuleLoader__ = { mode: "queue" }</script>'
@@ -107,6 +115,17 @@ function harness({ collapsedAttr = undefined, detailsAttr = undefined, sidebarRe
   if (sidebarRect) sidebar._rect = sidebarRect;
   frame.appendChild(sidebar);
   frame.appendChild(center);
+  let rightbar = null;
+  let overlay = null;
+  if (variant === "rc2") {
+    if (rightbarAttr !== undefined) frame.setAttribute("data-rightbar-collapsed", rightbarAttr);
+    rightbar = new El("div", { class: "pI_x6G_rightbarCol" });
+    if (rightbarRect) rightbar._rect = rightbarRect;
+    frame.appendChild(rightbar);
+    overlay = new El("div", { class: "pI_x6G_overlayLayer", "data-shell-overlay": "" });
+    if (overlayRect) overlay._rect = overlayRect;
+    frame.appendChild(overlay);
+  }
   const toggle = new El("button");
   toggle.setAttribute("aria-label", "打开侧边栏");
 
@@ -127,7 +146,7 @@ function harness({ collapsedAttr = undefined, detailsAttr = undefined, sidebarRe
     addEventListener() {},
     querySelector(sel) {
       const s2 = String(sel);
-      if (s2.includes(".pI_x6G_frame") || s2.includes("[data-sidebar-collapsed], [data-details-collapsed]") || s2.includes("[data-shell-overlay]")) return frame;
+      if (s2.includes(".pI_x6G_frame") || /\[data-(sidebar|details|rightbar)-collapsed\]/.test(s2) || s2.includes("[data-shell-overlay]")) return frame;
       if (s2.includes("aria-label=")) return withToggle ? toggle : null;
       if (s2.includes(".hHd-Xa_toggle")) return withToggle ? toggle : null;
       if (s2.includes("hHd-Xa")) return sidebar; // 子列识别用（真实页面里这是侧栏）
@@ -154,12 +173,15 @@ function harness({ collapsedAttr = undefined, detailsAttr = undefined, sidebarRe
     MutationObserver: class { observe() {} disconnect() {} },
     ResizeObserver: class { observe() {} disconnect() {} },
   };
+  // 真实浏览器里 window.location 必然存在（注入层用 location.assign/href 跳转），假 DOM 也要有
+  const loc = { href: "https://n.risegao.cn:13443/remote/dev-x/", host: "n.risegao.cn", pathname: "/remote/dev-x/", origin: "https://n.risegao.cn:13443" };
+  win.location = loc;
   const ctx = vm.createContext({
     window: win, document: doc, console, setTimeout: win.setTimeout, clearTimeout: win.clearTimeout,
     setInterval: () => 0, clearInterval() {}, MutationObserver: win.MutationObserver,
     ResizeObserver: win.ResizeObserver, requestAnimationFrame: win.requestAnimationFrame,
     navigator: { userAgent: "iPhone Safari", maxTouchPoints: 5, platform: "iPhone" },
-    location: { href: "https://n.risegao.cn:13443/app/", host: "n.risegao.cn" },
+    location: loc,
     localStorage: win.localStorage, URL, Date, Math, JSON, Object, Array, String, Number, RegExp, Boolean, Promise, Error, isNaN, parseInt, parseFloat,
     HTMLElement: El, // 脚本用 `c instanceof HTMLElement` 过滤 frame 的子列
   });
@@ -170,7 +192,7 @@ function harness({ collapsedAttr = undefined, detailsAttr = undefined, sidebarRe
   ctx.console = dbgConsole;
   ctx.globalThis = ctx;
   ctx.self = win;
-  return { ctx, html, body, frame, sidebar, toggle, win };
+  return { ctx, html, body, frame, sidebar, rightbar, overlay, toggle, win };
 }
 
 const ADAPTER_DEBUG = process.env.DSH_ADAPTER_DEBUG === "1";
@@ -260,48 +282,83 @@ test("运行时：能拿到官方 toggle 时，点遮罩仍走官方 toggle（�
   assert.ok(env.toggle._clicked >= 1, "应点击官方 toggle");
 });
 
-// ── 字号档位（2026-09-16 需求：4 档滑块、仅手机端生效） ──────────────────────
+// ── 远程控制悬浮按钮（2026-09-19：字号 + 加密小锁 + 返回设备列表，三合一） ──────
+//
+// 用户要求：「把字体的菜单和加密小锁的菜单合并成一个小悬浮按钮；点击后可以弹菜单调节字体，
+// 也可以返回设备列表，让用户主动返回回去；手机端要有，电脑端也可以有。」
 
-const findFsBtn = (env) => env.body.children.find((c) => c._cls.has("dsh-ma-fsbtn"));
-const findFsPanel = (env) => env.body.children.find((c) => c._cls.has("dsh-ma-fspanel"));
+const findFab = (env) => env.body.children.find((c) => c._cls.has("dsh-ma-fab"));
+const findMenu = (env) => env.body.children.find((c) => c._cls.has("dsh-ma-menu"));
 
-test("字号：菜单/字号按钮与面板都应创建（面板默认收起）", () => {
+test("悬浮菜单：按钮与菜单都创建，菜单默认收起", () => {
   const env = runAdapter(harness({}));
-  const btn = findFsBtn(env);
-  const panel = findFsPanel(env);
-  assert.ok(btn, "应有字号按钮");
-  assert.ok(panel, "应有字号面板");
-  assert.equal(panel.hidden, true, "面板默认收起（点按钮才展开）");
-  assert.ok((panel.querySelector ? panel : {}).querySelector === undefined || true);
+  const fab = findFab(env);
+  const menu = findMenu(env);
+  assert.ok(fab, "应有悬浮按钮");
+  assert.ok(menu, "应有菜单面板");
+  assert.equal(menu.hidden, true, "菜单默认收起（点按钮才展开）");
 });
 
-test("字号：默认档 = 最小（不加缩放属性，保持当前大小）", () => {
+test("悬浮菜单：点按钮开合菜单", () => {
   const env = runAdapter(harness({}));
-  assert.equal(env.html.getAttribute("data-dsh-ma-fs"), null, "默认不应带缩放属性");
-  assert.equal(env.win.localStorage.getItem("dsh-ma-font-scale"), null);
+  const fab = findFab(env);
+  const menu = findMenu(env);
+  fab.dispatch("click");
+  assert.equal(menu.hidden, false, "点按钮应展开菜单");
+  fab.dispatch("click");
+  assert.equal(menu.hidden, true, "再点应收起");
 });
 
-test("字号：滑块改档 → 属性/正文变量/持久化都生效", () => {
+test("悬浮菜单：字号档位仍生效（属性/正文变量/持久化）", () => {
   const env = runAdapter(harness({}));
-  const panel = findFsPanel(env);
-  const range = panel && panel.querySelector && panel.querySelector('input[type="range"]');
-  assert.ok(range, "面板里应有 range 滑块");
-  // 打到「大」(level 2)
+  const menu = findMenu(env);
+  const range = menu.querySelector('input[type="range"]');
+  assert.ok(range, "菜单里应有字号滑块");
   range.value = "2";
   range.dispatch("input");
   assert.equal(env.html.getAttribute("data-dsh-ma-fs"), "2", "应写入缩放属性（CSS 据此放大字号）");
-  assert.equal(env.win.localStorage.getItem("dsh-ma-font-scale"), "2", "应持久化到 localStorage");
-  const contentVar = env.html.style["--dsh-content-font-size"] || env.html._cssVars && env.html._cssVars["--dsh-content-font-size"];
-  assert.ok(contentVar, "应同步官方正文变量 --dsh-content-font-size（聊天正文才会变大）");
+  assert.equal(env.win.localStorage.getItem("dsh-ma-font-scale"), "2", "应持久化");
+  const contentVar = (env.html._cssVars || {})["--dsh-content-font-size"];
+  assert.ok(contentVar, "应同步官方正文变量 --dsh-content-font-size");
+  range.value = "0";
+  range.dispatch("input");
+  assert.equal(env.html.getAttribute("data-dsh-ma-fs"), null, "回到「最小」应移除缩放属性");
 });
 
-test("字号：恢复「最小」时移除缩放属性（回到当前大小）", () => {
+test("悬浮菜单：必须有「返回设备列表」，且回到 /app/（用户在镜像页的唯一主动退路）", () => {
   const env = runAdapter(harness({}));
-  const panel = findFsPanel(env);
-  const range = panel.querySelector('input[type="range"]');
-  range.value = "3"; range.dispatch("input");
-  assert.equal(env.html.getAttribute("data-dsh-ma-fs"), "3");
-  range.value = "0"; range.dispatch("input");
-  assert.equal(env.html.getAttribute("data-dsh-ma-fs"), null, "level 0 = 最小 → 不应留缩放属性");
-  assert.equal(env.win.localStorage.getItem("dsh-ma-font-scale"), "0");
+  const menu = findMenu(env);
+  const back = menu.querySelector(".dsh-ma-menu-back");
+  assert.ok(back, "菜单里必须有返回设备列表按钮");
+  back.dispatch("click");
+  assert.equal(env.ctx.location.href, "/app/", "点击后应跳到 APP 外壳（绝对路径，不能依赖当前镜像路径）");
+});
+
+test("悬浮菜单：E2EE 状态可合并（shim 在场时隐藏独立药丸并读它的状态）", () => {
+  const env = harness({});
+  env.win.__dshE2eeBadge = { state: () => ({ mode: "warn", text: "未加密（刷新后需重新解锁）" }) };
+  runAdapter(env);
+  assert.equal(env.html.getAttribute("data-dsh-ma-merged-e2ee"), "1",
+    "shim 在场时应挂牌合并（CSS 据此隐藏官方那颗独立药丸）");
+});
+
+test("多端适配：悬浮按钮与字号样式的 CSS 必须在 @media(max-width:820px) 之外（电脑端也要有）", () => {
+  const { html } = injectMobileAdapter("<!doctype html><html><head></head><body></body></html>");
+  const css = /<style id="[^"]*-css"[^>]*>([\s\S]*?)<\/style>/.exec(html)[1];
+  // 只保留 @media 之外的规则（做一次括号配平剥离），再断言关键选择器还在
+  let out = "", i = 0, depth = 0, inMedia = false;
+  while (i < css.length) {
+    if (css.startsWith("@media", i)) {
+      const open = css.indexOf("{", i);
+      let d = 1, j = open + 1;
+      while (j < css.length && d > 0) { if (css[j] === "{") d++; else if (css[j] === "}") d--; j++; }
+      i = j;
+      continue;
+    }
+    out += css[i++];
+  }
+  assert.match(out, /button\.dsh-ma-fab\s*\{/, "悬浮按钮样式必须在媒体查询之外（电脑端可见）");
+  assert.match(out, /div\.dsh-ma-menu\s*\{/, "菜单样式必须在媒体查询之外");
+  assert.match(out, /html\[data-dsh-ma-fs="3"\]/, "字号档位样式也应在媒体查询之外（电脑端同样生效）");
+  assert.match(out, /z-index:\s*40[01]/, "悬浮按钮/菜单层级要高于遮罩(290)，遮罩异常时仍是自救出口");
 });

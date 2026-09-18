@@ -973,7 +973,23 @@ async function resolveToken(refresh = false) {
       const d = await r.json();
       if (r.status === 200 && d.token) {
         console.log("[bridge] 登录成功,已获取 JWT");
+        // 登录成功 = 限流窗口已结束（服务端成功即清零），把退避提示删掉让 watcher 恢复正常节奏
+        try { fs.rmSync(path.join(path.dirname(CONFIG_PATH), ".dsh-login-ratelimited"), { force: true }); } catch { /* 非关键 */ }
         return d.token;
+      }
+      if (r.status === 429) {
+        // 服务端登录限流（每 IP 5 次失败 / 15 分钟）。**这不是密码错**：
+        // 旧文案一律提示"请检查 DSH_BRIDGE_EMAIL / DSH_BRIDGE_PASSWORD"，把限流误报成凭据问题，
+        // 用户会去反复改密码、反而把窗口拖长（2026-09-19 实测）。
+        const waitMs = Number(d.retry_after_ms) > 0 ? Number(d.retry_after_ms) : 0;
+        console.error(`[bridge] 登录被服务端限流（429）${waitMs ? `，约 ${Math.ceil(waitMs / 1000)} 秒后自动重试` : "，请稍后自动重试"}`);
+        console.error("[bridge] 凭据没错，是这台机器的出口 IP 短时间登录失败过多被临时限制；无需改密码。");
+        // 把"最早可重试时刻"落盘：watcher 据此退避，避免 10 秒一次空撞限流
+        try {
+          const until = Date.now() + (waitMs || 5 * 60 * 1000);
+          fs.writeFileSync(path.join(path.dirname(CONFIG_PATH), ".dsh-login-ratelimited"), String(until));
+        } catch { /* 非关键 */ }
+        process.exit(3);
       }
       console.error(`[bridge] 登录失败(${r.status}): ${d.error?.message || "未知错误"}`);
       console.error("[bridge] 请检查 DSH_BRIDGE_EMAIL / DSH_BRIDGE_PASSWORD,或直接设 DSH_BRIDGE_TOKEN");

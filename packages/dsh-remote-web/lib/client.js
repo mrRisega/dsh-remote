@@ -1727,6 +1727,25 @@ window.__ModuleLoader__.load({
       // ---------- 登录(密码/短信) ----------
       var doLogin = function () {
         if (!phone.trim() || !pass) { setMsg("err", "请填写手机号与密码"); return; }
+      /**
+       * 账号落盘（POST /dsh-remote/config）后的统一提示。
+       *
+       * 为什么单独抽出来：这次"换账号后设备不出现"的事故就是**静默失败**造成的 ——
+       * /config 会顺带重启 bridge（让新账号生效），但其返回的 bridgeRestart 前端从来不看，
+       * 于是"服务没重启成功"和"一切正常"在界面上长得一模一样。
+       */
+      function applyAccountSaved(cfg, okText) {
+        setSt(cfg);
+        var br = cfg && cfg.bridgeRestart;
+        if (br && br.ok === false && br.status !== "running" && br.status !== "provisioning" && br.status !== "skipped") {
+          setMsg("warn", okText + "；但后台服务（bridge）未能自动重启："
+            + ((br.detail || br.status) || "未知原因")
+            + " —— 新账号可能收不到这台设备，请点下方「重启服务」或重启一次 dsh web。");
+          return;
+        }
+        setMsg("ok", okText);
+      }
+
         if (!lcap || !lcap.id || !lcapTxt.trim()) { setMsg("err", "请输入图中验证码（点击图片可刷新）"); if (!lcap) loadCaptcha("login"); return; }
         var prevPhone = (st && st.config && st.config.phone) || "";
         setBusy("login");
@@ -1737,8 +1756,8 @@ window.__ModuleLoader__.load({
                 // 切换连接账号（手机号与之前不同）：清除旧账号留下的反馈线程凭据
                 if (prevPhone !== phone.trim()) fbClearThreads();
                 setPwdOpen(false); // 登录成功（可能从「忘记密码」返回）→ 收起重置表单
-                setSt(cfg); setPass(""); setLcapTxt(""); setLcap(null);
-                setMsg("ok", "✅ 登录成功，账号已保存");
+                setPass(""); setLcapTxt(""); setLcap(null);
+                applyAccountSaved(cfg, "✅ 登录成功，账号已保存");
               });
             }
             var relayBody = body.body || {};
@@ -1791,9 +1810,8 @@ window.__ModuleLoader__.load({
             if (body.ok || body.status === 201 || (body.body && body.body.token)) {
               return post("/dsh-remote/config", { phone: rphone.trim(), password: rpass }).then(function (cfg) {
                 setPwdOpen(false);
-                setSt(cfg);
                 setRphone(""); setRpass(""); setRpass2(""); setRsms(""); setRcap(null); setRcapTxt(""); setRInvite("");
-                setMsg("ok", "✅ 注册成功，已自动登录");
+                applyAccountSaved(cfg, "✅ 注册成功，已自动登录");
               });
             }
             var b = body.body || {};

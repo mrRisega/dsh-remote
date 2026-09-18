@@ -546,11 +546,28 @@ function launchAgentPath() {
  * `process.getuid()`，在 Windows 上直接 TypeError（这正是面板两个读状态接口 500 的根因）。
  * 现在：非 macOS 或取不到 uid 一律返回 null，调用方必须先判空。
  */
-function launchTarget() {
-  if (!isDarwin()) return null;
+/**
+ * launchd 域名阶梯（**必须与 dsh-setup.mjs 一致**）。
+ *
+ * 事故（2026-09-19 实测）：安装器按 macOS 26 的修复把作业装在 **`user/<uid>`** 域
+ * （gui 域会被系统置为 on-demand-only，RunAtLoad/KeepAlive 失效），
+ * 但插件这边只认 `gui/<uid>` → 切换账号时那次"重启 bridge"实际执行的是
+ *   launchctl bootout gui/501/com.dshremote.bridge   → 找不到
+ *   launchctl bootstrap gui/501 <plist>              → 失败
+ * 结果：旧 bridge 继续用**旧账号**跑，新账号的设备列表里永远看不到这台机器。
+ * 现在两边用同一条阶梯：user/<uid> 优先，gui/<uid> 兜底。
+ */
+function launchDomains() {
+  if (!isDarwin()) return [];
   const uid = currentUid();
-  if (uid === null) return null;
-  return `gui/${uid}/com.dshremote.bridge`;
+  return uid === null ? [] : [`user/${uid}`, `gui/${uid}`];
+}
+/** 所有可能承载本服务的 launchd target（按优先级）。 */
+function launchTargets() {
+  return launchDomains().map((d) => `${d}/com.dshremote.bridge`);
+}
+function launchTarget() {
+  return launchTargets()[0] || null; // 首选域（user/<uid>）
 }
 
 /**
@@ -567,12 +584,21 @@ function launchTarget() {
  * 现在：print 的 state 为准 + 附带 runs/lastExitCode/crashing 供面板与自愈解释原因；
  * 仅在 print 本身不可用时才回退 list，且回退路径要求 pid 真实存活。
  */
+const NO_LAUNCHD = { running: false, pid: null, state: "", runs: null, lastExitCode: null, crashing: false };
+
 function launchdStatus() {
   // 非 macOS 没有 launchctl（Windows 上连 process.getuid 都没有）：直接返回「无此服务」，
   // 不再去 shell 里调一个不存在的命令——这既避免 500，也避免每次轮询白起一个 cmd.exe。
-  if (!isDarwin()) return { running: false, pid: null, state: "", runs: null, lastExitCode: null, crashing: false };
-  const target = launchTarget();
-  if (!target) return { running: false, pid: null, state: "", runs: null, lastExitCode: null, crashing: false };
+  if (!isDarwin()) return { ...NO_LAUNCHD };
+  // 逐域查询：安装器可能把作业装在 user/<uid>，插件以前只看 gui/<uid> → 会把"正在运行"看成"未运行"。
+  for (const target of launchTargets()) {
+    const st = launchdStatusIn(target);
+    if (st.running || st.crashing || st.state) return st;
+  }
+  return { ...NO_LAUNCHD };
+}
+
+function launchdStatusIn(target) {
   const pr = sh(`launchctl print ${target}`);
   if (pr.ok) {
     const stateMatch = pr.stdout.match(/state\s*=\s*([^\n]+)/);
@@ -961,7 +987,7 @@ function reapBrokenAutostart(relayDir) {
   if (!plistEntryMissing()) return false;
   const st = launchdStatus();
   if (!st.running && !st.crashing && !st.state) return false; // 作业未被 launchd 加载、无可摘的东西
-  sh(`launchctl bootout ${launchTarget()}`);
+  for (const target of launchTargets()) sh(`launchctl bootout ${target}`);
   try { rmSync(launchAgentPath(), { force: true }); } catch { /* 非关键 */ }
   appendLogLine(relayDir, AUTO_INSTALL_LOG,
     `[dsh-remote-web] 已摘除失效自启动：plist 入口 ${join(relayDir, "dsh-setup.mjs")} 不存在`
@@ -997,16 +1023,15 @@ function killPid(pid, signal = "SIGTERM") {
 }
 
 /**
- * Windows：启动 bridge（0.6.7 新增）。
+ * 「脱离进程」方式启动 bridge（Windows 必用；macOS/Linux 在 launchd/systemd 托管不了时兜底）。
  *
- * Windows 上没有 launchd/systemd，dsh-setup.mjs 也不为 win32 生成自启动
- * （它明写「平台 win32 不支持自启动」）。但 bridge 本身在 Windows 上能跑——
- * 所以插件直接把 watcher（`node <relayDir>/dsh-setup.mjs run`）作为脱离进程拉起：
+ * Windows 上没有服务管理器自启动；macOS 上 launchd 被系统置为 on-demand-only（gui 域）时也托管不住。
+ * 此时插件直接把 watcher（`node <relayDir>/dsh-setup.mjs run`）作为脱离进程拉起：
  * 这与用户手动跑 `dsh-remote run` 是**同一条代码路径**，watcher 自己盯着 127.0.0.1:3080，
  * dsh web 活着就拉起 dsh-bridge.mjs、dsh web 退出就把 bridge 停掉。
  * 代价（如实告知用户）：不随开机自启；但 dsh web 每次启动后插件都会在自愈轮次里重新拉起它。
  */
-function startBridgeWindows(relayDir) {
+function startBridgeDetached(relayDir, fallbackReason = "") {
   if (skipsSystemOps()) return { ok: false, status: "skipped", detail: "测试隔离（DSH_RELAY_SKIP_SERVICE=1）：跳过真实服务操作" };
   if (!runtimeReady(relayDir)) {
     ensureRuntime(relayDir);
@@ -1046,16 +1071,18 @@ function startBridgeWindows(relayDir) {
     ok: true,
     status: "running",
     pid: child.pid,
-    // 如实区分两条路径：装过（或更新过）就有登录任务；没有的话只有"重开 dsh web 自动拉起"这一层保障
-    detail: windowsTaskRegistered()
+    // 如实区分两条路径：装过（且平台支持）就有自启动；否则只有"重开 dsh web 自动拉起"这一层保障
+    detail: isWindows() && windowsTaskRegistered()
       ? "已在后台启动 bridge 守护（已注册登录任务，下次登录会自动运行）"
-      : "已在后台启动 bridge 守护（未注册登录任务：不随开机自启，重开 dsh web 时插件会自动拉起）",
+      : `已在后台启动 bridge 守护${fallbackReason ? `（${fallbackReason}；不随开机自启，重开 dsh web 时插件会自动拉起）` : "（不随开机自启，重开 dsh web 时插件会自动拉起）"}`,
   };
 }
 
-/** Windows：停止 bridge（结束 watcher 与其 bridge 子进程，并清掉 pid 文件）。 */
-function stopBridgeWindows(relayDir) {
-  if (skipsSystemOps()) return { ok: false, status: "skipped", detail: "测试隔离（DSH_RELAY_SKIP_SERVICE=1）：跳过真实服务操作" };
+/** 停止「脱离进程」方式运行的 bridge（结束 watcher 与其 bridge 子进程，并清掉 pid 文件）。 */
+function stopBridgeDetached(relayDir, opts = {}) {
+  // 账号切换时用 force：即使处于测试隔离模式也要把进程停掉（否则"换个账号"在测试里走不通），
+  // 但隔离模式下仍只用信号结束**本插件记录的** pid，不碰任何系统服务。
+  if (skipsSystemOps() && !opts.force) return { ok: false, status: "skipped", detail: "测试隔离（DSH_RELAY_SKIP_SERVICE=1）：跳过真实服务操作" };
   const targets = [];
   for (const name of [WATCHER_PID_FILE, BRIDGE_PID_FILE]) {
     const pid = readPidFile(relayDir, name);
@@ -1082,7 +1109,7 @@ function startBridge(relayDir) {
     // 已彻底卸载：面板/自愈在重启前可能仍在内存中，禁止再把自启动与 plist 拉回来
     return { ok: false, status: "uninstalled", detail: "插件已彻底卸载，重启 dsh web 后生效" };
   }
-  if (isWindows()) return startBridgeWindows(relayDir);
+  if (isWindows()) return startBridgeDetached(relayDir);
   const plistPath = launchAgentPath();
   if (!plistPath) {
     return {
@@ -1110,21 +1137,32 @@ function startBridge(relayDir) {
   }
   if (!existsSync(plistPath)) writeAutostartFile(relayDir);
   if (!existsSync(plistPath)) return { ok: false, status: "not-installed", detail: "plist 生成失败" };
-  const target = launchTarget();
-  const boot = (() => {
-    sh(`launchctl bootout ${target}`);
-    // domain 一律由 launchTarget 推导（不再直接 process.getuid()：Windows 上没有该 API）
-    const domain = `gui/${currentUid()}`;
-    let r = sh(`launchctl bootstrap ${domain} ${shQuote(plistPath)}`);
-    if (!r.ok) {
-      sh(`launchctl unload ${shQuote(plistPath)}`);
-      r = sh(`launchctl load -w ${shQuote(plistPath)}`);
+  // 与 dsh-setup.mjs 同一条域阶梯：user/<uid> 优先（macOS 26 上唯一支持 RunAtLoad/KeepAlive 的域），
+  // gui/<uid> 兜底（只能靠 kickstart 拉这一次，不保证崩溃自愈）。
+  let lastDetail = "";
+  for (const domain of launchDomains()) {
+    const target = `${domain}/com.dshremote.bridge`;
+    // 清掉**另一个**域的历史注册，避免两处并存导致重复实例（与安装器同构）
+    for (const other of launchDomains()) {
+      if (other !== domain) sh(`launchctl bootout ${other}/com.dshremote.bridge`);
     }
-    return r;
-  })();
-  if (!boot.ok) return { ok: false, status: "failed", detail: (boot.stderr || boot.stdout).trim() || "launchctl 启动失败" };
-  const st = launchdStatus();
-  return { ok: st.running, status: st.running ? "running" : "failed", pid: st.pid, detail: st.running ? void 0 : "服务未进入运行态" };
+    sh(`launchctl bootout ${target}`);
+    let boot = sh(`launchctl bootstrap ${domain} ${shQuote(plistPath)}`);
+    if (!boot.ok) {
+      sh(`launchctl unload ${shQuote(plistPath)}`);
+      boot = sh(`launchctl load -w ${shQuote(plistPath)}`);
+    }
+    if (!boot.ok) { lastDetail = (boot.stderr || boot.stdout).trim() || `launchctl bootstrap ${domain} 失败`; continue; }
+    // bootstrap 只是登记：立刻 kickstart 一次，确保"这一次"一定起来
+    sh(`launchctl kickstart -k ${target}`);
+    const st = launchdStatusIn(target);
+    if (st.running) return { ok: true, status: "running", pid: st.pid, domain };
+    lastDetail = st.state ? `已登记但未运行（state=${st.state}, runs=${st.runs ?? "?"}）` : "已登记但查不到状态";
+  }
+  // launchd 都托管不了（macOS 26 的 on-demand-only / 权限异常等）→ 退化为脱离进程，
+  // 与 Windows 走同一条路径：绝不出现"重启失败但用户无感、旧账号继续跑"这种静默失败。
+  const d = startBridgeDetached(relayDir, `launchd 无法托管（${lastDetail || "未知原因"}）`);
+  return d.ok ? d : { ok: false, status: "failed", detail: `${lastDetail}；脱离进程兜底也失败：${d.detail}` };
 }
 
 /**
@@ -1177,12 +1215,20 @@ function scheduleRuntime(relayDir) {
 
 /** 停止 bridge：macOS/Linux 走 launchctl bootout；Windows 结束 watcher/bridge 进程。 */
 function stopBridge(relayDir) {
-  if (isWindows()) return stopBridgeWindows(relayDir);
-  const target = launchTarget();
-  if (!target) return { ok: false, status: "unsupported", detail: `当前平台（${osPlatform()}）没有 launchd 服务可停，请手动结束 \`dsh-remote run\` 进程` };
-  const r = sh(`launchctl bootout ${target}`);
+  if (isWindows()) return stopBridgeDetached(relayDir);
+  // 测试隔离：置位时绝不对真实 launchd/systemd 下手（切换账号也会走到这里，
+  // 少了这一条，用例就会去 bootout 开发者本机上真实运行的 bridge —— 实测过的污染风险）。
+  if (skipsSystemOps()) return { ok: false, status: "skipped", detail: "测试隔离（DSH_RELAY_SKIP_SERVICE=1）：跳过真实服务操作" };
+  const targets = launchTargets();
+  if (!targets.length) return { ok: false, status: "unsupported", detail: `当前平台（${osPlatform()}）没有 launchd 服务可停，请手动结束 \`dsh-remote run\` 进程` };
+  // 两个域都要停：作业可能由安装器装在 user/<uid>，而旧版插件只会去 gui/<uid> 找不到（实测事故）
+  let lastErr = "";
+  for (const target of targets) {
+    const r = sh(`launchctl bootout ${target}`);
+    if (!r.ok) lastErr = (r.stderr || r.stdout).trim();
+  }
   const st = launchdStatus();
-  return { ok: !st.running, status: st.running ? "failed" : "stopped", pid: null, detail: st.running ? (r.stderr || "停止失败").trim() : void 0 };
+  return { ok: !st.running, status: st.running ? "failed" : "stopped", pid: null, detail: st.running ? (lastErr || "停止失败").trim() : void 0 };
 }
 
 // ---------- 彻底卸载：bridge 自启动 / 残留进程 / 配置目录 ----------
@@ -2333,7 +2379,7 @@ const PLUGIN_ID = "dsh-remote-web";
 const PLUGIN_LEGACY_IDS = ["dsh-remote-ui"];
 const PLUGIN_ALL_IDS = [PLUGIN_ID, ...PLUGIN_LEGACY_IDS];
 /** 插件自身发布版本（与 dsh-remote 根包同步递增）。 */
-const PLUGIN_VERSION = "0.6.7-beta.3";
+const PLUGIN_VERSION = "0.6.7-beta.4";
 const UPDATE_LOG = ".dsh-update.log";
 const UPDATE_MARKER = ".dsh-update-running";
 
@@ -2729,6 +2775,51 @@ function spawnRuntimeCleanupDetached(relayDir, protectedPath) {
   }
 }
 
+/** 账号指纹：账号 / 模式 / 设备身份任一变化都意味着"必须用新凭据重新登记"。 */
+function accountFingerprintOf(cfg) {
+  const c = cfg || {};
+  return [c.local_key ? "local" : "saas", c.phone || c.email || "", String(c.device_id || "")].join("|");
+}
+
+/**
+ * 账号（或模式/设备身份）变化后，**必须让 bridge 用新凭据重新登记**。
+ *
+ * 事故（2026-09-19 实测）：从 A 账号切到 B 账号后，配置已经改了、device_id 也清了，
+ * 但**正在运行的 bridge 是启动时把账号/密码固化在环境变量里的**，它不会自己换账号；
+ * 而那次"重启 bridge"又因 launchd 域名不一致（插件只认 gui/<uid>，安装器装在 user/<uid>）静默失败
+ * → 设备继续留在 A 账号，B 账号的设备列表里永远看不到这台机器。
+ *
+ * 这里做三件事：① 停掉旧 bridge（含两个 launchd 域与脱离进程两种形态）；
+ * ② 删掉旧账号留下的状态文件（否则面板据 phase=online + 旧 device_id 谎报"已连接"，
+ * 自愈也就永远不会去纠正）；③ 交给调用方随后重新启动。
+ */
+function resetBridgeForAccountChange(relayDir, why) {
+  const stopped = stopBridge(relayDir);
+  // 脱离进程形态（launchd 托管不住时的兜底）也要收干净，否则它会用旧凭据继续跑
+  try { stopBridgeDetached(relayDir, { force: true }); } catch { /* 非关键 */ }
+  try {
+    if (bridgeStateFile(relayDir)) {
+      rmSync(join(relayDir, BRIDGE_STATE_FILE), { force: true });
+      appendLogLine(relayDir, AUTO_INSTALL_LOG, `[dsh-remote-web] ${why}：已清除过期的 bridge 状态记录（旧账号的注册证据作废）`);
+    }
+  } catch { /* 非关键 */ }
+  return stopped;
+}
+
+/**
+ * 运行中的 bridge 是否属于「当前账号」。
+ * 判据：bridge 状态文件记录的 device_id 必须与配置里的一致；配置里没有 device_id
+ * （= 刚切过账号、旧身份已作废）而状态里还有 → 说明跑的是**上一个账号**的 bridge。
+ * @returns {boolean} true=属于当前账号；false=过期（必须重启）；未记录 device_id 时按旧行为返回 true
+ */
+function bridgeMatchesCurrentAccount(relayDir, cfg) {
+  const state = bridgeStateFile(relayDir);
+  if (!state || !state.device_id) return true;          // 无记录可判：不改变既有行为
+  const want = String((cfg || loadConfig(relayDir)).device_id || "");
+  if (!want) return false;                              // 配置里身份已清空 = 旧 bridge 的注册已作废
+  return want === String(state.device_id);
+}
+
 /** 彻底卸载第 2 步 —— profile 插件清理（兼容市场“拒绝改写用户补丁”）：移除 include、依赖、bundle、本地目录与链接。 */
 function uninstallSelf(relayDir, profileDir, patchFile, pkgFile) {
   const out = { removedPatch: false, removedDep: false, removedDir: false, removedBundle: false };
@@ -2963,9 +3054,13 @@ async function composeConnect(relayDir, opts = {}) {
   const deviceId = String(cfg.device_id || "");
 
   // ── 中继注册证据（只有 bridge 进程在跑时才算「现在能用」） ──
+  // ⚠️ 先判「这个 bridge 是不是当前账号的」：账号切换后进程不会自己换凭据，
+  // 旧账号留下的状态文件（phase=online + 旧 device_id）会让面板谎报「已连接」，
+  // 自愈也就永远不会去重启它（2026-09-19 实测事故）。
+  const accountCurrent = bridgeMatchesCurrentAccount(relayDir, cfg);
   let registered = false;
   let registerSource = "";
-  if (runtime && bridgeRunning) {
+  if (runtime && bridgeRunning && accountCurrent) {
     if (state && state.phase === "online" && Number(state.tunnel_registered_at) > 0) {
       registered = true; registerSource = "state";
     } else if (log.tunnelRegistered) {
@@ -3034,6 +3129,10 @@ async function composeConnect(relayDir, opts = {}) {
     detail = bindError.code === "device_limit_exceeded"
       ? "已达本套餐设备数上限：同机重装会自动顶替旧设备；仍失败请到手机端「设备管理」解绑旧设备后点「重试」。"
       : "请确认网络与账号状态后点「重试」；仍不成功可点「复制诊断信息」发给客服。";
+  } else if (!accountCurrent) {
+    // 进程在跑，但它是**上一个账号**的 bridge：必须重启才能用新账号登记
+    phase = "starting";
+    detail = "检测到后台 bridge 仍是上一个账号的身份（账号切换后需要重启它才能用新账号重新登记），正在自动重启…";
   } else {
     phase = "connecting";
     detail = "bridge 进程已在运行，正在等待设备注册到中继…通常几秒内完成。";
@@ -3054,6 +3153,7 @@ async function composeConnect(relayDir, opts = {}) {
     installing: inst.installing,
     installStale: inst.stale,
     bridgeRunning,
+    accountCurrent, // 运行中的 bridge 是否属于当前账号（false = 上一个账号的进程还在跑）
     bridgePids,
     launchdState: launchd.state || "",
     launchdCrashLoop: Boolean(launchd.crashing),
@@ -3081,6 +3181,7 @@ function buildConnectDiagnostics(relayDir, conn, log) {
     `运行环境: ${conn.runtimeReady ? "已就绪" : "缺失"}${conn.installing ? "（后台安装中）" : ""}${conn.installStale ? "（安装标记已超时）" : ""}`,
     `bridge 进程: ${conn.bridgeRunning ? "在运行" : "未运行"}（pid=${conn.bridgePids && conn.bridgePids.length ? conn.bridgePids.join(",") : "-"}，launchd state=${conn.launchdState || "-"}，崩溃循环=${conn.launchdCrashLoop ? "是" : "否"}）`,
     `中继注册: ${conn.registered ? "已注册（" + conn.registerSource + "）" : "未注册"}`,
+    `bridge 账号: ${conn.accountCurrent === false ? "⚠️ 仍是上一个账号的身份（需重启 bridge 重新登记）" : "当前账号"}`,
     `最近错误: ${conn.error ? conn.error.code + ": " + conn.error.message : (log && log.lastError ? log.lastError : "无")}`,
     `自动重试: 已尝试 ${conn.attempts} 次${conn.nextRetryInMs ? `，约 ${Math.ceil(conn.nextRetryInMs / 1000)} 秒后重试` : ""}`,
     `bridge 日志: ${conn.logPath}`,
@@ -3115,6 +3216,17 @@ function ensureConnection(relayDir, opts = {}) {
   const launchd = launchdStatus();
   const manual = manualStatus(relayDir);
   if (launchd.running || (manual.allBridge || []).length || (manual.bridge || []).length) {
+    // 进程在跑 ≠ 跑对了账号：切换账号后旧 bridge 会一直用旧凭据，
+    // 只看"有没有进程"会让自愈永久停摆（实测事故）。这里多判一次账号归属。
+    if (!bridgeMatchesCurrentAccount(relayDir, cfg)) {
+      book.lastAttemptAt = now;
+      book.attempts += 1;
+      resetBridgeForAccountChange(relayDir, "bridge 身份与当前账号不符");
+      const r = startBridge(relayDir);
+      appendLogLine(relayDir, AUTO_INSTALL_LOG,
+        `[dsh-remote-web] 检测到旧账号的 bridge 仍在运行，已重启以用当前账号重新登记（${r.status || "?"}）`);
+      return { action: "restart", result: r };
+    }
     book.attempts = 0; // 进程已在跑：退避计数归零，后续只等注册
     book.lastAttemptAt = now;
     return { action: "none" };
@@ -4003,8 +4115,11 @@ function registerRoutes(ctx, relayDir) {
             if (secret) cfg.bridge_secret = secret;
           }
         }
+        // 账号/模式变化 → 先停掉旧 bridge 并作废它的注册证据，否则新账号永远等不到这台设备
+        const accountFpBefore = accountFingerprintOf(loadConfig(relayDir));
         saveConfig(relayDir, cfg);
         invalidateRelayToken(relayDir); // 账号可能变了：丢弃旧 token 缓存，立即用新账号认证
+        if (accountFingerprintOf(cfg) !== accountFpBefore) resetBridgeForAccountChange(relayDir, "账号/模式已变更");
         const bridgeRestart = startBridge(relayDir);
         // 登录成功即上报本机安装信息（企业端用于「升级插件后刷新版本号」口径）；失败静默。
         maybeReportInstall(relayDir, { force: true });
@@ -4015,11 +4130,17 @@ function registerRoutes(ctx, relayDir) {
       method: "POST",
       path: "/dsh-remote/logout",
       handler: async (_req, res) => {
-        // 退出登录:清除本机保存的账号(邮箱/密码),bridge 下次重启将不再自动登录
+        // 退出登录：清除本机保存的账号(邮箱/密码)，并**立刻停掉 bridge**。
+        // 为什么必须停：bridge 的凭据是启动时固化的，不停就会继续用旧账号的隧道对外服务 ——
+        // 用户以为"已退出登录"，实际上手机端仍能访问这台电脑（安全语义不成立）。
         const cfg = loadConfig(relayDir);
         delete cfg.phone;
         delete cfg.password;
+        delete cfg.device_id;          // 设备身份一并作废：下次登录会生成新身份并重新登记
+        delete cfg.device_private_key;
+        delete cfg.device_public_key;
         saveConfig(relayDir, cfg);
+        resetBridgeForAccountChange(relayDir, "退出登录");
         invalidateRelayToken(relayDir); // 退出登录：token 缓存立即失效
         sendJson(res, 200, { ok: true, ...(await composeStatus(relayDir)) });
       },

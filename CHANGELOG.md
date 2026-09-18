@@ -3,6 +3,44 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.7-beta.4] - 2026-09-19
+
+> **修「切换账号后设备没登记到新账号」**。现场（用户实测、本机复现）：退出账号 A（尾号 7541）→
+> 登录账号 B（尾号 7193）后，**B 的设备列表里永远看不到这台 Mac**，而它在 A 那边仍显示在线。
+
+### Fixed
+
+- **换账号后旧 bridge 继续用旧账号跑（致命）**。bridge 的账号/密码是**进程启动时从环境变量固化**的，
+  而 `dsh-setup run` 只在子进程**已退出**时才重新拉起它 —— 配置改了、账号换了，正在跑的进程不会换凭据。
+  现在 watcher 每轮重读配置后比较**账号指纹**（账号/模式/设备身份），一变就结束子进程，
+  下一轮用新凭据重新登记。
+- **切换账号时那次「重启 bridge」其实一直失败（致命）**。插件只认 `gui/<uid>` 域，而安装器按 macOS 26
+  的修复把作业装在 **`user/<uid>`** 域 → `Could not find service … in user gui: 501`，
+  且面板从不看 `bridgeRestart` 的返回值 → **静默失败**，用户完全无感。
+  现在插件与安装器用**同一条域阶梯**（user 优先、gui 兜底），`launchdStatus` 也逐域查询
+  （旧实现会把 user 域里正在运行的作业看成"未运行"）；launchd 都托管不住时退化为脱离进程，
+  与 Windows 走同一条路径。前端登录/注册落盘后会检查 `bridgeRestart`，失败给出可见提示。
+- **旧账号的注册证据没被清理（致命）**。`.dsh-bridge-state.json` 里还留着旧 `device_id` 与
+  `phase: online`，面板据此谎报「已连接」，自愈（只判"有没有 bridge 进程在跑"）永远不去纠正。
+  现在：账号/模式变更与退出登录都会**停掉旧 bridge 并删除过期状态**；`composeConnect` 会判断
+  "运行中的 bridge 是否属于当前账号"，不属于就报 `accountCurrent: false` 并自动重启（不再报 online）。
+- **退出登录不停 bridge（安全）**。旧实现只删配置里的账号，bridge 仍用旧账号的隧道对外服务 ——
+  用户以为"已退出登录"，实际手机端还能访问这台电脑。现在退出登录会停 bridge 并作废设备身份。
+- **429 被误报成「密码错」**。服务端登录限流（每 IP 5 次失败 / 15 分钟）时，bridge 一律提示
+  "请检查 DSH_BRIDGE_EMAIL / DSH_BRIDGE_PASSWORD"，把用户引去反复改密码（反而拖长窗口）。
+  现在如实说明"是出口 IP 被临时限流、凭据无需修改"，并把最早可重试时刻落盘，watcher 在窗口内
+  退避而不是每 10 秒空撞（登录成功即清除）。
+- **测试隔离缺口**：`stopBridge()` 从不检查 `DSH_RELAY_SKIP_SERVICE`；而切换账号会调用它，
+  于是用例会去 `launchctl bootout` 开发者本机上真实运行的 bridge。已补上隔离检查。
+
+### Added
+
+- **`test/account-switch-device.test.mjs`（9 个用例）**：锁死"旧账号的 online 状态不得当作注册证据"、
+  "账号一致时行为不变（回归）"、"切换账号要停旧 bridge + 清过期状态"、"退出登录要作废身份"、
+  "launchd 作业在 user 域时必须被认成运行中"（旧实现只看 gui）、以及 429 的如实报错与退避。
+- 连接阶段与诊断信息新增 **`accountCurrent`**：面板/「复制诊断信息」会直接写出
+  "bridge 账号: 当前账号 / ⚠️ 仍是上一个账号的身份"。
+
 ## [0.6.7-beta.3] - 2026-09-18
 
 > **修两个「卸载把 dsh web 弄坏」的致命缺陷 + Windows 文件权限的如实交付**。

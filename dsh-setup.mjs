@@ -863,11 +863,37 @@ dsh-remote：独立的本地设置页已移除。
 `);
 }
 
+/**
+ * 账号指纹：账号 / 模式 / 设备身份任一变化都意味着"必须用新凭据重新登记"。
+ * 为什么需要：bridge 的 DSH_BRIDGE_PHONE/PASSWORD 是**进程启动时**从环境变量固化的，
+ * 配置改了并不会影响已在跑的进程 —— 这是"切换账号后设备仍留在旧账号"的根因之一。
+ */
+function accountFingerprint(cfg) {
+  const c = cfg || {};
+  return [c.local_key ? "local" : "saas", c.phone || c.email || "", String(c.device_id || ""), String(c.local_key || "")].join("|");
+}
+
+/**
+ * 服务端登录限流的"最早可重试时刻"（bridge 在收到 429 时落盘）。
+ * 为什么需要：限流窗口是 15 分钟，而 watcher 每 10 秒就会重新拉起 bridge ——
+ * 不读这个文件就是 90 次空撞（日志刷屏、还可能拖长窗口）。它只是**退避提示**，绝不阻止正常启动。
+ */
+const LOGIN_RATELIMIT_FILE = ".dsh-login-ratelimited";
+function loginRateLimitUntil() {
+  const f = path.join(CONFIG_DIR, LOGIN_RATELIMIT_FILE);
+  try {
+    const until = Number(String(fs.readFileSync(f, "utf8")).trim());
+    if (Number.isFinite(until) && until > Date.now()) return until;
+    fs.rmSync(f, { force: true }); // 已过期：清掉，恢复正常启动
+  } catch { /* 无文件 = 未限流 */ }
+  return 0;
+}
+
 // ---------- run：前台跑 bridge（带配置 + 自启动 watcher） ----------
 async function runBridge() {
-  // Windows 去重：登录任务（Task Scheduler）与插件半的自愈都可能拉起 watcher，
-  // 两个 bridge 会抢同一个设备登记 → 这里以 pid 文件为准，已有守护在跑就直接退出。
-  if (IS_WIN) {
+  // 去重（所有平台）：自启动服务、登录任务、插件半的脱离进程兜底都可能拉起 watcher，
+  // 两个 bridge 会抢同一个设备登记 → 以 pid 文件为准，已有守护在跑就直接退出。
+  {
     const other = readPidFile(WATCHER_PID_FILE);
     if (other && other !== process.pid && pidAlive(other)) {
       console.log(`[dsh-remote] 已有一个 bridge 守护在运行（pid=${other}），本进程直接退出，避免重复实例。`);
@@ -876,6 +902,10 @@ async function runBridge() {
   }
   let cfg = loadConfig();
   let warnedNoLogin = false;
+  /** 当前 bridge 子进程使用的账号指纹（账号/模式/设备身份任一变化 → 重启子进程）。 */
+  let bridgeAccountFp = "";
+  /** 限流提示只打一次，避免刷屏。 */
+  let warnedRateLimit = false;
 
   // watcher：检测 dsh web（127.0.0.1:3080）存活，存活才启动 bridge
   const checkUpstream = () => new Promise((resolve) => {
@@ -917,6 +947,28 @@ async function runBridge() {
     }
     const apiUrl = saas ? (cfg.api_url || DEFAULT_API) : "";
 
+    // 账号/模式/设备身份变了 → 必须重启 bridge（它的凭据是启动时从环境变量固化的）。
+    // 没有这一条时：面板切了账号、旧 bridge 却继续用旧账号跑，新账号的设备列表里看不到这台机器
+    //（2026-09-19 实测事故）。
+    const fp = accountFingerprint(cfg);
+    if (!childStopped(bridgeProc) && bridgeAccountFp && bridgeAccountFp !== fp) {
+      console.log("[dsh-remote] 账号配置已变化 → 重启 bridge 让新账号生效...");
+      try { bridgeProc.kill(); } catch { /* 已退出 */ }
+      bridgeAccountFp = "";
+      return; // 下一轮（10s 内）用新配置重新拉起
+    }
+
+    // 服务端登录限流窗口内不反复拉起 bridge（凭据没错，改了也没用）
+    const rlUntil = loginRateLimitUntil();
+    if (rlUntil > Date.now()) {
+      if (!warnedRateLimit) {
+        warnedRateLimit = true;
+        console.log(`[dsh-remote] 登录被服务端限流，约 ${Math.ceil((rlUntil - Date.now()) / 1000)} 秒后自动重试（凭据无需修改）。`);
+      }
+      return;
+    }
+    warnedRateLimit = false;
+
     const alive = await checkUpstream();
     if (alive && childStopped(bridgeProc)) {
       starting = true;
@@ -944,7 +996,8 @@ async function runBridge() {
       });
       // Windows：落 pid 文件，供插件半发现进程（Windows 没有 pgrep/ps）。
       // 插件半启动 bridge 走的就是本函数，所以这里写一次两边都覆盖到。
-      if (IS_WIN) writePidFile(BRIDGE_PID_FILE, bridgeProc.pid);
+      writePidFile(BRIDGE_PID_FILE, bridgeProc.pid); // 供插件半发现进程（Windows 无 pgrep；POSIX 用于脱离进程兜底的去重）
+      bridgeAccountFp = fp; // 记下这个子进程用的是哪套凭据，配置一变就重启它
       setTimeout(() => { starting = false; }, 5000);
     } else if (!alive && bridgeProc && bridgeProc.exitCode === null) {
       console.log("[dsh-remote] dsh web 离线，停止 bridge...");
@@ -952,8 +1005,8 @@ async function runBridge() {
     }
   };
 
-  // Windows：watcher 自身的 pid 也要落盘（插件半据此判断"守护在跑"并避免重复拉起）
-  if (IS_WIN) {
+  // watcher 自身的 pid 也要落盘（插件半据此判断"守护在跑"并避免重复拉起）
+  {
     writePidFile(WATCHER_PID_FILE, process.pid);
     const cleanup = () => { removePidFile(WATCHER_PID_FILE); removePidFile(BRIDGE_PID_FILE); };
     process.on("exit", cleanup);

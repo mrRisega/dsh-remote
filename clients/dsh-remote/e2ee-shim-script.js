@@ -599,6 +599,14 @@
 
   /* ---- 状态徽标 ---- */
   var _badgeCollapseTimer = null; // 自动收缩(仅 ok 态):展示几秒后缩成仅 🔒,不挡界面
+  var _badgeState = null;         // 最近一次状态 {mode,text,note} —— 供合并后的悬浮菜单读取
+  /** 对外只读接口:让统一的「远程控制」悬浮按钮显示加密状态（不暴露任何密钥/会话材料）。 */
+  try {
+    window.__dshE2eeBadge = {
+      state: function () { return _badgeState; },
+      open: function () { var el = document.getElementById("dsh-e2ee-badge"); if (el && el.click) el.click(); return !!el; }
+    };
+  } catch (e) { /* ignore */ }
   function _badgeClearCollapse() {
     try { if (_badgeCollapseTimer) { clearTimeout(_badgeCollapseTimer); _badgeCollapseTimer = null; } } catch (e) {}
   }
@@ -643,8 +651,17 @@
   }
   function _badge(mode, text, note) {
     try {
-      // 桌面宽屏(>820)明文/告警态不加徽标 —— 与 mobile-adapter 的“桌面零打扰”契约一致;
+      // 合并给「远程控制悬浮菜单」(2026-09-19):状态挂到 window.__dshE2eeBadge 并广播事件,
+      // 让 mobile-adapter 的统一悬浮按钮显示加密状态、并把独立药丸收起来（只读、不碰加解密逻辑）。
+      _badgeState = { mode: String(mode), text: String(text == null ? "" : text), note: String(note == null ? "" : note) };
+      try {
+        var ev = new CustomEvent("dsh-e2ee-badge", { detail: _badgeState });
+        document.dispatchEvent(ev);
+        if (window !== document) window.dispatchEvent(ev);
+      } catch (e0) { /* 老浏览器:忽略 */ }
+      // 桌面宽屏(>820)明文/告警态不加**独立**徽标 —— 与 mobile-adapter 的“桌面零打扰”契约一致;
       // 加密态(ok)或窄屏始终给出明确状态(协议 §2.4“不静默”)。
+      // 状态本身照常发布，合并后的悬浮菜单无论宽窄都能看到它。
       if (mode !== "ok" && window.innerWidth > 820) return;
       var el = _badgeEl();
       if (!el) return;
