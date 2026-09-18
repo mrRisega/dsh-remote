@@ -70,7 +70,11 @@ test("Router 引导回跳：四种 reason 都有能照做的文案，且落到�
   }
   assert.match(body, /dsh-bridge/, "设备离线要说清「电脑端没在运行」，而不是只说「离线」");
   assert.match(body, /history\.replaceState\(null, "", "\/app\/"\)/, "处理完要清掉地址栏参数（刷新不重复提示）");
-  assert.match(body, /tokenExpired\(state\.token\)/, "令牌已失效时要走登录页提示（此时设备视图不可见）");
+  // 提示条挂在 <main> 顶部 → 登录视图（令牌失效）与设备列表视图都能看到，
+  // 所以**不按登录态分流**（分流会让登录页只剩几秒就消失的 toast）。
+  assert.ok(!/loggedIn/.test(body), "不得按登录态分流提示：两种视图都要能看见这句话");
+  assert.match(body, /\$\("entry-hint"\)/, "应走常驻提示条");
+  assert.match(body, /toast\(text, 6000\)/, "提示条元素缺失时才用 toast 兜底");
 
   // init 必须真的接住 reason（两种分支都要接：令牌仍有效 / 已失效）
   const init = html.slice(html.indexOf("(async function init()"));

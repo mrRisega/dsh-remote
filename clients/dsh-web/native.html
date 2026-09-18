@@ -175,13 +175,15 @@
     .auth-link:hover { text-decoration: underline; }
     .auth-hint { font-size: 14px; color: #57606a; margin-top: 6px; line-height: 1.7; }
     .auth-msg { font-size: 14px; margin-top: 10px; min-height: 18px; }
-    /* Router 引导回跳提示条(会话过期/设备离线/设备不可用) */
-    .entry-hint { display: flex; align-items: flex-start; gap: 10px; font-size: 14px; line-height: 1.7; }
+    /* Router 引导回跳提示条(会话过期/设备离线/设备不可用)。
+       ⚠️ 刻意**不用 flex**：`.card` 在部分页面是 flex 容器，混用会把文案挤成一字一行
+       （实测 2026-09-19），这里用普通块级 + 绝对定位的关闭按钮，与 .card 的任何 display 都互不干扰。 */
+    .entry-hint { position: relative; font-size: 14px; line-height: 1.7; padding-right: 34px; text-align: left; }
     .entry-hint.hidden { display: none; }
     .entry-hint.warn { border-left: 3px solid var(--warn, #9a6700); }
-    .entry-hint-ico { flex: none; }
-    .entry-hint-msg { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
-    .entry-hint-close { flex: none; border: none; background: none; color: var(--muted, #6b7280); font-size: 16px; line-height: 1; cursor: pointer; padding: 2px 4px; }
+    .entry-hint-ico { margin-right: 6px; }
+    .entry-hint-msg { overflow-wrap: anywhere; }
+    .entry-hint-close { position: absolute; top: 6px; right: 8px; border: none; background: none; color: var(--muted, #6b7280); font-size: 16px; line-height: 1; cursor: pointer; padding: 4px 6px; }
     .auth-msg.err { color: #cf222e; }
     .auth-msg.ok { color: #1a7f37; }
     .auth-user { display: flex; align-items: center; gap: 10px; margin: 12px 0 16px; }
