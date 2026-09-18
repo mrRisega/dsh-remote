@@ -78,9 +78,10 @@ lists online devices from `/_devices` and routes into `dsh web` through the tunn
 npx @mrrisega/dsh-remote setup --server wss://你的域名:端口 --key 你的访问密钥
 ```
 
-This writes the local config, verifies the key against `/_login`, and installs a
-launchd/systemd service that keeps the bridge alive. The bridge auto-starts when
-`dsh web` (127.0.0.1:3080) is up.
+This writes the local config, verifies the key against `/_login`, and installs an
+autostart entry that keeps the bridge alive — launchd on macOS, `systemd --user`
+on Linux, and a logon task in **Task Scheduler** (`dsh-remote-bridge`) on Windows.
+The bridge auto-starts when `dsh web` (127.0.0.1:3080) is up.
 
 ## Configuration reference (open.env)
 

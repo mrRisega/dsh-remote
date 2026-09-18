@@ -414,6 +414,14 @@ window.__ModuleLoader__.load({
     var connInFlight = { v: false };
     /** 最近一次连接阶段（供自调度定时器决定快/慢轮询节奏，避免依赖渲染闭包）。 */
     var connPhaseRef = { v: "" };
+    /**
+     * 连接阶段轮询的**连续失败**计数（0.6.7 新增）。
+     * 背景（用户实测）：轮询失败原来被 `.catch` 静默吞掉，而 node 半一旦 500
+     * （Windows 上 `process.getuid is not a function`），面板就永久停在「查询中…」转圈，
+     * 用户完全看不出发生了什么。现在连续失败到阈值就把失败原因摆到连接卡上。
+     */
+    var connFailRef = { v: 0 };
+    var CONN_FAIL_VISIBLE = 3; // ≈ 2.5s × 3：既要够快让用户看见，又要避免一次抖动就报红
     /** 连接阶段轮询节奏：未连通时 2.5s（自动推进），已连接后退避到 15s；页面隐藏时完全停下。 */
     var CONN_POLL_FAST_MS = 2500;
     var CONN_POLL_SLOW_MS = 15000;
@@ -1113,7 +1121,7 @@ window.__ModuleLoader__.load({
         log ? h("div", { className: "dru-up-log", title: "更新日志（尾部）" }, log) : null,
         selfMsg ? h("div", { className: "dru-msg dru-msg-" + selfMsg.kind }, selfMsg.text) : null,
         h("div", { className: "dru-hint", style: { marginTop: 8 } },
-          armed ? "⚠ 再次点击后即开始彻底卸载：① 移除 dsh web 配置中的插件引用与本地文件；② 停止并移除 bridge 自启动服务（macOS com.dshremote.bridge / Linux dsh-bridge）并结束残留进程；③ 清空本地配置目录（~/.dsh-remote：账号、设备密钥、固化运行时等）。此操作不可撤销，如需再次使用请在插件市场重新安装。" :
+          armed ? "⚠ 再次点击后即开始彻底卸载：① 移除 dsh web 配置中的插件引用与本地文件；② 停止并移除 bridge 自启动服务（macOS com.dshremote.bridge / Linux dsh-bridge / Windows 任务计划程序 dsh-remote-bridge）并结束残留进程；③ 清空本地配置目录（~/.dsh-remote：账号、设备密钥、固化运行时等）。此操作不可撤销，如需再次使用请在插件市场重新安装。" :
             "检测新版、一键在线更新、彻底卸载都在本卡片完成。")
       );
     }
@@ -1621,6 +1629,7 @@ window.__ModuleLoader__.load({
         connInFlight.v = true;
         api("/dsh-remote/bridge-status").then(function (b) {
           if (!b || !b.ok || !b.connect) return;
+          connFailRef.v = 0; // 成功即清零：一次抖动不该把面板染红
           var prev = connPhaseRef.v;
           connPhaseRef.v = b.connect.phase || "";
           setConn(b.connect);
@@ -1634,7 +1643,26 @@ window.__ModuleLoader__.load({
               refreshDeviceList(); // 手机扫码后设备列表自动出现，无需刷新页面
             }
           }
-        }).catch(function () { /* 轮询失败静默：下一轮自动重试 */ })
+        }).catch(function (e) {
+          // 【0.6.7】原来这里是空 catch（"轮询失败静默：下一轮自动重试"）。在 Windows 上
+          // node 半因 process.getuid 崩溃返回 500 时，这段静默让面板**永久**停在
+          // 「查询中…」，用户完全无从判断（正是收到的那份诊断报告里的现象）。
+          // 现在：连续失败到阈值就把原因摆到连接卡上，并提示可以直接重试。
+          connFailRef.v += 1;
+          if (connFailRef.v >= CONN_FAIL_VISIBLE) {
+            setConn({
+              phase: "error",
+              online: false,
+              text: "状态读取失败",
+              detail: "本机状态接口连续 " + connFailRef.v + " 次请求失败："
+                + ((e && e.message) ? e.message : String(e))
+                + "（面板读不到 bridge 状态，扫码/远程访问都不会推进）。可点「重试」，或刷新页面；若持续失败请把诊断信息发给客服。",
+              error: { code: "status_unreachable", message: "无法读取本机 bridge 状态（/dsh-remote/bridge-status 请求失败）" },
+              retryable: true,
+              attempts: connFailRef.v,
+            });
+          }
+        })
           .finally(function () { connInFlight.v = false; });
       }
 
@@ -2421,7 +2449,13 @@ window.__ModuleLoader__.load({
                 : h("button", { type: "button", className: "dru-btn dru-btn-danger", disabled: busy !== "", onClick: function () { toggleBridge(false); } }, busy === "stop" ? "停止中…" : "停止 bridge")
             ),
             h("div", { className: "dru-meta" }, st && st.config && st.config.deviceId ? "设备 ID：" + st.config.deviceId : "设备 ID：生成中"),
-            h("div", { className: "dru-meta" }, st ? (st.service && st.service.plistExists ? "自启动服务已安装" : "自启动服务未安装（启动时自动创建）") : ""),
+            h("div", { className: "dru-meta" }, st ? (st.service && (st.service.plistExists || st.service.serviceManager === "detached")
+              ? (st.service.serviceManager === "detached"
+                ? (st.service.autostartTask
+                    ? "自启动：已注册登录任务（任务计划程序 dsh-remote-bridge）"
+                    : "自启动：未注册登录任务（由面板在 dsh web 启动时自动拉起 bridge）")
+                : "自启动服务已安装")
+              : "自启动服务未安装（启动时自动创建）") : ""),
             // 0.6.2：把「运行环境缺失 / launchd 崩溃循环」如实告诉用户，而不是显示「运行中」
             st && !serviceRuntimeReady
               ? h("div", { className: "dru-hint", style: { marginTop: 8 } },

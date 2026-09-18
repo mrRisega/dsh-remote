@@ -26,7 +26,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn, execSync } from "node:child_process";
+import { spawn, spawnSync, execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { childStopped } from "./clients/dsh-remote/src/lifecycle.mjs";
 
@@ -44,6 +44,22 @@ const CONFIG_PATH = path.join(CONFIG_DIR, ".dsh-config.json");
 const DEFAULT_API = "https://n.risegao.cn:13443/relay-api";
 const DEFAULT_APP_URL = "https://n.risegao.cn:13443/app/";
 const REPO_URL = "https://github.com/mrRisega/dsh-remote";
+
+// ---------- 平台（0.6.7 起支持 Windows） ----------
+const IS_WIN = process.platform === "win32";
+/**
+ * Windows 自启动 = 任务计划程序（Task Scheduler）里的登录任务。
+ * 为什么不是「启动文件夹快捷方式」：生成 .lnk 需要额外依赖或 COM 调用，而 schtasks 系统自带，
+ * 且**不需要管理员**就能为当前用户建 ONLOGON 任务（默认「仅在用户登录时运行」，不存密码）。
+ */
+const WIN_TASK_NAME = "dsh-remote-bridge";
+/**
+ * watcher / bridge 的 pid 文件（Windows 必需）。
+ * Windows 没有 pgrep/ps，插件半（dsh-remote-web）与安装器都靠这两个文件发现进程：
+ * watcher = 本安装器 `run` 子命令的进程，bridge = 它拉起的 dsh-bridge.mjs 子进程。
+ */
+const WATCHER_PID_FILE = ".dsh-watcher.pid";
+const BRIDGE_PID_FILE = ".dsh-bridge.pid";
 
 // ---------- 运行时自物化（npm/npx 安装 → 固化到配置目录，脱离 npx 缓存） ----------
 // npx 每次安装的缓存目录（~/.npm/_npx/<hash>）不固定：缓存一旦清理，指向它的自启动服务
@@ -310,6 +326,95 @@ function sleepSync(ms) {
   catch { /* 极端环境不支持 → 退化为忙等一小会 */ const end = Date.now() + ms; while (Date.now() < end) { /* spin */ } }
 }
 
+/**
+ * 运行 schtasks（Windows 任务计划程序）。
+ * **不走 sh()**：/TR 里必然带引号（node 路径与脚本路径都可能含空格），
+ * 经 cmd.exe 转一层会把嵌套引号绞碎；spawnSync 直接把 argv 交给 CreateProcess，
+ * 由 Node 负责转义，参数原样到达 schtasks。
+ */
+function schtasks(args, timeoutMs = 15000) {
+  try {
+    const r = spawnSync("schtasks", args, { encoding: "utf8", timeout: timeoutMs, windowsHide: true });
+    return {
+      ok: r.status === 0,
+      code: r.status,
+      stdout: String(r.stdout || ""),
+      stderr: String(r.stderr || (r.error && r.error.message) || ""),
+    };
+  } catch (e) {
+    return { ok: false, code: -1, stdout: "", stderr: e.message };
+  }
+}
+
+/** 写 pid 文件（Windows 进程发现用；失败不致命，插件半还有 PowerShell 兜底扫描）。 */
+function writePidFile(name, pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return;
+  try {
+    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+    fs.writeFileSync(path.join(CONFIG_DIR, name), String(pid));
+  } catch { /* 非关键 */ }
+}
+
+function removePidFile(name) {
+  try { fs.rmSync(path.join(CONFIG_DIR, name), { force: true }); } catch { /* 非关键 */ }
+}
+
+function readPidFile(name) {
+  try {
+    const n = Number(String(fs.readFileSync(path.join(CONFIG_DIR, name), "utf8")).trim());
+    return Number.isInteger(n) && n > 0 ? n : null;
+  } catch { return null; }
+}
+
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; }
+}
+
+/**
+ * 注册 Windows 登录任务（幂等：先删再建）。
+ * /DELAY 0000:15：登录后等 15 秒再起，避免与桌面环境抢启动时机
+ * （watcher 本身就会等 dsh web 的 3080 端口，晚起没有任何副作用）。
+ * ⚠️ 已知限制（如实告知，不假装完美）：ONLOGON 任务在用户会话里运行，登录时会有一个控制台窗口；
+ * 想彻底隐藏需要"不管用户是否登录都运行"(存密码/S4U) 或第三方隐藏器，都需要额外凭据或依赖，
+ * 故这里只做「能自启」，并在安装汇总里说明用户可在任务计划程序里勾「隐藏」。
+ */
+let winTaskCache = null;
+
+function writeWindowsTask() {
+  const node = NODE_BIN;
+  const setup = runtimeSetupPath();
+  const tr = `"${node}" "${setup}" run`;
+  if (tr.length > 255) {
+    console.log(`⚠️ 自启动命令过长（${tr.length} 字符，schtasks 上限 261）：${tr}`);
+    console.log("   建议把 dsh-remote 装到更短的路径，或用 `dsh-remote run` 手动运行 bridge。");
+  }
+  schtasks(["/Delete", "/TN", WIN_TASK_NAME, "/F"]); // 幂等清理（不存在也只是非 0 退出，不影响后续
+  const created = schtasks(["/Create", "/TN", WIN_TASK_NAME, "/TR", tr, "/SC", "ONLOGON", "/DELAY", "0000:15", "/F"]);
+  if (!created.ok) {
+    winTaskCache = false;
+    console.warn(`⚠️ 自启动任务注册失败: ${(created.stderr || created.stdout).trim() || `schtasks 退出码 ${created.code}`}`);
+    console.warn("   可手动执行 `dsh-remote run` 运行 bridge（功能完全一样，只是不随登录自启）。");
+    return null;
+  }
+  winTaskCache = true;
+  return `任务计划程序 / ${WIN_TASK_NAME}`; // 汇总里展示的"路径"
+}
+
+/** 查询 Windows 登录任务是否已注册（退出码 0 = 存在；不解析本地化输出）。 */
+function windowsTaskInstalled() {
+  return schtasks(["/Query", "/TN", WIN_TASK_NAME]).ok;
+}
+
+/**
+ * 本次进程内查询一次登录任务是否已注册（汇总里多处要用，避免反复起 schtasks）。
+ * 注册/删除任务时同步刷新缓存，保证汇总看到的是最终状态。
+ */
+function winTaskOk() {
+  if (winTaskCache === null) winTaskCache = windowsTaskInstalled();
+  return winTaskCache;
+}
+
 function writeAutostartFile() {
   const runCmd = `"${NODE_BIN}" "${runtimeSetupPath()}" run`;
   if (process.platform === "darwin") {
@@ -353,7 +458,8 @@ function writeAutostartFile() {
     fs.writeFileSync(unitPath, unit);
     return unitPath; // 路径在最终汇总里统一展示
   }
-  console.log("⚠️ 当前平台暂不支持自启动，请手动运行 `dsh-remote run`");
+  if (IS_WIN) return writeWindowsTask();
+  console.log(`⚠️ 当前平台（${process.platform}）暂不支持自启动，请手动运行 \`dsh-remote run\``);
   return null;
 }
 
@@ -471,6 +577,22 @@ function startBridgeDarwin(plistPath) {
 }
 
 function restartBridgeService() {
+  if (IS_WIN) {
+    if (!windowsTaskInstalled()) writeWindowsTask(); // 静默补生成(调用方会汇总展示)
+    // /Run 只是"现在跑一次"；等 pid 文件出现才算真的起来了（schtasks 的退出码只说明任务被触发）
+    const r = schtasks(["/Run", "/TN", WIN_TASK_NAME]);
+    if (!r.ok) return { ok: false, status: "failed", detail: (r.stderr || r.stdout).trim() || `schtasks /Run 退出码 ${r.code}` };
+    for (let i = 0; i < 20; i += 1) {
+      const pid = readPidFile(WATCHER_PID_FILE);
+      if (pid && pidAlive(pid)) return { ok: true, status: "running", pid };
+      sleepSync(400);
+    }
+    return {
+      ok: false,
+      status: "degraded-detached",
+      detail: "已触发自启动任务，但没等到 bridge 守护进程（dsh web 可能还没运行；打开 dsh web 后会自动接上）",
+    };
+  }
   const svcFile = autostartFilePath();
   if (svcFile && !fs.existsSync(svcFile)) {
     writeAutostartFile(); // 静默补生成(调用方会汇总展示路径)
@@ -516,8 +638,21 @@ function resolveProfileDir(argv = []) {
     : process.env.DSH_PROFILE_DIR || path.join(os.homedir(), ".dsh", "profiles", "web");
 }
 
-/** 监听 127.0.0.1:3080 的进程 pid（= dsh web）。lsof 不可用时回退 pgrep。 */
+/**
+ * 监听 127.0.0.1:3080 的进程 pid（= dsh web）。
+ * macOS/Linux：lsof → pgrep；Windows：netstat -ano 取 LISTENING 行的最后一列
+ * （netstat 是系统自带，比每次都起 PowerShell 快得多）。
+ */
 function dshWebPid() {
+  if (IS_WIN) {
+    const r = sh('netstat -ano | findstr ":3080"');
+    for (const line of String(r.stdout || "").split("\n")) {
+      if (!/LISTENING/i.test(line)) continue;
+      const m = line.trim().match(/(\d+)\s*$/);
+      if (m) return Number(m[1]);
+    }
+    return null;
+  }
   const l = sh("lsof -nP -iTCP:3080 -sTCP:LISTEN -t 2>/dev/null || true");
   const pid = String(l.stdout || "").trim().split(/\s+/).filter(Boolean)[0];
   if (pid && /^\d+$/.test(pid)) return Number(pid);
@@ -554,8 +689,10 @@ function dshWebLaunchdJob() {
 }
 
 function restartDshWeb() {
-  const uid = process.getuid();
+  // ⚠️ process.getuid 只在 macOS 分支里取：Windows 上**没有这个函数**，
+  // 旧写法把它放在函数首行无条件调用 → 安装流程在 Windows 直接 TypeError 中断。
   if (process.platform === "darwin") {
+    const uid = process.getuid();
     const job = dshWebLaunchdJob();
     if (job) {
       const r = sh(`launchctl kickstart -k gui/${uid}/${job}`);
@@ -566,6 +703,7 @@ function restartDshWeb() {
     const r = sh("systemctl --user restart dsh-web 2>/dev/null || systemctl --user restart dsh 2>/dev/null");
     if (r.ok) return { ok: true, how: "systemctl --user restart dsh-web" };
   }
+  if (IS_WIN) return restartDshWebWindows();
   // 兜底：沿用原命令行重启（只在能拿到真实 node 入口时做，npx 缓存路径不可靠）
   const pid = dshWebPid();
   if (!pid) return { ok: false, how: "", detail: "未找到 dsh web 进程" };
@@ -580,6 +718,95 @@ function restartDshWeb() {
   } catch (e) {
     return { ok: false, how: "", detail: e.message };
   }
+}
+
+/**
+ * Windows：重启 dsh web（沿用原命令行自拉起）。
+ *
+ * 与插件半的重启助手同源思路：**先校验新进程拉得起来，再动旧进程**；用 node 跑一个 .mjs 助手，
+ * 不经过任何 shell（Windows 没有 /bin/sh，cmd.exe 的引号规则又极易把带空格的 node/入口路径绞碎）。
+ * 拿不到命令行（例如经 npx 启动）时如实拒绝，让用户手动重启，绝不"杀掉却起不来"。
+ */
+function restartDshWebWindows() {
+  const pid = dshWebPid();
+  if (!pid) return { ok: false, how: "", detail: "未找到监听 3080 的进程（dsh web 没在运行？）" };
+  const cmdline = windowsProcessCommandLine(pid);
+  if (!cmdline) return { ok: false, how: "", detail: "无法获取 dsh web 的启动命令行，请手动重启" };
+  if (/_npx|node_modules\\\.bin|node_modules\/\.bin/.test(cmdline)) {
+    return { ok: false, how: "", detail: "dsh web 是经 npx 启动的，无法安全复用命令行，请手动重启" };
+  }
+  const argv = parseWindowsCommandLine(cmdline);
+  if (!argv.length || !fs.existsSync(argv[0])) {
+    return { ok: false, how: "", detail: "dsh web 的启动命令无法解析为可执行程序，请手动重启" };
+  }
+  const helper = path.join(CONFIG_DIR, ".dsh-restart-dshweb.mjs");
+  const plan = JSON.stringify({ pid, argv, log: path.join(CONFIG_DIR, ".dsh-restart.log") });
+  const src = `import { spawn, spawnSync } from "node:child_process";
+import { appendFileSync, existsSync, openSync, closeSync } from "node:fs";
+import { setTimeout as delay } from "node:timers/promises";
+const PLAN = ${plan};
+function logLine(m) { try { appendFileSync(PLAN.log, "\\n[" + new Date().toISOString() + "] " + m + "\\n"); } catch (e) {} }
+if (!existsSync(PLAN.argv[0])) { logLine("重启中止：可执行文件不存在 " + PLAN.argv[0]); process.exit(1); }
+function alive(p) { try { process.kill(p, 0); return true; } catch (e) { return e.code === "EPERM"; } }
+logLine("dsh web 重启助手启动：旧 pid=" + PLAN.pid);
+await delay(1000);
+try { process.kill(PLAN.pid); } catch (e) {}
+const deadline = Date.now() + 30000;
+while (Date.now() < deadline && alive(PLAN.pid)) await delay(200);
+if (alive(PLAN.pid)) spawnSync("taskkill", ["/PID", String(PLAN.pid), "/T", "/F"], { windowsHide: true });
+let out = "ignore";
+try { out = openSync(PLAN.log, "a"); } catch (e) {}
+const child = spawn(PLAN.argv[0], PLAN.argv.slice(1), { detached: true, stdio: ["ignore", out, out], windowsHide: true });
+child.on("error", (e) => logLine("重新拉起失败：" + e.message));
+child.unref();
+if (typeof out === "number") { try { closeSync(out); } catch (e) {} }
+logLine("已重新拉起 dsh web：pid=" + String(child.pid));
+`;
+  try {
+    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+    fs.writeFileSync(helper, src);
+    const child = spawn(NODE_BIN, [helper], { detached: true, stdio: "ignore", cwd: os.homedir(), windowsHide: true });
+    child.on("error", () => { /* 有 error 监听：绝不能把宿主/安装器打挂 */ });
+    child.unref();
+    return { ok: true, how: "Windows 重启助手（原命令行自拉起）" };
+  } catch (e) {
+    return { ok: false, how: "", detail: e.message };
+  }
+}
+
+/** 读某进程的完整命令行（PowerShell CIM；取不到返回空串）。 */
+function windowsProcessCommandLine(pid) {
+  const script = `(Get-CimInstance Win32_Process -Filter "ProcessId=${Number(pid)}").CommandLine`;
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+  try {
+    const r = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+      { encoding: "utf8", timeout: 8000, windowsHide: true });
+    return String(r.stdout || "").trim();
+  } catch { return ""; }
+}
+
+/**
+ * 把 Windows 命令行拆成 argv（按 CreateProcess/CRT 的引号规则）。
+ * 不引第三方依赖；处理 `"a b" c`、`a\b c`、`"a\"b"` 等常见形态即可。
+ */
+function parseWindowsCommandLine(cmd) {
+  const out = [];
+  let cur = "";
+  let inQuote = false;
+  let started = false;
+  for (let i = 0; i < cmd.length; i += 1) {
+    const ch = cmd[i];
+    if (ch === "\\" && cmd[i + 1] === '"') { cur += '"'; i += 1; started = true; continue; }
+    if (ch === '"') { inQuote = !inQuote; started = true; continue; }
+    if (!inQuote && /\s/.test(ch)) {
+      if (started) { out.push(cur); cur = ""; started = false; }
+      continue;
+    }
+    cur += ch;
+    started = true;
+  }
+  if (started) out.push(cur);
+  return out;
 }
 
 function installAutostart() {
@@ -607,6 +834,15 @@ dsh-remote：独立的本地设置页已移除。
 
 // ---------- run：前台跑 bridge（带配置 + 自启动 watcher） ----------
 async function runBridge() {
+  // Windows 去重：登录任务（Task Scheduler）与插件半的自愈都可能拉起 watcher，
+  // 两个 bridge 会抢同一个设备登记 → 这里以 pid 文件为准，已有守护在跑就直接退出。
+  if (IS_WIN) {
+    const other = readPidFile(WATCHER_PID_FILE);
+    if (other && other !== process.pid && pidAlive(other)) {
+      console.log(`[dsh-remote] 已有一个 bridge 守护在运行（pid=${other}），本进程直接退出，避免重复实例。`);
+      return;
+    }
+  }
   let cfg = loadConfig();
   let warnedNoLogin = false;
 
@@ -671,13 +907,29 @@ async function runBridge() {
       bridgeProc = spawn(NODE_BIN,
         [path.join(THIS_DIR, "clients/dsh-remote/dsh-bridge.mjs")],
         { env: childEnv, stdio: "inherit" });
-      bridgeProc.on("exit", () => { console.log("[dsh-remote] bridge 退出，等待重启..."); });
+      bridgeProc.on("exit", () => {
+        removePidFile(BRIDGE_PID_FILE);
+        console.log("[dsh-remote] bridge 退出，等待重启...");
+      });
+      // Windows：落 pid 文件，供插件半发现进程（Windows 没有 pgrep/ps）。
+      // 插件半启动 bridge 走的就是本函数，所以这里写一次两边都覆盖到。
+      if (IS_WIN) writePidFile(BRIDGE_PID_FILE, bridgeProc.pid);
       setTimeout(() => { starting = false; }, 5000);
     } else if (!alive && bridgeProc && bridgeProc.exitCode === null) {
       console.log("[dsh-remote] dsh web 离线，停止 bridge...");
       bridgeProc.kill();
     }
   };
+
+  // Windows：watcher 自身的 pid 也要落盘（插件半据此判断"守护在跑"并避免重复拉起）
+  if (IS_WIN) {
+    writePidFile(WATCHER_PID_FILE, process.pid);
+    const cleanup = () => { removePidFile(WATCHER_PID_FILE); removePidFile(BRIDGE_PID_FILE); };
+    process.on("exit", cleanup);
+    for (const sig of ["SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"]) {
+      try { process.on(sig, () => { cleanup(); process.exit(0); }); } catch { /* 该信号在本平台不可注册 */ }
+    }
+  }
 
   await ensureBridge();
   setInterval(ensureBridge, 10000); // 每 10s 检查
@@ -834,13 +1086,23 @@ async function setup(argv) {
   const svcSkipped = st.status === "skipped" || st.status === "unsupported" || !svc.path;
   // 第三态:起来了、但本机 launchd 不保证崩溃自愈(on-demand-only 的 gui domain 只能靠 kickstart 拉起),
   // 必须与"完全正常"分开说 —— 否则用户以为有自启,进程一崩就永久掉线且找不到原因。
-  const svcFragile = !svcSkipped && st.ok && st.selfHealing === false;
+  // Windows 没有 launchd，这条判断对它不成立（否则会把 win32 误报成"本机不支持崩溃自愈"）。
+  const svcFragile = !IS_WIN && !svcSkipped && st.ok && st.selfHealing === false;
   const svcDegraded = st.status === "degraded-detached";
-  const svcState = svcSkipped
-    ? (st.status === "skipped" ? "未安装（本次显式跳过）" : "未安装（当前平台不支持自启动）")
-    : (st.ok
-        ? `✅ 运行中${st.pid ? ` (pid=${st.pid})` : ""}${svcFragile ? "，但本机不支持崩溃自愈" : ""}`
-        : (svcDegraded ? "⚠️ 未被系统托管（已用后台进程兜底）" : `未运行 (${st.detail || st.status})`));
+  // Windows：自启动 = 任务计划程序里的登录任务。口径与 macOS/Linux 不同
+  // （"任务已注册" ≠ "进程此刻在跑"），所以单独给文案，避免复用"未被系统托管"这种会误导的措辞。
+  const winTask = IS_WIN && winTaskOk();
+  const svcState = IS_WIN
+    ? (st.status === "skipped"
+        ? "未安装（本次显式跳过）"
+        : (!winTask
+            ? "未注册（登录任务创建失败，可用 `dsh-remote run` 手动运行 bridge）"
+            : (st.ok ? `✅ 已注册，守护进程在运行${st.pid ? ` (pid=${st.pid})` : ""}` : "✅ 已注册（登录后自动运行；dsh web 打开时会立刻接上）")))
+    : (svcSkipped
+        ? (st.status === "skipped" ? "未安装（本次显式跳过）" : "未安装（当前平台不支持自启动）")
+        : (st.ok
+            ? `✅ 运行中${st.pid ? ` (pid=${st.pid})` : ""}${svcFragile ? "，但本机不支持崩溃自愈" : ""}`
+            : (svcDegraded ? "⚠️ 未被系统托管（已用后台进程兜底）" : `未运行 (${st.detail || st.status})`)));
   const L = [];
   L.push("✅ 安装完成");
   if (selfHosted) {
@@ -865,7 +1127,13 @@ async function setup(argv) {
     L.push("   如果 dsh web 已经开着但看不到本机，先重启 dsh web 让插件生效。");
   } else if (!st.ok) {
     L.push("");
-    if (svcDegraded) {
+    if (IS_WIN) {
+      // Windows：登录任务已注册，只是此刻 bridge 守护还没就绪（dsh web 刚起、或还没登录账号）
+      L.push(`ℹ bridge 守护还没就绪: ${st.detail || st.status}`);
+      L.push(`   已注册登录任务「${WIN_TASK_NAME}」，下次登录会自动运行；`);
+      L.push("   也可以现在执行 `dsh-remote run` 前台运行 bridge（Ctrl-C 退出）。");
+      L.push(`   日志: ${CONFIG_DIR}\\.dsh-bridge.log`);
+    } else if (svcDegraded) {
       // launchd 托管失败但进程活着:能立刻用,只是没有自启/自愈。如实说明,别让用户以为有自启。
       L.push(`⚠️ ${st.detail}`);
       L.push(`   bridge 已在后台运行${st.pid ? `（pid=${st.pid}）` : ""}，现在就能用；`);
@@ -1220,7 +1488,17 @@ function ensurePluginLinked(profileDir, pluginLocalDir) {
   try {
     fs.symlinkSync(pluginLocalDir, nmPlugin, "dir");
   } catch {
-    fs.cpSync(pluginLocalDir, nmPlugin, { recursive: true });
+    // Windows：普通目录符号链接需要管理员或"开发者模式"，非管理员时直接 EPERM。
+    // junction（目录联接）**不需要任何特权**，且 realpath 同样解析到目标，
+    // 所以放在符号链接与整目录拷贝之间——能让 Windows 用户也拿到"链接"语义（改一处即生效）。
+    let linked = false;
+    if (process.platform === "win32") {
+      try {
+        fs.symlinkSync(path.resolve(pluginLocalDir), nmPlugin, "junction"); // junction 只接受绝对路径
+        linked = true;
+      } catch { /* 退化到拷贝 */ }
+    }
+    if (!linked) fs.cpSync(pluginLocalDir, nmPlugin, { recursive: true });
   }
   try { return fs.realpathSync(nmPlugin) === pluginLocalDir; } catch { return false; }
 }

@@ -3,6 +3,64 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.7-beta.1] - 2026-09-18
+
+> **Windows 可用版（预发）**。0.6.6 及更早的插件半整套「服务状态 / 启停 / 重启」按 macOS/Linux 写死
+> （launchctl / systemd / pgrep / ps / /bin/sh），在 Windows 上**安装一切正常、运行期必死**。
+> 本轮由用户侧诊断报告定位、本地逐条复现后全部修掉，并补了 16 个 Windows 平台用例进测试套件。
+>
+> ⚠️ 本版先发 **npm `beta` 通道**（`latest` 仍停留在 0.6.6）：Windows 分支是在开发机上以
+> `DSH_RELAY_PLATFORM=win32` 模拟跑通的，**真机验证**（`schtasks` 参数引号解析、PowerShell 输出结构、
+> `taskkill /T /F`、登录任务的控制台窗口）还需要一位 Windows 用户确认后再转正式版。
+> 安装预发版：`dsh plugin --profile web add dsh-remote-web@0.6.7-beta.1`（装完重启一次 dsh web）。
+
+### Fixed
+
+- **Windows：`/dsh-remote/status` 与 `/bridge-status` 双双 500 → 面板永久卡在「查询中…」**。
+  `launchTarget()` 无条件调用 `process.getuid()`，而 Windows **没有这个函数**（不是返回 undefined，
+  是 typeof !== "function"）→ 所有读状态的接口都抛错；前端又静默吞掉 `bridge-status` 的失败，
+  于是只显示红字「读取状态失败: process.getuid is not a function」并永久转圈。
+  现在 uid 取不到一律返回 null，非 macOS 平台直接短路 launchd 查询（也不再白调一次不存在的 launchctl）。
+- **Windows：运行环境永远补不上（`npx_cmd_unavailable`）**。Windows 的 npx 是 `npx.cmd`，
+  而 Node ≥20.12（CVE-2024-27980 的修复）起 `spawn("npx.cmd")` 不带 shell 会**同步抛 EINVAL**。
+  现在优先用**当前 node 直接跑 npm 自带的 `npx-cli.js`**（完全不经过 cmd.exe，无空格/中文路径陷阱），
+  找不到才退回 `npx.cmd` + `shell: true`。
+- **Windows：点「重启 DeepSeek harness」会把 dsh web 打挂且不自恢复**。旧实现生成 `#!/bin/sh`
+  脚本再 `spawn("/bin/sh")`（Windows 无 /bin/sh → ENOENT），而那个 ChildProcess **没有 `'error'` 监听**
+  → 未捕获异常直接终止宿主进程；更糟的是代码先把「已调度重启」写进日志并返回成功。
+  现在 Windows 改用 **node 跑的 `.mjs` 助手**（不经过任何 shell），且**先校验 node/入口/工作目录存在再动旧进程**
+  （宁可重启失败，也不把自己杀掉却起不来）；重启必须等 `spawn` 真正成功才报成功。
+- **Windows：bridge 永远显示「已停止」**。进程发现原来只用 `pgrep`/`ps`，Windows 上恒为空。
+  现在 `dsh-setup run` 会落 `.dsh-watcher.pid` / `.dsh-bridge.pid`，插件读文件 + `process.kill(pid,0)` 判活，
+  并用 PowerShell（`-EncodedCommand`，免引号地狱）扫描 node 进程兜底。
+- **Windows：插件不会自己拉起 bridge**。`startBridge` 原来只认 plist（非 macOS 直接返回「仅支持 macOS」）。
+  现在 Windows 由插件把 `dsh-setup.mjs run` 作为**脱离进程**拉起（与 `dsh-remote run` 同一条代码路径，
+  含 pid 追踪、幂等去重、停止时结束进程树），并做「登录任务 + 插件自愈」双路径下的重复实例防护。
+- **Windows：安装器直接 TypeError 中断**。`restartDshWeb()` 在函数首行无条件 `process.getuid()`。
+  现在 getuid 收进 darwin 分支；Windows 走 PowerShell 取命令行 + node 助手自拉起（拿不到命令行时如实拒绝，
+  绝不「杀掉却起不来」）。
+- **PATH 拼错**：子进程 env 的 PATH 原来写死 `":"` 分隔符与 POSIX 目录，在 Windows 上会拼成一个不存在的路径
+  （node/npx 全找不到）。现在按平台用 `path.delimiter`。
+- **`execSync("sleep 1")`**：Windows 没有 `sleep` 命令。改用 `Atomics.wait` 的 `sleepSync`。
+- **`dsh-setup.mjs` 其余 Windows 分支**：`dshWebPid()` 原来只用 lsof/pgrep（Windows 恒为 null），
+  现在用 `netstat -ano`；插件目录链接在无管理员/开发者模式时退回 **junction**（不需要特权）而不是整目录拷贝。
+- **面板文案**：不再把 Windows 说成「自启动服务未安装（启动时自动创建）」或沿用 macOS 专属措辞；
+  卸载说明写明 Windows 会删掉任务计划条目。
+
+### Added
+
+- **Windows 自启动**：安装器在**任务计划程序**注册登录任务 `dsh-remote-bridge`
+  （`schtasks /SC ONLOGON /DELAY 0000:15`，非管理员即可为当前用户创建、不存密码），
+  彻底卸载时一并删除。已知限制：ONLOGON 任务在用户会话里运行，登录时会有一个控制台窗口
+  （要彻底隐藏需要存密码/S4U 或第三方隐藏器）；**由插件自愈拉起的那条路径是隐藏的**，
+  所以日常使用不会看到窗口。macOS/Linux 的 launchd/systemd 行为完全不变。
+- **测试**：新增 `packages/dsh-remote-web/test/windows-compat.test.mjs`（15 个用例）。插件支持
+  `DSH_RELAY_PLATFORM=win32` 显式覆盖平台，于是 Windows 分支可以在 macOS/Linux 开发机上
+  **真正跑一遍**，而不是只看源码像不像：接口不再 500、不调 launchctl、npx 走 node+CLI、
+  重启助手语法合法且带「先校验再杀」、pid 文件进程发现、卸载删任务、前端失败可见等全部有断言。
+- **前端**：`bridge-status` 轮询连续失败 3 次即把失败原因摆到连接卡上（原先静默 catch，
+  用户只看到无限「查询中…」），成功即清零，避免一次抖动就把面板染红。
+
 ## [0.6.6] - 2026-09-16
 
 > **正式版**（发表于 npm `latest`）。预发版 beta.1 ~ beta.4 到此收束，内容与 beta.4 一致。

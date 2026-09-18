@@ -21,14 +21,64 @@
 //
 // 不依赖任何第三方包：只使用 node 内置模块与 cordis 注入的 webServer 服务。
 import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync, accessSync, chmodSync, openSync, closeSync, readSync, fstatSync, rmSync, statSync, constants as fsConstants } from "node:fs";
-import { join, dirname, sep } from "node:path";
-import { execSync, spawn } from "node:child_process";
+import { join, dirname, sep, delimiter } from "node:path";
+import { execSync, spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { homedir, platform } from "node:os";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 /** 本插件在 host 侧的服务依赖。 */
 export const inject = ["webServer"];
+
+// ---------- 平台抽象层（0.6.7：Windows 支持） ----------
+//
+// 为什么单独抽一层：本插件整套「服务状态 / 启停」原本按 macOS/Linux 写死
+// （launchctl / systemctl / pgrep / ps / /bin/sh），在 Windows 上运行期直接炸：
+//   · process.getuid() 在 Windows 不存在（不是返回 undefined，是**没有这个函数**）
+//     → /dsh-remote/status 与 /bridge-status 双双 500，面板永久停在「查询中…」；
+//   · spawn("npx.cmd") 不带 shell（Node ≥20.12 起）同步抛 EINVAL → 运行环境永远补不上；
+//   · spawn("/bin/sh") 在 Windows 报 ENOENT，且当时没有 'error' 监听 → 未捕获异常打挂 dsh web。
+// 下面所有平台判断一律走 osPlatform()，绝不直接读 process.platform——这样测试可以用
+// DSH_RELAY_PLATFORM=win32 在 macOS/Linux 开发机上把 Windows 分支真正跑一遍（见 test/windows-compat.test.mjs）。
+
+/**
+ * 当前运行平台（win32/darwin/linux/…）。
+ * DSH_RELAY_PLATFORM 仅供测试/诊断模拟其它平台，生产环境不设置；调用时读取（非模块加载时固定）。
+ */
+function osPlatform() {
+  return String(process.env.DSH_RELAY_PLATFORM || "").trim() || process.platform;
+}
+/** 是否 Windows：无 launchd/systemd、无 pgrep/ps、无 /bin/sh、npx 是 .cmd。 */
+function isWindows() {
+  return osPlatform() === "win32";
+}
+function isDarwin() {
+  return osPlatform() === "darwin";
+}
+
+/**
+ * 当前进程 uid。**Windows 没有 process.getuid**（typeof !== "function"），
+ * 旧实现无条件调用它，导致所有读状态的接口 500。取不到一律返回 null，
+ * 调用方按「本平台无 launchd domain」处理。
+ */
+function currentUid() {
+  return typeof process.getuid === "function" ? process.getuid() : null;
+}
+
+/** 同步睡眠（不引第三方依赖；Windows 没有 `sleep` 命令）。 */
+function sleepSync(ms) {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    const end = Date.now() + ms;
+    while (Date.now() < end) { /* 极端环境退化为忙等 */ }
+  }
+}
+
+/** quote 成 POSIX shell 单引号字面量（仅 darwin/linux 的 sh 调用用）。 */
+function shQuote(s) {
+  return "'" + String(s).replace(/'/g, `'\\''`) + "'";
+}
 
 /** 默认配置目录（可被 entry config 的 relayDir / DSH_RELAY_DIR 环境变量覆盖）。 */
 const DEFAULT_RELAY_DIR = process.env.DSH_RELAY_DIR || join(homedir(), ".dsh-remote");
@@ -76,15 +126,45 @@ function preferredNode() {
 const NODE_BIN = preferredNode();
 
 /**
- * 解析 npx 绝对路径。DeepSeek App 拉起 dsh web 时 PATH 只有 /usr/bin:/bin:/usr/sbin:/sbin
+ * 解析 npx 的调用方式。DeepSeek App 拉起 dsh web 时 PATH 只有 /usr/bin:/bin:/usr/sbin:/sbin
  * （没有 /opt/homebrew/bin 等），裸 `npx` 会 spawn ENOENT 而静默失败——必须按绝对路径找，
  * 且子进程 env 的 PATH 要把当前 node 所在目录补在最前（npx 的 #!/usr/bin/env node 依赖它）。
+ *
+ * 【0.6.7 Windows 修复】Windows 上 npx 是批处理 npx.cmd：
+ *   · Node ≥20.12（CVE-2024-27980 的修复）起，`spawn("npx.cmd")` 不带 shell 会**同步抛 EINVAL**，
+ *     于是运行环境永远补不上（生产遥测里 install_failed/fail_code=npx_cmd_unavailable 全在 win32）；
+ *   · 首选「用当前 node 直接跑 npm 自带的 npx-cli.js」——完全不经过 cmd.exe，没有空格/引号/
+ *     中文路径陷阱，也不需要 shell:true；
+ *   · 找不到 npx-cli.js 才退回 npx.cmd + shell:true（参数是常量，无注入面）。
+ * @returns {{command:string, args:string[], shell:boolean, kind:string}}
+ *          args 是前置参数（如 npx-cli.js 的路径），调用方接上自己的参数即可。
  */
-function npxCommand() {
-  const name = process.platform === "win32" ? "npx.cmd" : "npx";
+function npxInvocation() {
+  // 显式覆盖优先（测试注入假 npx；生产通常不设）
+  const overrideDir = process.env.DSH_SETUP_NPX_DIR || "";
+  const nodeDir = dirname(process.execPath);
+  if (isWindows()) {
+    // npm 自带 CLI 的位置：Node 官方 Windows 安装在 <node>\node_modules\npm\bin\npx-cli.js，
+    // 也有把 npm 放在同级 lib\node_modules 下的布局，一并尝试。
+    const cliCandidates = [
+      ...(overrideDir ? [join(overrideDir, "node_modules", "npm", "bin", "npx-cli.js")] : []),
+      join(nodeDir, "node_modules", "npm", "bin", "npx-cli.js"),
+      join(nodeDir, "lib", "node_modules", "npm", "bin", "npx-cli.js"),
+    ];
+    for (const p of cliCandidates) {
+      if (existsSync(p)) return { command: process.execPath, args: [p], shell: false, kind: "node-npx-cli" };
+    }
+    // 退回 .cmd：Windows 上**必须** shell:true，否则 EINVAL（这是 0.6.6 及更早的死因）
+    const cmdDirs = [overrideDir, nodeDir, process.env.APPDATA ? join(process.env.APPDATA, "npm") : ""].filter(Boolean);
+    for (const d of cmdDirs) {
+      const real = resolveExecutable(join(d, "npx.cmd"));
+      if (real) return { command: real, args: [], shell: true, kind: "npx-cmd" };
+    }
+    return { command: "npx.cmd", args: [], shell: true, kind: "npx-cmd-bare" };
+  }
   const dirs = [
-    process.env.DSH_SETUP_NPX_DIR || "",  // 显式覆盖优先（测试注入假 npx；生产通常不设）
-    dirname(process.execPath),           // 与当前 node 同目录（homebrew/usr/local 均可覆盖）
+    overrideDir,
+    nodeDir,                             // 与当前 node 同目录（homebrew/usr/local 均可覆盖）
     "/opt/homebrew/bin",
     "/usr/local/bin",
     "/opt/homebrew/opt/node@20/bin",
@@ -92,18 +172,74 @@ function npxCommand() {
     "/usr/bin",
   ].filter(Boolean);
   for (const d of dirs) {
-    const real = resolveExecutable(join(d, name));
-    if (real) return real;
+    const real = resolveExecutable(join(d, "npx"));
+    if (real) return { command: real, args: [], shell: false, kind: "npx" };
   }
-  return name; // 全找不到 → 退回裸名（普通 shell 场景仍可用）
+  return { command: "npx", args: [], shell: false, kind: "npx-bare" }; // 全找不到 → 退回裸名（普通 shell 场景仍可用）
 }
 
 /** 子进程环境：把 node 目录补进 PATH（npx 及其 shebang 需要），可附加额外变量。 */
 function spawnEnv(extra) {
   const nodeDir = dirname(process.execPath);
   const base = process.env.PATH || "";
-  const PATH = [nodeDir, base, "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"].filter(Boolean).join(":");
+  // PATH 分隔符必须按平台取（Windows 是 ";"，POSIX 是 ":"）：写死 ":" 会把整条 PATH
+  // 在 Windows 上拼成一个不存在的路径，node/npx 全部找不到。
+  // 追加的 POSIX 目录只在类 Unix 上有意义，Windows 上不追加。
+  const posixDirs = isWindows() ? [] : ["/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin"];
+  const PATH = [nodeDir, base, ...posixDirs].filter(Boolean).join(delimiter);
   return { ...process.env, PATH, ...(extra || {}) };
+}
+
+/**
+ * 派生后台子进程并**始终挂 'error' 监听**。
+ *
+ * 背景（Windows 实测致命）：没有 'error' 监听器的 ChildProcess，一旦启动失败
+ * （ENOENT/EINVAL/EPERM）就会把 error 事件抛成**未捕获异常**，直接打挂宿主 dsh web。
+ * 面板的「重启 DeepSeek harness」按钮就是这么把 dsh web 打死的（spawn("/bin/sh") 在 Windows ENOENT）。
+ *
+ * @returns {{child: import("node:child_process").ChildProcess|null, error: Error|null}}
+ *          error 非空 = 同步启动失败（参数非法/被策略拒绝）；异步失败由 onError 回调兜底。
+ */
+function safeSpawn(command, args, opts = {}) {
+  const { onError, ...spawnOpts } = opts;
+  let child;
+  try {
+    child = spawn(command, args, spawnOpts);
+  } catch (e) {
+    return { child: null, error: e };
+  }
+  // 兜底监听：既用于上报，也用于「吞掉」本可打挂宿主的未捕获 error 事件。
+  child.on("error", (e) => {
+    try { onError?.(e); } catch { /* 回调自身出错不得影响宿主 */ }
+  });
+  return { child, error: null };
+}
+
+/**
+ * 派生后台子进程并等它「真的起来了」再返回。
+ * 异步启动失败（ENOENT）不抛异常、只在下一个 tick 发 'error' 事件——不等就会误报成功
+ * （旧实现的「已调度重启」就是在 spawn 失败的情况下照样返回成功）。
+ * @returns {Promise<{child, error}>}
+ */
+function spawnAndConfirm(command, args, opts = {}) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(command, args, opts);
+    } catch (e) {
+      resolve({ child: null, error: e });
+      return;
+    }
+    let settled = false;
+    const settle = (error) => {
+      if (settled) return;
+      settled = true;
+      resolve({ child, error });
+    };
+    child.once("error", (e) => settle(e));
+    child.once("spawn", () => settle(null));
+    child.on("error", () => { /* 已 settle 之后的 error 只吞掉，绝不外抛 */ });
+  });
 }
 
 // ---------- 后台子进程标记（防重入 + 宿主重启自愈） ----------
@@ -369,12 +505,21 @@ function skipsSystemOps() {
 // ---------- bridge 服务状态 / 启停（launchctl，macOS） ----------
 
 function launchAgentPath() {
-  if (platform() === "darwin") return join(homedir(), "Library/LaunchAgents/com.dshremote.bridge.plist");
+  if (isDarwin()) return join(homedir(), "Library/LaunchAgents/com.dshremote.bridge.plist");
   return null;
 }
 
+/**
+ * launchd 作业 target（`gui/<uid>/<label>`）。
+ * **Windows/Linux 上没有 launchctl、也没有 process.getuid**——旧实现无条件调
+ * `process.getuid()`，在 Windows 上直接 TypeError（这正是面板两个读状态接口 500 的根因）。
+ * 现在：非 macOS 或取不到 uid 一律返回 null，调用方必须先判空。
+ */
 function launchTarget() {
-  return `gui/${process.getuid()}/com.dshremote.bridge`;
+  if (!isDarwin()) return null;
+  const uid = currentUid();
+  if (uid === null) return null;
+  return `gui/${uid}/com.dshremote.bridge`;
 }
 
 /**
@@ -392,7 +537,11 @@ function launchTarget() {
  * 仅在 print 本身不可用时才回退 list，且回退路径要求 pid 真实存活。
  */
 function launchdStatus() {
+  // 非 macOS 没有 launchctl（Windows 上连 process.getuid 都没有）：直接返回「无此服务」，
+  // 不再去 shell 里调一个不存在的命令——这既避免 500，也避免每次轮询白起一个 cmd.exe。
+  if (!isDarwin()) return { running: false, pid: null, state: "", runs: null, lastExitCode: null, crashing: false };
   const target = launchTarget();
+  if (!target) return { running: false, pid: null, state: "", runs: null, lastExitCode: null, crashing: false };
   const pr = sh(`launchctl print ${target}`);
   if (pr.ok) {
     const stateMatch = pr.stdout.match(/state\s*=\s*([^\n]+)/);
@@ -419,8 +568,109 @@ function launchdStatus() {
   return { running: false, pid: null, state: "", runs: null, lastExitCode: null, crashing: false };
 }
 
+// ---------- Windows：bridge 进程发现（0.6.7） ----------
+//
+// Windows 没有 pgrep/ps/launchctl，而 bridge 在 Windows 上也不由服务管理器托管
+// （dsh-setup.mjs 明确不生成 Windows 自启动）。所以进程发现按「pid 文件优先、PowerShell 兜底」两级：
+//   ① pid 文件：插件自己 spawn 的 watcher、以及 `dsh-remote run` 跑起来的 watcher/bridge
+//      都会把 pid 落到配置目录（见 dsh-setup.mjs 的 writePidFile）。读文件 + process.kill(pid,0)
+//      判活，零 shell 开销——面板 2~3s 轮询一次也扛得住。
+//   ② PowerShell 扫 node.exe 的命令行：兼容「用户跑的是没写 pid 文件的旧版运行时」。
+//      这条路径要起一个 powershell.exe（数百毫秒），故结果带 TTL 缓存，绝不被轮询打爆。
+
+const WATCHER_PID_FILE = ".dsh-watcher.pid";
+const BRIDGE_PID_FILE = ".dsh-bridge.pid";
+/** Windows 自启动任务名（与 dsh-setup.mjs 的 WIN_TASK_NAME 必须一致）。 */
+const WIN_TASK_NAME = "dsh-remote-bridge";
+const WIN_SCAN_TTL_MS = 5000;
+
+/** 读 pid 文件（内容为纯数字 pid；缺失/损坏返回 null）。 */
+function readPidFile(relayDir, name) {
+  try {
+    const n = Number(String(readFileSync(join(relayDir, name), "utf8")).trim());
+    return Number.isInteger(n) && n > 0 ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 用 PowerShell 列出所有 node.exe 的 pid/父 pid/命令行。
+ * 走 -EncodedCommand（UTF-16LE base64）：命令行里带引号/中文/空格时不会被 PowerShell 自己的
+ * 引号解析吃掉，也不需要经过 shell。Get-CimInstance 不可用时回退 Get-WmiObject（Win7/精简系统）。
+ */
+let winProcScanCache = { at: 0, procs: [] };
+function windowsNodeProcesses() {
+  if (Date.now() - winProcScanCache.at < WIN_SCAN_TTL_MS) return winProcScanCache.procs;
+  const script = [
+    "try { $p = Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" }",
+    "catch { $p = Get-WmiObject Win32_Process -Filter \"Name='node.exe'\" }",
+    "$p | Select-Object ProcessId,ParentProcessId,CommandLine | ConvertTo-Json -Compress",
+  ].join("; ");
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+  let procs = [];
+  try {
+    const r = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], {
+      encoding: "utf8", timeout: 8000, windowsHide: true, maxBuffer: 8 * 1024 * 1024,
+    });
+    const raw = String(r.stdout || "").trim();
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      for (const p of (Array.isArray(parsed) ? parsed : [parsed])) {
+        const pid = Number(p && p.ProcessId);
+        if (!Number.isInteger(pid) || pid <= 0) continue;
+        procs.push({
+          pid,
+          ppid: Number(p.ParentProcessId) || null,
+          commandLine: String((p && p.CommandLine) || ""),
+        });
+      }
+    }
+  } catch { procs = []; } // 无 PowerShell / 解析失败 → 静默降级为空（不阻断状态查询）
+  winProcScanCache = { at: Date.now(), procs };
+  return procs;
+}
+
+/**
+ * Windows 登录任务（任务计划程序）是否已注册——由 dsh-setup.mjs 安装/一键更新时注册，
+ * 插件只读不写。带 60s 缓存：面板 2~3s 轮询一次状态，不能每轮都起一个 schtasks。
+ */
+let winTaskCache = { at: 0, ok: false };
+function windowsTaskRegistered() {
+  if (Date.now() - winTaskCache.at < 60_000) return winTaskCache.ok;
+  let ok = false;
+  try {
+    const r = spawnSync("schtasks", ["/Query", "/TN", WIN_TASK_NAME], { windowsHide: true, encoding: "utf8", timeout: 8000 });
+    ok = r.status === 0;
+  } catch { ok = false; }
+  winTaskCache = { at: Date.now(), ok };
+  return ok;
+}
+
+/** Windows 版 manualStatus：pid 文件优先，PowerShell 兜底。语义与 POSIX 版一致。 */
+function windowsManualStatus(relayDir) {
+  const watcher = [];
+  const bridge = [];
+  const allBridge = [];
+  const push = (arr, pid) => { if (pid && !arr.includes(pid)) arr.push(pid); };
+  const wPid = readPidFile(relayDir, WATCHER_PID_FILE);
+  const bPid = readPidFile(relayDir, BRIDGE_PID_FILE);
+  if (wPid && pidAlive(wPid) !== false && wPid !== process.pid) push(watcher, wPid);
+  if (bPid && pidAlive(bPid) !== false && bPid !== process.pid) { push(bridge, bPid); push(allBridge, bPid); }
+  // 兜底扫描只在 pid 文件一无所获时进行：避免每次轮询都起一个 PowerShell。
+  if (!watcher.length && !bridge.length) {
+    for (const p of windowsNodeProcesses()) {
+      if (p.pid === process.pid || p.pid === wPid || p.pid === bPid) continue;
+      if (/dsh-setup\.mjs/.test(p.commandLine)) push(watcher, p.pid);
+      else if (/dsh-bridge\.mjs/.test(p.commandLine)) { push(bridge, p.pid); push(allBridge, p.pid); }
+    }
+  }
+  return { watcher, bridge, allBridge };
+}
+
 /** 检查手动运行的 watcher（dsh-setup.mjs run）与 bridge 子进程（排除 launchd 托管链）。 */
-function manualStatus() {
+function manualStatus(relayDir) {
+  if (isWindows()) return windowsManualStatus(relayDir || DEFAULT_RELAY_DIR);
   const launchdPid = launchdStatus().pid;
   const out = (() => {
     const r = sh("pgrep -fl 'dsh-setup.mjs|dsh-bridge.mjs'");
@@ -554,13 +804,32 @@ function ensureRuntime(relayDir) {
   try {
     mkdirSync(relayDir, { recursive: true });
     const log = join(relayDir, AUTO_INSTALL_LOG);
-    const child = spawn(npxCommand(), ["--yes", UPDATE_SPEC], {
+    const clear = () => { try { rmSync(marker, { force: true }); } catch { /* ignore */ } };
+    // 补装失败（spawn 都起不来）时统一收尾：清安装标记 + 记日志 + 进退避 + 匿名遥测。
+    // 没有这条兜底，spawn 的异步 'error' 会变成未捕获异常打挂宿主（旧实现在 Windows 上正是如此）。
+    const failSpawn = (e, kind) => {
+      clear();
+      appendLogLine(relayDir, AUTO_INSTALL_LOG, `[auto-install] 启动 npx 失败(${kind}): ${e.message}`);
+      noteProvisionFailure(relayDir);
+      telemetryRecord(relayDir, "install_failed", { fail_code: telemetryFailCodeFromError(e) });
+    };
+    const npx = npxInvocation();
+    const { child, error } = safeSpawn(npx.command, [...npx.args, "--yes", UPDATE_SPEC], {
       detached: true,
+      // Windows 上跑 npx.cmd 必须经 shell（Node ≥20.12 起否则 EINVAL）；走 node+npx-cli.js 时不需要。
+      shell: npx.shell,
+      // Windows：别让 Node 给子进程开一个控制台窗口（POSIX 上该选项被忽略）
+      windowsHide: true,
       // DSH_BRIDGE_INSTALL_SOURCE：本机运行环境是插件自愈补的 → 安装器原样透传到 plist/bridge env，
       // 于是设备行上的 install_source 如实记成 plugin_market（而不是安装器默认的 npx）。
       env: spawnEnv({ npm_config_registry: "https://registry.npmjs.org", DSH_BRIDGE_INSTALL_SOURCE: "plugin_market" }),
-      stdio: ["ignore", openSync(log, "a"), openSync(log, "a")]
+      stdio: ["ignore", openSync(log, "a"), openSync(log, "a")],
+      onError: (e) => failSpawn(e, npx.kind),
     });
+    if (error || !child) {
+      failSpawn(error || new Error("spawn 未返回子进程"), npx.kind);
+      return false;
+    }
     writeMarker(marker, child.pid); // 记 pid：宿主重启后可立即清理死进程残留
     // 记下「本机运行环境是插件自愈补的」：登录后的 /api/install-report 与 bridge 设备登记
     // 都据此上报 install_source=plugin_market（区分用户自己跑 npx 安装器的那条路径）。
@@ -568,7 +837,6 @@ function ensureRuntime(relayDir) {
       writeFileSync(join(relayDir, PROVISIONED_MARKER),
         JSON.stringify({ at: Date.now(), version: PLUGIN_VERSION, source: "plugin_market" }));
     } catch { /* 非关键：上报时按缺省判据降级 */ }
-    const clear = () => { try { rmSync(marker, { force: true }); } catch { /* ignore */ } };
     // 匿名遥测：补装生命周期（install_started → runtime_ready / install_failed(fail_code)）。
     // 失败原因只归类到白名单 fail_code，绝不外发原始错误文本（可能含路径/主机名/用户名）。
     const tb = telemetryBook(relayDir);
@@ -657,6 +925,8 @@ function plistEntryMissing() {
  */
 function reapBrokenAutostart(relayDir) {
   if (skipsSystemOps()) return false;
+  // 只有 macOS 有 launchd 自启动项可摘；Windows/Linux 走的是 systemd/无自启动，判据不适用。
+  if (!isDarwin()) return false;
   if (!plistEntryMissing()) return false;
   const st = launchdStatus();
   if (!st.running && !st.crashing && !st.state) return false; // 作业未被 launchd 加载、无可摘的东西
@@ -668,14 +938,128 @@ function reapBrokenAutostart(relayDir) {
   return true;
 }
 
+/** 写 pid 文件（Windows 进程发现用；写不了不致命，还有 PowerShell 兜底扫描）。 */
+function writePidFile(relayDir, name, pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    mkdirSync(relayDir, { recursive: true });
+    writeFileSync(join(relayDir, name), String(pid), { mode: 0o600 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 结束一个进程（Windows 用 taskkill 连子进程一起收；POSIX 用给定信号）。 */
+function killPid(pid, signal = "SIGTERM") {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (isWindows()) {
+    const r = spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true, encoding: "utf8", timeout: 8000 });
+    return r.status === 0 || pidAlive(pid) === false;
+  }
+  try {
+    process.kill(pid, signal);
+    return true;
+  } catch {
+    return pidAlive(pid) !== true; // ESRCH = 本来就不在了，也算成功
+  }
+}
+
+/**
+ * Windows：启动 bridge（0.6.7 新增）。
+ *
+ * Windows 上没有 launchd/systemd，dsh-setup.mjs 也不为 win32 生成自启动
+ * （它明写「平台 win32 不支持自启动」）。但 bridge 本身在 Windows 上能跑——
+ * 所以插件直接把 watcher（`node <relayDir>/dsh-setup.mjs run`）作为脱离进程拉起：
+ * 这与用户手动跑 `dsh-remote run` 是**同一条代码路径**，watcher 自己盯着 127.0.0.1:3080，
+ * dsh web 活着就拉起 dsh-bridge.mjs、dsh web 退出就把 bridge 停掉。
+ * 代价（如实告知用户）：不随开机自启；但 dsh web 每次启动后插件都会在自愈轮次里重新拉起它。
+ */
+function startBridgeWindows(relayDir) {
+  if (skipsSystemOps()) return { ok: false, status: "skipped", detail: "测试隔离（DSH_RELAY_SKIP_SERVICE=1）：跳过真实服务操作" };
+  if (!runtimeReady(relayDir)) {
+    ensureRuntime(relayDir);
+    return {
+      ok: false,
+      status: "provisioning",
+      runtimeMissing: true,
+      detail: "桌面运行环境（bridge）尚未安装，已在后台自动安装，完成后会自动启动 bridge——请稍候刷新面板（也可点下方「一键更新」查看进度）",
+    };
+  }
+  // 幂等：watcher 已在跑就别再拉第二个（否则会有两个 bridge 抢同一个设备登记）
+  const existing = readPidFile(relayDir, WATCHER_PID_FILE);
+  if (existing && pidAlive(existing) !== false) {
+    return { ok: true, status: "running", pid: existing };
+  }
+  const setup = join(relayDir, "dsh-setup.mjs");
+  if (!existsSync(setup)) return { ok: false, status: "not-installed", detail: `运行环境入口脚本不存在（${setup}）` };
+  const log = join(relayDir, ".dsh-bridge.log");
+  let out = "ignore";
+  try { out = openSync(log, "a"); } catch { /* 打不开日志：退化到丢弃输出，不阻断启动 */ }
+  const { child, error } = safeSpawn(process.execPath, [setup, "run"], {
+    detached: true,
+    cwd: homedir(),
+    env: spawnEnv({ DSH_BRIDGE_INSTALL_SOURCE: installSourceOf(relayDir), DSH_BRIDGE_INSTALL_VERSION: PLUGIN_VERSION }),
+    stdio: ["ignore", out, out],
+    windowsHide: true,
+    onError: (e) => appendLogLine(relayDir, AUTO_INSTALL_LOG, `[dsh-remote-web] Windows 启动 bridge 失败: ${e.message}`),
+  });
+  if (typeof out === "number") { try { closeSync(out); } catch { /* 已随子进程继承，父进程这份可以关 */ } }
+  if (error || !child) {
+    const msg = (error || new Error("spawn 未返回子进程")).message;
+    return { ok: false, status: "failed", detail: `启动 bridge 失败: ${msg}` };
+  }
+  writePidFile(relayDir, WATCHER_PID_FILE, child.pid);
+  child.unref();
+  return {
+    ok: true,
+    status: "running",
+    pid: child.pid,
+    // 如实区分两条路径：装过（或更新过）就有登录任务；没有的话只有"重开 dsh web 自动拉起"这一层保障
+    detail: windowsTaskRegistered()
+      ? "已在后台启动 bridge 守护（已注册登录任务，下次登录会自动运行）"
+      : "已在后台启动 bridge 守护（未注册登录任务：不随开机自启，重开 dsh web 时插件会自动拉起）",
+  };
+}
+
+/** Windows：停止 bridge（结束 watcher 与其 bridge 子进程，并清掉 pid 文件）。 */
+function stopBridgeWindows(relayDir) {
+  if (skipsSystemOps()) return { ok: false, status: "skipped", detail: "测试隔离（DSH_RELAY_SKIP_SERVICE=1）：跳过真实服务操作" };
+  const targets = [];
+  for (const name of [WATCHER_PID_FILE, BRIDGE_PID_FILE]) {
+    const pid = readPidFile(relayDir, name);
+    if (pid && pidAlive(pid) !== false && !targets.includes(pid)) targets.push(pid);
+  }
+  for (const pid of targets) killPid(pid, "SIGKILL");
+  for (const name of [WATCHER_PID_FILE, BRIDGE_PID_FILE]) {
+    try { rmSync(join(relayDir, name), { force: true }); } catch { /* 非关键 */ }
+  }
+  // 复核：pid 文件之外可能还有用户手动跑起来、或用旧版运行时起的进程
+  const manual = manualStatus(relayDir);
+  const still = [...new Set([...manual.watcher, ...manual.bridge])];
+  return {
+    ok: still.length === 0,
+    status: still.length ? "failed" : "stopped",
+    pid: null,
+    detail: still.length ? `仍有 ${still.length} 个 bridge 相关进程未结束（pid ${still.join(", ")}）` : void 0,
+  };
+}
+
 /** 启动 bridge：确保运行环境就绪 + plist 存在 → launchctl bootstrap（回退 load -w）。 */
 function startBridge(relayDir) {
   if (UNINSTALLED_DIRS.has(relayDir)) {
     // 已彻底卸载：面板/自愈在重启前可能仍在内存中，禁止再把自启动与 plist 拉回来
     return { ok: false, status: "uninstalled", detail: "插件已彻底卸载，重启 dsh web 后生效" };
   }
+  if (isWindows()) return startBridgeWindows(relayDir);
   const plistPath = launchAgentPath();
-  if (!plistPath) return { ok: false, status: "unsupported", detail: "仅支持 macOS" };
+  if (!plistPath) {
+    return {
+      ok: false,
+      status: "unsupported",
+      detail: `当前平台（${osPlatform()}）暂不支持自启动服务，请手动运行 \`dsh-remote run\``,
+    };
+  }
   if (skipsSystemOps()) return { ok: false, status: "skipped", detail: "测试隔离（DSH_RELAY_SKIP_SERVICE=1）：跳过真实服务操作" };
   // 【0.6.2 关键修复】运行环境缺失时绝不 bootstrap：写一个指向不存在脚本的 plist
   // 只会让 launchd 进入 KeepAlive 崩溃循环——面板还可能因瞬时 pid 谎报「已启动」。
@@ -696,13 +1080,17 @@ function startBridge(relayDir) {
   if (!existsSync(plistPath)) writeAutostartFile(relayDir);
   if (!existsSync(plistPath)) return { ok: false, status: "not-installed", detail: "plist 生成失败" };
   const target = launchTarget();
-  const q = (s) => "'" + String(s).replace(/'/g, `'\\''`) + "'";
-  sh(`launchctl bootout ${target}`);
-  let boot = sh(`launchctl bootstrap gui/${process.getuid()} ${q(plistPath)}`);
-  if (!boot.ok) {
-    sh(`launchctl unload ${q(plistPath)}`);
-    boot = sh(`launchctl load -w ${q(plistPath)}`);
-  }
+  const boot = (() => {
+    sh(`launchctl bootout ${target}`);
+    // domain 一律由 launchTarget 推导（不再直接 process.getuid()：Windows 上没有该 API）
+    const domain = `gui/${currentUid()}`;
+    let r = sh(`launchctl bootstrap ${domain} ${shQuote(plistPath)}`);
+    if (!r.ok) {
+      sh(`launchctl unload ${shQuote(plistPath)}`);
+      r = sh(`launchctl load -w ${shQuote(plistPath)}`);
+    }
+    return r;
+  })();
   if (!boot.ok) return { ok: false, status: "failed", detail: (boot.stderr || boot.stdout).trim() || "launchctl 启动失败" };
   const st = launchdStatus();
   return { ok: st.running, status: st.running ? "running" : "failed", pid: st.pid, detail: st.running ? void 0 : "服务未进入运行态" };
@@ -746,6 +1134,9 @@ function scheduleRuntime(relayDir) {
       // 运行环境已在，看服务是否已在运行（runtime 可能位于 npx 缓存/固化目录，不必重复安装）
       const st = launchdStatus();
       if (st.running) { done = true; clearInterval(iv); return; }
+      // Windows 没有 launchd：以「watcher 进程在跑」为就绪判据。否则 launchdStatus 永远是 false，
+      // done 永远不置位，watcher 会一直空转（虽然 startBridge 幂等，但每轮都白跑一次进程发现）。
+      if (isWindows() && manualStatus(relayDir).watcher.length > 0) { done = true; clearInterval(iv); return; }
       startBridge(relayDir); // 环境在但服务没起 → 拉起
     } catch { /* 下一轮再试 */ }
   }, selfhealIntervalMs());
@@ -753,9 +1144,11 @@ function scheduleRuntime(relayDir) {
   return () => clearInterval(iv);
 }
 
-/** 停止 bridge：launchctl bootout。 */
-function stopBridge() {
+/** 停止 bridge：macOS/Linux 走 launchctl bootout；Windows 结束 watcher/bridge 进程。 */
+function stopBridge(relayDir) {
+  if (isWindows()) return stopBridgeWindows(relayDir);
   const target = launchTarget();
+  if (!target) return { ok: false, status: "unsupported", detail: `当前平台（${osPlatform()}）没有 launchd 服务可停，请手动结束 \`dsh-remote run\` 进程` };
   const r = sh(`launchctl bootout ${target}`);
   const st = launchdStatus();
   return { ok: !st.running, status: st.running ? "failed" : "stopped", pid: null, detail: st.running ? (r.stderr || "停止失败").trim() : void 0 };
@@ -802,13 +1195,13 @@ function uninstallRuntime(relayDir, protectedPath) {
     removedPlist: false,   // 自启动文件（plist / systemd unit）已删除
     killedPids: [],        // 额外结束的残留进程 pid 列表
     removedDir: false,     // 配置目录 relayDir 已整目录清空
-    servicePlatform: platform() === "darwin" ? "launchd" : platform() === "linux" ? "systemd" : "none",
+    servicePlatform: isDarwin() ? "launchd" : isWindows() ? "windows-detached" : osPlatform() === "linux" ? "systemd" : "none",
   };
   const skipService = process.env.DSH_RELAY_SKIP_SERVICE === "1";
   if (!skipService) {
     // a) 停服务 + 移除自启动文件
     try {
-      if (platform() === "darwin") {
+      if (isDarwin()) {
         // 只处理「plist 位于当前 HOME」的服务：本插件/dsh-setup.mjs 安装的服务一定在此
         const plistPath = launchAgentPath();
         if (plistPath && existsSync(plistPath)) {
@@ -816,13 +1209,25 @@ function uninstallRuntime(relayDir, protectedPath) {
           // 只删 plist 文件它照样被 KeepAlive 反复重拉（见 launchdStatus 注释）。
           const st = launchdStatus();
           if (st.running || st.crashing) {
-            const r = stopBridge(); // launchctl bootout → KeepAlive 一并失效
+            const r = stopBridge(relayDir); // launchctl bootout → KeepAlive 一并失效
             out.stoppedService = r.ok;
           }
           rmSync(plistPath, { force: true });
           out.removedPlist = !existsSync(plistPath);
         }
-      } else if (platform() === "linux") {
+      } else if (isWindows()) {
+        // Windows：自启动 = 任务计划程序里的登录任务（dsh-setup.mjs 注册）。
+        // 卸载必须把任务一起删掉，否则下次登录又会被拉起来 —— 用户会以为"卸载没生效"。
+        const before = manualStatus(relayDir);
+        if (before.watcher.length || before.bridge.length) {
+          const r = stopBridgeWindows(relayDir);
+          out.stoppedService = r.ok;
+        }
+        try {
+          const r = spawnSync("schtasks", ["/Delete", "/TN", WIN_TASK_NAME, "/F"], { windowsHide: true, encoding: "utf8", timeout: 15000 });
+          out.removedPlist = r.status === 0 || /cannot find|找不到|不存在/i.test(String(r.stdout || "") + String(r.stderr || ""));
+        } catch { /* 任务不存在/无权限：不致命，残留可由用户手动清理 */ }
+      } else if (osPlatform() === "linux") {
         // systemd --user 用户态服务，与 dsh-setup.mjs 安装的 dsh-bridge 同名
         const isActive = sh("systemctl --user is-active dsh-bridge");
         if (isActive.ok && String(isActive.stdout).trim() === "active") {
@@ -841,13 +1246,13 @@ function uninstallRuntime(relayDir, protectedPath) {
     } catch { /* 服务清理失败不致命：目录照常清理，剩余残留可由用户手动处理 */ }
     // b) 杀残留手动进程（launchd 托管的已随 bootout 结束；manualStatus 排除本进程）
     try {
-      const manual = manualStatus();
+      const manual = manualStatus(relayDir);
       const targets = [...manual.watcher, ...manual.bridge];
       for (const pid of targets) {
         try { process.kill(pid, "SIGTERM"); out.killedPids.push(pid); } catch { /* EPERM/ESRCH 忽略 */ }
       }
       if (targets.length) {
-        try { execSync("sleep 1", { timeout: 3000 }); } catch { /* 等待进程退出 */ }
+        sleepSync(1000); // 同步等待进程退出（Windows 没有 sleep 命令，改用 Atomics.wait）
         for (const pid of targets) {
           if (pidAlive(pid)) {
             try { process.kill(pid, "SIGKILL"); } catch { /* 已退出 */ }
@@ -881,7 +1286,8 @@ function uninstallRuntime(relayDir, protectedPath) {
 //           ② 一条可靠的重启实现（优先交回监管者，其次自拉起）；③ 面板按钮用的路由。
 
 const RESTART_STATE_FILE = ".dsh-restart-state.json";
-const RESTART_SCRIPT_FILE = ".dsh-restart-harness.sh";
+const RESTART_SCRIPT_FILE = ".dsh-restart-harness.sh";   // macOS/Linux：/bin/sh 脚本
+const RESTART_HELPER_FILE = ".dsh-restart-harness.mjs"; // Windows：node 助手（无 /bin/sh）
 const RESTART_LOG_FILE = ".dsh-restart.log";
 
 /**
@@ -1008,23 +1414,88 @@ function buildRestartScript(mode, target, cmd, relayDir) {
 }
 
 /**
+ * Windows 重启助手（0.6.7 新增）——**必须**是 .mjs 而不是 /bin/sh 脚本。
+ *
+ * 现场（0.6.6 及更早，用户实测）：restartHarness 生成 `#!/bin/sh` 脚本再 `spawn("/bin/sh")`，
+ * Windows 没有 /bin/sh → ENOENT；而那个 ChildProcess 又没挂 'error' 监听
+ * → 未捕获异常直接终止 dsh web。更糟的是代码先把「已调度重启」写进日志并返回成功，
+ * 用户看到"成功"、进程却已经没了（残留物 `.dsh-restart.log` 里正是 `mode=relaunch helper=undefined`）。
+ *
+ * 现在：用当前 node 跑本文件（不走任何 shell，参数原样传递，路径含空格/中文都不出问题），
+ * 且**先校验新进程能拉起来再动旧进程**——宁可重启失败，也不能把自己杀掉却起不来。
+ */
+function buildRestartHelperSource(cmd, relayDir) {
+  const plan = JSON.stringify({
+    pid: process.pid, node: cmd.node, args: cmd.args, cwd: cmd.cwd,
+    log: join(relayDir, RESTART_LOG_FILE),
+  });
+  return `// dsh-remote 自动生成：重启 DeepSeek harness（Windows 助手；由插件写入并 detached 执行）
+import { spawn, spawnSync } from "node:child_process";
+import { appendFileSync, existsSync, openSync, closeSync } from "node:fs";
+import { setTimeout as delay } from "node:timers/promises";
+
+const PLAN = ${plan};
+function logLine(msg) {
+  try { appendFileSync(PLAN.log, "\\n[" + new Date().toISOString() + "] " + msg + "\\n"); } catch (e) { /* 日志写不了不阻断重启 */ }
+}
+
+// ① 先确认新进程真的拉得起来，再动旧进程（旧实现最大的风险是"杀掉却起不来"）
+if (PLAN.cwd && !existsSync(PLAN.cwd)) { logLine("重启中止：工作目录不存在 " + PLAN.cwd); process.exit(1); }
+if (PLAN.cwd) process.chdir(PLAN.cwd); // 先切回原工作目录：入口若是相对路径也能被正确解析
+if (!existsSync(PLAN.node)) { logLine("重启中止：node 不存在 " + PLAN.node); process.exit(1); }
+const entry = PLAN.args[0];
+if (!entry || !existsSync(entry)) { logLine("重启中止：dsh 入口不存在 " + entry); process.exit(1); }
+
+function alive(pid) {
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; }
+}
+
+logLine("restart helper 启动：mode=relaunch(win32) 旧 pid=" + PLAN.pid);
+await delay(1000); // 先把 HTTP 响应让浏览器收完
+
+// ② 结束旧进程（Windows 上 process.kill 即 TerminateProcess）
+try { process.kill(PLAN.pid); } catch (e) { /* 可能已自行退出 */ }
+const deadline = Date.now() + 30000;
+while (Date.now() < deadline && alive(PLAN.pid)) await delay(200);
+if (alive(PLAN.pid)) {
+  logLine("旧进程 30s 未退出，改用 taskkill /T /F");
+  spawnSync("taskkill", ["/PID", String(PLAN.pid), "/T", "/F"], { windowsHide: true });
+  await delay(500);
+}
+
+// ③ 用同一条命令行自拉起（脱离本助手，助手退出后它继续跑）
+let out = "ignore";
+try { out = openSync(PLAN.log, "a"); } catch (e) { /* 退化到丢弃输出 */ }
+const child = spawn(PLAN.node, PLAN.args, {
+  cwd: PLAN.cwd, detached: true, stdio: ["ignore", out, out], windowsHide: true,
+});
+child.on("error", (e) => logLine("重新拉起失败：" + e.message));
+child.unref();
+if (typeof out === "number") { try { closeSync(out); } catch (e) {} }
+logLine("已重新拉起 dsh web：pid=" + String(child.pid));
+`;
+}
+
+/**
  * 重启 DeepSeek harness（dsh web）。
  * 只重启「承载本插件的那个进程」（pid 匹配到的监管者或自身），绝不触碰 bridge。
- * @returns {{ok:boolean, status:string, mode?:string, detail?:string, script?:string, log?:string}}
+ * @returns {Promise<{ok:boolean, status:string, mode?:string, detail?:string, script?:string, log?:string}>}
  */
-function restartHarness(relayDir, opts = {}) {
+async function restartHarness(relayDir, opts = {}) {
   if (skipsSystemOps()) return { ok: false, status: "skipped", detail: "测试隔离（DSH_RELAY_SKIP_SERVICE=1）：跳过真实重启" };
   const cmd = selfCommand();
   let mode = "relaunch";
   let target = "";
-  if (platform() === "darwin") {
+  if (isDarwin()) {
     const label = launchdLabelForPid(process.pid);
-    if (label) { mode = "launchd"; target = `gui/${process.getuid()}/${label}`; }
-  } else if (platform() === "linux") {
+    const uid = currentUid();
+    if (label && uid !== null) { mode = "launchd"; target = `gui/${uid}/${label}`; }
+  } else if (osPlatform() === "linux") {
     const unit = systemdUnitForSelf();
     if (unit) { mode = "systemd"; target = unit; }
   }
-  const script = buildRestartScript(mode, target, cmd, relayDir);
+  // Windows 一律走 .mjs 助手（无监管者，也不存在 /bin/sh）
+  const script = isWindows() ? buildRestartHelperSource(cmd, relayDir) : buildRestartScript(mode, target, cmd, relayDir);
   // 匿名遥测：重启 DeepSeek harness（自动倒计时或手动按钮都经这里）——触发一次记一条。
   // 放在 dry-run 之前：测试/诊断用的 dry-run 也走同一条入口，便于用例锁死这条埋点。
   telemetryRecord(relayDir, "harness_restart");
@@ -1033,17 +1504,30 @@ function restartHarness(relayDir, opts = {}) {
     // 测试/诊断用：只返回将要执行的脚本，不做任何真实动作
     return { ok: true, status: "dry-run", mode, target, script, log: join(relayDir, RESTART_LOG_FILE) };
   }
-  const scriptPath = join(relayDir, RESTART_SCRIPT_FILE);
+  const scriptPath = join(relayDir, isWindows() ? RESTART_HELPER_FILE : RESTART_SCRIPT_FILE);
   try {
     mkdirSync(relayDir, { recursive: true });
     writeFileSync(scriptPath, script, { mode: 0o700 });
     const log = join(relayDir, RESTART_LOG_FILE);
-    const child = spawn("/bin/sh", [scriptPath], {
+    // 非 macOS 平台没有 /bin/sh；Windows 用 node 直接跑 .mjs 助手。
+    const runner = isWindows() ? process.execPath : "/bin/sh";
+    const out = openSync(log, "a");
+    // 【0.6.7 关键修复】必须等「真的派生成功」再报成功：spawn 失败是**异步** 'error' 事件，
+    // 旧实现不等就返回 ok:true（Windows 上 /bin/sh ENOENT 时正是如此）→ 用户看到"成功"、
+    // 进程其实已经没了。spawnAndConfirm 同时保证永远有 'error' 监听，绝不打挂宿主。
+    const { child, error } = await spawnAndConfirm(runner, [scriptPath], {
       detached: true,
       cwd: homedir(),
       env: spawnEnv(),
-      stdio: ["ignore", openSync(log, "a"), openSync(log, "a")],
+      stdio: ["ignore", out, out],
+      windowsHide: true,
     });
+    try { closeSync(out); } catch { /* 已随子进程继承，父进程这份可以关 */ }
+    if (error || !child) {
+      const msg = (error || new Error("spawn 未返回子进程")).message;
+      appendLogLine(relayDir, RESTART_LOG_FILE, `[restart] 调度失败：${msg}（未执行任何重启动作，dsh web 仍在运行）`);
+      return { ok: false, status: "failed", mode, target, log, detail: `调度重启失败: ${msg}` };
+    }
     child.unref();
     appendLogLine(relayDir, RESTART_LOG_FILE, `[restart] 已调度重启：mode=${mode}${target ? " target=" + target : ""} helper=${child.pid}`);
     return {
@@ -1659,7 +2143,7 @@ function maskPhone(p) {
 async function composeStatus(relayDir) {
   const cfg = loadConfig(relayDir);
   const launchd = launchdStatus();
-  const manual = manualStatus();
+  const manual = manualStatus(relayDir);
   // 注册/绑定失败提示(bridge 写 .bind-error.json;面板据此展示“已达上限/需解绑”引导)
   let bindError = null;
   try {
@@ -1687,6 +2171,12 @@ async function composeStatus(relayDir) {
     relayReachable: pub.ok,
     service: {
       plistExists: Boolean(launchAgentPath() && existsSync(launchAgentPath())),
+      // 平台与服务管理器：面板据此给出平台正确的文案（Windows 没有"自启动服务"这回事，
+      // 也不该把 bridge 说成 launchd/systemd 服务）
+      platform: osPlatform(),
+      serviceManager: isDarwin() ? "launchd" : isWindows() ? "detached" : osPlatform() === "linux" ? "systemd" : "none",
+      // Windows：登录任务（任务计划程序）是否已注册——面板据此给"能不能开机自启"的准确说法
+      autostartTask: isWindows() ? windowsTaskRegistered() : null,
       launchd,
       manual,
       running: launchd.running || manual.bridge.length > 0,
@@ -1812,7 +2302,7 @@ const PLUGIN_ID = "dsh-remote-web";
 const PLUGIN_LEGACY_IDS = ["dsh-remote-ui"];
 const PLUGIN_ALL_IDS = [PLUGIN_ID, ...PLUGIN_LEGACY_IDS];
 /** 插件自身发布版本（与 dsh-remote 根包同步递增）。 */
-const PLUGIN_VERSION = "0.6.6";
+const PLUGIN_VERSION = "0.6.7-beta.1";
 const UPDATE_LOG = ".dsh-update.log";
 const UPDATE_MARKER = ".dsh-update-running";
 
@@ -1898,16 +2388,23 @@ function recentUpdateFailure(relayDir) {
   return rec;
 }
 
-/** 以 detached 子进程执行 `npx --yes <UPDATE_SPEC>`（env 可覆盖 npm 源/更新通道）。 */
-function spawnUpdater(relayDir, extraEnv) {
+/** 以 detached 子进程执行 `npx --yes <UPDATE_SPEC>`（env 可覆盖 npm 源/更新通道）。
+ * @returns {{child, error}} 由 safeSpawn 返回——永远挂了 'error' 监听，启动失败不会打挂宿主。
+ */
+function spawnUpdater(relayDir, extraEnv, onError) {
   const log = join(relayDir, UPDATE_LOG);
-  return spawn(npxCommand(), ["--yes", UPDATE_SPEC], {
+  const npx = npxInvocation();
+  return safeSpawn(npx.command, [...npx.args, "--yes", UPDATE_SPEC], {
     detached: true,
     cwd: homedir(),
+    // Windows 上跑 npx.cmd 必须经 shell（Node ≥20.12 起否则 EINVAL）；走 node+npx-cli.js 时不需要。
+    shell: npx.shell,
+    windowsHide: true, // Windows：不弹控制台窗口（POSIX 上该选项被忽略）
     // PATH 补 node 目录：App 最小 PATH 下也能跑 npx；同时保持本机既有的安装来源口径
     // （在线更新会重跑安装器并重写 plist，若不带来源就会把 plugin_market 误记成 npx）。
     env: spawnEnv({ DSH_BRIDGE_INSTALL_SOURCE: installSourceOf(relayDir), ...(extraEnv || {}) }),
-    stdio: ["ignore", openSync(log, "a"), openSync(log, "a")]
+    stdio: ["ignore", openSync(log, "a"), openSync(log, "a")],
+    onError,
   });
 }
 
@@ -1941,9 +2438,23 @@ function runOnlineUpdate(relayDir) {
 
     let retried = false;
     const clear = () => { try { rmSync(marker, { force: true }); } catch { /* ignore */ } };
+    // 启动失败（ENOENT/EINVAL…）的收尾：清 marker + 记日志 + 记失败原因（面板可查询）+ 匿名遥测。
+    // 抽出来给「同步失败」与「异步 'error' 事件」共用，保证任何一种失败都不会变成未捕获异常。
+    const failUpdaterSpawn = (e) => {
+      appendLogLine(relayDir, UPDATE_LOG, `[update] 子进程启动失败: ${e.message}`);
+      clear();
+      const fc = telemetryFailCodeFromError(e);
+      noteUpdateFailure(relayDir, e.message, fc); // ← 面板可查询，不再只躺在日志里
+      telemetryRecord(relayDir, "update_failed", { fail_code: fc });
+    };
     const run = () => {
       // 第一次：官方 npm 源；失败(exit≠0/网络)才回退用户默认源（通常为国内镜像）
-      const child = spawnUpdater(relayDir, retried ? {} : { npm_config_registry: "https://registry.npmjs.org" });
+      const { child, error } = spawnUpdater(
+        relayDir, retried ? {} : { npm_config_registry: "https://registry.npmjs.org" }, failUpdaterSpawn);
+      if (error || !child) {
+        if (error) failUpdaterSpawn(error);
+        return null;
+      }
       writeMarker(marker, child.pid);
       child.on("exit", (code) => {
         if (!retried && code !== 0) {
@@ -1969,13 +2480,6 @@ function runOnlineUpdate(relayDir) {
         } else {
           updateFailures.delete(String(relayDir)); // 成功即清掉旧失败
         }
-      });
-      child.on("error", (e) => {
-        appendLogLine(relayDir, UPDATE_LOG, `[update] 子进程启动失败: ${e.message}`);
-        clear();
-        const fc = telemetryFailCodeFromError(e);
-        noteUpdateFailure(relayDir, e.message, fc); // ← 面板可查询，不再只躺在日志里
-        telemetryRecord(relayDir, "update_failed", { fail_code: fc });
       });
       child.unref();
       return child;
@@ -2226,7 +2730,7 @@ async function accountDeviceBound(relayDir, cfg) {
 async function composeConnect(relayDir, opts = {}) {
   const cfg = opts.cfg || loadConfig(relayDir);
   const launchd = opts.launchd || launchdStatus();
-  const manual = opts.manual || manualStatus();
+  const manual = opts.manual || manualStatus(relayDir);
   const book = connectBook(relayDir);
   const now = Date.now();
   const hasAcct = hasAccountCreds(cfg);
@@ -2391,7 +2895,7 @@ function ensureConnection(relayDir, opts = {}) {
     return { action: "provision" };
   }
   const launchd = launchdStatus();
-  const manual = manualStatus();
+  const manual = manualStatus(relayDir);
   if (launchd.running || (manual.allBridge || []).length || (manual.bridge || []).length) {
     book.attempts = 0; // 进程已在跑：退避计数归零，后续只等注册
     book.lastAttemptAt = now;
@@ -3291,7 +3795,7 @@ function registerRoutes(ctx, relayDir) {
       handler: async (_req, res) => {
         // 首次安装/在线更新后重启 DeepSeek harness：插件本体与浏览器半在进程启动时装载，
         // 不重启则面板入口与 /dsh-remote/* 路由都不会出现。只重启承载本插件的进程。
-        const r = restartHarness(relayDir);
+        const r = await restartHarness(relayDir);
         const payload = { ...(await composeStatus(relayDir)), ...r };
         if (!r.ok) payload.error = r.detail || r.status || "重启失败";
         sendJson(res, r.ok ? 200 : 500, payload);
@@ -3314,7 +3818,7 @@ function registerRoutes(ctx, relayDir) {
       method: "POST",
       path: "/dsh-remote/stop",
       handler: async (_req, res) => {
-        const r = stopBridge();
+        const r = stopBridge(relayDir);
         const payload = { ...(await composeStatus(relayDir)), ...r };
         if (!r.ok) payload.error = r.detail || r.status || "停止失败";
         sendJson(res, r.ok ? 200 : 500, payload);

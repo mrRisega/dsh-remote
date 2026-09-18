@@ -28,6 +28,28 @@ dsh-remote 是一个轻量的**隧道模式**远程控制方案：电脑端运�
                            └→ bridge (电脑端) → 127.0.0.1:3080 (dsh web)
 ```
 
+## 0.6.7 速览（Windows 可用版）
+
+0.6.6 及更早的插件半整套「服务状态 / 启停 / 重启」是按 macOS/Linux 写死的
+（launchctl / systemd / pgrep / ps / /bin/sh），**在 Windows 上安装一切正常、运行期必死**：
+面板红字「读取状态失败: process.getuid is not a function」、状态永远停在「查询中…」、
+运行环境补不上、点「重启 DeepSeek harness」还会把 dsh web 打挂。本轮全部修掉：
+
+- **Windows 不再 500**：`process.getuid` 在 Windows 上根本不存在（不是返回 undefined），
+  旧的 `launchTarget()` 无条件调它 → 所有读状态接口抛错。现在非 macOS 直接短路 launchd 查询。
+- **Windows 能补上运行环境**：`spawn("npx.cmd")` 在 Node ≥20.12 起不带 shell 会抛 EINVAL。
+  现在用**当前 node 直接跑 npm 自带的 `npx-cli.js`**（不经 cmd.exe），退回 `.cmd` 时必带 `shell: true`。
+- **「重启 DeepSeek harness」不再打挂进程**：Windows 改用 node 跑的 `.mjs` 助手（不再 `/bin/sh`），
+  且**先校验 node/入口/工作目录存在再动旧进程**，spawn 真正成功才回报成功。
+- **Windows 进程发现**：安装器落 `.dsh-watcher.pid` / `.dsh-bridge.pid`，插件按 pid 判活
+  （不再依赖 Windows 上不存在的 `pgrep`/`ps`），必要时用 PowerShell 扫 node 进程兜底。
+- **Windows 自启动**：安装器在**任务计划程序**注册登录任务 `dsh-remote-bridge`，卸载时一并删除；
+  插件自愈也会隐藏地把 bridge 拉起来（日常使用看不到控制台窗口）。
+- **面板不再无限转圈**：`bridge-status` 轮询连续失败 3 次会把原因摆到连接卡上（原先静默 catch）。
+
+> 平台支持：**macOS / Linux / Windows** 均可运行。自启动方式按平台分别是
+> launchd、systemd --user、任务计划程序（Windows）。macOS/Linux 的行为与 0.6.6 完全一致。
+
 ## 0.6.4 速览（首次安装不再卡）
 
 - **登录后 bridge 自动连上，全程零刷新**：面板自动补运行环境 → 拉起 bridge → 显示「正在连接中继…」，连上后自动变成「已连接 ✅」并刷新二维码与设备列表；失败有可读原因、自动重试倒计时和「复制诊断信息」。
@@ -84,8 +106,9 @@ dsh-remote 是一个轻量的**隧道模式**远程控制方案：电脑端运�
 
 ## 安装
 
-需要 Node.js ≥ 20。电脑端**一条命令**完成安装：自动安装 bridge 与 dsh web 插件、
-写入配置、创建开机自启服务：
+需要 Node.js ≥ 20（macOS / Linux / Windows 均可）。电脑端**一条命令**完成安装：
+自动安装 bridge 与 dsh web 插件、写入配置、创建开机自启（macOS launchd / Linux systemd --user /
+Windows 任务计划程序）：
 
 ```bash
 npx @mrrisega/dsh-remote
