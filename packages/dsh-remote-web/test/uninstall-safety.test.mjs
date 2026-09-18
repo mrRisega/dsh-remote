@@ -209,6 +209,69 @@ test("CLI 卸载（dsh-remote plugin --uninstall）：同样必须留下合法�
   }
 });
 
+/** 本机是否有真正的 dsh CLI（CI 通常没有 → 该用例自动跳过）。 */
+function dshAvailable() {
+  try { return spawnSync("dsh", ["--help"], { stdio: "ignore", timeout: 20000 }).status === 0; }
+  catch { return false; }
+}
+const HAS_DSH = dshAvailable();
+
+/**
+ * 最强的一条：把卸载结果交给**真实 dsh 解析器**判定。
+ * 报告的 Fix E 正是要求这个 —— 断言对象不是"我们写了什么"，而是"dsh 能不能 compose 出插件树"
+ *（compose 成功 ≈ dsh web 能启动）。另外附一条反例：纯注释文档必须被 dsh 拒绝，
+ * 否则这条用例就是空断言（证明它有牙齿）。
+ */
+test("（需本机装有 dsh）卸载后的 patch 必须能被真实 dsh 解析：--dump-config 成功", { skip: !HAS_DSH && "本机没有 dsh CLI" }, async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-un-real-"));
+  const prevHome = process.env.HOME;
+  const prevSkip = process.env.DSH_RELAY_SKIP_SERVICE;
+  process.env.HOME = home;
+  process.env.DSH_RELAY_SKIP_SERVICE = "1";
+  const dshHome = path.join(home, "dshhome");
+  const profile = path.join(dshHome, "profiles", "web");
+  fs.mkdirSync(profile, { recursive: true });
+  fs.writeFileSync(path.join(profile, "package.json"), JSON.stringify({ name: "web", version: "0.0.0", dsh: { profile: {} } }));
+  const patchFile = path.join(profile, "cordis.patch.yml");
+  const comments = "# Your patch layer for this dsh profile, applied after every bundle layer:\n# a top-level YAML array of loader patch entries\n";
+  const runDsh = () => spawnSync("dsh", ["--profile", "web", "--dump-config"], {
+    encoding: "utf8", timeout: 60000, env: { ...process.env, DSH_HOME: dshHome },
+  });
+  try {
+    // 反例（负向对照）：纯注释 → dsh 必须报错（否则本用例没有牙齿）
+    fs.writeFileSync(patchFile, comments);
+    const negative = runDsh();
+    assert.notEqual(negative.status, 0, "纯注释文档必须被 dsh 拒绝（这就是用户遇到的启动失败）");
+    assert.match(String(negative.stderr || "") + String(negative.stdout || ""), /top-level YAML array/);
+
+    // 正向：我们的安装器写入的 patch → dsh 必须接受
+    fs.writeFileSync(patchFile, `${comments}[]\n`);
+    fs.mkdirSync(path.join(profile, "node_modules"), { recursive: true });
+    fs.writeFileSync(path.join(profile, "node_modules", "probe"), "");
+    const ok = runDsh();
+    assert.equal(ok.status, 0, `安装态 patch 应能被 dsh 接受：${ok.stderr}`);
+
+    // 关键：走一遍真实卸载（插件路由），卸载后 dsh 仍必须能 compose
+    const { patchFile: installedPatch } = await (async () => {
+      const { profile: p2, patchFile: pf } = await plantProfile(home);
+      return { patchFile: pf };
+    })();
+    const routes = boot(path.join(home, "relay"));
+    const { host, base } = await serve(routes);
+    try {
+      await (await fetch(`${base}/dsh-remote/self/uninstall`, { method: "POST" })).json();
+    } finally { host.close(); }
+    fs.copyFileSync(installedPatch, patchFile); // 把"卸载后的 patch"交给真实 dsh 判定
+    const after = runDsh();
+    assert.equal(after.status, 0, `★卸载后的 patch 必须仍能被 dsh 接受（否则 dsh web 起不来）：${after.stderr}`);
+    assert.ok(isTopLevelArrayDoc(fs.readFileSync(patchFile, "utf8")));
+  } finally {
+    if (prevSkip === undefined) delete process.env.DSH_RELAY_SKIP_SERVICE; else process.env.DSH_RELAY_SKIP_SERVICE = prevSkip;
+    process.env.HOME = prevHome;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 // ─────────────────────── ② 卸载顺序与阻塞（缺陷二） ───────────────────────
 
 test("源码契约：卸载必须先卸插件、再关自愈、最后才把慢活交子进程", () => {
