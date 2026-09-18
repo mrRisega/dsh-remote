@@ -3,28 +3,46 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.6.7] - 2026-09-19
 
-> **自建版对齐**：把闭源版这一轮的「镜像页退路与引导」同步到开源仓库
-> （部署在服务器上的那半边在闭源仓库，跑在用户本机的这半边在这里）。
+> **正式版**（发表于 npm `latest`）。预发版 beta.1 ~ beta.4 到此收束，并含这一轮的
+> **镜像页整屏遮罩根因修复**与手机端引导。Windows 从本版起可用（beta.1）、换账号设备登记（beta.4）
+> 都在其中。
 
 ### Fixed
 
+- **镜像页一打开整屏就是遮罩、主体界面点不动（致命，Windows 用户先撞到）**。官方 DSH 从 0.1.5-rc.2
+  起把布局第三列由 `details` 改名 `rightbar`（`pI_x6G_detailsCol` → `pI_x6G_rightbarCol`、
+  `data-details-collapsed` → `data-rightbar-collapsed`），并把 `overlayLayer`（`inset:0` 全屏、
+  `data-shell-overlay`）留在 frame 末尾、折叠时不再渲染拖拽把手。适配层那条「详情抽屉兜底 = 取 frame
+  最后一个子元素」于是把**官方 overlay 层当成了详情抽屉**：属性名认不到 → 判「未折叠」，全屏元素 →
+  几何判「可见」 → `dsh-ma-details-open` 常亮 → 全屏 scrim 拦截整屏点击，且每次状态变化都重新加上，
+  点遮罩也救不回来（Mac 没被撞到只是因为它还是 0.1.2-rc.1，属版本巧合）。
+  现在：第三列按 `/details|rightbar/` 识别并显式排除 overlay 层/拖拽把手/全屏元素；折叠态两个属性名
+  都认（都认不到就只信几何）；遮罩收口成**唯一闸门**并加 800ms 看门狗 —— 只要遮罩在拦截而没有抽屉
+  真的在视口里就立刻摘掉；CSS 侧删掉了第二条能让遮罩生效的路径。
 - **点进设备后地址栏只剩端口，刷新还可能白屏**。手机端外壳以前跳根路径 `/`：地址栏看不出在哪台设备上；
-  而 `dsh_device` cookie 2 小时就过期，刷新根路径时中继解析不到设备 → 只剩一句纯文本 404。
+  而 `dsh_device` cookie 一过期，刷新根路径时中继解析不到设备 → 只剩一句纯文本 404（手机上就是白屏）。
   现在跳 `/remote/<deviceId>/`：刷新 / 收藏 / 返回都指向同一台设备，cookie 失效也有路径兜底。
-- **会话"过一段时间就报错"**：会话 cookie 写死 2 小时，而令牌有效期是可配的（自签可更长），
-  "令牌还有效、cookie 先死" → 设备列表与镜像页必然 401。现在 cookie 的 `max-age` 由 JWT 自己的
-  `exp` 推导，两边同生共死。
+- **会话「过一段时间就报错」**：会话 cookie 写死 2 小时，而令牌有效期是可配的（移动端会话默认 30 天），
+  「令牌还有效、cookie 先死」→ 设备列表与镜像页必然 401。现在 cookie 的 `max-age` 由 JWT 自己的 `exp`
+  推导，两边同生共死。
 - **会话过期 / 设备离线时不再甩报错页**：中继对**页面导航**一律 302 回 `/app/?reason=…`
-  （expired / offline / forbidden / unknown_device），接口与子资源保持 JSON 状态码语义
-  （以前未登录一律 302 到 `/login/`，客户端拿 HTML 当 JSON 解析，报的错与真实原因无关）。
-  外壳接住后给一句话说明并落在正确视图，提示条可手动关闭。
+  （expired / offline / forbidden / unknown_device）并清掉失效的设备 cookie；接口与子资源保持 JSON
+  状态码语义（以前未登录一律 302 到 `/login/`，客户端拿一张 HTML 当 JSON 解析，报的错与真实原因无关）。
+  外壳接住后给一句能照做的话（离线会说清是电脑端 `dsh-bridge` 没在运行），提示条可手动关闭。
+
+### Changed
+
+- **镜像页「字号」按钮与右上角「加密小锁」合并为一个悬浮按钮**：点开菜单即可调字号档位、看加密状态、
+  以及**返回设备列表**（用户在镜像页唯一的主动退路）。样式移出 `@media` → 手机端与电脑端都有；
+  层级高于遮罩与抽屉，即使判定异常也点得到。加密状态由 E2EE shim 只读暴露（`window.__dshE2eeBadge`
+  + `dsh-e2ee-badge` 事件），原独立小药丸收进菜单，不再各占一角。
 
 ### Added
 
-- `packages/relay-router/test/native-app-entry.test.mjs`：手机端外壳的进设备路径 / 会话寿命 /
-  引导回跳契约（与闭源仓库同名用例同源同断言，两边行为必须一致）。
+- `packages/relay-router/test/native-app-entry.test.mjs`：手机端外壳的进设备路径 / 会话寿命 / 引导回跳契约
+  （与闭源仓库同名用例同源同断言，两边行为必须一致）。
 
 ## [0.6.7-beta.4] - 2026-09-19
 
