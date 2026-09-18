@@ -799,7 +799,9 @@ const SCRIPT = `(() => {
           });
           let strikes = 0;
           const noteStatus = (status) => {
-            if (status !== 401 && status !== 403) { strikes = 0; return; }
+            // 只认 401：中继对"会话失效"回 401，对"设备不属于本账号"回 403 —— 后者不是会话过期，
+            // 拿它提示"请重新登录"会把人引到错误的动作上。
+            if (status !== 401) { strikes = 0; return; }
             strikes += 1;
             if (strikes >= 2) bar.hidden = false;
           };
