@@ -427,6 +427,54 @@ test("WS 包装:URL 追加 &e2ee=&w=,逐消息封包(计数递增)且桥端可�
   ws.close(1000);
 });
 
+test("WS 包装:连续 send 的计数与发送顺序严格一致(防并行的 seal 打乱顺序)", async () => {
+  /**
+   * 这条是上面那条的**确定性加强版**，用来稳定复现一个竞态：
+   *
+   *   旧实现里 `send()` 会**立刻**调用 `_sealSend()`（`counter: this._p2b++` 当场求值），
+   *   而 `_sendQ` 只串了 promise、**没有串住"开始加密"这一步**。于是两次背靠背的
+   *   `send()` 各自并行发起一次 seal，谁先完成谁先发 —— **WebSocket 的消息有序性被破坏**。
+   *   旧代码下上面那条用例约 1/5 概率变红，长期被误当成"flaky 测试"；其实是它抓到了真竞态。
+   *
+   * 上面那条依赖 WebCrypto 的完成顺序，**不够确定**（实测把消息加到 8 条也可能侥幸通过）。
+   * 这里改用**确定性手法**：把第一次 `seal` 故意拖慢 —— 只要实现还会并行发起 seal，
+   * 第一条就一定排在后面，用例必然失败；把"开始加密"排进队列后必然通过。
+   */
+  const seS = makeSeSession();
+  const peer = bridgePeer(seS.sessId, seS.shk, seS.saltH);
+  const ORIGIN = "http://relay.local";
+
+  let sealCalls = 0;
+  const realSeal = seS.seal.bind(seS);
+  seS.seal = async function (opt) {
+    sealCalls += 1;
+    if (sealCalls === 1) await new Promise((r) => setTimeout(r, 80)); // 只拖慢第一条
+    return realSeal(opt);
+  };
+
+  const patched = shim.seMakeWsCtor(FakeNative, { sess: seS, origin: ORIGIN });
+  const ws = patched(ORIGIN + "/api/events.mux?x=1");
+  const inner = ws._inner;
+
+  const N = 6;
+  for (let i = 0; i < N; i++) ws.send("msg-" + i);
+  await until(() => inner.sent.length === N);
+  assert.equal(inner.sent.length, N, `${N} 条都发出去了`);
+
+  const parts = shim.seWsLabelParts(inner.url.slice(inner.url.indexOf("/api")));
+  for (let i = 0; i < N; i++) {
+    const env = JSON.parse(inner.sent[i]);
+    assert.equal(
+      env.c,
+      i,
+      `第 ${i} 条信封的计数应为 ${i} —— 顺序被打乱了（说明 seal 又变成并行发起了）`
+    );
+    const opened = peer.open({ kind: "w", dir: "p2b", env, counter: env.c, wsLabel: parts.wsLabel });
+    assert.equal(Buffer.from(opened.data).toString("utf8"), "msg-" + i, `第 ${i} 条内容要对应`);
+  }
+  ws.close(1000);
+});
+
 test("WS 包装:下行信封解密→原文事件;binaryType=arraybuffer;重放 → 1008 关闭", async () => {
   const seS = makeSeSession();
   const peer = bridgePeer(seS.sessId, seS.shk, seS.saltH);

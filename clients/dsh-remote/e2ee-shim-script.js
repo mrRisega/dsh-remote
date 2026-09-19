@@ -529,14 +529,27 @@
   };
   SeE2eeWs.prototype.send = function (data) {
     var self = this;
-    var p;
-    if (typeof data === "string") p = this._sealSend(data, 0);
-    else if (typeof Blob !== "undefined" && data instanceof Blob) p = data.arrayBuffer().then(function (ab) { return self._sealSend(new Uint8Array(ab), 1); });
-    else if (data instanceof ArrayBuffer) p = this._sealSend(new Uint8Array(data), 1);
-    else if (ArrayBuffer.isView(data)) p = this._sealSend(new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength || data.length), 1);
-    else p = Promise.reject(seErr("bad_ws_data", "e2ee: 不支持的 WS 消息类型"));
-    this._sendQ = this._sendQ.then(function () { return p; })
-      .catch(function (e) { seNotifyFail("⚠ 无法加密 WS 消息: " + (e && e.message || e)); });
+    /* ⚠️ 消息体在**调用时刻**归一化（同步完成，保持调用者看到的语义），
+       但**加密与发送必须排进 `_sendQ` 队列里做**。
+       2026-09-19 修：原先写成
+           if (typeof data === "string") p = this._sealSend(data, 0);
+           this._sendQ = this._sendQ.then(function () { return p; });
+       队列只串了 **promise**，没有串住"开始加密"这个动作 —— 两次背靠背的 `send()`
+       会**各自立刻**发起一次 seal（WebCrypto 走线程池，完成顺序无保证），而
+       `counter: this._p2b++` 是在 seal **之前**求值的，于是**计数 1 的信封可能先于
+       计数 0 发出**。WebSocket 本该保证消息有序，这条路被破坏了。
+       （它是间歇性的：端到端用例 `e2ee-shim.test.mjs` 的 WS 顺序断言约 1/5 概率变红，
+       一直被当成"flaky 测试"，其实是它抓到了真竞态。）
+       现在把 `_sealSend` 整体推迟到队列里执行，计数器与发送顺序严格一致。 */
+    var norm;
+    if (typeof data === "string") norm = Promise.resolve({ payload: data, t: 0 });
+    else if (typeof Blob !== "undefined" && data instanceof Blob) norm = data.arrayBuffer().then(function (ab) { return { payload: new Uint8Array(ab), t: 1 }; });
+    else if (data instanceof ArrayBuffer) norm = Promise.resolve({ payload: new Uint8Array(data), t: 1 });
+    else if (ArrayBuffer.isView(data)) norm = Promise.resolve({ payload: new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength || data.length), t: 1 });
+    else norm = Promise.reject(seErr("bad_ws_data", "e2ee: 不支持的 WS 消息类型"));
+    this._sendQ = this._sendQ.then(function () {
+      return norm.then(function (m) { return self._sealSend(m.payload, m.t); });
+    }).catch(function (e) { seNotifyFail("⚠ 无法加密 WS 消息: " + (e && e.message || e)); });
   };
   SeE2eeWs.prototype._sealSend = async function (payload, t) {
     var env = await this._meta.sess.seal({ kind: "w", dir: SE_DIR_P2B, counter: this._p2b++, data: payload, t: t, wsLabel: this._meta.wsLabel });
