@@ -41,214 +41,370 @@ window.__ModuleLoader__.load({
     var styleEl = document.createElement("style");
     styleEl.setAttribute("data-plugin", "dsh-remote-web");
     styleEl.textContent = [
+      // ═══════════════════════════════════════════════════════════════════════
+      // 🎨 主题令牌层（--dru-*）—— 亮色 / 深色双套，**只作用于面板自己的根节点**
+      // ───────────────────────────────────────────────────────────────────────
+      // 宿主（DeepSeek Harness Web）表达「深色」的实测信号（2026-09 在本机 GUI 实读，见文末说明）：
+      //   ① document.body 上的属性 `data-ds-dark-theme` —— **存在即深色**（值恒为空串；
+      //      宿主写的是 body.toggleAttribute('data-ds-dark-theme', dark)，不是 data-theme="dark"）
+      //   ② document.documentElement.style.colorScheme = 'dark' | 'light' —— **两种模式都会写**，
+      //      所以它同时能表达「浅色」，是判断「宿主是否已表态」的可靠依据
+      // 出处是宿主自己的实现：@deepseek-ai/dsh-client-ui-theme 的 boot 脚本 +
+      // @deepseek-ai/dsh-client-ui-layout 的 ThemePresenter（`html{color-scheme}` + body 调色板属性）。
+      //
+      // ⚠️ `prefers-color-scheme` **不是**宿主的表达方式：宿主只在用户选「跟随系统」时才看它
+      //    （偏好存在 ~/.dsh/settings.yaml 的 ui-theme.preference，本机实测为 "light"）。
+      //    所以本插件把它只当**兜底**（宿主没表态时才用系统偏好）。
+      //
+      // 令牌**只**定义在 .dru-settings-section / .dru-popup / .dru-nav-remote 上，
+      // 绝不写 :root / body —— 否则会污染整个 GUI。JS 解析出主题后往根节点写
+      // data-dru-theme="dark|light"，下面按属性切换；末一条 `:not([data-dru-theme])`
+      // 是 JS 尚未执行时的纯 CSS 兜底（一旦 JS 写过属性就不再参与，不会打架）。
+      ".dru-settings-section,.dru-popup,.dru-nav-remote{",
+      "  color-scheme:light;",
+      "  --dru-surface:#f6f8fa;",          // 卡片底
+      "  --dru-surface-2:#ffffff;",        // 抬升面（输入框/行/弹窗卡）
+      "  --dru-surface-3:#eaeef2;",        // 再抬升 / 按下态 / 进度槽
+      "  --dru-hover:#f6f8fa;",           // 悬浮底
+      "  --dru-fg:#1f2328;",              // 正文
+      "  --dru-fg-muted:#57606a;",        // 次级文字
+      "  --dru-border:#d0d7de;",          // 面上描边（装饰）
+      "  --dru-border-soft:#eaeef2;",     // 更淡的分隔线
+      "  --dru-border-ctl:#d0d7de;",      // 控件描边（输入/按钮/页签）
+      "  --dru-accent:#0969da;",
+      "  --dru-accent-strong:#0860bd;",
+      "  --dru-accent-active:#0757a8;",
+      "  --dru-accent-fg:#0550ae;",
+      "  --dru-accent-tint:#ddf4ff;",
+      "  --dru-accent-tint-2:#f0f6ff;",
+      "  --dru-accent-tint-border:#b6e3ff;",
+      "  --dru-accent-fill:#0969da;",      // 主按钮填充
+      "  --dru-on-accent:#ffffff;",        // 主按钮/头像上的文字
+      "  --dru-tip-fg:#0a3069;",          // 气泡正文
+      "  --dru-tip-fg-strong:#0550ae;",   // 气泡强调
+      "  --dru-success:#1a7f37;",
+      "  --dru-success-fg:#116329;",
+      "  --dru-success-soft:#dafbe1;",
+      "  --dru-success-border:#aceebb;",
+      "  --dru-success-glow:rgba(26,127,55,.6);",
+      "  --dru-warn:#9a6700;",
+      "  --dru-warn-fg:#7d4e00;",
+      "  --dru-warn-fg-2:#6b5900;",
+      "  --dru-warn-soft:#fff8c5;",
+      "  --dru-warn-border:#eed888;",
+      "  --dru-warn-border-2:#d4a72c;",
+      "  --dru-danger:#cf222e;",
+      "  --dru-danger-soft:#fff0f1;",
+      "  --dru-danger-soft-2:#ffdfe0;",
+      "  --dru-danger-border:#ffb3b6;",
+      "  --dru-dot-off:#6e7781;",
+      "  --dru-reddot:#e5484d;",
+      "  --dru-log-bg:#0d1117;",
+      "  --dru-log-fg:#e6edf3;",
+      "  --dru-overlay:rgba(0,0,0,.5);",
+      "  --dru-shadow:rgba(0,0,0,.45);",
+      "  --dru-focus:#0969da;",
+      "  --dru-focus-halo:rgba(9,105,218,.28);",
+      "  --dru-focus-halo-2:rgba(9,105,218,.18);",
+      "  --dru-focus-halo-3:rgba(9,105,218,.15);",
+      "}",
+      // 深色：JS 写的 data-dru-theme 优先；宿主属性作 JS 未执行时的兜底。
+      // 取值跟着宿主的深色基色走（body 实测 #151517 / 层 1 #232324 / 层 2 #2c2c2e / 层 3 #353638），
+      // 语义色**在深底上重新取值**，不是沿用亮色值（亮色的 #1a7f37 / #cf222e 在深底对比度不足）。
+      ".dru-settings-section[data-dru-theme=\"dark\"],.dru-popup[data-dru-theme=\"dark\"],.dru-nav-remote[data-dru-theme=\"dark\"],",
+      "body[data-ds-dark-theme] .dru-settings-section:not([data-dru-theme]),",
+      "body[data-ds-dark-theme] .dru-popup:not([data-dru-theme]),",
+      "body[data-ds-dark-theme] .dru-nav-remote:not([data-dru-theme]){",
+      "  color-scheme:dark;",
+      "  --dru-surface:#232324;",
+      "  --dru-surface-2:#2c2c2e;",
+      "  --dru-surface-3:#353638;",
+      "  --dru-hover:#303236;",
+      "  --dru-fg:#f0f2f5;",
+      "  --dru-fg-muted:#b9bec6;",
+      "  --dru-border:#52565c;",
+      "  --dru-border-soft:#2f3237;",
+      "  --dru-border-ctl:#6b7280;",     // 对卡片 3.25:1 —— 控件轮廓在深底上认得出（WCAG 1.4.11）
+      "  --dru-accent:#6ba4ff;",
+      "  --dru-accent-strong:#8ab8ff;",
+      "  --dru-accent-active:#a6c9ff;",
+      "  --dru-accent-fg:#9cc4ff;",
+      "  --dru-accent-tint:#16324d;",
+      "  --dru-accent-tint-2:#1d3c5c;",
+      "  --dru-accent-tint-border:#2a5580;",
+      "  --dru-accent-fill:#2f6fd0;",
+      "  --dru-on-accent:#ffffff;",
+      "  --dru-tip-fg:#bcd8ff;",
+      "  --dru-tip-fg-strong:#dbe9ff;",
+      "  --dru-success:#56d364;",
+      "  --dru-success-fg:#7ee787;",
+      "  --dru-success-soft:#12351f;",
+      "  --dru-success-border:#2b5c39;",
+      "  --dru-success-glow:rgba(86,211,100,.45);",
+      "  --dru-warn:#e3b341;",
+      "  --dru-warn-fg:#f0c674;",
+      "  --dru-warn-fg-2:#e8cd94;",
+      "  --dru-warn-soft:#3a2d0c;",
+      "  --dru-warn-border:#6b5417;",
+      "  --dru-warn-border-2:#8a6d1f;",
+      "  --dru-danger:#ff7b72;",
+      "  --dru-danger-soft:#4a1d1f;",
+      "  --dru-danger-soft-2:#5c2426;",
+      "  --dru-danger-border:#7a383c;",
+      "  --dru-dot-off:#8b9199;",
+      "  --dru-reddot:#ff6b6b;",
+      "  --dru-log-bg:#0b0d11;",
+      "  --dru-log-fg:#e6edf3;",
+      "  --dru-overlay:rgba(0,0,0,.66);",
+      "  --dru-shadow:rgba(0,0,0,.66);",
+      "  --dru-focus:#8ab8ff;",
+      "  --dru-focus-halo:rgba(138,184,255,.30);",
+      "  --dru-focus-halo-2:rgba(138,184,255,.22);",
+      "  --dru-focus-halo-3:rgba(138,184,255,.20);",
+      "}",
       // 设置页栏目容器（nav 选中后渲染在 settings.section 内容区）
-      ".dru-settings-section{max-width:720px;display:flex;flex-direction:column;gap:14px;padding-top:2px}",
+      ".dru-settings-section{max-width:720px;display:flex;flex-direction:column;gap:14px;padding-top:2px;color:var(--dru-fg)}",
       ".dru-settings-head{display:flex;align-items:center;gap:10px;padding:6px 2px 2px}",
       ".dru-settings-icon{font-size:24px;line-height:1;flex:none}",
-      ".dru-settings-title{margin:0;font-size:17px;font-weight:600;color:var(--dsw-alias-label-primary,#e6edf3)}",
-      // 副标题用 #57606a（对 #f6f8fa 卡片底色 6.0:1，达 AA 正文标准）；旧的 #8c959f 只有 2.85:1
-      ".dru-settings-sub{font-size:12.5px;color:var(--dsw-alias-label-tertiary,#57606a);margin-top:3px;line-height:1.6}",
+      // 标题/副标题优先沿用宿主语义令牌（自带深浅两套），取不到再退回本插件令牌
+      ".dru-settings-title{margin:0;font-size:17px;font-weight:600;color:var(--dsw-alias-label-primary,var(--dru-fg))}",
+      ".dru-settings-sub{font-size:12.5px;color:var(--dsw-alias-label-tertiary,var(--dru-fg-muted));margin-top:3px;line-height:1.6}",
       ".dru-settings-body{display:flex;flex-direction:column;gap:14px}",
       // 首次安装引导小红点（挂在设置页「远程访问」导航栏目右上角）
-      ".dru-reddot{position:absolute;top:9px;right:12px;width:7px;height:7px;border-radius:50%;background:#e5484d;box-shadow:0 0 0 2px var(--dsw-alias-bg-layer-2,#fff);pointer-events:none;z-index:1}",
-      ".dru-card{background:#f6f8fa;border:1px solid #eaeef2;border-radius:10px;padding:14px 16px}",
-      ".dru-card h3{margin:0 0 8px;font-size:13px;font-weight:700;color:#1f2328}",
-      ".dru-url{background:#ffffff;border:1px solid #d0d7de;border-radius:8px;padding:9px 11px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;word-break:break-all;display:flex;align-items:center;justify-content:space-between;gap:8px;color:#1f2328}",
-      ".dru-url button{flex:none;min-height:44px;padding:10px 14px;border:1px solid #d0d7de;background:#ffffff;color:#0969da;border-radius:6px;font-size:12.5px;font-weight:600;cursor:pointer;font-family:inherit;transition:background .12s ease,border-color .12s ease}",
-      ".dru-url button:hover{background:#f6f8fa;border-color:#0969da}",
-      ".dru-url button:active{background:#eaeef2}",
+      ".dru-reddot{position:absolute;top:9px;right:12px;width:7px;height:7px;border-radius:50%;background:var(--dru-reddot);box-shadow:0 0 0 2px var(--dsw-alias-bg-layer-2,var(--dru-surface-2));pointer-events:none;z-index:1}",
+      ".dru-card{background:var(--dru-surface);border:1px solid var(--dru-border-soft);border-radius:10px;padding:14px 16px;color:var(--dru-fg)}",
+      ".dru-card h3{margin:0 0 8px;font-size:13px;font-weight:700;color:var(--dru-fg)}",
+      ".dru-url{background:var(--dru-surface-2);border:1px solid var(--dru-border);border-radius:8px;padding:9px 11px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;word-break:break-all;display:flex;align-items:center;justify-content:space-between;gap:8px;color:var(--dru-fg)}",
+      ".dru-url button{flex:none;min-height:44px;padding:10px 14px;border:1px solid var(--dru-border-ctl);background:var(--dru-surface-2);color:var(--dru-accent);border-radius:6px;font-size:12.5px;font-weight:600;cursor:pointer;font-family:inherit;transition:background .12s ease,border-color .12s ease}",
+      ".dru-url button:hover{background:var(--dru-hover);border-color:var(--dru-accent)}",
+      ".dru-url button:active{background:var(--dru-surface-3)}",
       ".dru-field{margin-bottom:11px}",
-      ".dru-field > label{display:block;font-size:12.5px;font-weight:600;color:#1f2328;margin-bottom:5px}",
-      ".dru-input{width:100%;box-sizing:border-box;min-height:44px;padding:10px 11px;border-radius:8px;border:1px solid #d0d7de;background:#ffffff;color:#1f2328;font-size:13.5px;font-family:inherit}",
-      ".dru-input:focus{border-color:#0969da;box-shadow:0 0 0 3px rgba(9,105,218,.28)}",
+      ".dru-field > label{display:block;font-size:12.5px;font-weight:600;color:var(--dru-fg);margin-bottom:5px}",
+      ".dru-input{width:100%;box-sizing:border-box;min-height:44px;padding:10px 11px;border-radius:8px;border:1px solid var(--dru-border-ctl);background:var(--dru-surface-2);color:var(--dru-fg);font-size:13.5px;font-family:inherit}",
+      ".dru-input:focus{border-color:var(--dru-accent);box-shadow:0 0 0 3px var(--dru-focus-halo)}",
       ".dru-actions{display:flex;gap:8px;flex-wrap:wrap}",
       // 触控目标 ≥44px（相邻 8px，见 .dru-actions/.dru-tabs gap）：按钮统一 min-height + hover/active 反馈
       ".dru-btn{min-height:44px;padding:10px 15px;border-radius:8px;border:1px solid transparent;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;transition:background .12s ease,border-color .12s ease,box-shadow .12s ease}",
       ".dru-btn:disabled{opacity:.55;cursor:default}",
-      ".dru-btn-primary{background:#0969da;color:#ffffff;border-color:#0969da}",
-      ".dru-btn-primary:hover:not(:disabled){background:#0860bd}",
-      ".dru-btn-primary:active:not(:disabled){background:#0757a8;border-color:#0757a8}",
-      ".dru-btn-ghost{background:#ffffff;color:#1f2328;border-color:#d0d7de}",
-      ".dru-btn-ghost:hover:not(:disabled){background:#f6f8fa;border-color:#0969da}",
-      ".dru-btn-ghost:active:not(:disabled){background:#eaeef2}",
-      ".dru-btn-danger{background:#ffffff;color:#cf222e;border-color:#cf222e}",
-      ".dru-btn-danger:hover:not(:disabled){background:#fff0f1}",
-      ".dru-btn-danger:active:not(:disabled){background:#ffdfe0}",
+      ".dru-btn-primary{background:var(--dru-accent-fill);color:var(--dru-on-accent);border-color:var(--dru-accent-fill)}",
+      ".dru-btn-primary:hover:not(:disabled){background:var(--dru-accent-strong);border-color:var(--dru-accent-strong)}",
+      ".dru-btn-primary:active:not(:disabled){background:var(--dru-accent-active);border-color:var(--dru-accent-active)}",
+      ".dru-btn-ghost{background:var(--dru-surface-2);color:var(--dru-fg);border-color:var(--dru-border-ctl)}",
+      ".dru-btn-ghost:hover:not(:disabled){background:var(--dru-hover);border-color:var(--dru-accent)}",
+      ".dru-btn-ghost:active:not(:disabled){background:var(--dru-surface-3)}",
+      ".dru-btn-danger{background:var(--dru-surface-2);color:var(--dru-danger);border-color:var(--dru-danger)}",
+      ".dru-btn-danger:hover:not(:disabled){background:var(--dru-danger-soft)}",
+      ".dru-btn-danger:active:not(:disabled){background:var(--dru-danger-soft-2)}",
       // 行内文字按钮：视觉高度不变（不破坏排版），用 ::after 把命中区扩到 ≥44px
-      ".dru-linkbtn{display:inline-block;position:relative;padding:0;border:none;background:none;color:#0969da;font-size:12.5px;line-height:1.7;cursor:pointer;font-family:inherit;text-decoration:none}",
+      ".dru-linkbtn{display:inline-block;position:relative;padding:0;border:none;background:none;color:var(--dru-accent);font-size:12.5px;line-height:1.7;cursor:pointer;font-family:inherit;text-decoration:none}",
       ".dru-linkbtn::after{content:\"\";position:absolute;left:-8px;right:-8px;top:-12px;bottom:-12px}",
       ".dru-linkbtn:hover{text-decoration:underline}",
-      ".dru-linkbtn:active{color:#0550ae}",
+      ".dru-linkbtn:active{color:var(--dru-accent-fg)}",
       ".dru-tabs{display:flex;gap:8px;margin-bottom:12px}",
-      ".dru-tab{flex:1;min-height:44px;display:flex;align-items:center;justify-content:center;padding:8px 0;text-align:center;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600;color:#57606a;background:#f6f8fa;border:1px solid #d0d7de;user-select:none;transition:background .12s ease,border-color .12s ease}",
-      ".dru-tab:hover{background:#ffffff;border-color:#0969da;color:#0969da}",
-      ".dru-tab.active{color:#0969da;background:#ffffff;border-color:#0969da}",
+      ".dru-tab{flex:1;min-height:44px;display:flex;align-items:center;justify-content:center;padding:8px 0;text-align:center;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600;color:var(--dru-fg-muted);background:var(--dru-surface);border:1px solid var(--dru-border-ctl);user-select:none;transition:background .12s ease,border-color .12s ease}",
+      ".dru-tab:hover{background:var(--dru-surface-2);border-color:var(--dru-accent);color:var(--dru-accent)}",
+      ".dru-tab.active{color:var(--dru-accent);background:var(--dru-surface-2);border-color:var(--dru-accent)}",
       ".dru-captcha{display:flex;align-items:stretch;gap:8px}",
       ".dru-captcha .dru-input{flex:1;min-width:0}",
-      ".dru-captcha-box{width:118px;height:44px;flex:none;border-radius:8px;border:1px solid #d0d7de;cursor:pointer;background:#f6f8fa;display:flex;align-items:center;justify-content:center;font-size:12px;color:#57606a;overflow:hidden}",
+      ".dru-captcha-box{width:118px;height:44px;flex:none;border-radius:8px;border:1px solid var(--dru-border-ctl);cursor:pointer;background:var(--dru-surface);display:flex;align-items:center;justify-content:center;font-size:12px;color:var(--dru-fg-muted);overflow:hidden}",
       ".dru-captcha-box svg{display:block;width:100%;height:100%}",
       ".dru-user{display:flex;align-items:center;gap:10px;margin-bottom:12px}",
-      ".dru-avatar{width:40px;height:40px;border-radius:50%;background:#0969da;color:#ffffff;display:flex;align-items:center;justify-content:center;font-size:17px;font-weight:700;flex-shrink:0}",
-      ".dru-user .mail{font-size:14px;font-weight:600;color:#1f2328;word-break:break-all}",
-      ".dru-user .plan{font-size:12px;color:#57606a;margin-top:2px}",
-      ".dru-status-line{display:flex;align-items:center;gap:8px;font-size:13px;color:#1f2328}",
+      ".dru-avatar{width:40px;height:40px;border-radius:50%;background:var(--dru-accent-fill);color:var(--dru-on-accent);display:flex;align-items:center;justify-content:center;font-size:17px;font-weight:700;flex-shrink:0}",
+      ".dru-user .mail{font-size:14px;font-weight:600;color:var(--dru-fg);word-break:break-all}",
+      ".dru-user .plan{font-size:12px;color:var(--dru-fg-muted);margin-top:2px}",
+      ".dru-status-line{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--dru-fg)}",
       ".dru-dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex:none}",
-      ".dru-dot-on{background:#1a7f37;box-shadow:0 0 6px rgba(26,127,55,.6)}",
-      ".dru-dot-off{background:#6e7781}",
-      ".dru-meta{font-size:12px;color:#57606a;margin-top:6px;word-break:break-all}",
+      ".dru-dot-on{background:var(--dru-success);box-shadow:0 0 6px var(--dru-success-glow)}",
+      ".dru-dot-off{background:var(--dru-dot-off)}",
+      ".dru-meta{font-size:12px;color:var(--dru-fg-muted);margin-top:6px;word-break:break-all}",
       ".dru-msg{font-size:12.5px;min-height:18px;margin-top:8px}",
-      ".dru-msg-ok{color:#1a7f37}",
-      ".dru-msg-err{color:#cf222e}",
-      ".dru-msg-warn{color:#9a6700}",
-      ".dru-hint{font-size:12px;color:#57606a;line-height:1.6}",
+      ".dru-msg-ok{color:var(--dru-success)}",
+      ".dru-msg-err{color:var(--dru-danger)}",
+      ".dru-msg-warn{color:var(--dru-warn)}",
+      ".dru-hint{font-size:12px;color:var(--dru-fg-muted);line-height:1.6}",
       // ── 重启 DeepSeek harness（首次安装/更新后置顶提醒 + 底部常驻按钮） ──
-      ".dru-restart-alert{display:flex;gap:10px;align-items:flex-start;background:#fff8c5;border:1px solid #d4a72c;border-radius:10px;padding:12px 14px;margin-bottom:12px}",
+      ".dru-restart-alert{display:flex;gap:10px;align-items:flex-start;background:var(--dru-warn-soft);border:1px solid var(--dru-warn-border-2);border-radius:10px;padding:12px 14px;margin-bottom:12px}",
       ".dru-restart-alert-icon{font-size:18px;line-height:1.2}",
-      ".dru-restart-alert-title{font-size:13px;font-weight:700;color:#7d4e00}",
-      ".dru-restart-alert-sub{font-size:12px;color:#6b5900;margin-top:4px;line-height:1.6}",
-      ".dru-restart-foot{margin-top:14px;padding-top:12px;border-top:1px solid #eaeef2;display:flex;gap:10px;align-items:center;flex-wrap:wrap}",
+      ".dru-restart-alert-title{font-size:13px;font-weight:700;color:var(--dru-warn-fg)}",
+      ".dru-restart-alert-sub{font-size:12px;color:var(--dru-warn-fg-2);margin-top:4px;line-height:1.6}",
+      ".dru-restart-foot{margin-top:14px;padding-top:12px;border-top:1px solid var(--dru-border-soft);display:flex;gap:10px;align-items:center;flex-wrap:wrap}",
       ".dru-restart-foot .dru-hint{flex:1;min-width:180px;margin:0}",
       // ── 用户反馈模块 ──
       ".dru-fb-tabs{display:flex;gap:8px;margin-bottom:10px}",
-      ".dru-fb-tab{flex:1;min-height:44px;display:flex;align-items:center;justify-content:center;padding:8px 0;text-align:center;border-radius:8px;cursor:pointer;font-size:12.5px;font-weight:600;color:#57606a;background:#eaeef2;border:1px solid #d0d7de;user-select:none}",
-      ".dru-fb-tab.active{color:#0969da;background:#ffffff;border-color:#0969da}",
-      ".dru-fb-select{width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #d0d7de;background:#ffffff;color:#1f2328;font-size:13.5px;font-family:inherit}",
-      ".dru-fb-textarea{width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #d0d7de;background:#ffffff;color:#1f2328;font-size:13.5px;font-family:inherit;resize:vertical;min-height:64px}",
-      ".dru-fb-textarea:focus{border-color:#0969da;box-shadow:0 0 0 3px rgba(9,105,218,.28)}",
-      ".dru-fb-select:focus{border-color:#0969da;box-shadow:0 0 0 3px rgba(9,105,218,.28)}",
-      ".dru-fb-item{border:1px solid #eaeef2;border-radius:8px;background:#ffffff;padding:10px 12px;margin-bottom:8px}",
+      ".dru-fb-tab{flex:1;min-height:44px;display:flex;align-items:center;justify-content:center;padding:8px 0;text-align:center;border-radius:8px;cursor:pointer;font-size:12.5px;font-weight:600;color:var(--dru-fg-muted);background:var(--dru-surface-3);border:1px solid var(--dru-border-ctl);user-select:none}",
+      ".dru-fb-tab.active{color:var(--dru-accent);background:var(--dru-surface-2);border-color:var(--dru-accent)}",
+      ".dru-fb-select{width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid var(--dru-border-ctl);background:var(--dru-surface-2);color:var(--dru-fg);font-size:13.5px;font-family:inherit}",
+      ".dru-fb-textarea{width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid var(--dru-border-ctl);background:var(--dru-surface-2);color:var(--dru-fg);font-size:13.5px;font-family:inherit;resize:vertical;min-height:64px}",
+      ".dru-fb-textarea:focus{border-color:var(--dru-accent);box-shadow:0 0 0 3px var(--dru-focus-halo)}",
+      ".dru-fb-select:focus{border-color:var(--dru-accent);box-shadow:0 0 0 3px var(--dru-focus-halo)}",
+      ".dru-fb-item{border:1px solid var(--dru-border-soft);border-radius:8px;background:var(--dru-surface-2);padding:10px 12px;margin-bottom:8px;color:var(--dru-fg)}",
       ".dru-fb-item-head{display:flex;align-items:center;gap:8px;margin-bottom:4px;flex-wrap:wrap}",
       ".dru-fb-badge{font-size:11px;border-radius:999px;padding:1px 8px;flex:none}",
-      ".dru-fb-badge-open{color:#9a6700;background:#fff8c5;border:1px solid #eed888}",
-      ".dru-fb-badge-processing{color:#0969da;background:#ddf4ff;border:1px solid #b6e3ff}",
-      ".dru-fb-badge-done{color:#1a7f37;background:#dafbe1;border:1px solid #aceebb}",
-      ".dru-fb-cat{font-size:11px;border-radius:999px;padding:1px 8px;flex:none;color:#57606a;background:#f6f8fa;border:1px solid #d0d7de}",
-      ".dru-fb-item-title{font-size:13px;font-weight:600;color:#1f2328;flex:1;min-width:120px}",
-      ".dru-fb-item-content{font-size:12.5px;color:#57606a;white-space:pre-wrap;word-break:break-word;margin:4px 0}",
-      ".dru-fb-item-time{font-size:11.5px;color:#57606a}",
-      ".dru-fb-reply{border-top:1px dashed #eaeef2;margin-top:8px;padding-top:8px}",
+      ".dru-fb-badge-open{color:var(--dru-warn);background:var(--dru-warn-soft);border:1px solid var(--dru-warn-border)}",
+      ".dru-fb-badge-processing{color:var(--dru-tip-fg-strong);background:var(--dru-accent-tint);border:1px solid var(--dru-accent-tint-border)}",
+      ".dru-fb-badge-done{color:var(--dru-success-fg);background:var(--dru-success-soft);border:1px solid var(--dru-success-border)}",
+      ".dru-fb-cat{font-size:11px;border-radius:999px;padding:1px 8px;flex:none;color:var(--dru-fg-muted);background:var(--dru-surface);border:1px solid var(--dru-border)}",
+      ".dru-fb-item-title{font-size:13px;font-weight:600;color:var(--dru-fg);flex:1;min-width:120px}",
+      ".dru-fb-item-content{font-size:12.5px;color:var(--dru-fg-muted);white-space:pre-wrap;word-break:break-word;margin:4px 0}",
+      ".dru-fb-item-time{font-size:11.5px;color:var(--dru-fg-muted)}",
+      ".dru-fb-reply{border-top:1px dashed var(--dru-border-soft);margin-top:8px;padding-top:8px}",
       ".dru-fb-reply-row{display:flex;gap:6px;align-items:flex-start;margin-bottom:6px}",
-      ".dru-fb-reply-who{font-size:12px;font-weight:600;color:#0969da;flex:none;width:76px}",
-      ".dru-fb-reply-who.user{color:#57606a}",
-      ".dru-fb-reply-text{font-size:12.5px;color:#1f2328;white-space:pre-wrap;word-break:break-word;flex:1}",
-      ".dru-fb-reply-input{width:100%;box-sizing:border-box;padding:7px 10px;border-radius:8px;border:1px solid #d0d7de;background:#ffffff;font-size:12.5px;font-family:inherit;resize:vertical;min-height:44px}",
-      ".dru-fb-empty{font-size:12.5px;color:#57606a;text-align:center;padding:14px 0}",
+      ".dru-fb-reply-who{font-size:12px;font-weight:600;color:var(--dru-accent);flex:none;width:76px}",
+      ".dru-fb-reply-who.user{color:var(--dru-fg-muted)}",
+      ".dru-fb-reply-text{font-size:12.5px;color:var(--dru-fg);white-space:pre-wrap;word-break:break-word;flex:1}",
+      ".dru-fb-reply-input{width:100%;box-sizing:border-box;padding:7px 10px;border-radius:8px;border:1px solid var(--dru-border-ctl);background:var(--dru-surface-2);color:var(--dru-fg);font-size:12.5px;font-family:inherit;resize:vertical;min-height:44px}",
+      ".dru-fb-empty{font-size:12.5px;color:var(--dru-fg-muted);text-align:center;padding:14px 0}",
       // ── 满意度弹窗（1 小时体验后，只弹一次） ──
-      ".dru-popup{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:2147482000;display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box}",
-      ".dru-popup-card{width:min(400px,calc(100vw - 48px));background:#ffffff;color:#1f2328;border:1px solid #d0d7de;border-radius:12px;box-shadow:0 24px 64px rgba(0,0,0,.45);font-size:14px;line-height:1.5;font-family:var(--dsw-font-family,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif);overflow:hidden}",
+      ".dru-popup{position:fixed;inset:0;background:var(--dru-overlay);z-index:2147482000;display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box}",
+      ".dru-popup-card{width:min(400px,calc(100vw - 48px));background:var(--dru-surface-2);color:var(--dru-fg);border:1px solid var(--dru-border);border-radius:12px;box-shadow:0 24px 64px var(--dru-shadow);font-size:14px;line-height:1.5;font-family:var(--dsw-font-family,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif);overflow:hidden}",
       ".dru-popup-body{padding:22px 22px 16px;text-align:center}",
       ".dru-popup-icon{font-size:34px;margin-bottom:8px}",
-      ".dru-popup-title{font-size:16px;font-weight:700;color:#1f2328;margin-bottom:6px}",
-      ".dru-popup-sub{font-size:12.5px;color:#57606a;margin-bottom:16px}",
+      ".dru-popup-title{font-size:16px;font-weight:700;color:var(--dru-fg);margin-bottom:6px}",
+      ".dru-popup-sub{font-size:12.5px;color:var(--dru-fg-muted);margin-bottom:16px}",
       ".dru-popup-rate{display:flex;gap:10px;justify-content:center;margin-bottom:14px}",
-      ".dru-popup-rate button{flex:1;max-width:96px;border:1px solid #d0d7de;background:#f6f8fa;border-radius:10px;padding:12px 6px;font-size:20px;cursor:pointer;font-family:inherit}",
-      ".dru-popup-rate button:hover{border-color:#0969da;background:#ddf4ff}",
-      ".dru-popup-rate button.sel{border-color:#0969da;background:#ddf4ff;box-shadow:0 0 0 3px rgba(9,105,218,.15)}",
-      ".dru-popup-rate button .lbl{display:block;font-size:11px;color:#57606a;margin-top:4px;font-weight:600}",
-      ".dru-popup-textarea{width:100%;box-sizing:border-box;padding:9px 11px;border-radius:8px;border:1px solid #d0d7de;background:#ffffff;color:#1f2328;font-size:13px;font-family:inherit;resize:vertical;min-height:56px;text-align:left}",
-      ".dru-popup-invite{background:#f6f8fa;border:1px dashed #d0d7de;border-radius:8px;padding:12px;font-size:13px;color:#57606a;text-align:center;margin-bottom:12px}",
+      ".dru-popup-rate button{flex:1;max-width:96px;border:1px solid var(--dru-border-ctl);background:var(--dru-surface);border-radius:10px;padding:12px 6px;font-size:20px;cursor:pointer;font-family:inherit}",
+      ".dru-popup-rate button:hover{border-color:var(--dru-accent);background:var(--dru-accent-tint)}",
+      ".dru-popup-rate button.sel{border-color:var(--dru-accent);background:var(--dru-accent-tint);box-shadow:0 0 0 3px var(--dru-focus-halo-3)}",
+      ".dru-popup-rate button .lbl{display:block;font-size:11px;color:var(--dru-fg-muted);margin-top:4px;font-weight:600}",
+      ".dru-popup-textarea{width:100%;box-sizing:border-box;padding:9px 11px;border-radius:8px;border:1px solid var(--dru-border-ctl);background:var(--dru-surface-2);color:var(--dru-fg);font-size:13px;font-family:inherit;resize:vertical;min-height:56px;text-align:left}",
+      ".dru-popup-invite{background:var(--dru-surface);border:1px dashed var(--dru-border);border-radius:8px;padding:12px;font-size:13px;color:var(--dru-fg-muted);text-align:center;margin-bottom:12px}",
       ".dru-popup-actions{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-top:14px}",
-      ".dru-popup-foot{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 16px;border-top:1px solid #eaeef2;font-size:12px;color:#57606a}",
-      ".dru-popup-foot button{min-height:44px;border:none;background:none;color:#57606a;cursor:pointer;font-size:12.5px;font-family:inherit;padding:10px 8px;border-radius:6px}",
-      ".dru-popup-foot button:hover{color:#0969da;background:#f6f8fa}",
+      ".dru-popup-foot{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 16px;border-top:1px solid var(--dru-border-soft);font-size:12px;color:var(--dru-fg-muted)}",
+      ".dru-popup-foot button{min-height:44px;border:none;background:none;color:var(--dru-fg-muted);cursor:pointer;font-size:12.5px;font-family:inherit;padding:10px 8px;border-radius:6px}",
+      ".dru-popup-foot button:hover{color:var(--dru-accent);background:var(--dru-hover)}",
       ".dru-popup .dru-msg{text-align:left}",
-      ".dru-community-qr{display:block;width:220px;max-width:62vw;margin:0 auto;background:#ffffff;padding:10px;border-radius:10px;border:1px solid #d0d7de;box-sizing:content-box}",
-      ".dru-restart-auto{display:flex;align-items:center;gap:8px;margin-top:10px;font-size:12.5px;color:#1a7f37;background:#dafbe1;border-radius:8px;padding:8px 10px}",
-      ".dru-restart-auto.muted{color:#57606a;background:#f6f8fa}",
-      ".dru-fb-community{margin-top:16px;padding-top:14px;border-top:1px dashed #d0d7de;text-align:center}",
+      ".dru-community-qr{display:block;width:220px;max-width:62vw;margin:0 auto;background:var(--dru-surface-2);padding:10px;border-radius:10px;border:1px solid var(--dru-border);box-sizing:content-box}",
+      ".dru-restart-auto{display:flex;align-items:center;gap:8px;margin-top:10px;font-size:12.5px;color:var(--dru-success);background:var(--dru-success-soft);border-radius:8px;padding:8px 10px}",
+      ".dru-restart-auto.muted{color:var(--dru-fg-muted);background:var(--dru-surface)}",
+      ".dru-fb-community{margin-top:16px;padding-top:14px;border-top:1px dashed var(--dru-border);text-align:center}",
       ".dru-fb-community .dru-community-qr{width:180px;max-width:56vw}",
       // ── 自管理：版本与更新（插件面板内提供在线更新/彻底卸载，市场无更新按钮） ──
       ".dru-ver-badge{display:inline-block;font-size:11px;border-radius:999px;padding:1px 8px;margin-left:6px;vertical-align:1px}",
-      ".dru-ver-badge-new{color:#9a6700;background:#fff8c5;border:1px solid #eed888}",
-      ".dru-ver-badge-ok{color:#1a7f37;background:#dafbe1;border:1px solid #aceebb}",
-      ".dru-up-log{margin-top:8px;background:#0d1117;color:#e6edf3;border-radius:8px;padding:8px 10px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;line-height:1.5;white-space:pre-wrap;word-break:break-word;max-height:150px;overflow:auto}",
+      ".dru-ver-badge-new{color:var(--dru-warn);background:var(--dru-warn-soft);border:1px solid var(--dru-warn-border)}",
+      ".dru-ver-badge-ok{color:var(--dru-success-fg);background:var(--dru-success-soft);border:1px solid var(--dru-success-border)}",
+      ".dru-up-log{margin-top:8px;background:var(--dru-log-bg);color:var(--dru-log-fg);border-radius:8px;padding:8px 10px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;line-height:1.5;white-space:pre-wrap;word-break:break-word;max-height:150px;overflow:auto}",
       // 版本卡信息层级（0.6.9）：版本号大字 + 通道 chip + 指标行（已用时/无输出）+ 卡住告警
       ".dru-ver-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}",
-      ".dru-ver-num{font-size:15px;font-weight:700;color:#1f2328}",
-      ".dru-ver-chip{font-size:11.5px;border-radius:999px;padding:2px 9px;color:#0a3069;background:#ddf4ff;border:1px solid #b6e3ff;white-space:nowrap}",
-      ".dru-ver-metrics{margin-top:9px;background:#ffffff;border:1px solid #d0d7de;border-radius:8px;padding:9px 11px}",
-      ".dru-ver-metric{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:12.5px;line-height:1.9;color:#1f2328}",
-      ".dru-ver-metric > span:first-child{color:#57606a}",
-      ".dru-stall{margin-top:9px;background:#fff8c5;border:1px solid #d4a72c;border-radius:8px;padding:10px 12px;font-size:12.5px;line-height:1.65;color:#6b5900}",
-      ".dru-stall b{color:#7d4e00}",
-      ".dru-spin{width:13px;height:13px;border-radius:50%;border:2px solid #d0d7de;border-top-color:#0969da;display:inline-block;vertical-align:-2px;animation:dru-spin .9s linear infinite}",
+      ".dru-ver-num{font-size:15px;font-weight:700;color:var(--dru-fg)}",
+      ".dru-ver-chip{font-size:11.5px;border-radius:999px;padding:2px 9px;color:var(--dru-tip-fg);background:var(--dru-accent-tint);border:1px solid var(--dru-accent-tint-border);white-space:nowrap}",
+      ".dru-ver-metrics{margin-top:9px;background:var(--dru-surface-2);border:1px solid var(--dru-border);border-radius:8px;padding:9px 11px}",
+      ".dru-ver-metric{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:12.5px;line-height:1.9;color:var(--dru-fg)}",
+      ".dru-ver-metric > span:first-child{color:var(--dru-fg-muted)}",
+      ".dru-stall{margin-top:9px;background:var(--dru-warn-soft);border:1px solid var(--dru-warn-border-2);border-radius:8px;padding:10px 12px;font-size:12.5px;line-height:1.65;color:var(--dru-warn-fg-2)}",
+      ".dru-stall b{color:var(--dru-warn-fg)}",
+      ".dru-spin{width:13px;height:13px;border-radius:50%;border:2px solid var(--dru-border);border-top-color:var(--dru-accent);display:inline-block;vertical-align:-2px;animation:dru-spin .9s linear infinite}",
       "@keyframes dru-spin{to{transform:rotate(360deg)}}",
-      // ── 🎯 邀请好友（0.6.9）：奖励前置（大字）→ 进度 → 邀请码/链接（一键复制）→ 折叠规则 → 记录 ──
-      ".dru-invite-hero{font-size:20px;line-height:1.4;font-weight:700;color:#1f2328;margin:2px 0 8px}",
-      ".dru-invite-hero em{font-style:normal;color:#0550ae}",
-      ".dru-invite-sub{font-size:13px;line-height:1.65;color:#57606a}",
-      ".dru-invite-prog{margin-top:12px;background:#ffffff;border:1px solid #d0d7de;border-radius:8px;padding:10px 12px}",
-      ".dru-invite-prog-top{display:flex;align-items:baseline;justify-content:space-between;gap:8px;flex-wrap:wrap;font-size:13px;font-weight:600;color:#1f2328}",
-      ".dru-invite-prog-top .n{font-size:15px;font-weight:700;color:#0550ae}",
-      ".dru-invite-bar{height:8px;border-radius:999px;background:#eaeef2;overflow:hidden;margin:9px 0 7px}",
-      ".dru-invite-bar-fill{height:100%;border-radius:999px;background:#0969da;transition:width .3s ease}",
-      ".dru-invite-next{font-size:12.5px;line-height:1.65;color:#57606a}",
+      // ── 🎁 带新用户换会员（0.6.9）：交换句式奖励大字 → 三步走 → 进度 → 邀请码/链接（一键复制）→ 折叠规则 → 记录 ──
+      ".dru-invite-hero{font-size:20px;line-height:1.4;font-weight:700;color:var(--dru-fg);margin:2px 0 8px}",
+      ".dru-invite-hero em{font-style:normal;color:var(--dru-accent-fg)}",
+      ".dru-invite-sub{font-size:13px;line-height:1.65;color:var(--dru-fg-muted)}",
+      ".dru-invite-sub b{color:var(--dru-fg)}",
+      ".dru-invite-prog{margin-top:12px;background:var(--dru-surface-2);border:1px solid var(--dru-border);border-radius:8px;padding:10px 12px}",
+      ".dru-invite-prog-top{display:flex;align-items:baseline;justify-content:space-between;gap:8px;flex-wrap:wrap;font-size:13px;font-weight:600;color:var(--dru-fg)}",
+      ".dru-invite-prog-top .n{font-size:15px;font-weight:700;color:var(--dru-accent-fg)}",
+      ".dru-invite-bar{height:8px;border-radius:999px;background:var(--dru-surface-3);overflow:hidden;margin:9px 0 7px}",
+      ".dru-invite-bar-fill{height:100%;border-radius:999px;background:var(--dru-accent-fill);transition:width .3s ease}",
+      ".dru-invite-next{font-size:12.5px;line-height:1.65;color:var(--dru-fg-muted)}",
       ".dru-copy-row{margin-top:12px}",
       ".dru-copy-row:first-child{margin-top:4px}",
-      ".dru-copy-label{font-size:12.5px;font-weight:600;color:#1f2328;margin-bottom:6px}",
-      ".dru-copy-box{display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:#ffffff;border:1px solid #d0d7de;border-radius:8px;padding:9px 11px}",
-      ".dru-code-val{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:19px;font-weight:700;letter-spacing:2.5px;color:#1f2328;flex:1;min-width:140px;word-break:break-all}",
-      ".dru-link-val{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;line-height:1.55;color:#1f2328;flex:1;min-width:180px;word-break:break-all;overflow-wrap:anywhere}",
-      ".dru-copy-btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;flex:none;min-height:44px;padding:10px 16px;border-radius:8px;border:1px solid #0969da;background:#0969da;color:#ffffff;font:600 13px/1.2 inherit;cursor:pointer;transition:background .12s ease,border-color .12s ease}",
-      ".dru-copy-btn:hover:not(:disabled){background:#0860bd;border-color:#0860bd}",
-      ".dru-copy-btn:active:not(:disabled){background:#0757a8;border-color:#0757a8}",
+      ".dru-copy-label{font-size:12.5px;font-weight:600;color:var(--dru-fg);margin-bottom:6px}",
+      ".dru-copy-box{display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:var(--dru-surface-2);border:1px solid var(--dru-border);border-radius:8px;padding:9px 11px}",
+      ".dru-code-val{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:19px;font-weight:700;letter-spacing:2.5px;color:var(--dru-fg);flex:1;min-width:140px;word-break:break-all}",
+      ".dru-link-val{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;line-height:1.55;color:var(--dru-fg);flex:1;min-width:180px;word-break:break-all;overflow-wrap:anywhere}",
+      ".dru-copy-btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;flex:none;min-height:44px;padding:10px 16px;border-radius:8px;border:1px solid var(--dru-accent-fill);background:var(--dru-accent-fill);color:var(--dru-on-accent);font:600 13px/1.2 inherit;cursor:pointer;transition:background .12s ease,border-color .12s ease}",
+      ".dru-copy-btn:hover:not(:disabled){background:var(--dru-accent-strong);border-color:var(--dru-accent-strong)}",
+      ".dru-copy-btn:active:not(:disabled){background:var(--dru-accent-active);border-color:var(--dru-accent-active)}",
       ".dru-copy-btn:disabled{opacity:.55;cursor:default}",
-      ".dru-copy-btn.copied{background:#1a7f37;border-color:#1a7f37}",
-      ".dru-empty{text-align:center;padding:20px 14px;background:#ffffff;border:1px dashed #d0d7de;border-radius:10px}",
+      ".dru-copy-btn.copied{background:var(--dru-success);border-color:var(--dru-success)}",
+      ".dru-empty{text-align:center;padding:20px 14px;background:var(--dru-surface-2);border:1px dashed var(--dru-border);border-radius:10px}",
       ".dru-empty-icon{font-size:26px;line-height:1;margin-bottom:8px}",
-      ".dru-empty-title{font-size:13.5px;font-weight:600;color:#1f2328;margin-bottom:5px}",
-      ".dru-empty-sub{font-size:12.5px;line-height:1.7;color:#57606a;max-width:380px;margin:0 auto}",
+      ".dru-empty-title{font-size:13.5px;font-weight:600;color:var(--dru-fg);margin-bottom:5px}",
+      ".dru-empty-sub{font-size:12.5px;line-height:1.7;color:var(--dru-fg-muted);max-width:380px;margin:0 auto}",
       ".dru-empty-actions{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-top:14px}",
-      ".dru-disclose{width:100%;box-sizing:border-box;min-height:44px;display:flex;align-items:center;justify-content:space-between;gap:10px;background:#ffffff;border:1px solid #d0d7de;border-radius:8px;padding:10px 12px;font:600 13px/1.3 inherit;color:#1f2328;cursor:pointer;text-align:left}",
-      ".dru-disclose:hover{background:#f6f8fa;border-color:#0969da}",
-      ".dru-disclose-caret{font-size:12px;font-weight:600;color:#57606a;flex:none}",
-      ".dru-rules{margin:10px 0 0;padding-left:20px;font-size:12.5px;line-height:1.8;color:#57606a}",
+      ".dru-disclose{width:100%;box-sizing:border-box;min-height:44px;display:flex;align-items:center;justify-content:space-between;gap:10px;background:var(--dru-surface-2);border:1px solid var(--dru-border-ctl);border-radius:8px;padding:10px 12px;font:600 13px/1.3 inherit;color:var(--dru-fg);cursor:pointer;text-align:left}",
+      ".dru-disclose:hover{background:var(--dru-hover);border-color:var(--dru-accent)}",
+      ".dru-disclose-caret{font-size:12px;font-weight:600;color:var(--dru-fg-muted);flex:none}",
+      ".dru-rules{margin:10px 0 0;padding-left:20px;font-size:12.5px;line-height:1.8;color:var(--dru-fg-muted)}",
       ".dru-rules li{margin-bottom:6px}",
-      ".dru-rules b{color:#1f2328}",
-      ".dru-rec{background:#ffffff;border:1px solid #eaeef2;border-radius:8px;padding:10px 12px;margin-bottom:8px}",
+      ".dru-rules b{color:var(--dru-fg)}",
+      ".dru-rec{background:var(--dru-surface-2);border:1px solid var(--dru-border-soft);border-radius:8px;padding:10px 12px;margin-bottom:8px}",
       ".dru-rec-top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}",
-      ".dru-rec-who{font-size:13px;font-weight:600;color:#1f2328;flex:1;min-width:120px;word-break:break-all}",
-      ".dru-rec-when{font-size:12px;color:#57606a}",
+      ".dru-rec-who{font-size:13px;font-weight:600;color:var(--dru-fg);flex:1;min-width:120px;word-break:break-all}",
+      ".dru-rec-when{font-size:12px;color:var(--dru-fg-muted)}",
       ".dru-rec-tag{font-size:11.5px;border-radius:999px;padding:1px 9px;flex:none;white-space:nowrap}",
-      ".dru-rec-tag-ok{color:#116329;background:#dafbe1;border:1px solid #aceebb}",
-      ".dru-rec-tag-wait{color:#9a6700;background:#fff8c5;border:1px solid #eed888}",
-      ".dru-rec-sub{font-size:12px;color:#57606a;margin-top:5px;line-height:1.6}",
-      ".dru-rec-head{display:flex;gap:8px;font-size:11.5px;font-weight:600;color:#57606a;padding:0 4px 7px;border-bottom:1px solid #eaeef2;margin-bottom:9px}",
+      ".dru-rec-tag-ok{color:var(--dru-success-fg);background:var(--dru-success-soft);border:1px solid var(--dru-success-border)}",
+      ".dru-rec-tag-wait{color:var(--dru-warn);background:var(--dru-warn-soft);border:1px solid var(--dru-warn-border)}",
+      ".dru-rec-sub{font-size:12px;color:var(--dru-fg-muted);margin-top:5px;line-height:1.6}",
+      ".dru-rec-head{display:flex;gap:8px;font-size:11.5px;font-weight:600;color:var(--dru-fg-muted);padding:0 4px 7px;border-bottom:1px solid var(--dru-border-soft);margin-bottom:9px}",
+      // ── 🔀 转化 or 拉新：痛点时刻的并列二选一（两条都是真按钮：命中区 ≥44px、可键盘聚焦） ──
+      // 蓝色左边框把它从周边灰字里提出来 —— 用户「正在疼」的时刻不再被一行 12px 灰字糊过去。
+      ".dru-dual{margin-top:10px;background:var(--dru-surface-2);border:1px solid var(--dru-border);border-left:3px solid var(--dru-accent);border-radius:8px;padding:11px 12px}",
+      ".dru-dual-title{font-size:13px;font-weight:700;color:var(--dru-fg);line-height:1.5}",
+      ".dru-dual-sub{font-size:12.5px;line-height:1.65;color:var(--dru-fg-muted);margin-top:3px}",
+      // 窄屏（手机）自动上下堆叠；每个按钮都独占一行，绝不缩到点不中
+      ".dru-dual-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}",
+      ".dru-dual-actions .dru-btn{flex:1 1 210px}",
+      ".dru-dual-note{font-size:12px;line-height:1.65;color:var(--dru-fg-muted);margin-top:8px}",
+      ".dru-dual-note b{color:var(--dru-fg)}",
+      // 三步走（① 复制专属链接 → ② 发给还没注册过的新用户 → ③ 对方上线即到账）
+      ".dru-steps{margin:10px 0 0;padding:0;list-style:none;counter-reset:dru-step}",
+      ".dru-steps li{position:relative;padding-left:26px;font-size:12.5px;line-height:1.7;color:var(--dru-fg-muted);margin-bottom:7px}",
+      ".dru-steps li:last-child{margin-bottom:0}",
+      ".dru-steps li::before{counter-increment:dru-step;content:counter(dru-step);position:absolute;left:0;top:2px;width:18px;height:18px;border-radius:50%;background:var(--dru-accent-fill);color:var(--dru-on-accent);font-size:11px;font-weight:700;line-height:18px;text-align:center}",
+      ".dru-steps b{color:var(--dru-fg)}",
+      // ── 🎁 邀请收益引导气泡（0.6.9）：把「带 N 位新用户 → 得 M 天 PRO」摆到按钮旁 ──
+      // 数字来自 public-config 的 invite_rule（见 inviteRuleOf），关闭态/取不到时不渲染。
+      // 交互克制：进入时一次 320ms 弹入（power1.out），之后每 4.5s 一次轻微呼吸（占空比 ~28%，不是持续闪烁）。
+      ".dru-tip-wrap{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:10px;max-width:100%;min-width:0}",
+      ".dru-tip{position:relative;display:flex;align-items:center;gap:9px;flex:1 1 260px;min-width:0;box-sizing:border-box;background:var(--dru-accent-tint);border:1px solid var(--dru-accent-tint-border);border-radius:10px;padding:9px 42px 9px 11px;font-size:12.5px;line-height:1.6;color:var(--dru-tip-fg);animation:dru-tip-in .32s cubic-bezier(.215,.61,.355,1) both}",
+      ".dru-tip b{color:var(--dru-tip-fg-strong);font-weight:700}",
+      ".dru-tip-ic{flex:none;font-size:16px;line-height:1;display:inline-block;transform-origin:50% 50%;animation:dru-tip-breathe 4.5s ease-in-out 1.2s infinite}",
+      ".dru-tip-close{position:absolute;top:4px;right:4px;width:30px;height:30px;display:flex;align-items:center;justify-content:center;padding:0;border:none;background:none;color:var(--dru-tip-fg);font-size:14px;line-height:1;cursor:pointer;border-radius:6px;font-family:inherit}",
+      // 视觉 30px，命中区补到 ≥44px（与 .dru-linkbtn 同一手法）
+      ".dru-tip-close::after{content:\"\";position:absolute;left:-7px;right:-7px;top:-7px;bottom:-7px}",
+      ".dru-tip-close:hover{background:var(--dru-accent-tint-2);color:var(--dru-tip-fg-strong)}",
+      "@keyframes dru-tip-in{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}",
+      "@keyframes dru-tip-breathe{0%,72%,100%{transform:scale(1)}82%{transform:scale(1.09)}}",
       // ── 📱 远程访问（一次性访问密钥 + 已授权设备管理） ──
       ".dru-access-flex{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-start;margin-top:10px}",
       ".dru-access-col{flex:1;min-width:230px;display:flex;flex-direction:column;gap:8px}",
-      ".dru-qr-img{width:180px;height:180px;flex:none;border-radius:8px;border:1px solid #d0d7de;background:#ffffff;object-fit:contain}",
-      ".dru-qr-ph{width:180px;height:180px;flex:none;border-radius:8px;border:1px dashed #d0d7de;background:#f6f8fa;color:#57606a;font-size:12px;display:flex;align-items:center;justify-content:center;text-align:center;padding:10px;box-sizing:border-box}",
+      ".dru-qr-img{width:180px;height:180px;flex:none;border-radius:8px;border:1px solid var(--dru-border);background:var(--dru-surface-2);object-fit:contain}",
+      ".dru-qr-ph{width:180px;height:180px;flex:none;border-radius:8px;border:1px dashed var(--dru-border);background:var(--dru-surface);color:var(--dru-fg-muted);font-size:12px;display:flex;align-items:center;justify-content:center;text-align:center;padding:10px;box-sizing:border-box}",
       ".dru-url.big{font-size:13.5px;font-weight:600}",
-      ".dru-cd{font-size:12px;color:#9a6700;margin-top:2px}",
-      ".dru-cd-ok{color:#1a7f37}",
-      ".dru-key-note{font-size:12px;color:#57606a;line-height:1.6}",
-      ".dru-dev{border:1px solid #eaeef2;border-radius:8px;background:#ffffff;padding:9px 11px;margin-bottom:8px}",
+      ".dru-cd{font-size:12px;color:var(--dru-warn);margin-top:2px}",
+      ".dru-cd-ok{color:var(--dru-success)}",
+      ".dru-key-note{font-size:12px;color:var(--dru-fg-muted);line-height:1.6}",
+      ".dru-dev{border:1px solid var(--dru-border-soft);border-radius:8px;background:var(--dru-surface-2);padding:9px 11px;margin-bottom:8px}",
       ".dru-dev-top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}",
-      ".dru-dev-name{font-size:13px;font-weight:600;color:#1f2328;flex:1;min-width:130px}",
-      ".dru-dev-meta{font-size:11.5px;color:#57606a}",
-      ".dru-dev-sub{font-size:11.5px;color:#57606a;margin-top:4px}",
-      ".dru-dev-tag{font-size:11.5px;color:#57606a;border:1px solid #d0d7de;border-radius:999px;padding:0 7px;flex:none;white-space:nowrap}",
-      ".dru-dev-tag-off{color:#cf222e;border-color:#ffb3b6;background:#fff0f1}",
+      ".dru-dev-name{font-size:13px;font-weight:600;color:var(--dru-fg);flex:1;min-width:130px}",
+      ".dru-dev-meta{font-size:11.5px;color:var(--dru-fg-muted)}",
+      ".dru-dev-sub{font-size:11.5px;color:var(--dru-fg-muted);margin-top:4px}",
+      ".dru-dev-tag{font-size:11.5px;color:var(--dru-fg-muted);border:1px solid var(--dru-border);border-radius:999px;padding:0 7px;flex:none;white-space:nowrap}",
+      ".dru-dev-tag-off{color:var(--dru-danger);border-color:var(--dru-danger-border);background:var(--dru-danger-soft)}",
       // Phase-5:端到端加密(E2EE)状态行 —— 启用=绿字绿点,未启用=灰字(纯文字状态行,不打扰)
-      ".dru-e2ee-line{display:flex;align-items:center;gap:7px;margin-top:6px;font-size:12px;line-height:1.5;color:#57606a}",
-      ".dru-e2ee-line.ok{color:#1a7f37}",
+      ".dru-e2ee-line{display:flex;align-items:center;gap:7px;margin-top:6px;font-size:12px;line-height:1.5;color:var(--dru-fg-muted)}",
+      ".dru-e2ee-line.ok{color:var(--dru-success)}",
       // 侧栏「远程访问」快捷按钮(2026-09 恢复注入,与官方「设置」按钮共存不遮挡):
       // 独立 button(非 clone),插在官方「设置」按钮之前,同源同布局不覆盖官方热区。
-      ".dru-nav-remote{display:inline-flex;align-items:center;gap:6px;height:30px;margin:0 0 2px;padding:0 10px;border:1px solid #d0d7de;border-radius:8px;background:#ffffff;color:#0969da;font:500 12.5px/1 inherit;cursor:pointer;white-space:nowrap;user-select:none}",
-      ".dru-nav-remote:hover:not(:disabled){background:#f0f6ff;border-color:#0969da}",
-      ".dru-nav-remote-dot{position:absolute;top:-2px;right:-2px;width:8px;height:8px;border-radius:50%;background:#e5484d;box-shadow:0 0 0 2px #fff;pointer-events:none}",
+      ".dru-nav-remote{display:inline-flex;align-items:center;gap:6px;height:30px;margin:0 0 2px;padding:0 10px;border:1px solid var(--dru-border-ctl);border-radius:8px;background:var(--dru-surface-2);color:var(--dru-accent);font:500 12.5px/1 inherit;cursor:pointer;white-space:nowrap;user-select:none}",
+      ".dru-nav-remote:hover:not(:disabled){background:var(--dru-accent-tint-2);border-color:var(--dru-accent)}",
+      ".dru-nav-remote-dot{position:absolute;top:-2px;right:-2px;width:8px;height:8px;border-radius:50%;background:var(--dru-reddot);box-shadow:0 0 0 2px var(--dru-surface-2);pointer-events:none}",
       // 侧栏入口与官方按钮同高（30px）；用 ::after 把命中区补到 ≥44px，不破坏与原按钮的对齐
       ".dru-nav-remote::after{content:\"\";position:absolute;left:0;right:0;top:-7px;bottom:-7px}",
       // ── 无障碍基线（0.6.9）────────────────────────────────────────────────
       // 键盘焦点必须可见：放在样式表末尾，覆盖上面任何 outline:none（同特异性后者胜）
-      ".dru-settings-section :focus-visible,.dru-popup :focus-visible{outline:2px solid #0969da;outline-offset:2px}",
+      ".dru-settings-section :focus-visible,.dru-popup :focus-visible{outline:2px solid var(--dru-focus);outline-offset:2px}",
       ".dru-settings-section [role=\"region\"]:focus-visible{outline-offset:-2px}",
-      ".dru-btn:focus-visible,.dru-copy-btn:focus-visible,.dru-tab:focus-visible,.dru-disclose:focus-visible{outline:2px solid #0969da;outline-offset:2px;box-shadow:0 0 0 4px rgba(9,105,218,.18)}",
-      // 尊重系统「减少动态效果」：关掉过渡与旋转动画（状态文字照常更新）
+      ".dru-btn:focus-visible,.dru-copy-btn:focus-visible,.dru-tab:focus-visible,.dru-disclose:focus-visible{outline:2px solid var(--dru-focus);outline-offset:2px;box-shadow:0 0 0 4px var(--dru-focus-halo-2)}",
+      ".dru-tip-close:focus-visible{outline:2px solid var(--dru-focus);outline-offset:1px}",
+      ".dru-nav-remote:focus-visible{outline:2px solid var(--dru-focus);outline-offset:2px}",
+      // 尊重系统「减少动态效果」：关掉过渡与旋转动画（状态文字照常更新）。
+      // 🎁 引导气泡在这条下**完全不动**（静态显示），符合「reduce 时没有动效」的要求。
       "@media (prefers-reduced-motion: reduce){",
       "  .dru-btn,.dru-copy-btn,.dru-tab,.dru-disclose,.dru-invite-bar-fill,.dru-nav-remote,.dru-input,.dru-fb-tab,.dru-popup-rate button{transition:none !important}",
-      "  .dru-spin{animation:none !important;border-top-color:#0969da}",
+      "  .dru-spin{animation:none !important;border-top-color:var(--dru-accent)}",
+      "  .dru-tip{animation:none !important}",
+      "  .dru-tip-ic{animation:none !important}",
       "}",
       // 窄屏（手机竖屏打开本机面板）：卡片内边距收紧、代码/链接不溢出
       "@media (max-width:520px){",
@@ -256,9 +412,136 @@ window.__ModuleLoader__.load({
       "  .dru-invite-hero{font-size:18px}",
       "  .dru-copy-box{flex-direction:column;align-items:stretch}",
       "  .dru-copy-btn{width:100%}",
+      // 气泡独占一行，绝不把按钮挤到屏幕外（320px 下也不横向滚动）
+      "  .dru-tip{flex:1 1 100%;padding:9px 40px 9px 10px;font-size:12px}",
       "}",
     ].join("\n");
     document.head.appendChild(styleEl);
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 🎨 主题跟随（深色 / 亮色）—— 解析宿主信号，实时跟随，不污染宿主
+    // ──────────────────────────────────────────────────────────────────────
+    /**
+     * 宿主表达「深色」的**实测信号**（2026-09 在本机 GUI http://127.0.0.1:3080 用 headless
+     * Chromium + CDP 实读，不是猜的）：
+     *
+     *   ① `document.body` 上的属性 **`data-ds-dark-theme`** —— **存在即深色**，值恒为空串。
+     *      宿主写的是 `document.body.toggleAttribute('data-ds-dark-theme', dark)`，
+     *      **不是** `data-theme="dark"`、也不是 `class="dark"`。
+     *   ② `document.documentElement.style.colorScheme` = `'dark' | 'light'` —— **两种模式都会写**，
+     *      所以它同时能表达「浅色」，是判断「宿主是否已经表态」的可靠依据。
+     *
+     * 实测证据：在真实 GUI 里把 ① 翻成存在、并把 ② 写成 'dark' 之后（这正是宿主 ThemePresenter
+     * 的两行原文），`getComputedStyle(document.body).backgroundColor` 由 `rgb(255,255,255)`
+     * 变成 `rgb(21,21,23)`，`--dsw-alias-bg-base` 由 `#fff` 变成 `#151517`，
+     * `--dsw-alias-label-primary` 由 `#0f1115` 变成 `#f9fafb` —— 整套宿主题跟着切。还原后回到亮色。
+     *
+     * 出处（宿主自己的代码，非第三方猜测）：
+     *   · `@deepseek-ai/dsh-client-ui-theme/lib/index.js` 的 bootThemeScript()：
+     *       `document.documentElement.style.colorScheme = dark ? 'dark' : 'light'`
+     *       `document.body.toggleAttribute('data-ds-dark-theme', dark)`
+     *   · `@deepseek-ai/dsh-client-ui-layout` 的 ThemePresenter（运行期同两处 DOM 写入，
+     *     `DARK_ATTRIBUTE = "data-ds-dark-theme"`）
+     *
+     * ⚠️ `prefers-color-scheme` **不是**宿主的表达方式 —— 宿主只在用户选「跟随系统」时才看它
+     *    （偏好存 `~/.dsh/settings.yaml` 的 `ui-theme.preference`，本机实测 `light`；
+     *     实测该环境下 `matchMedia('(prefers-color-scheme: dark)').matches === false`，
+     *     而用户在 GUI 里切换主题**根本不会**改变它）。所以这里把它**只当兜底**：
+     *     宿主没表态（非 DSH 宿主、boot 脚本未执行）时才退回系统偏好。
+     */
+    var DARK_ATTR = "data-ds-dark-theme";
+    var THEME_MQ = "(prefers-color-scheme: dark)";
+    /** 读宿主当前主题：'dark' | 'light'。任何异常都退回 'light'（绝不把面板打挂）。 */
+    function resolveTheme() {
+      try {
+        var body = document && document.body;
+        if (body && typeof body.hasAttribute === "function" && body.hasAttribute(DARK_ATTR)) return "dark";
+        var de = document && document.documentElement;
+        var cs = de && de.style ? String(de.style.colorScheme || "").trim().toLowerCase() : "";
+        if (cs === "dark") return "dark";
+        if (cs === "light") return "light";
+        // 宿主没表态 → 系统偏好兜底（`matchMedia` 在 node 测试沙箱里不存在，故双重探测）
+        var mq = typeof matchMedia === "function" ? matchMedia(THEME_MQ) : null;
+        if (!mq && typeof window !== "undefined" && window && typeof window.matchMedia === "function") mq = window.matchMedia(THEME_MQ);
+        if (mq && typeof mq.matches === "boolean") return mq.matches ? "dark" : "light";
+      } catch (e) { /* 忽略：判定失败一律按亮色 */ }
+      return "light";
+    }
+    /**
+     * 主题外部存储：面板根/弹窗用 useSyncExternalStore 订阅，侧栏按钮用 themeApplyToNav 直改。
+     * 用「存储 + 订阅」而不是 useState，是因为侧栏入口挂在面板之外、生命周期也更长。
+     */
+    var themeState = { value: null, subs: [], obs: null, mq: null, watching: false, navEl: null };
+    function themeGet() {
+      if (themeState.value === null) themeState.value = resolveTheme();
+      return themeState.value;
+    }
+    function themeApplyToNav() {
+      try {
+        var el = themeState.navEl || document.getElementById(NAV_ENTRY_ID);
+        if (el && el.setAttribute) el.setAttribute("data-dru-theme", themeGet());
+      } catch (e) { /* 忽略 */ }
+    }
+    function themeSubscribe(fn) {
+      if (typeof fn !== "function") return function () {};
+      themeState.subs.push(fn);
+      themeStartWatch();
+      return function () {
+        var i = themeState.subs.indexOf(fn);
+        if (i >= 0) themeState.subs.splice(i, 1); // 组件卸载即退订，不泄漏
+      };
+    }
+    /** 重算主题；变了才通知订阅者（避免无谓重渲染）。 */
+    function themeRecompute() {
+      var next = resolveTheme();
+      if (next === themeState.value) return;
+      themeState.value = next;
+      themeApplyToNav();
+      var subs = themeState.subs.slice();
+      for (var i = 0; i < subs.length; i++) { try { subs[i](); } catch (e) { /* 单个订阅者异常不影响其它 */ } }
+    }
+    /**
+     * 开始监听主题变化（幂等）。两个信号源：
+     *   · MutationObserver：观察 `<body>` 的属性（data-ds-dark-theme 是属性）+ `<html>` 的
+     *     style（color-scheme 写在 html 的内联 style 上）—— 宿主切换时两者都会变；
+     *   · matchMedia 的 change 事件：兜底路径（跟随系统）时才会用上。
+     * 用户可能在面板开着的时候切主题，所以**必须**实时重算，不能只在加载时判一次。
+     */
+    function themeStartWatch() {
+      if (themeState.watching) return;
+      themeState.watching = true;
+      try {
+        var obs = new MutationObserver(function () { themeRecompute(); });
+        if (document.body) obs.observe(document.body, { attributes: true, attributeFilter: [DARK_ATTR, "class", "style"] });
+        if (document.documentElement) obs.observe(document.documentElement, { attributes: true, attributeFilter: [DARK_ATTR, "class", "style"] });
+        themeState.obs = obs;
+      } catch (e) { /* 忽略：没有 MutationObserver 时仍靠 matchMedia 与首帧判定 */ }
+      try {
+        var mq = typeof matchMedia === "function" ? matchMedia(THEME_MQ) : null;
+        if (!mq && typeof window !== "undefined" && window && typeof window.matchMedia === "function") mq = window.matchMedia(THEME_MQ);
+        if (mq) {
+          if (typeof mq.addEventListener === "function") mq.addEventListener("change", themeRecompute);
+          else if (typeof mq.addListener === "function") mq.addListener(themeRecompute);
+          themeState.mq = mq;
+        }
+      } catch (e) { /* 忽略 */ }
+      try { if (window && window.addEventListener) window.addEventListener("pagehide", themeStopWatch); } catch (e) {}
+      themeRecompute();
+    }
+    /** 停止监听并释放资源（页面卸载时调用；订阅者仍在时下次 subscribe 会自动重启）。 */
+    function themeStopWatch() {
+      try { if (themeState.obs) themeState.obs.disconnect(); } catch (e) {}
+      themeState.obs = null;
+      try {
+        if (themeState.mq) {
+          if (typeof themeState.mq.removeEventListener === "function") themeState.mq.removeEventListener("change", themeRecompute);
+          else if (typeof themeState.mq.removeListener === "function") themeState.mq.removeListener(themeRecompute);
+        }
+      } catch (e) {}
+      themeState.mq = null;
+      try { if (window && window.removeEventListener) window.removeEventListener("pagehide", themeStopWatch); } catch (e) {}
+      themeState.watching = false;
+    }
 
     // ── 首次安装引导小红点（设置页「远程访问」栏目，localStorage 控制） ────
     // 无 dsh-remote-seen-dot key 视为首次：在设置页导航栏目右上角显示 CSS 圆点；
@@ -280,6 +563,23 @@ window.__ModuleLoader__.load({
         window.__dshRemoteDotObs = null;
       }
       window.__dshRemoteDotWatch = false;
+    }
+
+    // ── 🎁 邀请收益引导气泡的「已关闭」记忆 ─────────────────────────────────
+    // 键名沿用本插件的统一前缀 dsh-remote-（与 dsh-remote-seen-dot 一致）。
+    // 用户关过一次就永久记住，不再每次进面板都骚扰；localStorage 不可用（隐私模式/被禁）
+    // 时 read 返回 false 但不会抛 —— 读不到就当作「没关过」，宁可多显示一次也不报错。
+    var INVITE_TIP_KEY = "dsh-remote-invite-tip-dismissed-v1";
+    // 气泡的 DOM id：触发按钮用 aria-describedby 指向它（同一屏只此一处）
+    var INVITE_TIP_ID = "dru-invite-tip";
+    // ⚠️ 命名注意：这两个函数名**不能**叫 inviteTipDismissed —— 组件里有一个同名的 `var`
+    //    （useState 值）。`var` 会提升并遮蔽整个函数体，连 `useState(inviteTipWasDismissed())`
+    //    的参数都会被解析成那个尚未赋值的局部 var（undefined），导致「已关闭」记忆失效。
+    function inviteTipWasDismissed() {
+      try { return localStorage.getItem(INVITE_TIP_KEY) === "1"; } catch (e) { return false; }
+    }
+    function inviteTipDismiss() {
+      try { localStorage.setItem(INVITE_TIP_KEY, "1"); } catch (e) { /* 忽略 */ }
     }
     /** 给单个设置页导航栏目按钮挂红点（幂等）。 */
     function dotInject(cell) {
@@ -390,6 +690,12 @@ window.__ModuleLoader__.load({
         btn.id = NAV_ENTRY_ID;
         btn.className = "dru-nav-remote";
         btn.setAttribute("data-dru-remote", "1");
+        // 🎨 侧栏入口在面板之外，拿不到面板根上的令牌 → 自己也挂一份主题属性
+        btn.setAttribute("data-dru-theme", themeGet());
+        themeState.navEl = btn;
+        // 入口常驻，所以它自己就是主题观察器的一个订阅者：
+        // 用户切深色时（哪怕面板没开着）这里也要立刻跟上。
+        themeStartWatch();
         btn.title = "打开「远程访问」设置(快捷入口)";
         btn.style.position = "relative";
         btn.textContent = "📱 远程访问";
@@ -563,7 +869,7 @@ window.__ModuleLoader__.load({
       if (m < 60) return m + " 分 " + (s % 60 < 10 ? "0" : "") + (s % 60) + " 秒";
       return Math.floor(m / 60) + " 小时 " + (m % 60 < 10 ? "0" : "") + (m % 60) + " 分";
     }
-    /** 手机号掩码（邀请记录里的好友手机号：面板只展示掩码，完整号码留在服务端）。 */
+    /** 手机号掩码（邀请记录里的新用户手机号：面板只展示掩码，完整号码留在服务端）。 */
     function maskPhoneLike(v) {
       var s = String(v == null ? "" : v).trim();
       if (!s) return "";
@@ -592,12 +898,72 @@ window.__ModuleLoader__.load({
     var connFailRef = { v: 0 };
     var CONN_FAIL_VISIBLE = 3; // ≈ 2.5s × 3：既要够快让用户看见，又要避免一次抖动就报红
     /**
-     * 「连接偏慢」的本地观察起点（0 = 不慢）——用于在用户干等时给一个轻量邀请入口。
+     * 「连接偏慢」的本地观察起点（0 = 不慢）——用于在用户干等时给出「转化 or 拉新」双路块。
      * 只用既有 /dsh-remote/bridge-status 下发字段 + 本地计时，**不新增也不假设后端字段**；
      * 观察不到就永远不显示（宁可不出现，也不误报）。
      */
     var slowConnTrack = { since: 0 };
     var SLOW_CONNECT_HINT_MS = 90000; // 非 online 阶段持续 90s 才认为「明显偏慢」
+    // ── 事实口径常量（🔒 只写线上真值，一个字都不编）─────────────────────────────
+    // 邀请奖励：线上 public-config 下发 invite_rule { n: 1, days: 3 }。
+    //   此处只在 public-config 取不到时（旧 node 半 / 请求失败）兜底，
+    //   用「与线上一致」的值，避免面板显示 3 位/15 天这种和线上对不上的旧口径。
+    //   注意：被邀请人**没有任何额外奖励**（trial_days = 0），所以禁止任何「双方都得」的写法。
+    var INVITE_RULE_FALLBACK = { n: 1, days: 3 };
+    // ── 套餐口径：**先读线上真形状** ─────────────────────────────────────────
+    // 线上实测（GET https://n.risegao.cn:13443/relay-api/api/public-config）：
+    //   plans.free    = { max_mbps: 1,  monthly_gb: 1 }
+    //   plans.pro     = { max_mbps: 5,  monthly_gb: 20, devices: 1,  monthly_resets: 5 }
+    //   plans.pro_max = { max_mbps: 10, monthly_gb: 60, devices: 10, online: 3 }
+    //   prices        = { pro: 20, pro_max: 30, ... }   ← 价格在**另一个**顶层字段；plans 里没有价格
+    // 所以：带宽读 plans[k].max_mbps、流量读 plans[k].monthly_gb、价格读 prices[k]。
+    // ⚠️ 早期版本检测的是 { mbps, gb, price } —— 线上这三个键**都不存在**，
+    //    于是特性检测永远不命中、面板一直用常量。现在真形状优先，旧形状只作兼容兜底。
+    // PLAN_FACTS 仅在**字段缺失或非法**时兜底（值仍与线上一致：PRO ¥20/月 5 Mbps 20 GB）。
+    var PLAN_FACTS = {
+      pro: { mbps: 5, gb: 20, price: 20, name: "PRO" },
+      pro_max: { mbps: 10, gb: 60, price: 30, name: "Pro Max" }
+    };
+    /** 免费档口径（与 PLAN_FACTS 同源）：仅在服务端没下发 plans.free 时兜底。 */
+    var FREE_FACTS = { mbps: 1, gb: 1 };
+    /**
+     * 取第一个**合法数值**：未定义 / null / 空串 / 非数字 → 跳到下一个候选。
+     * 全都没命中 → null（由调用方决定兜底）。
+     *
+     * 🔒 刻意**不用** `Number(x) > 0 ? x : 兜底`：`monthly_gb: 0`（可能表示「不限流量」）
+     *    与 `prices.pro: 0`（免费档）都是**合法值**，`> 0` 会把它们吃掉 ——
+     *    这与后端 `|| 3 / || 15` 是同一类 bug（0 被当成「没配」）。
+     *    这里只判「缺没缺」，不判「大不大」。
+     */
+    function firstNum(candidates) {
+      for (var i = 0; i < candidates.length; i++) {
+        var raw = candidates[i];
+        if (raw === undefined || raw === null || raw === "") continue;
+        var n = Number(raw);
+        if (isFinite(n)) return n;
+      }
+      return null;
+    }
+    /**
+     * 拉新是否被**显式关闭**：public-config.invite_rule 的 n / days 配成 0（或负数）= 关闭拉新
+     * （与 `trial_days = 0 = 关闭` 同一约定）。关闭后所有拉新入口与卡片整体隐藏 ——
+     * 既不显示「每 0 位新用户 → 0 天」，也不留一个点进去没内容的入口。
+     *
+     * 🔒 这里必须**只看原始值**：不能先过 `Number(x) > 0 ? x : 兜底` 那一层，
+     * 否则 0 会被兜底值吃掉（后端那个 `|| 3 / || 15` 的 bug 就是这么把关闭态吃成「每 3 人送 15 天」的）。
+     *
+     * 返回 false（＝按显示处理）的情况：public-config 取不到、invite_rule 缺失、字段缺失或非数字
+     * —— 判断不了就别把功能藏掉（向后兼容旧 node 半）。
+     */
+    function inviteOffFrom(rule) {
+      if (!rule || typeof rule !== "object") return false;
+      var nRaw = rule.n, dRaw = rule.days;
+      var nNum = Number(nRaw), dNum = Number(dRaw);
+      var present = function (raw) { return raw !== undefined && raw !== null && raw !== ""; };
+      var nOff = present(nRaw) && isFinite(nNum) && nNum <= 0;
+      var dOff = present(dRaw) && isFinite(dNum) && dNum <= 0;
+      return !!(nOff || dOff);
+    }
     /** 连接阶段轮询节奏：未连通时 2.5s（自动推进），已连接后退避到 15s；页面隐藏时完全停下。 */
     var CONN_POLL_FAST_MS = 2500;
     var CONN_POLL_SLOW_MS = 15000;
@@ -1003,6 +1369,9 @@ window.__ModuleLoader__.load({
     }
 
     function FeedbackPopup() {
+      // 🎨 主题：弹窗是 shell.overlay 下的独立根（不在 .dru-settings-section 里），
+      // 同样要拿一份 data-dru-theme 才有深色令牌；放在 useState 之前不扰动 hook 序号。
+      var theme = useSyncExternalStore(themeSubscribe, themeGet);
       var open = usePopupOpen();
       var stepArr = useState("rate"); var step = stepArr[0]; var setStep = stepArr[1];
       var ratingArr = useState(null); var rating = ratingArr[0]; var setRating = ratingArr[1];
@@ -1023,7 +1392,19 @@ window.__ModuleLoader__.load({
           if (!acct || !acct.invite_code) { setPopupInvite({ code: "" }); return; }
           api("/dsh-remote/remote-url").then(function (u) {
             var base = (u && u.remoteUrl) || "https://n.risegao.cn:13443/app/";
-            setPopupInvite({ code: acct.invite_code, link: base.replace(/\/+$/, "") + "/?invite=" + encodeURIComponent(acct.invite_code) });
+            // 特性检测：public-config 里带了 invite_rule 就用服务端数值；没带 → 0 = 不显示具体数字。
+            // 🔒 用 firstNum 只判「缺没缺」：`n/days` 配成 0 是合法的「活动关闭」态，
+            //    不能被 `> 0` 这样写吃掉再回落成 1/3（后端 `|| 3 / || 15` 的同款坑）。
+            var pc = (u && u.publicConfig) || null;
+            var raw = (pc && pc.invite_rule) || null;
+            var nNum = firstNum([raw && raw.n]);
+            var dNum = firstNum([raw && raw.days]);
+            setPopupInvite({
+              code: acct.invite_code,
+              link: base.replace(/\/+$/, "") + "/?invite=" + encodeURIComponent(acct.invite_code),
+              n: nNum === null ? 0 : nNum,
+              days: dNum === null ? 0 : dNum
+            });
           }).catch(function () { setPopupInvite({ code: acct.invite_code }); });
         }).catch(function () { setPopupInvite({ code: "" }); });
       }
@@ -1035,6 +1416,13 @@ window.__ModuleLoader__.load({
         api("/dsh-remote/feedback-config").then(function (b) {
           setFbAuth(b.auth === "account" ? "account" : "anonymous");
         }).catch(function () { setFbAuth("anonymous"); });
+        // 拉新关闭态探测（public-config 的 invite_rule.n / days = 0 = 关闭）：
+        // 只有明确读到「关闭」才记下来 —— 读不到/字段缺失一律不记（判断不了 → 按显示处理）。
+        // 命中关闭时复用 popupInvite 这个既有 state 触发重渲染，同时挡住后面的取码/取链接请求。
+        api("/dsh-remote/remote-url").then(function (u) {
+          var pc = (u && u.publicConfig) || null;
+          if (inviteOffFrom(pc && pc.invite_rule)) setPopupInvite({ code: "", link: "", inviteOff: true });
+        }).catch(function () {});
         // eslint-disable-next-line react-hooks/exhaustive-deps
       }, [open]);
 
@@ -1065,7 +1453,7 @@ window.__ModuleLoader__.load({
           .finally(function () { setBusy(""); });
       };
 
-      return h("div", { className: "dru-popup", onMouseDown: function (e) { if (e.target === e.currentTarget) fbPopupLater(); } },
+      return h("div", { className: "dru-popup", "data-dru-theme": theme, onMouseDown: function (e) { if (e.target === e.currentTarget) fbPopupLater(); } },
         h("div", { className: "dru-popup-card", role: "dialog", "aria-label": "用户反馈" },
           h("div", { className: "dru-popup-body" },
             step === "rate"
@@ -1092,11 +1480,22 @@ window.__ModuleLoader__.load({
               : h("div", null,
                   h("div", { className: "dru-popup-icon" }, "🤝"),
                   h("div", { className: "dru-popup-title" }, "愿意推荐给朋友吗？"),
-                  h("div", { className: "dru-popup-sub" }, "邀请好友一起使用，双方都能获得更好的体验"),
+                  // 拉新关闭态：不承诺任何奖励、不指路邀请页（入口与卡片也一并隐藏）。
+                  // 但这一步**整块保留**（否则 recommend 永远为 null，「完成」按钮不出现＝死胡同）。
+                  popupInvite && popupInvite.inviteOff
+                    ? h("div", { className: "dru-popup-sub" },
+                        "（当前没有推荐奖励活动：带新用户换会员时长已暂时关闭，把 App 分享给朋友就好。）")
+                    // 交换句式（不能说「双方都得」：被邀请人没有任何额外奖励，trial_days = 0）
+                    : h("div", { className: "dru-popup-sub" },
+                        popupInvite && popupInvite.n && popupInvite.days
+                          ? "带 " + popupInvite.n + " 位新用户 → 你得 " + popupInvite.days + " 天 PRO 会员：对方用你的邀请链接注册新账号 + 在电脑上装好并上线后自动到账。"
+                          : "带新用户 → 你得会员时长：对方用你的邀请链接注册新账号 + 在电脑上装好 dsh-remote-web 并上线后自动到账（奖励只发给邀请人）。"),
                   recommend === true
                     ? h("div", { className: "dru-popup-invite" },
                         h("div", null, "🎉 感谢推荐！"),
-                        popupInvite && popupInvite.code && popupInvite.link
+                        popupInvite && popupInvite.inviteOff
+                          ? h("div", { style: { marginTop: 6, fontSize: 12 } }, "当前未开放带新用户换会员时长的活动，暂时不需要邀请链接。")
+                          : popupInvite && popupInvite.code && popupInvite.link
                           ? h("div", null,
                               h("div", { className: "dru-url", style: { marginTop: 10, textAlign: "left" } },
                                 h("span", null, popupInvite.link),
@@ -1107,19 +1506,21 @@ window.__ModuleLoader__.load({
                                   });
                                 } }, inviteCopied ? "已复制" : "复制邀请链接")
                               ),
-                              h("div", { style: { marginTop: 8, fontSize: 12 } }, "把链接发给好友，注册时自动带上你的邀请码。")
+                              h("div", { style: { marginTop: 8, fontSize: 12 } }, "把链接发给一位还没注册过的新用户，对方注册时会自动带上你的邀请码。")
                             )
                           : h("div", { style: { marginTop: 6, fontSize: 12 } },
                               popupInvite && popupInvite.code
-                                ? "邀请码 " + popupInvite.code + " 已生成：在设置面板 →「🎯 邀请好友，一起用远程访问」里复制邀请链接。"
-                                : "登录手机号账号后，在设置面板 →「🎯 邀请好友，一起用远程访问」里获取专属邀请链接。")
+                                ? "邀请码 " + popupInvite.code + " 已生成：在设置面板 →「🎁 带新用户，换会员时长」里复制邀请链接。"
+                                : "登录手机号账号后，在设置面板 →「🎁 带新用户，换会员时长」里获取专属邀请链接。")
                       )
                     : h("div", null,
                         h("div", { className: "dru-popup-actions" },
                           h("button", { type: "button", className: "dru-btn dru-btn-primary", onClick: function () { setRecommend(true); loadPopupInvite(); } }, "愿意推荐"),
                           h("button", { type: "button", className: "dru-btn dru-btn-ghost", onClick: function () { setRecommend(false); } }, "暂时不了")
                         ),
-                        h("div", { className: "dru-hint", style: { marginTop: 10 } }, "推荐成功可获得专属邀请链接")
+                        popupInvite && popupInvite.inviteOff
+                          ? null
+                          : h("div", { className: "dru-hint", style: { marginTop: 10 } }, "推荐成功可获得你的专属邀请链接（带新用户换会员时长）")
                       ),
                   message && h("div", { className: "dru-msg dru-msg-" + message.kind }, message.text),
                   recommend !== null && h("div", { className: "dru-popup-actions" },
@@ -1509,6 +1910,10 @@ window.__ModuleLoader__.load({
     // 匿名装机统计的「面板打开」只上报一次/每页（node 半还会每进程去重）。
     var panelOpenedSent = false;
     function RemoteControlSection(props) {
+      // 🎨 主题（宿主深色/亮色）：订阅外部存储 → 宿主切换时本组件自动重渲染，
+      // 根节点上的 data-dru-theme 随之更新，整套 --dru-* 令牌实时切换。
+      // 放在全部 useState 之前：不改变既有 hook 序号（useSyncExternalStore 与 useState 各自计数）。
+      var theme = useSyncExternalStore(themeSubscribe, themeGet);
 
       var statusArr = useState(null); var st = statusArr[0]; var setSt = statusArr[1];
       var modeArr = useState("saas"); var mode = modeArr[0]; var setMode = modeArr[1];   // saas | local
@@ -1581,12 +1986,15 @@ window.__ModuleLoader__.load({
       var connArr = useState(null); var conn = connArr[0]; var setConn = connArr[1];
       var copiedDiagArr = useState(false); var copiedDiag = copiedDiagArr[0]; var setCopiedDiag = copiedDiagArr[1];
 
-      // ── 🎯 邀请视图（0.6.9 重排）状态：放在全部既有字段之后，保持既有 hook 序号不变 ──
+      // ── 🎁 邀请视图（带新用户换会员）状态：放在全部既有字段之后，保持既有 hook 序号不变 ──
       var invLoadArr = useState(false); var inviteLoading = invLoadArr[0]; var setInviteLoading = invLoadArr[1]; // 记录/规则读取中
       var invErrArr = useState(null); var inviteErr = invErrArr[0]; var setInviteErr = invErrArr[1];             // 记录读取失败原因（≠空记录）
       var invRulesArr = useState(false); var inviteRulesOpen = invRulesArr[0]; var setInviteRulesOpen = invRulesArr[1]; // 活动规则默认折叠
       var invCopyArr = useState(""); var inviteCopied = invCopyArr[0]; var setInviteCopied = invCopyArr[1];      // "" | "code" | "link"（复制成功反馈）
       var invCopyErrArr = useState(null); var inviteCopyErr = invCopyErrArr[0]; var setInviteCopyErr = invCopyErrArr[1]; // 复制失败原因（就近提示）
+      // 🎁 邀请收益引导气泡的「已关闭」态（同样追加在末尾，不动既有 hook 序号）。
+      // 初值直接读 localStorage：已关闭过就不再出现，不闪一下再消失。
+      var tipDismissedArr = useState(inviteTipWasDismissed()); var inviteTipDismissed = tipDismissedArr[0]; var setInviteTipDismissed = tipDismissedArr[1];
 
       var refresh = useCallback(function () {
         setBusy("status");
@@ -2361,7 +2769,7 @@ window.__ModuleLoader__.load({
       /**
        * 拉取邀请视图数据：公共配置（邀请规则/试用天数）+ 我的邀请记录。
        * 【0.6.9 修正】记录拉取失败**不再静默当成"没有记录"**：否则用户会以为
-       * "好友明明装好了却没记上"。失败时记下原因，由列表位置给出「重试」。
+       * "新用户明明装好了却没记上"。失败时记下原因，由列表位置给出「重试」。
        */
       var loadInvite = function () {
         setInviteLoading(true);
@@ -2390,18 +2798,208 @@ window.__ModuleLoader__.load({
       var input = function (attrs) { return h("input", Object.assign({ className: "dru-input", type: "text" }, attrs)); };
       var card = function (title, children) { return h("div", { className: "dru-card" }, title ? h("h3", null, title) : null, children); };
       /**
-       * 轻量邀请入口（0.6.9）：额度将尽 / 连接偏慢时用的**文字链**层级入口——
-       * 与主 CTA（升级 PRO / 重试）并列但不抢焦点，不弹窗、不打断。
+       * 邀请奖励口径：优先 public-config 下发的 invite_rule，取不到才用与线上一致的兜底常量。
+       * off=true（n / days 被显式配成 0）表示拉新已关闭 → 所有拉新入口/卡片整体隐藏。
        */
-      function renderInviteLink(label, title) {
-        return h("button", {
-          type: "button",
-          className: "dru-linkbtn",
-          style: { margin: "0 4px" },
-          title: title || label,
-          disabled: busy !== "",
-          onClick: function () { setView("invite"); loadInvite(); }
-        }, label);
+      function inviteRuleOf() {
+        var raw = (pub && pub.invite_rule) || null;
+        var r = raw || {};
+        // 与 planFactsOf 同一套取值规则：**只判「缺没缺」，不判「大不大」**。
+        // n / days 配成 0 是「关闭」这一合法状态（下面 off 会置 true 并隐藏所有拉新入口），
+        // 绝不能用 `> 0` 把 0 吃掉再回落成 1/3 —— 那正是后端 `|| 3 / || 15` 的同款 bug。
+        var n = firstNum([r.n]);
+        var days = firstNum([r.days]);
+        return {
+          n: n === null ? INVITE_RULE_FALLBACK.n : n,
+          days: days === null ? INVITE_RULE_FALLBACK.days : days,
+          off: inviteOffFrom(raw)
+        };
+      }
+      /**
+       * 🎁 邀请收益引导气泡（0.6.9）。
+       *
+       * 要解决的问题（用户原话）：按钮只写了「带新用户换会员」四个字，**没有说清能拿到什么**
+       * —— 用户看不出点进去是「带 1 位新用户 → 得 3 天 PRO」。所以把收益摆到按钮旁边。
+       *
+       * 数字**全部来自后台** public-config 的 invite_rule（走 inviteRuleOf）：
+       *   · 关闭态（n / days 被配成 0）→ **不渲染**（活动都关了，再引导就是骗点击）；
+       *   · 取不到配置 → inviteRuleOf 已回落成与线上一致的 {n:1, days:3}；
+       *   · `0` 是合法值，绝不会被当成「取不到」再回落（见 inviteOffFrom 的注释）。
+       * 同一屏只在这里出现一次 —— 账号卡是邀请的唯一入口，别处不再重复放。
+       *
+       * 交互克制：进入时一次 320ms 弹入，之后每 4.5s 一次轻微呼吸（占空比 ~28%，不是持续闪烁）；
+       * 可关闭且关闭后永久记住（localStorage）；`prefers-reduced-motion: reduce` 下完全不动。
+       * 无障碍：整条是 role=status + aria-live=polite + aria-atomic 的**完整句子**
+       * （不播报裸数字）；触发按钮用 aria-describedby 指过来，聚焦即能听到收益。
+       */
+      function renderInviteTip() {
+        if (inviteTipDismissed) return null;
+        var r = inviteRuleOf();
+        if (r.off) return null; // 活动关闭 → 不引导
+        return h("div", { className: "dru-tip-wrap" },
+          h("div", {
+            className: "dru-tip",
+            id: INVITE_TIP_ID,
+            role: "status",
+            "aria-live": "polite",
+            "aria-atomic": "true"
+          },
+            h("span", { className: "dru-tip-ic", "aria-hidden": "true" }, "🎁"),
+            h("span", null,
+              "带 ", h("b", null, r.n + " 位新用户"), " → 你得 ", h("b", null, r.days + " 天 PRO")),
+            h("button", {
+              type: "button",
+              className: "dru-tip-close",
+              "aria-label": "关闭邀请奖励提示",
+              title: "不再提示",
+              onClick: function () { inviteTipDismiss(); setInviteTipDismissed(true); }
+            }, "✕")
+          )
+        );
+      }
+      /**
+       * 把 public-config 的套餐配置收敛成一份事实对象（**线上真形状优先**）。
+       *
+       * 取值顺序（每个字段各自独立回落，绝不因为一个字段缺失就把整份配置丢掉）：
+       *   mbps  ← plans[key].max_mbps → plans[key].mbps(旧形状) → PLAN_FACTS[key].mbps
+       *   gb    ← plans[key].monthly_gb → plans[key].gb(旧形状) → PLAN_FACTS[key].gb
+       *   price ← prices[key] → plans[key].price(旧形状) → PLAN_FACTS[key].price
+       * `fromServer` = 服务端确实下发了本档的套餐对象（→ 数字已权威，不再写相对说法）。
+       * name 只取本地常量：服务端不下发展示名，且它是 UI 文案不是配置。
+       */
+      function planFactsOf(key) {
+        var base = PLAN_FACTS[key] || PLAN_FACTS.pro;
+        var srvPlan = pub && pub.plans ? pub.plans[key] : null;
+        var srvPrices = pub && pub.prices ? pub.prices[key] : null;
+        var obj = srvPlan && typeof srvPlan === "object" ? srvPlan : null;
+        return {
+          name: base.name,
+          mbps: firstNum([obj && obj.max_mbps, obj && obj.mbps, base.mbps]),
+          gb: firstNum([obj && obj.monthly_gb, obj && obj.gb, base.gb]),
+          price: firstNum([srvPrices, obj && obj.price, base.price]),
+          fromServer: !!obj
+        };
+      }
+      /** 免费档带宽（用于「免费档的 N 倍」）：plans.free.max_mbps 优先，其次 quota.max_mbps，最后常量。 */
+      function freeMbpsOf() {
+        var srvFree = pub && pub.plans && pub.plans.free && typeof pub.plans.free === "object" ? pub.plans.free : null;
+        return firstNum([srvFree && srvFree.max_mbps, srvFree && srvFree.mbps, quota && quota.max_mbps, FREE_FACTS.mbps]);
+      }
+      /**
+       * 套餐规格文案（**先特性检测** pub.plans / pub.prices，取不到才走 PLAN_FACTS 常量）。
+       * 支持形态：字符串（整段规格文案）｜{ max_mbps, monthly_gb } + prices[key]（线上真形状）
+       *          ｜{ mbps, gb, price }（旧形状，兼容保留）。
+       * dimension="bandwidth" 时带带宽；服务端已下发本档数字 → **不再写**「免费档的 N 倍」相对说法
+       * （相对说法只在常量兜底时才有意义，否则会和权威数字并用自相矛盾）。
+       */
+      function planSpecText(key, dimension) {
+        var srvStr = pub && pub.plans ? pub.plans[key] : null;
+        if (typeof srvStr === "string" && srvStr) return srvStr;
+        var f = planFactsOf(key);
+        if (dimension !== "bandwidth") return f.gb + " GB/月，¥" + f.price + "/月";
+        var spec = f.mbps + " Mbps";
+        if (!f.fromServer) {
+          var freeMbps = freeMbpsOf();
+          var times = freeMbps && freeMbps > 0 ? Math.round(f.mbps / freeMbps) : 0;
+          if (times > 1) spec += "（免费档的 " + times + " 倍）";
+        }
+        return spec + " · " + f.gb + " GB/月，¥" + f.price + "/月";
+      }
+      /**
+       * 转化那条路的套餐键与文案（dimension = "size" 流量维度 | "bandwidth" 带宽维度，
+       * 后者用于「连接偏慢」场景）。免费 → 升 PRO；PRO → 升 Pro Max；Pro Max 无更高档 → null（只剩拉新路）。
+       * label / title 同源（都走 planSpecText），服务端下发了 pub.plans 也不会自相矛盾。
+       */
+      function upgradePath(dimension) {
+        var plan = account ? account.plan : "free";
+        var isMemberNow = plan === "pro" || plan === "pro_max";
+        var key = !isMemberNow ? "pro" : plan === "pro" ? "pro_max" : "";
+        if (!key) return null; // 已是 Pro Max：没有更高档，不显示「升级」这条
+        var name = planFactsOf(key).name; // 展示名只来自本地常量（服务端不下发）
+        var spec = planSpecText(key, dimension);
+        return {
+          key: key,
+          label: "🚀 升级 " + name + "：" + spec,
+          title: "升级到 " + name + "：" + spec + "（带登录态打开套餐页，会员流量按自然月计量）"
+        };
+      }
+      /**
+       * 🔀 转化 or 拉新（0.6.9）：在用户**正在疼**的时刻（免费额度将尽 / 已被限速 / 连接偏慢）
+       * 给一个明确二选一 —— 要么升级套餐（转化），要么带新用户换会员时长（拉新）。
+       *
+       * 与上一版的区别：两条路都是**真按钮**（.dru-btn，命中区 ≥44px、有 :focus-visible 焦点环），
+       * 不再是一行 12px 灰字文字链；拉新那条必须说清是**交换**（带 N 位新用户 → 得 M 天 PRO），
+       * 不能只说「邀请好友」。
+       *
+       * 事实口径（线上 public-config / 运营公布值，见文件顶部 PLAN_FACTS 注释）：
+       *   · 邀请：每 n 位**新用户** → 邀请人得 days 天 PRO（invite_rule {n:1, days:3}）
+       *   · 被邀请人**没有任何额外奖励**（trial_days = 0）→ 绝不写「双方都得」
+       *   · 计入条件：对方用你的链接**注册新账号** + 在电脑上**装好 dsh-remote-web 并上线**
+       *   · 会员按自然月计量：3 天是**会员时长**，不是流量（不写「3 天能拿 20GB」）
+       * kind = "quota"（额度将尽/已限速）| "slow"（连接偏慢，带宽维度措辞）
+       *
+       * 关闭态（invite_rule.n / days 配成 0）与单路收敛：
+       *   · 拉新关闭 → 不渲染拉新按钮，也不留空位；文案改成单路（标题/副句/说明同步收口）。
+       *   · 已是 Pro Max（没有更高档）→ 只剩拉新那一路，此时它接主 CTA 样式。
+       *   · 两路都没了（Pro Max + 拉新关闭）→ **整块返回 null**，不留一个空壳块。
+       */
+      function renderDualPath(kind) {
+        var r = inviteRuleOf();
+        var isSlow = kind === "slow";
+        // 慢 → 带宽维度措辞（5 Mbps / 免费档的 5 倍）；额度将尽 → 流量维度措辞（20 GB/月）
+        var up = upgradePath(isSlow ? "bandwidth" : "size");
+        var inviteOk = !r.off;
+        if (!up && !inviteOk) return null; // 两路都没有 → 整块不显示（会员 + 拉新关闭）
+        var twoWay = !!up && inviteOk;
+        var inviteLabel = "🎁 带 " + r.n + " 位新用户：换 " + r.days + " 天 PRO";
+        var inviteTitle = "带 " + r.n + " 位还没注册过的新用户（用你的链接注册 + 装好电脑端并上线）→ 你得 " + r.days + " 天 PRO";
+        var title = twoWay
+          ? (isSlow ? "⚡ 连接偏慢，两条路提升带宽" : "⚡ 免费额度将尽 / 已被限速，两条路接着用")
+          : up
+            ? (isSlow ? "⚡ 连接偏慢：升级带宽可以更快" : "⚡ 免费额度将尽 / 已被限速：升级套餐继续用")
+            : (isSlow ? "⚡ 连接偏慢：带新用户可换会员时长" : "⚡ 免费额度将尽 / 已被限速：带新用户可换会员时长");
+        var sub = twoWay
+          ? (isSlow
+              ? "免费档带宽有限：排队、跨网、高峰期会被限速，这是慢的主因。要么升级带宽，要么带新用户换会员时长。"
+              : "免费额度用完会被限速，继续用只有两条路：要么升级套餐，要么带一位新用户换会员时长。")
+          : up
+            ? (isSlow
+                ? "免费档带宽有限：排队、跨网、高峰期会被限速，这是慢的主因；升级带宽可直接改善。"
+                : "免费额度用完会被限速；升级套餐即可继续用（会员流量按自然月计量）。")
+            : "带一位还没注册过的新用户，换 " + r.days + " 天 PRO：对方用你的邀请链接注册新账号 + 在电脑上装好 dsh-remote-web 并上线后自动到账。";
+        return h("div", { className: "dru-dual" },
+          h("div", { className: "dru-dual-title" }, title),
+          h("div", { className: "dru-dual-sub" }, sub),
+          h("div", { className: "dru-dual-actions" },
+            // 转化路：带登录态打开套餐页，复用既有 openUpgradeAuth，不凭空造 URL
+            up
+              ? h("button", {
+                  type: "button",
+                  className: "dru-btn dru-btn-primary",
+                  disabled: busy !== "",
+                  title: up.title,
+                  onClick: openUpgradeAuth
+                }, busy === "upgrade" ? "生成链接中…" : up.label)
+              : null,
+            // 拉新路（关闭态整体不渲染）：必须能点，且必须是交换句式；只剩它一路时接主 CTA 样式
+            inviteOk
+              ? h("button", {
+                  type: "button",
+                  className: "dru-btn " + (up ? "dru-btn-ghost" : "dru-btn-primary"),
+                  disabled: busy !== "",
+                  title: inviteTitle,
+                  onClick: function () { setView("invite"); loadInvite(); }
+                }, inviteLabel)
+              : null),
+          // 交换说明只在拉新可用时出现（关闭态或纯升级态不该再讲拉新）
+          inviteOk
+            ? h("div", { className: "dru-dual-note" },
+                "拉新这条路是", h("b", null, "交换"), "：对方", h("b", null, "用你的邀请链接注册新账号"), "，并在电脑上",
+                h("b", null, "装好 dsh-remote-web 并上线"), "后，", h("b", null, r.days + " 天 PRO 自动到账"),
+                "；只有你得奖，对方没有额外奖励（对方必须是还没注册过的新用户才计入）。",
+                isSlow ? "会员按自然月计量，" + r.days + " 天是会员时长、不是流量。" : "")
+            : null
+        );
       }
 
       // ---------- 我的信息(个人中心) ----------
@@ -2434,17 +3032,21 @@ window.__ModuleLoader__.load({
         else if (source === "trial") planText = "试用 PRO 会员 · 到期 " + fmtDate(a.trial_expires_at);
         else if (endsAt) planText = plan === "pro_max" ? "Pro Max 会员 · 到期 " + fmtDate(endsAt) : "PRO 会员 · 到期 " + fmtDate(endsAt);
         else planText = plan === "pro_max" ? "Pro Max 长期会员" : "PRO 长期会员";
-        // 【0.6.9】额度将尽时的轻量邀请入口：只依据服务端已下发的额度字段判断
+        // 【0.6.9】「额度将尽 / 已被限速」判定：只依据服务端已下发的额度字段
         //   · limit_enabled 且 percent ≥ 80（接近用尽）
         //   · limit_enabled 但没下发 max_mbps（文案已显示「已限速」＝正在被限速）
         // 判断不了（quota 缺失、不限量、会员）→ 不显示，绝不误报。
+        // 注意：会员（PRO / Pro Max）的额度不吃这条免费档判断，所以「升级」永远不会弹给付费用户，
+        // 但连接偏慢那条（renderConnectBlock）对会员同样成立 —— 会员也会遇到慢，那时只剩拉新路。
         var quotaPctNum = Number(quotaPct);
         var quotaTight = !!(quota && quota.limit_enabled && !isMember &&
           ((isFinite(quotaPctNum) && quotaPctNum >= 80) || !quota.max_mbps));
-        // 邀请规则（公共配置下发；缺省时用与邀请页一致的兜底值，不编造）
-        var invRule = (pub && pub.invite_rule) || {};
-        var invRuleN = Number(invRule.n) > 0 ? Number(invRule.n) : 3;
-        var invRuleDays = Number(invRule.days) > 0 ? Number(invRule.days) : 15;
+        // 拉新关闭态（invite_rule.n / days = 0）→ 账号卡入口整体隐藏，不留点进去没内容的入口
+        var invOff = inviteRuleOf().off;
+        // 🎁 引导气泡是否在屏：活动没关 + 用户没关掉过。
+        // 计算一次给按钮的 aria-describedby 用（气泡没渲染时不能指向不存在的 id）。
+        var invTipOn = !invOff && !inviteTipDismissed;
+        var invTipRule = invTipOn ? inviteRuleOf() : null;
         return h("div", null,
           h("div", { className: "dru-user" },
             h("div", { className: "dru-avatar" }, (st.config.phone || "D").charAt(0).toUpperCase()),
@@ -2461,21 +3063,27 @@ window.__ModuleLoader__.load({
           h("div", { className: "dru-actions", style: { marginTop: 10 } },
             h("button", { type: "button", className: "dru-btn dru-btn-primary", style: { display: "inline-flex", alignItems: "center" }, disabled: busy !== "", title: "升级/续费（带登录态打开）", onClick: openUpgradeAuth },
               busy === "upgrade" ? "生成链接中…" : (!isMember ? "🚀 升级 PRO" : source === "trial" ? "🚀 转正式 PRO" : "🔄 续费会员")),
-            h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "", onClick: function () { setView("invite"); loadInvite(); } }, "🎯 邀请好友得会员"),
+            // 拉新关闭 → 入口整体隐藏（否则会点进一个没有内容的邀请页）
+            // 按钮文字自带可访问名称；气泡在屏时用 aria-describedby 把「能得多少」也读出来。
+            invOff ? null : h("button", {
+              type: "button",
+              className: "dru-btn dru-btn-ghost",
+              disabled: busy !== "",
+              title: invTipRule ? "带 " + invTipRule.n + " 位新用户可得 " + invTipRule.days + " 天 PRO 会员" : "带新用户换会员",
+              "aria-describedby": invTipOn ? INVITE_TIP_ID : undefined,
+              onClick: function () { setView("invite"); loadInvite(); }
+            }, "🎁 带新用户换会员"),
             h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "", onClick: function () { setView("feedback"); } }, "💬 用户反馈"),
             h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "", onClick: togglePwdForm }, pwdOpen ? "收起修改密码" : "🔒 修改密码"),
             h("button", { type: "button", className: "dru-btn dru-btn-danger", disabled: busy !== "", onClick: function () { doLogout(false); } }, "退出登录")
           ),
+          // 🎁 邀请收益引导气泡：紧贴上面那排按钮（不遮挡按钮、窄屏独占一行）
+          renderInviteTip(),
           h("div", { className: "dru-hint", style: { marginTop: 8 } },
             "升级/续费以带登录态方式打开：点击后生成一次性访问链接并直接跳转，无需重新登录。" +
             (endsAt && isMember ? "到期后如需继续使用会员权益，请在到期前续费。" : "")),
-          // 额度将尽 → 轻量邀请入口（文字链层级，不抢「升级 PRO」主 CTA）
-          quotaTight
-            ? h("div", { className: "dru-hint", style: { marginTop: 6 } },
-                "免费额度快用完了？也可以先",
-                renderInviteLink("🎯 邀请好友得会员", "邀请好友获得 PRO 会员奖励"),
-                "——每邀请满 " + invRuleN + " 位好友，得 " + invRuleDays + " 天 PRO 会员（详情见邀请页）。")
-            : null,
+          // 额度将尽 / 已被限速 → 🔀 双路块：升级套餐（转化）or 带新用户换会员时长（拉新）
+          quotaTight ? renderDualPath("quota") : null,
           pwdOpen ? renderResetPwdForm(false) : null
         );
       }
@@ -2488,7 +3096,7 @@ window.__ModuleLoader__.load({
         // 浏览器端不再出现明文手机号。登录卡「忘记密码」为用户自行输入,原样使用。
         var curPhone = ((st && st.config && st.config.phone) || "");
         var ph = fromLogin ? phone : "";
-        return h("div", { className: "dru-card", style: { marginTop: 10, border: "1px dashed #d0d7de" } },
+        return h("div", { className: "dru-card", style: { marginTop: 10, border: "1px dashed var(--dru-border)" } },
           h("h3", null, fromLogin ? "忘记密码（短信重置）" : "🔒 修改密码（短信验证）"),
           h("div", { className: "dru-hint", style: { marginBottom: 8 } },
             fromLogin
@@ -2520,7 +3128,7 @@ window.__ModuleLoader__.load({
         );
       }
 
-      // ---------- 🎯 邀请视图（0.6.9 重排：奖励大字 → 进度 → 邀请码/链接一键复制 → 折叠规则 → 记录） ----------
+      // ---------- 🎁 邀请视图（0.6.9 重排：交换大字 → 三步走 → 进度 → 邀请码/链接一键复制 → 折叠规则 → 记录） ----------
       /** 体面空态：图标 + 标题 + 说明 + 可选操作（替代过去"一行灰字了事"）。 */
       function emptyState(icon, title, sub, actions) {
         return h("div", { className: "dru-empty" },
@@ -2571,13 +3179,13 @@ window.__ModuleLoader__.load({
             : null
         );
       }
-      /** 邀请记录里的好友展示名：只用接口给的 invitee_phone（掩码），缺字段时降级，不编造。 */
+      /** 邀请记录里的新用户展示名：只用接口给的 invitee_phone（掩码），缺字段时降级，不编造。 */
       function inviteeName(r) {
         var phone = maskPhoneLike(r && r.invitee_phone);
         if (phone) return phone;
         var dev = r && r.device_id ? String(r.device_id) : "";
-        if (dev) return "好友（设备 " + (dev.length > 6 ? dev.slice(-6) : dev) + "）";
-        return "好友";
+        if (dev) return "新用户（设备 " + (dev.length > 6 ? dev.slice(-6) : dev) + "）";
+        return "新用户";
       }
       /** 一条邀请记录：谁 / 什么时候 / 是否已生效（时间或状态字段缺失时如实标注，不编造）。 */
       function renderInviteRecords(records, ruleN) {
@@ -2594,8 +3202,11 @@ window.__ModuleLoader__.load({
             ),
             h("div", { className: "dru-rec-sub" },
               pending
-                ? "好友已完成设备绑定，奖励按规则结算（每满 " + ruleN + " 位发放一次）。"
-                : "好友已完成电脑端安装并绑定设备，已计入你的有效邀请。")
+                ? (ruleN > 0
+                    ? "这位新用户已完成设备绑定，奖励按规则结算（每满 " + ruleN + " 位发放一次）。"
+                    // 拉新关闭态：不引用具体结算规则（不能显示「每满 0 位」这种假承诺）
+                    : "这位新用户已完成设备绑定；奖励结算以运营规则为准（活动当前未开放）。")
+                : "这位新用户已完成电脑端安装并上线，已计入你的有效邀请。")
           );
         }));
       }
@@ -2617,6 +3228,35 @@ window.__ModuleLoader__.load({
           }))
         );
       }
+      /**
+       * 「我的邀请记录」卡：邀请视图与**拉新关闭态**共用。
+       * 关闭态下这是唯一保留的卡片 —— 记录是历史事实（不承诺任何未来奖励），
+       * 关上活动不该让用户看不到自己已经计入的有效邀请与已到账奖励。
+       */
+      function renderInviteRecordCard(records, rewards, validCount, ruleN, ruleDays, inviteErr, inviteLoading) {
+        return card("我的邀请记录" + (inviteErr ? "" : "（" + validCount + "）"), [
+          inviteLoading
+            ? h("div", { className: "dru-invite-sub" }, "正在读取邀请记录…")
+            : inviteErr
+              ? h("div", null,
+                  h("div", { className: "dru-msg dru-msg-err", style: { marginTop: 0 } }, "读取邀请记录失败：" + inviteErr),
+                  h("div", { className: "dru-actions", style: { marginTop: 8 } },
+                    h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: inviteLoading, onClick: loadInvite }, "重试")))
+              : validCount === 0
+                ? emptyState("📨", "还没有新用户通过你的链接进来",
+                    "把上面的邀请链接发给一位还没注册过的新用户：对方注册 + 在电脑上装好 dsh-remote-web 并上线后，会自动出现在这里。")
+                : h("div", null, [
+                    h("div", { className: "dru-rec-head" },
+                      h("span", { style: { flex: "1" } }, "新用户"),
+                      h("span", null, "状态"),
+                      h("span", null, "时间")),
+                    renderInviteRecords(records, ruleN),
+                    renderInviteRewards(rewards, ruleDays),
+                    h("div", { className: "dru-invite-sub", style: { marginTop: 6 } },
+                      "名单里的新用户都已完成电脑端安装并上线，所以都算有效邀请。")
+                  ])
+        ]);
+      }
       /** 活动规则：默认折叠，点开才显示（层级清晰，不再和奖励说明挤在一堆小字里）。 */
       function renderInviteRules(n, days) {
         return h("div", { className: "dru-card" },
@@ -2631,11 +3271,13 @@ window.__ModuleLoader__.load({
           ),
           inviteRulesOpen
             ? h("ol", { className: "dru-rules" }, [
-                h("li", null, "好友通过你的邀请链接注册（或在注册时填写你的邀请码），即与你绑定邀请关系。"),
-                h("li", null, "好友在这台电脑上装好后台服务并成功登录后，才计入 1 位", h("b", null, "有效邀请"), "；同一位好友只计一次。"),
-                h("li", null, "每累计 ", h("b", null, n + " 位"), "有效邀请，自动发放 ", h("b", null, days + " 天 PRO 会员"), "，在原到期时间上顺延（已是长期会员则保持长期）。"),
-                h("li", null, "奖励自动到账，无需申请：可在「我的邀请记录」下方看到「已到账奖励」。"),
-                h("li", null, "邀请码与邀请链接长期有效，随时可在本页复制；好友解绑或重装设备不会撤回已计入的邀请。"),
+                h("li", null, "这是", h("b", null, "交换"), "：你带新用户，平台给你会员时长 —— 每带 ", h("b", null, n + " 位新用户"), "，你得 ", h("b", null, days + " 天 PRO"), "。"),
+                h("li", null, h("b", null, "只有新注册账号才计入"), "：对方必须是还没注册过的新用户，且通过你的邀请链接注册（或在注册时填写你的邀请码），才与你绑定邀请关系。"),
+                h("li", null, "对方还要在这台电脑上", h("b", null, "装好 dsh-remote-web 并成功上线"), "，才计入 1 位", h("b", null, "有效邀请"), "；同一位新用户只计一次。"),
+                h("li", null, h("b", null, "奖励只发给邀请人"), "：你得 ", h("b", null, days + " 天 PRO"), "，被邀请的新用户没有额外的邀请奖励（注册送礼与邀请无关）。"),
+                h("li", null, "奖励自动到账，无需申请：可在「我的邀请记录」下方看到「已到账奖励」，在原到期时间上顺延（已是长期会员则保持长期）。"),
+                h("li", null, h("b", null, days + " 天是会员时长、不是流量"), "：会员流量按自然月计量，天数是按天顺延的会员有效期。"),
+                h("li", null, "邀请码与邀请链接长期有效，随时可在本页复制；新用户解绑或重装设备不会撤回已计入的邀请。"),
                 h("li", null, "规则与数值以本页面显示的为准（运营可能调整活动力度）。")
               ])
             : null
@@ -2643,9 +3285,9 @@ window.__ModuleLoader__.load({
       }
 
       function renderInvite() {
-        var rule = (pub && pub.invite_rule) || {};
-        var ruleN = Number(rule.n) > 0 ? Number(rule.n) : 3;
-        var ruleDays = Number(rule.days) > 0 ? Number(rule.days) : 15;
+        var inv = inviteRuleOf();
+        var ruleN = inv.n;
+        var ruleDays = inv.days;
         var trialDays = Number(pub && pub.trial_days) > 0 ? Number(pub.trial_days) : 0; // 注册送礼（关闭时不下发/为 0）
         var code = (account && account.invite_code) || "";
         var base = (st && st.remoteUrl) || (pub && pub.app_url) || "https://n.risegao.cn:13443/app/";
@@ -2667,21 +3309,53 @@ window.__ModuleLoader__.load({
           });
         };
 
+        // ── 拉新关闭态（invite_rule.n / days 配成 0）──────────────────────────────
+        // 邀请卡**整卡不渲染**：不显示「带 0 位新用户 → 0 天 PRO」，也不留只有一个复制按钮的空壳；
+        // 邀请码/邀请链接（拉新的工具）与活动规则（引用 n/days）一并收起。
+        // 只保留「我的邀请记录」——那是**历史事实**，不是承诺，且关闭活动不该让用户看不到自己已计入的记录。
+        // 这一页在关闭态下正常也进不来（所有入口都隐藏了），此处是防御性渲染（例如停留在本页时配置刷成关闭）。
+        if (inv.off) {
+          return h("div", null,
+            h("button", { type: "button", className: "dru-btn dru-btn-ghost", style: { width: "100%" }, onClick: function () { setView("home"); } }, "← 返回账号"),
+            card("🎁 带新用户换会员时长 · 当前未开放", [
+              h("div", { className: "dru-invite-sub" },
+                "运营已暂时关闭「带新用户换会员时长」活动，所以这里不再显示邀请链接与奖励进度。"),
+              h("div", { className: "dru-invite-sub", style: { marginTop: 8 } },
+                "你已有的历史记录不受影响（下方「我的邀请记录」仍可查看）；重新开放后本页会自动恢复。")
+            ]),
+            loggedInSaaS
+              ? renderInviteRecordCard(records, rewards, validCount, 0, ruleDays, inviteErr, inviteLoading)
+              : null,
+            message ? h("div", { className: "dru-msg dru-msg-" + message.kind }, message.text) : null
+          );
+        }
+
         return h("div", null,
           h("button", { type: "button", className: "dru-btn dru-btn-ghost", style: { width: "100%" }, onClick: function () { setView("home"); } }, "← 返回账号"),
 
-          // ① 奖励是什么（大字 + 一句人话）
-          card("🎯 邀请好友，一起用远程访问", [
+          // ① 交换是什么（大字：带 N 位新用户 → 得 M 天 PRO；一句人话说清条件与「只有你得奖」）
+          card("🎁 带新用户，换会员时长", [
             h("div", { className: "dru-invite-hero" },
-              "邀请 ", h("em", null, ruleN + " 位"), "好友 → 你得 ", h("em", null, ruleDays + " 天 PRO 会员")),
+              "带 ", h("em", null, ruleN + " 位"), "新用户 → 得 ", h("em", null, ruleDays + " 天 PRO")),
             h("div", { className: "dru-invite-sub" },
-              "好友用你的邀请链接注册，并在这台电脑上装好后台服务后计入；每满 " + ruleN + " 位自动到账，会员天数可累加"
-              + (trialDays > 0 ? "。好友自己注册即得 " + trialDays + " 天 PRO 试用，不用邀请也一样。" : "。")),
-            // 进度：已邀请 / 已到账 / 还差几位（数据全部来自接口，未登录或未加载时不编造数字）
+              "这是一次交换：新用户", h("b", null, "用你的邀请链接注册新账号"), "，并在电脑上",
+              h("b", null, "装好 dsh-remote-web 并上线"), "后，", ruleDays + " 天 PRO ",
+              "自动到账（每满 " + ruleN + " 位结算一次，会员天数可累加）；",
+              h("b", null, "只有你得奖"),
+              trialDays > 0
+                ? "，新用户自己注册即得 " + trialDays + " 天 PRO 试用，不用邀请也一样。"
+                : "，新用户没有额外的邀请奖励（必须是还没注册过的新用户才计入）。"),
+            // 三步走：把「怎么带」讲到不需要思考（① 复制 → ② 发给没注册过的新用户 → ③ 对方上线即到账）
+            h("ol", { className: "dru-steps" }, [
+              h("li", null, "复制", h("b", null, "你的专属邀请链接"), "（下方「我的邀请链接」，点一下就复制）。"),
+              h("li", null, "发给一位", h("b", null, "还没注册过的新用户"), "（对方注册时自动带上你的邀请码）。"),
+              h("li", null, "他注册新账号 + 在电脑上装好 dsh-remote-web 并上线 → ", h("b", null, ruleDays + " 天 PRO 自动到账"), "。")
+            ]),
+            // 进度：已带来 / 已到账 / 还差几位（数据全部来自接口，未登录或未加载时不编造数字）
             loggedInSaaS
               ? h("div", { className: "dru-invite-prog" },
                   h("div", { className: "dru-invite-prog-top" },
-                    h("span", null, "已邀请 ", h("span", { className: "n" }, String(validCount)), " 位好友"),
+                    h("span", null, "已带来 ", h("span", { className: "n" }, String(validCount)), " 位新用户"),
                     inviteErr ? null : h("span", null, "已到账 " + rewards.length + " 次（每次 " + ruleDays + " 天）")
                   ),
                   h("div", { className: "dru-invite-bar", role: "img", "aria-label": "距离下一次奖励的进度" },
@@ -2689,19 +3363,19 @@ window.__ModuleLoader__.load({
                   h("div", { className: "dru-invite-next" },
                     inviteLoading
                       ? "正在读取你的邀请记录…"
-                      : "本轮已累计 " + toward + "/" + ruleN + " 位，再邀请 " + nextGap + " 位即可获得下一次 " + ruleDays + " 天 PRO 会员。")
+                      : "本轮已累计 " + toward + "/" + ruleN + " 位，再带 " + nextGap + " 位新用户即可获得下一次 " + ruleDays + " 天 PRO。")
                 )
               : null,
             // ② 我的邀请码 / 邀请链接（一键复制）
             code
               ? h("div", null,
-                  copyRow("我的邀请码", code, "code", "好友注册时填这个码，或直接用下面的邀请链接（自动带上）。"),
-                  copyRow("我的邀请链接", link, "link", "链接较长，可一键复制后发给好友；好友打开即进入注册页。")
+                  copyRow("我的邀请码", code, "code", "新用户注册时填这个码，或直接用下面的邀请链接（自动带上）。"),
+                  copyRow("我的邀请链接", link, "link", "链接较长，可一键复制后发给还没注册过的新用户；对方打开即进入注册页。")
                 )
               : loggedInSaaS
                 ? h("div", { style: { marginTop: 10 } },
                     emptyState("🎫", "正在为你生成专属邀请码",
-                      "邀请码绑定你的手机号账号：好友通过它注册，奖励会自动记到这个账号上。（偶尔需要手动获取一次）",
+                      "邀请码绑定你的手机号账号：新用户通过它注册后，奖励会自动记到这个账号上。（偶尔需要手动获取一次）",
                       [h("button", {
                         type: "button",
                         className: "dru-btn dru-btn-primary",
@@ -2718,35 +3392,14 @@ window.__ModuleLoader__.load({
                   )
                 : h("div", { style: { marginTop: 10 } },
                     emptyState("🔑", "登录后即可获得你的专属邀请码",
-                      "邀请码绑定你的手机号账号：好友通过它注册，奖励会自动记到这个账号上。登录后回到本页即可复制分享。",
+                      "邀请码绑定你的手机号账号：新用户通过它注册后，奖励会自动记到这个账号上。登录后回到本页即可复制分享。",
                       [h("button", { type: "button", className: "dru-btn dru-btn-primary", onClick: function () { setView("home"); } }, "去登录")])
                   )
           ]),
 
           // ③ 邀请记录（谁 / 什么时候 / 是否已生效）
           loggedInSaaS
-            ? card("我的邀请记录" + (inviteErr ? "" : "（" + validCount + "）"), [
-                inviteLoading
-                  ? h("div", { className: "dru-invite-sub" }, "正在读取邀请记录…")
-                  : inviteErr
-                    ? h("div", null,
-                        h("div", { className: "dru-msg dru-msg-err", style: { marginTop: 0 } }, "读取邀请记录失败：" + inviteErr),
-                        h("div", { className: "dru-actions", style: { marginTop: 8 } },
-                          h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: inviteLoading, onClick: loadInvite }, "重试")))
-                    : validCount === 0
-                      ? emptyState("📨", "还没有好友通过邀请安装",
-                          "把上面的邀请链接发给好友：好友注册并在电脑上装好后台服务后，会自动出现在这里。")
-                      : h("div", null, [
-                          h("div", { className: "dru-rec-head" },
-                            h("span", { style: { flex: "1" } }, "好友"),
-                            h("span", null, "状态"),
-                            h("span", null, "时间")),
-                          renderInviteRecords(records, ruleN),
-                          renderInviteRewards(rewards, ruleDays),
-                          h("div", { className: "dru-invite-sub", style: { marginTop: 6 } },
-                            "名单里的好友都已完成电脑端安装与设备绑定，所以都算有效邀请。")
-                        ])
-              ])
+            ? renderInviteRecordCard(records, rewards, validCount, ruleN, ruleDays, inviteErr, inviteLoading)
             : null,
 
           // ④ 活动规则（默认折叠）
@@ -2831,14 +3484,15 @@ window.__ModuleLoader__.load({
               "首次安装会自动下载并配置，期间请不要关闭 DeepSeek；装完会自动启动后台服务，无需任何操作。"));
           }
           if (connInfo.deviceId) rows.push(h("div", { className: "dru-meta" }, "设备 ID：" + connInfo.deviceId));
-          // 【0.6.9】连接明显偏慢时的轻量邀请入口（不打断、不弹窗）：
+          // 【0.6.9】连接明显偏慢时的 🔀 双路块（不打断、不弹窗）：把「等」变成一次选择 ——
+          // 升级带宽（转化）or 带新用户换会员时长（拉新，会员同样走这条）。
           // 判定只用既有字段 —— 服务端重试次数 attempts≥3、或阶段文案里出现限速/带宽/较慢类提示、
           // 或本地观察「非 online 阶段持续 ≥90s」。判断不了就不显示（宁可不出现，也不误报）。
+          // 放在「立即重试 / 复制诊断信息」之上：先给选择，再给重试（重试仍在，不是死胡同）。
+          // 拉新关闭 + 已是 Pro Max 时 renderDualPath 返回 null → 这块自然不出现（不会留空壳）。
           if (connSlow) {
-            rows.push(h("div", { className: "dru-hint", style: { marginTop: 8 } },
-              "连接比平时慢一些（仍在自动推进，无需操作）：等待时也可以",
-              renderInviteLink("🎯 邀请好友得会员", "连接偏慢时顺手邀请好友 —— 每满若干位得 PRO 会员奖励"),
-              "，好友装好后双方访问都会更快。"));
+            var dualSlow = renderDualPath("slow");
+            if (dualSlow) rows.push(dualSlow);
           }
           rows.push(h("div", { className: "dru-actions", style: { marginTop: 8 } },
             h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "", onClick: retryConnect }, busy === "connect-retry" ? "立即重试中…" : "立即重试"),
@@ -2958,7 +3612,7 @@ window.__ModuleLoader__.load({
                 h("button", {
                   type: "button",
                   className: "dru-btn dru-btn-ghost",
-                  style: { color: "#cf222e", borderColor: "#cf222e" },
+                  style: { color: "var(--dru-danger)", borderColor: "var(--dru-danger)" },
                   disabled: devBusy !== "",
                   onClick: function () { doDeleteDevice(id); }
                 }, devBusy === "delete:" + id ? "删除中…" : armedDel === id ? "⚠ 再点一次确认删除记录" : "删除记录")
@@ -2967,7 +3621,7 @@ window.__ModuleLoader__.load({
           }),
           h("div", { className: "dru-hint", style: { marginTop: 4 } },
             "取消配对后，对方需重新扫码/登录才能再次远程访问本机。"),
-          h("div", { className: "dru-actions", style: { marginTop: 8, borderTop: "1px dashed #eaeef2", paddingTop: 8 } },
+          h("div", { className: "dru-actions", style: { marginTop: 8, borderTop: "1px dashed var(--dru-border-soft)", paddingTop: 8 } },
             h("button", {
               type: "button",
               className: "dru-btn dru-btn-ghost",
@@ -3050,7 +3704,7 @@ window.__ModuleLoader__.load({
                             field("手机号", input({ type: "tel", value: rphone, placeholder: "11 位手机号", autoComplete: "tel", onChange: function (e) { setRphone(e.target.value); } })),
                             field("密码", input({ type: "password", value: rpass, placeholder: "至少 8 位", autoComplete: "new-password", onChange: function (e) { setRpass(e.target.value); } })),
                             field("确认密码", input({ type: "password", value: rpass2, placeholder: "再次输入密码", autoComplete: "new-password", onChange: function (e) { setRpass2(e.target.value); } })),
-                            field("邀请码（选填）", input({ value: rInvite, placeholder: "好友的邀请码，如 A8K2M4XQ", autoComplete: "off", onChange: function (e) { setRInvite(e.target.value); } })),
+                            field("邀请码（选填）", input({ value: rInvite, placeholder: "邀请你的人的邀请码，如 A8K2M4XQ", autoComplete: "off", onChange: function (e) { setRInvite(e.target.value); } })),
                             rcap && field("图形验证码", h("div", { className: "dru-captcha" },
                               input({ value: rcapTxt, placeholder: "图中数字", autoComplete: "off", inputMode: "numeric", maxLength: 6, onChange: function (e) { setRcapTxt(e.target.value); } }),
                               h("div", { className: "dru-captcha-box", title: "看不清？点击刷新", onClick: function () { loadCaptcha("register"); }, dangerouslySetInnerHTML: rcap.svg && rcap.svg.indexOf("<svg") === 0 ? { __html: rcap.svg } : void 0 },
@@ -3191,7 +3845,7 @@ window.__ModuleLoader__.load({
       function renderCommunityModal() {
         if (!commOpen || !(community && community.qrcode)) return null;
         var close = function () { setCommOpen(false); };
-        return h("div", { className: "dru-popup", onMouseDown: function (e) { if (e.target === e.currentTarget) close(); } },
+        return h("div", { className: "dru-popup", "data-dru-theme": theme, onMouseDown: function (e) { if (e.target === e.currentTarget) close(); } },
           h("div", { className: "dru-popup-card", role: "dialog", "aria-label": "加入企微交流群" },
             h("div", { className: "dru-popup-body" },
               h("div", { className: "dru-popup-icon" }, "💬"),
@@ -3210,7 +3864,7 @@ window.__ModuleLoader__.load({
         );
       }
 
-      return h("div", { className: "dru-settings-section", role: "region", "aria-label": "远程访问" },
+      return h("div", { className: "dru-settings-section", role: "region", "aria-label": "远程访问", "data-dru-theme": theme },
         h("div", { className: "dru-settings-head" },
           h("span", { className: "dru-settings-icon" }, "📱"),
           h("div", null,
@@ -3307,6 +3961,10 @@ window.__ModuleLoader__.load({
       dotWatch();
       // 侧栏「远程访问」快捷入口（2026-09 恢复注入：与官方「设置」按钮共存不遮挡）
       navEnsureStart();
+      // 🎨 主题：**不在这里**建 observer —— 观察器只在真有订阅者时才创建
+      // （面板/弹窗挂载 → themeSubscribe；侧栏入口挂上 → mountNavEntry）。
+      // 这样「没有任何东西需要跟随主题」时不会白留一个 MutationObserver，
+      // 也避免与本插件已有的红点观察器互相干扰。
 
       // 满意度弹窗已停用（不再调度）；组件与调度代码保留，便于日后恢复。
       var FB_POPUP_RETIRED = true;
