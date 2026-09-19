@@ -63,7 +63,7 @@
 `node_missing` · `node_too_old` · `npm_unreachable` · `npm_eacces` · `platform_unsupported` ·
 `runtime_install_timeout` · `launchd_failed` · `bridge_exit` · `bind_conflict` · `bind_device_limit` ·
 `npx_cmd_unavailable` · `registry_timeout` · `install_script_missing` · `npx_exit_nonzero` ·
-`npx_output_encoding` · `unknown`
+`npx_output_encoding` · `update_stalled`（更新进程长时间无输出、判定卡住）· `unknown`
 
 > 原始错误文本**绝不外发**（它可能含文件路径、用户名、主机名）：只做白名单归类，
 > 归不进去的一律记 `unknown`。
@@ -72,6 +72,10 @@
 > `npx_output_encoding` 是 2026-09 为定位「Windows 上装不上运行环境」而拆细的形态
 > （命令调不起来 / 注册表超时 / 包或安装脚本缺失 / 退出码非零 / 输出乱码）——
 > 它们仍然只是**枚举值**，不包含任何原始文本。
+>
+> `update_stalled`（0.6.9 新增）：更新进程**活着但长时间没有任何输出**（中国网络访问 npm 官方源的
+> 典型失败形态是"挂起"而非快速失败）。它被单列出来，是为了让"卡死"这一类在统计里可见 ——
+> 此前它只会落进 `unknown` 或干脆不产生事件，导致规模被持续低估。
 
 ## 3. 不采集什么（硬边界）
 

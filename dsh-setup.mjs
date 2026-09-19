@@ -7,7 +7,7 @@
  *   dsh-remote settings                        提示如何登录（独立设置页已移除，见 dsh web 面板）
  *   dsh-remote run                             前台运行 bridge（调试/守护）
  *   dsh-remote status                          查看配置与服务状态
- *   dsh-remote plugin [--uninstall]            手动安装/卸载 dsh web 远程控制插件
+ *   dsh-remote plugin [--uninstall]            手动安装/卸载 dsh web 远程访问插件
  *
  * setup 选项（全部可选）:
  *   --server <wss://host:port> --key <访问密钥>   自建模式（不填则连默认云端服务）
@@ -18,8 +18,8 @@
  * 行为:
  *   1. 写入配置 <CONFIG_DIR>/.dsh-config.json（0600；npm 安装时为 ~/.dsh-remote/）
  *   2. 生成自启动服务（macOS launchd / Linux systemd），随 dsh web(3080) 存活自动保活
- *   3. 自动把远程控制插件装进 dsh web 设置页（若检测到 profile）
- *   4. 登录/连接配置在 dsh web → 设置 → 「远程控制」面板完成（SaaS 注册登录 / 自建切换）
+ *   3. 自动把远程访问插件装进 dsh web 设置页（若检测到 profile）
+ *   4. 登录/连接配置在 dsh web → 设置 → 「远程访问」面板完成（SaaS 注册登录 / 自建切换）
  *      自建 CLI 用户也可用 `dsh-remote setup --server … --key …`（无需再打开设置页）
  */
 
@@ -160,14 +160,14 @@ function printHelp() {
   dsh-remote settings     显示登录/连接配置指引（独立设置页已移除）
   dsh-remote run          前台运行 bridge（调试）
   dsh-remote status       查看配置与服务状态
-  dsh-remote plugin       手动安装 dsh web 远程控制插件（--uninstall 卸载）
+  dsh-remote plugin       手动安装 dsh web 远程访问插件（--uninstall 卸载）
   dsh-remote repair       修复插件挂载（dsh web 起不来时用；只碰 profile，不联网）
   dsh-remote --help       显示本用法（等同 dsh-remote help）
 
 自建模式（可选）:
   dsh-remote setup --server wss://你的域名:端口 --key 访问密钥
 
-登录/连接配置: 打开 dsh web → 设置 → 「远程控制」→ 注册或登录手机号即可
+登录/连接配置: 打开 dsh web → 设置 → 「远程访问」→ 注册或登录手机号即可
 （自建用户切「自建服务」标签或直接用上方 setup 命令，无需另开页面）。
 文档: ${REPO_URL}
 `);
@@ -848,7 +848,7 @@ function installAutostart() {
 }
 
 // ---------- settings：旧独立设置页已移除（引导到 dsh web 插件面板） ----------
-// 云服务用户在 dsh web → 设置 → 「远程控制」面板即可注册/登录（自建切换也在此面板）；
+// 云服务用户在 dsh web → 设置 → 「远程访问」面板即可注册/登录（自建切换也在此面板）；
 // 独立设置页(127.0.0.1:3499)与面板功能完全重复、且暴露自建表单给普通用户造成困惑,已移除。
 // 保留 `dsh-remote settings` 命令为“引导提示”,避免旧脚本/旧文档直接调它时报错。
 function settingsHint() {
@@ -856,7 +856,7 @@ function settingsHint() {
 dsh-remote：独立的本地设置页已移除。
 
 请直接在 dsh web 里完成登录/连接配置（无需任何命令）：
-  打开 dsh web → 设置 → 「远程控制」→ 注册或登录手机号即可（自建模式切换也在该面板）。
+  打开 dsh web → 设置 → 「远程访问」→ 注册或登录手机号即可（自建模式切换也在该面板）。
 
 自建用户若偏好命令行，可用：
   dsh-remote setup --server wss://你的域名:端口 --key 访问密钥
@@ -928,7 +928,7 @@ async function runBridge() {
     if (!saas && !local) {
       if (!warnedNoLogin) {
         warnedNoLogin = true;
-        console.log("⚠️ 尚未登录：请打开 dsh web → 设置 → 「远程控制」，注册/登录手机号（或切到自建模式）后自动启动。");
+        console.log("⚠️ 尚未登录：请打开 dsh web → 设置 → 「远程访问」，注册/登录手机号（或切到自建模式）后自动启动。");
       }
       return;
     }
@@ -1095,7 +1095,7 @@ async function setup(argv) {
   }
 
   // 插件是**进程启动时**装载的：刚装进 profile 的插件，运行中的 dsh web 里并没有
-  // （既没有 /dsh-remote/* 路由，也没有「设置 → 远程控制」面板项）。
+  // （既没有 /dsh-remote/* 路由，也没有「设置 → 远程访问」面板项）。
   // 这里做一个确定性判断：进程启动时间早于插件落盘时间 → 必须重启 dsh web 才生效。
   const pluginDir = path.join(resolveProfileDir(argv), PLUGIN_LOCAL_DIR);
   const pluginMtime = fs.existsSync(path.join(pluginDir, "lib", "index.js"))
@@ -1148,7 +1148,7 @@ async function setup(argv) {
   if (needRestart && !noRestart && webUp) {
     console.log("");
     console.log("ℹ 检测到运行中的 dsh web 早于本次插件安装 —— 插件只在进程启动时装载，");
-    console.log("  所以「设置 → 远程控制」面板暂时还没出现。正在为你重启 dsh web（2 秒后执行，Ctrl-C 可跳过）…");
+    console.log("  所以「设置 → 远程访问」面板暂时还没出现。正在为你重启 dsh web（2 秒后执行，Ctrl-C 可跳过）…");
     sleepSync(2000);
     restartResult = restartDshWeb();
     if (restartResult.ok) {
@@ -1193,7 +1193,7 @@ async function setup(argv) {
     L.push(`   服务器: ${cfg.tunnel_url}`);
     L.push(`   手机端: 打开 ${cfg.tunnel_url.replace(/^ws/, "https")}/app/ ，用访问密钥登录`);
   } else {
-    L.push(`   远程控制地址: ${pub.app_url || DEFAULT_APP_URL}`);
+    L.push(`   远程访问地址: ${pub.app_url || DEFAULT_APP_URL}`);
   }
   L.push(svcSkipped
     ? `   自启动服务: ${svcState}，可用 \`dsh-remote run\` 手动运行 bridge`
@@ -1239,10 +1239,10 @@ async function setup(argv) {
   } else if (hotMounted) {
     L.push("");
     L.push("   下一步: 插件已热加载（无需重启 dsh web）——刷新一下浏览器页面，");
-    L.push("          再打开 设置 → 「远程控制」→ 注册/登录手机号即可。");
+    L.push("          再打开 设置 → 「远程访问」→ 注册/登录手机号即可。");
   } else if (needRestart && restartResult && restartResult.ok) {
     L.push("");
-    L.push("   下一步: dsh web 已重启，直接打开 http://127.0.0.1:3080 → 设置 → 「远程控制」→ 注册/登录手机号。");
+    L.push("   下一步: dsh web 已重启，直接打开 http://127.0.0.1:3080 → 设置 → 「远程访问」→ 注册/登录手机号。");
   } else if (needRestart && pluginResult && pluginResult.hotPatch && pluginResult.changed) {
     // patch 已写入但探测窗口内没等到面板接口:热加载很可能还在进行(插件节点半启动+注册路由)。
     // 这种情况**不能**直接让用户重启 —— 先让他等几秒刷新,再给兜底方案。
@@ -1251,7 +1251,7 @@ async function setup(argv) {
       L.push(`ℹ 插件已按热加载方式登记，但运行中的 dsh web 仍在用旧版本（${runningSeen} → 期望 ${pkgVersion()}）：`);
       L.push("   刷新页面即可（浏览器半会跟着更新）；若刷新后功能仍不对，再重启一次 dsh web。");
     } else {
-      L.push("ℹ 插件已按热加载方式登记（patch 已写入），若「设置 → 远程控制」还没出现：");
+      L.push("ℹ 插件已按热加载方式登记（patch 已写入），若「设置 → 远程访问」还没出现：");
       L.push("   等几秒后刷新页面即可；仍未出现再重启一次 dsh web（命令见 README）。");
     }
   } else if (needRestart) {
@@ -1261,15 +1261,15 @@ async function setup(argv) {
     L.push("   请手动执行（任选其一）：");
     L.push("     launchctl kickstart -k gui/$(id -u)/com.dshweb.dev     # 用 launchd 托管时");
     L.push("     kill $(lsof -ti tcp:3080 -sTCP:LISTEN) && dsh web --no-open   # 手动启动时");
-    L.push("   重启后：打开 http://127.0.0.1:3080 → 设置 → 「远程控制」→ 注册/登录手机号。");
+    L.push("   重启后：打开 http://127.0.0.1:3080 → 设置 → 「远程访问」→ 注册/登录手机号。");
   } else {
     L.push("");
-    L.push("   下一步: 打开 dsh web → 设置 → 「远程控制」→ 注册/登录手机号即可（无需任何命令）。");
+    L.push("   下一步: 打开 dsh web → 设置 → 「远程访问」→ 注册/登录手机号即可（无需任何命令）。");
   }
   console.log("\n" + L.join("\n") + "\n");
 }
 
-// ---------- plugin：安装/卸载 dsh web 远程控制插件 ----------
+// ---------- plugin：安装/卸载 dsh web 远程访问插件 ----------
 /** 当前插件名（2026-09 由 dsh-remote-ui 更名；dsh-remote-web = dsh-remote 的 dsh web 插件半）。 */
 const PLUGIN_ID = "dsh-remote-web";
 /** 更名前的历史插件名（≤0.4.9）：升级安装/卸载时一并清理，避免旧 id 残留导致重复激活。 */
@@ -2113,7 +2113,7 @@ else if (cmd === "status") {
   console.log("配置文件:", CONFIG_PATH);
   console.log("连接模式:", local ? `自建服务（${cfg.tunnel_url || "未设置服务器地址"}）` : `SaaS 云端服务（${cfg.phone || "未配置账号"}）`);
   console.log("API:", cfg.api_url || (local ? "（自建模式无需账号 API）" : DEFAULT_API));
-  console.log("远程地址/登录: 打开 dsh web → 设置 → 「远程控制」查看与操作");
+  console.log("远程地址/登录: 打开 dsh web → 设置 → 「远程访问」查看与操作");
   // 插件挂载诊断：报障时一眼看出是"链接坏了"还是"别的毛病"
   const profileDir = resolveProfileDir([]);
   if (fs.existsSync(path.join(profileDir, "package.json"))) {

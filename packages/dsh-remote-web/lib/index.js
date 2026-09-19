@@ -276,8 +276,12 @@ function spawnAndConfirm(command, args, opts = {}) {
 // 兼容旧格式（纯时间戳数字 → 只按超时清理）。
 
 function readMarkerInfo(filePath) {
+  // ⚠️ `raw` 必须声明在 try **之外**：它下面还要用。此前写成 `const raw = …` 在 try 块内，
+  // 于是"旧格式（纯时间戳数字）标记"会在这里抛 ReferenceError ——
+  // 所有调用点都被 try/catch 吞掉，表现是**旧格式标记永远不会被清理**（潜伏缺陷，0.6.9 修）。
+  let raw = "";
   try {
-    const raw = readFileSync(filePath, "utf8").trim();
+    raw = readFileSync(filePath, "utf8").trim();
     const j = JSON.parse(raw);
     if (Number.isInteger(j?.pid) || Number.isInteger(j?.at)) return j;
   } catch { /* 非 JSON → 数字时间戳或空 */ }
@@ -308,19 +312,58 @@ function pidAlive(pid) {
  */
 function sweepStaleMarkers(relayDir) {
   const now = Date.now();
-  for (const name of [PROVISION_MARKER, UPDATE_MARKER]) {
+  for (const [name, logName, kind] of [
+    [PROVISION_MARKER, AUTO_INSTALL_LOG, "install"],
+    [UPDATE_MARKER, UPDATE_LOG, "update"],
+  ]) {
     const p = join(relayDir, name);
     let info;
     try { info = readMarkerInfo(p); } catch { continue; }
     if (!info) continue;
     const dead = pidAlive(info.pid);
     const expired = now - info.at > STALE_MARKER_MS;
+    // 【0.6.9 新增】进程**活着但长时间没有推进** → 先结束它再清标记。
+    // 诊断报告 P2：旧实现只看「进程还在不在」，挂死的进程因此永远不被结束，用户每次重试都堆一个。
+    if (dead !== false) {
+      const idle = progressIdleMs(relayDir, logName, info.at);
+      if (idle > stallIdleMs(kind)
+        && killStalledChild(relayDir, logName, info, kind, "宿主启动清理")) {
+        stopProgressWatch(kind === "update" ? UPDATE_WATCH_KEY : `install:${relayDir}`);
+        try { rmSync(p, { force: true }); } catch { /* ignore */ }
+        continue;
+      }
+    }
     if (dead === false || (dead === null && expired)) {
       try { rmSync(p, { force: true }); } catch { /* ignore */ }
       appendLogLine(relayDir, AUTO_INSTALL_LOG,
         `[dsh-remote-web] 清理残留标记 ${name}（pid=${info.pid ?? "?"}, at=${new Date(info.at).toISOString()}${dead === false ? ", 进程已死" : ", 已超时"}）`);
     }
   }
+}
+
+/**
+ * 复用面板已有的 2~3s 轮询，顺手驱动「卡住的更新」自愈（诊断报告 F5）。
+ *
+ * 补装之所以能自愈，靠的是「每次轮询都再试一次」（ensureConnection → ensureRuntime）；
+ * 而更新路径原先只有一次性 fire-and-forget（全文只有一个调用点），**一旦第一次卡住就再没有任何后续**。
+ * 这里把同一套引擎平移到更新上：轮询时若发现「标记在、但日志很久没变」，
+ * 就结束进程 + 清标记 + 如实记一条失败（面板据此给「重试」，而不是永久转圈）。
+ */
+function healStalledJobs(relayDir) {
+  try {
+    const marker = join(relayDir, UPDATE_MARKER);
+    if (!existsSync(marker)) return false;
+    const info = readMarkerInfo(marker);
+    const idle = progressIdleMs(relayDir, UPDATE_LOG, info && info.at);
+    if (idle <= stallIdleMs("update")) return false; // 还在推进：不打扰
+    const killed = killStalledChild(relayDir, UPDATE_LOG, info, "update", "面板轮询发现长时间无输出");
+    stopProgressWatch(UPDATE_WATCH_KEY);
+    try { rmSync(marker, { force: true }); } catch { /* ignore */ }
+    noteUpdateFailure(relayDir, `更新进程长时间没有响应（已 ${Math.round(idle / 1000)} 秒无输出），已结束并清理，可以重试`, "update_stalled");
+    telemetryRecord(relayDir, "update_failed", { fail_code: "update_stalled" });
+    appendLogLine(relayDir, UPDATE_LOG, `[update] 看门狗：已 ${Math.round(idle / 1000)}s 无输出 → 结束进程(${killed ? "已结束" : "进程已不在"})并清标记`);
+    return true;
+  } catch { return false; }
 }
 
 /** 读取 JSON body。 */
@@ -861,7 +904,11 @@ function ensureRuntime(relayDir) {
   try {
     mkdirSync(relayDir, { recursive: true });
     const log = join(relayDir, AUTO_INSTALL_LOG);
-    const clear = () => { try { rmSync(marker, { force: true }); } catch { /* ignore */ } };
+    const watchKey = `install:${relayDir}`;
+    const clear = () => {
+      stopProgressWatch(watchKey);
+      try { rmSync(marker, { force: true }); } catch { /* ignore */ }
+    };
     // 补装失败（spawn 都起不来）时统一收尾：清安装标记 + 记日志 + 进退避 + 匿名遥测。
     // 没有这条兜底，spawn 的异步 'error' 会变成未捕获异常打挂宿主（旧实现在 Windows 上正是如此）。
     const failSpawn = (e, kind) => {
@@ -870,6 +917,7 @@ function ensureRuntime(relayDir) {
       noteProvisionFailure(relayDir);
       telemetryRecord(relayDir, "install_failed", { fail_code: telemetryFailCodeFromError(e) });
     };
+    let stalledInstall = false; // 本轮是否因"长时间无输出"被判卡住（归因用）
     const npx = npxInvocation();
     const { child, error } = safeSpawn(npx.command, [...npx.args, "--yes", UPDATE_SPEC], {
       detached: true,
@@ -888,6 +936,19 @@ function ensureRuntime(relayDir) {
       return false;
     }
     writeMarker(marker, child.pid); // 记 pid：宿主重启后可立即清理死进程残留
+    // 【0.6.9 关键修复】补装同样要有无输出看门狗。
+    // 这一条直接对应"面板注册完成、设备却没有上报"的装机流失：npx 拉取在"连得上但传不动"的
+    // 链路上会**挂起**（进程活着、永远不产出 exit），旧实现只在"pid 死 或 标记超 10 分钟"时才清理，
+    // 于是卡住的安装能吃满 10 分钟退避窗口、反复失败；用户看到的是"正在安装…"永远不动。
+    startProgressWatch(watchKey, {
+      relayDir, logName: AUTO_INSTALL_LOG, kind: "install",
+      getChild: () => child,
+      onStall: (idle) => {
+        stalledInstall = true;
+        appendLogLine(relayDir, AUTO_INSTALL_LOG,
+          `[auto-install] 已 ${Math.round(idle / 1000)}s 无输出 → 判定卡住，结束该进程并按失败处理（下一轮会重试）`);
+      },
+    });
     // 记下「本机运行环境是插件自愈补的」：登录后的 /api/install-report 与 bridge 设备登记
     // 都据此上报 install_source=plugin_market（区分用户自己跑 npx 安装器的那条路径）。
     try {
@@ -906,8 +967,9 @@ function ensureRuntime(relayDir) {
         noteProvisionSuccess(relayDir);
         telemetryRuntimeReady(relayDir); // 退出码 0 ≠ 装好了
       } else {
-        // 退出码非 0，或退出码 0 但安装脚本没落盘（装到一半/装错包）→ 都算失败并进入退避
-        const code2 = code === 0 ? "install_script_missing" : telemetryFailCodeFromText(readTail(log));
+        // 退出码非 0、卡住超时、或退出码 0 但安装脚本没落盘（装到一半/装错包）→ 都算失败并进入退避
+        const code2 = stalledInstall ? "runtime_install_timeout"
+          : (code === 0 ? "install_script_missing" : telemetryFailCodeFromText(readTail(log)));
         const back = noteProvisionFailure(relayDir);
         appendLogLine(relayDir, AUTO_INSTALL_LOG,
           `[auto-install] 第 ${back.fails} 次失败（归因 ${code2}），${Math.round(back.waitMs / 1000)}s 后才会重试`);
@@ -2379,7 +2441,7 @@ const PLUGIN_ID = "dsh-remote-web";
 const PLUGIN_LEGACY_IDS = ["dsh-remote-ui"];
 const PLUGIN_ALL_IDS = [PLUGIN_ID, ...PLUGIN_LEGACY_IDS];
 /** 插件自身发布版本（与 dsh-remote 根包同步递增）。 */
-const PLUGIN_VERSION = "0.6.8";
+const PLUGIN_VERSION = "0.6.9-beta.1";
 const UPDATE_LOG = ".dsh-update.log";
 const UPDATE_MARKER = ".dsh-update-running";
 
@@ -2387,21 +2449,183 @@ const UPDATE_MARKER = ".dsh-update-running";
  * 更新通道（发布策略）：普通用户只拉稳定 dist-tag `latest`；预发(alpha/beta)由作者/内测
  * 通过 `DSH_UPDATE_TAG=beta`（或显式版本号）拉取。迭代一律先发 beta/alpha，稳定后才升 latest。
  */
-const UPDATE_TAG = (process.env.DSH_UPDATE_TAG || "latest").replace(/^@/, "");
-const UPDATE_SPEC = `@mrrisega/dsh-remote@${UPDATE_TAG}`;
+/**
+ * 「无输出看门狗」——更新与补装共用（0.6.9）。
+ *
+ * 0.6.8 诊断报告的核心结论：旧的三套卡死治理（sweepStaleMarkers / runOnlineUpdate 的陈旧判定 /
+ * 镜像回退）**判据全选错了** —— 它们问的是"标记还在不在 / 进程还活不活"，没有一套在问
+ * "它还在不在往前推进"。而中国网络访问 registry.npmjs.org 的**典型**失败形态恰恰是**挂起**
+ * （TCP 连得上、传输不动）：进程活着、标记是新的、却永远不产出任何事件（没有 exit、没有新日志）。
+ * 于是镜像回退只在"快速失败"这一种形态下生效，最常见的那种零覆盖 ——
+ * 用户看到的是永久「更新中 / 正在安装」，而装机数就是不涨。
+ *
+ * 判据换成**日志文件多久没有新增字节**：进度信号是现成的（两条路径本来就把子进程输出写进日志），
+ * 而且用 mtime 判定在**宿主重启后依然有效**（内存里的看门狗做不到这点）。
+ * 超时 → 判定卡住 → 结束该子进程 → 走与 exit≠0 **完全相同**的回退路径。
+ * 阈值可用 DSH_UPDATE_IDLE_MS / DSH_INSTALL_IDLE_MS 覆盖（仅供测试把链路压到亚秒级）。
+ */
+function stallPollMs() {
+  const n = Number(process.env.DSH_STALL_POLL_MS);
+  return Number.isFinite(n) && n > 0 ? n : 2000;
+}
+/** 无输出多久判定卡住；默认 120s（给慢链路留余量，又不让用户干等到天荒地老）。 */
+function stallIdleMs(kind) {
+  const env = kind === "update" ? process.env.DSH_UPDATE_IDLE_MS : process.env.DSH_INSTALL_IDLE_MS;
+  const n = Number(env);
+  return Number.isFinite(n) && n > 0 ? n : 120_000;
+}
 
-/** 查询所选通道(npm dist-tag)最新版（官方源优先，失败回退 npmmirror；纯服务端无 CORS 限制）。 */
-async function npmLatestVersion() {
+/** 日志文件自 `since` 以来多久没变化（毫秒）。取不到文件时退化为"距 since 的时长"。 */
+function progressIdleMs(relayDir, logName, since) {
+  try {
+    return Date.now() - statSync(join(relayDir, logName)).mtimeMs;
+  } catch {
+    return Date.now() - (Number(since) || Date.now());
+  }
+}
+
+/** 进度看板：key → { startedAt, lastProgressAt, lastSize, stalled, kind, timer }（供面板读"已用时/是否卡住"）。 */
+const progressWatch = new Map();
+
+/**
+ * 给一个后台子进程装上无输出看门狗。
+ * @param {string} key 唯一键（'update' / 'install:<relayDir>'）
+ * @param {{relayDir:string, logName:string, getChild:()=>any, onStall?:(idleMs:number)=>void, kind:"update"|"install"}} opts
+ */
+function startProgressWatch(key, opts) {
+  stopProgressWatch(key);
+  const { relayDir, logName, getChild, onStall, kind } = opts;
+  const logFile = join(relayDir, logName);
+  const st = { startedAt: Date.now(), lastProgressAt: Date.now(), lastSize: -1, stalled: false, kind, timer: null };
+  progressWatch.set(key, st);
+  const timer = setInterval(() => {
+    let size = -1;
+    try { size = statSync(logFile).size; } catch { size = -1; } // 文件还没有 = 也没有任何输出
+    if (size !== st.lastSize) { st.lastSize = size; st.lastProgressAt = Date.now(); return; } // 有新增输出 = 在推进
+    const idle = Date.now() - st.lastProgressAt;
+    if (idle < stallIdleMs(kind)) return;
+    st.stalled = true;
+    clearInterval(timer);
+    timer.unref?.();
+    // ① 先结束子进程：它会触发 'exit'，从而走与"退出码非 0"完全相同的回退/报错路径
+    try { getChild()?.kill(); } catch { /* 已退出 */ }
+    // ② 再通知调用方记日志（顺序固定：kill 是必须发生的动作，日志是告知）
+    try { onStall?.(idle); } catch { /* 回调出错不得影响关闭 */ }
+  }, stallPollMs());
+  timer.unref?.();
+  st.timer = timer;
+  return st;
+}
+
+function stopProgressWatch(key) {
+  const st = progressWatch.get(key);
+  if (st?.timer) clearInterval(st.timer);
+  progressWatch.delete(key);
+}
+
+/** 供面板/诊断读取的进度信息（没有进行中的任务时返回 null）。 */
+function progressInfoOf(key) {
+  const st = progressWatch.get(key);
+  if (!st) return null;
+  const now = Date.now();
+  return {
+    elapsedMs: now - st.startedAt,
+    idleMs: now - st.lastProgressAt,
+    stalled: Boolean(st.stalled),
+    idleThresholdMs: stallIdleMs(st.kind),
+  };
+}
+
+/**
+ * 结束"标记里记着、但已经不推进"的子进程。
+ * 诊断报告 P2：挂死的子进程**从不被结束**（`child.kill()` 在插件半全文无匹配，标记里的 pid
+ * 只被用来"判活"、从未被用来"结束"）→ 用户重试几次就在机器上堆几个挂死的 node 进程，无人回收。
+ * 判据同样不能用 pidAlive（挂起的进程是"活"的），要结合"日志多久没变化"。
+ */
+function killStalledChild(relayDir, logName, info, kind, why) {
+  const pid = Number(info && info.pid);
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (pidAlive(pid) !== true) return false;                     // 已经死了：交给标记清理逻辑
+  const idle = progressIdleMs(relayDir, logName, info && info.at);
+  if (idle < stallIdleMs(kind)) return false;                   // 还在推进：不碰它
+  const ok = killPid(pid, "SIGKILL");                            // Windows 上走 taskkill /T /F
+  appendLogLine(relayDir, AUTO_INSTALL_LOG,
+    `[dsh-remote-web] 结束卡住的${kind === "update" ? "更新" : "运行环境安装"}进程 pid=${pid}（${why}；已 ${Math.round(idle / 1000)}s 无输出）`);
+  return ok;
+}
+
+/**
+ * 更新通道（0.6.9 修：诊断报告 P3「通道默认值不自洽」）。
+ * 原实现无条件拉 `latest`：**预发版装机的用户在面板点「一键更新」= 降级或什么都不做**，
+ * 而面板既不显示当前通道、也不沿用当前通道 —— 作者/内测用户点出一个方向相反的操作且无从判断。
+ * 现在：显式设置优先（DSH_UPDATE_TAG，用于主动切通道），否则**沿用装机通道**
+ * （当前是预发版 → beta；正式版 → latest）。
+ */
+function updateChannel() {
+  const explicit = String(process.env.DSH_UPDATE_TAG || "").trim().replace(/^@/, "");
+  if (explicit) return explicit;
+  return /-/.test(String(PLUGIN_VERSION || "")) ? "beta" : "latest";
+}
+const UPDATE_TAG = updateChannel();
+const UPDATE_SPEC = `@mrrisega/dsh-remote@${UPDATE_TAG}`;
+/** 看门狗在 progressWatch 里的键（更新只有一个，用常量；补装按 relayDir 区分）。 */
+const UPDATE_WATCH_KEY = "update";
+/**
+ * 被用户取消的更新（按 relayDir）。
+ * 为什么需要：取消会 kill 子进程 → 触发 'exit' → 那里的"换源重试"逻辑会**立刻重新 spawn**，
+ * 把标记写回来，用户看到的是"点了取消还在更新"。这个集合就是给重试链装的总闸。
+ */
+const updateCancelledDirs = new Set();
+
+/** 抓一次 npm dist-tags（官方源优先，失败回退 npmmirror；纯服务端无 CORS 限制）。 */
+async function fetchDistTags() {
   for (const reg of ["https://registry.npmjs.org/@mrrisega/dsh-remote", "https://registry.npmmirror.com/@mrrisega/dsh-remote"]) {
     try {
       const res = await fetch(reg, { signal: AbortSignal.timeout(8000) });
       if (!res.ok) continue;
       const j = await res.json();
       const tags = j && j["dist-tags"] ? j["dist-tags"] : {};
-      if (typeof tags[UPDATE_TAG] === "string") return tags[UPDATE_TAG];
+      if (Object.keys(tags).length) return tags;
     } catch { /* 试下一个源 */ }
   }
-  return "";
+  return {};
+}
+
+/** 在「当前通道」与 latest 之间取更高者（**更新与"检查更新"必须用同一口径**，否则面板会说"已是最新"而更新却装新版）。 */
+function pickBestTag(tags) {
+  const t = tags || {};
+  const channelVer = typeof t[UPDATE_TAG] === "string" ? t[UPDATE_TAG] : "";
+  const latestVer = typeof t.latest === "string" ? t.latest : "";
+  if (!latestVer) return { tag: UPDATE_TAG, version: channelVer, why: "线上没有 latest 通道信息" };
+  if (!channelVer) return { tag: "latest", version: latestVer, why: "当前通道无对应版本，改用 latest" };
+  const cmp = compareVersions(latestVer, channelVer);
+  if (cmp !== null && cmp > 0) {
+    return { tag: "latest", version: latestVer, why: `latest(${latestVer}) 高于当前通道 ${UPDATE_TAG}(${channelVer})` };
+  }
+  return { tag: UPDATE_TAG, version: channelVer, why: `当前通道 ${UPDATE_TAG}(${channelVer}) 不低于 latest(${latestVer})` };
+}
+
+/** 查询"对我而言"的最新版本号（口径同 pickBestTag）。 */
+async function npmLatestVersion() {
+  return pickBestTag(await fetchDistTags()).version;
+}
+
+/**
+ * 决定本次更新**真正该装的 tag**：在「当前通道」与 `latest` 之间**取更高者**。
+ *
+ * 为什么不无条件跟随通道（诊断报告 P3 的另一半）：开发期内 beta 领先（跟随 beta 是对的），
+ * 但**正式版一旦发布，latest 就反超**；此时死跟 beta 会让内测用户卡在一个旧 beta 上，
+ * 点「一键更新」什么都不发生 —— 那正是报告里说的"方向相反的操作"。
+ * 取更高者同时满足两种情况：既不会把 beta 装机降级到稳定版，也不会让它错过已发布的稳定版。
+ * 取不到 tag（断网/超时）时保守回退到当前通道，绝不因此阻断更新。
+ * @returns {{tag:string, version:string, why:string}}
+ */
+async function resolveUpdateTarget() {
+  try {
+    return pickBestTag(await fetchDistTags());
+  } catch {
+    return { tag: UPDATE_TAG, version: "", why: "无法读取 npm 通道信息，按当前通道执行" };
+  }
 }
 
 /**
@@ -2468,10 +2692,10 @@ function recentUpdateFailure(relayDir) {
 /** 以 detached 子进程执行 `npx --yes <UPDATE_SPEC>`（env 可覆盖 npm 源/更新通道）。
  * @returns {{child, error}} 由 safeSpawn 返回——永远挂了 'error' 监听，启动失败不会打挂宿主。
  */
-function spawnUpdater(relayDir, extraEnv, onError) {
+function spawnUpdater(relayDir, extraEnv, onError, spec = UPDATE_SPEC) {
   const log = join(relayDir, UPDATE_LOG);
   const npx = npxInvocation();
-  return safeSpawn(npx.command, [...npx.args, "--yes", UPDATE_SPEC], {
+  return safeSpawn(npx.command, [...npx.args, "--yes", spec], {
     detached: true,
     cwd: homedir(),
     // Windows 上跑 npx.cmd 必须经 shell（Node ≥20.12 起否则 EINVAL）；走 node+npx-cli.js 时不需要。
@@ -2494,7 +2718,7 @@ function spawnUpdater(relayDir, extraEnv, onError) {
  *     失败(国内网络)才回退用户默认镜像源；
  *   - marker 记录 pid，子进程退出/出错即清理；宿主重启后由 sweepStaleMarkers 立即清掉死进程残留。
  */
-function runOnlineUpdate(relayDir) {
+async function runOnlineUpdate(relayDir) {
   try {
     mkdirSync(relayDir, { recursive: true });
     const marker = join(relayDir, UPDATE_MARKER);
@@ -2510,11 +2734,21 @@ function runOnlineUpdate(relayDir) {
         return { ok: false, detail: "已有更新在进行中，请稍候（若长时间无进展，最多 10 分钟后可重试）" };
       }
     }
-    appendLogLine(relayDir, UPDATE_LOG, `[update] 开始在线更新 ${UPDATE_SPEC} (${new Date().toISOString()})`);
+    updateCancelledDirs.delete(relayDir); // 新一轮开始：清掉上次的取消闸
+    // 【0.6.9】目标 tag 在「当前通道」与 latest 之间取更高者（见 resolveUpdateTarget 注释）：
+    // 既不把内测装机降级到稳定版，也不让它错过已发布的正式版。
+    const target = await resolveUpdateTarget();
+    const spec = `@mrrisega/dsh-remote@${target.tag}`;
+    appendLogLine(relayDir, UPDATE_LOG,
+      `[update] 开始在线更新 ${spec}（通道 ${UPDATE_TAG}；${target.why}）(${new Date().toISOString()})`);
     telemetryRecord(relayDir, "update_started"); // 匿名遥测：在线更新开始
 
     let retried = false;
-    const clear = () => { try { rmSync(marker, { force: true }); } catch { /* ignore */ } };
+    let stalled = false; // 本轮是否因"长时间无输出"被判定卡住（决定失败归因与是否回退）
+    const clear = () => {
+      stopProgressWatch(UPDATE_WATCH_KEY);
+      try { rmSync(marker, { force: true }); } catch { /* ignore */ }
+    };
     // 启动失败（ENOENT/EINVAL…）的收尾：清 marker + 记日志 + 记失败原因（面板可查询）+ 匿名遥测。
     // 抽出来给「同步失败」与「异步 'error' 事件」共用，保证任何一种失败都不会变成未捕获异常。
     const failUpdaterSpawn = (e) => {
@@ -2525,18 +2759,43 @@ function runOnlineUpdate(relayDir) {
       telemetryRecord(relayDir, "update_failed", { fail_code: fc });
     };
     const run = () => {
-      // 第一次：官方 npm 源；失败(exit≠0/网络)才回退用户默认源（通常为国内镜像）
+      if (updateCancelledDirs.has(relayDir)) { updateCancelledDirs.delete(relayDir); return null; } // 已取消：不再重试
+      // 第一次：官方 npm 源；失败(exit≠0 **或长时间无输出**)才回退用户默认源（通常为国内镜像）
+      stalled = false;
+      const holder = { child: null };
       const { child, error } = spawnUpdater(
-        relayDir, retried ? {} : { npm_config_registry: "https://registry.npmjs.org" }, failUpdaterSpawn);
+        relayDir, retried ? {} : { npm_config_registry: "https://registry.npmjs.org" }, failUpdaterSpawn, spec);
       if (error || !child) {
         if (error) failUpdaterSpawn(error);
         return null;
       }
+      holder.child = child;
       writeMarker(marker, child.pid);
+      // 【0.6.9 关键修复】无输出看门狗：中国网络访问 npm 官方源的典型失败形态是**挂起**
+      // （进程活着、永远不产出 exit），旧实现只看"退出码非 0"，于是回退永不触发、标记永不清除、
+      // 用户永久停在「更新中」。这里以"日志多久没新增字节"为判据，卡住即结束进程 →
+      // 自然而然地走下面 exit≠0 的同一条回退路径。
+      startProgressWatch(UPDATE_WATCH_KEY, {
+        relayDir, logName: UPDATE_LOG, kind: "update",
+        getChild: () => holder.child,
+        onStall: (idle) => {
+          stalled = true;
+          appendLogLine(relayDir, UPDATE_LOG,
+            `[update] 已 ${Math.round(idle / 1000)}s 无输出 → 判定卡住，结束该进程${retried ? "（已重试过，不再回退）" : "，回退默认源(npmmirror 等)重试"}…`);
+        },
+      });
       child.on("exit", (code) => {
-        if (!retried && code !== 0) {
+        stopProgressWatch(UPDATE_WATCH_KEY);
+        // 用户取消导致的退出：既不重试、也不记失败（取消不是失败）
+        if (updateCancelledDirs.has(relayDir)) {
+          updateCancelledDirs.delete(relayDir);
+          appendLogLine(relayDir, UPDATE_LOG, "[update] 已取消：不再换源重试");
+          return;
+        }
+        if (!retried && (code !== 0 || stalled)) {
           retried = true;
-          appendLogLine(relayDir, UPDATE_LOG, `[update] 官方源安装失败(exit=${code})，回退默认源(npmmirror 等)重试…`);
+          appendLogLine(relayDir, UPDATE_LOG,
+            `[update] ${stalled ? "官方源长时间无输出" : `官方源安装失败(exit=${code})`}，回退默认源(npmmirror 等)重试…`);
           run();
           return;
         }
@@ -2547,12 +2806,16 @@ function runOnlineUpdate(relayDir) {
         // 插件走 patch 热加载、bridge 是独立进程，重启 harness 已无必要（用户实测反馈）。
         // 成功不发事件（update_started 已发过，失败才发 update_failed；白名单里没有 update_done，
         // 硬发只会被服务端静默丢弃）。
-        if (code !== 0) {
+        if (code !== 0 || stalled) {
           const tail = readTail(join(relayDir, UPDATE_LOG));
-          const fc = telemetryFailCodeFromText(tail);
+          // 卡住是一种**独立的失败形态**，必须有自己的归因码 —— 旧实现只在 exit≠0 时记失败，
+          // 所以遥测里永远看不到"卡死"这一类，规模被持续低估（诊断报告 F2）。
+          const fc = stalled ? "update_stalled" : telemetryFailCodeFromText(tail);
           // 只把最后的可读片段给用户看（不含完整路径/用户名）；分类码仍按白名单上报
           const lastLine = String(tail || "").split("\n").map((l) => l.trim()).filter(Boolean).slice(-1)[0] || "";
-          noteUpdateFailure(relayDir, lastLine || `安装进程退出码 ${code}`, fc);
+          noteUpdateFailure(relayDir, stalled
+            ? "更新进程长时间没有任何输出（已判定卡住并结束），通常是本机到 npm 官方源的链路不通"
+            : (lastLine || `安装进程退出码 ${code}`), fc);
           telemetryRecord(relayDir, "update_failed", { fail_code: fc });
         } else {
           updateFailures.delete(String(relayDir)); // 成功即清掉旧失败
@@ -2568,7 +2831,7 @@ function runOnlineUpdate(relayDir) {
       const rec = recentUpdateFailure(relayDir);
       return { ok: false, detail: (rec && rec.detail) || "无法启动更新进程（npx 不可用？）", failCode: rec ? rec.failCode : "unknown" };
     }
-    return { ok: true, pid: child.pid, log: join(relayDir, UPDATE_LOG) };
+    return { ok: true, pid: child.pid, log: join(relayDir, UPDATE_LOG), channel: UPDATE_TAG, targetTag: target.tag, targetVersion: target.version };
   } catch (e) {
     try { rmSync(join(relayDir, UPDATE_MARKER), { force: true }); } catch { /* ignore */ }
     telemetryRecord(relayDir, "update_failed", { fail_code: telemetryFailCodeFromError(e) });
@@ -3200,6 +3463,8 @@ function buildConnectDiagnostics(relayDir, conn, log) {
  */
 function ensureConnection(relayDir, opts = {}) {
   if (UNINSTALLED_DIRS.has(relayDir)) return null;
+  // 顺手治一次「卡住的更新」（复用面板已有的轮询，不需要新定时器 —— 诊断报告 F5）
+  healStalledJobs(relayDir);
   const book = connectBook(relayDir);
   if (opts.force) { book.attempts = 0; book.lastAttemptAt = 0; }
   const now = Date.now();
@@ -3279,7 +3544,7 @@ const TELEMETRY_EVENT_NAMES = new Set([
 const TELEMETRY_FAIL_CODES = new Set([
   "node_missing", "node_too_old", "npm_unreachable", "npm_eacces", "platform_unsupported",
   "runtime_install_timeout", "launchd_failed", "bridge_exit", "bind_conflict", "bind_device_limit",
-  "npx_cmd_unavailable", "registry_timeout", "install_script_missing", "npx_exit_nonzero", "npx_output_encoding",
+  "npx_cmd_unavailable", "registry_timeout", "install_script_missing", "npx_exit_nonzero", "npx_output_encoding", "update_stalled",
   "unknown",
 ]);
 /** node 半只发 source=plugin。 */
@@ -3858,7 +4123,29 @@ function registerRoutes(ctx, relayDir) {
       path: "/dsh-remote/self",
       handler: async (_req, res) => {
         const runtimeReady = existsSync(join(relayDir, "dsh-setup.mjs"));
-        sendJson(res, 200, { ok: true, version: PLUGIN_VERSION, runtimeReady, relayDir });
+        // channel：当前更新通道（面板要显示出来 —— 否则预发版用户会点出一个方向相反的操作）
+        sendJson(res, 200, { ok: true, version: PLUGIN_VERSION, channel: UPDATE_TAG, runtimeReady, relayDir });
+      },
+    },
+    {
+      // 取消「正在进行的更新」：结束挂死的更新子进程 + 清标记。
+      // 面板在「疑似卡住」时提供这个按钮 —— 此前用户面对的是没有时间、没有日志、没有按钮的 spinner。
+      // 注意：取消**不写 update_failed 遥测**（用户主动取消不是失败），只在本地留一条可查询记录。
+      method: "POST",
+      path: "/dsh-remote/self/update/cancel",
+      handler: async (_req, res) => {
+        updateCancelledDirs.add(relayDir); // 先落闸：kill 会触发 exit，那里的重试逻辑必须看到"已取消"
+        const marker = join(relayDir, UPDATE_MARKER);
+        const info = readMarkerInfo(marker);
+        const pid = Number(info && info.pid);
+        let killed = false;
+        if (Number.isInteger(pid) && pid > 0 && pidAlive(pid) === true) killed = killPid(pid, "SIGKILL");
+        stopProgressWatch(UPDATE_WATCH_KEY);
+        let cleared = false;
+        try { rmSync(marker, { force: true }); cleared = !existsSync(marker); } catch { /* ignore */ }
+        appendLogLine(relayDir, UPDATE_LOG, `[update] 用户取消：结束进程(${killed ? "已结束" : "无活动进程"})，清标记(${cleared ? "成功" : "失败"})`);
+        if (cleared) noteUpdateFailure(relayDir, "更新已被取消，可以重新点「一键更新」再试一次", "user_cancelled");
+        sendJson(res, 200, { ok: true, killed, cleared, detail: cleared ? "已取消" : "取消失败：标记未能清除" });
       },
     },
     {
@@ -3879,7 +4166,7 @@ function registerRoutes(ctx, relayDir) {
       method: "POST",
       path: "/dsh-remote/self/update",
       handler: async (_req, res) => {
-        sendJson(res, 200, { ok: true, ...runOnlineUpdate(relayDir) });
+        sendJson(res, 200, { ok: true, ...(await runOnlineUpdate(relayDir)) });
       },
     },
     {
@@ -3887,13 +4174,26 @@ function registerRoutes(ctx, relayDir) {
       path: "/dsh-remote/self/update-log",
       handler: async (_req, res) => {
         const failure = recentUpdateFailure(relayDir);
+        const markerInfo = readMarkerInfo(join(relayDir, UPDATE_MARKER));
+        const running = existsSync(join(relayDir, UPDATE_MARKER));
+        const live = progressInfoOf(UPDATE_WATCH_KEY);
+        const idleMs = running ? progressIdleMs(relayDir, UPDATE_LOG, markerInfo && markerInfo.at) : 0;
+        const idleThresholdMs = stallIdleMs("update");
         sendJson(res, 200, {
           ok: true,
-          running: existsSync(join(relayDir, UPDATE_MARKER)),
+          running,
+          channel: UPDATE_TAG,
           log: tailOf(join(relayDir, UPDATE_LOG)),
           // 供前端在"没成功"时如实报错（此前失败只写日志，界面显示"已完成"）
           failure: failure ? { detail: failure.detail, failCode: failure.failCode, at: failure.at } : null,
-          version: PLUGIN_VERSION
+          version: PLUGIN_VERSION,
+          // 【0.6.9】让「卡住」在界面上可见：已用时 / 距上次日志变化多久 / 是否超过阈值。
+          // 用日志 mtime 判定 —— 宿主重启后依然有效（实测：重启也清不掉的永久「更新中」）。
+          startedAt: (markerInfo && markerInfo.at) || (live && live.startedAt) || 0,
+          elapsedMs: running && markerInfo ? Date.now() - markerInfo.at : (live ? live.elapsedMs : 0),
+          idleMs,
+          idleThresholdMs,
+          stalled: Boolean(running && idleMs > idleThresholdMs) || Boolean(live && live.stalled)
         });
       },
     },

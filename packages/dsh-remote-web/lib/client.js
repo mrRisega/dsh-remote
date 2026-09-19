@@ -46,36 +46,46 @@ window.__ModuleLoader__.load({
       ".dru-settings-head{display:flex;align-items:center;gap:10px;padding:6px 2px 2px}",
       ".dru-settings-icon{font-size:24px;line-height:1;flex:none}",
       ".dru-settings-title{margin:0;font-size:17px;font-weight:600;color:var(--dsw-alias-label-primary,#e6edf3)}",
-      ".dru-settings-sub{font-size:12px;color:var(--dsw-alias-label-tertiary,#8c959f);margin-top:2px}",
+      // 副标题用 #57606a（对 #f6f8fa 卡片底色 6.0:1，达 AA 正文标准）；旧的 #8c959f 只有 2.85:1
+      ".dru-settings-sub{font-size:12.5px;color:var(--dsw-alias-label-tertiary,#57606a);margin-top:3px;line-height:1.6}",
       ".dru-settings-body{display:flex;flex-direction:column;gap:14px}",
       // 首次安装引导小红点（挂在设置页「远程访问」导航栏目右上角）
       ".dru-reddot{position:absolute;top:9px;right:12px;width:7px;height:7px;border-radius:50%;background:#e5484d;box-shadow:0 0 0 2px var(--dsw-alias-bg-layer-2,#fff);pointer-events:none;z-index:1}",
       ".dru-card{background:#f6f8fa;border:1px solid #eaeef2;border-radius:10px;padding:14px 16px}",
       ".dru-card h3{margin:0 0 8px;font-size:13px;font-weight:700;color:#1f2328}",
       ".dru-url{background:#ffffff;border:1px solid #d0d7de;border-radius:8px;padding:9px 11px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;word-break:break-all;display:flex;align-items:center;justify-content:space-between;gap:8px;color:#1f2328}",
-      ".dru-url button{flex:none;border:1px solid #d0d7de;background:#ffffff;color:#0969da;border-radius:6px;padding:3px 8px;font-size:12px;cursor:pointer}",
-      ".dru-url button:hover{background:#f6f8fa}",
+      ".dru-url button{flex:none;min-height:44px;padding:10px 14px;border:1px solid #d0d7de;background:#ffffff;color:#0969da;border-radius:6px;font-size:12.5px;font-weight:600;cursor:pointer;font-family:inherit;transition:background .12s ease,border-color .12s ease}",
+      ".dru-url button:hover{background:#f6f8fa;border-color:#0969da}",
+      ".dru-url button:active{background:#eaeef2}",
       ".dru-field{margin-bottom:11px}",
       ".dru-field > label{display:block;font-size:12.5px;font-weight:600;color:#1f2328;margin-bottom:5px}",
-      ".dru-input{width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #d0d7de;background:#ffffff;color:#1f2328;font-size:13.5px;font-family:inherit}",
-      ".dru-input:focus{outline:none;border-color:#0969da;box-shadow:0 0 0 3px rgba(9,105,218,.15)}",
+      ".dru-input{width:100%;box-sizing:border-box;min-height:44px;padding:10px 11px;border-radius:8px;border:1px solid #d0d7de;background:#ffffff;color:#1f2328;font-size:13.5px;font-family:inherit}",
+      ".dru-input:focus{border-color:#0969da;box-shadow:0 0 0 3px rgba(9,105,218,.28)}",
       ".dru-actions{display:flex;gap:8px;flex-wrap:wrap}",
-      ".dru-btn{padding:8px 14px;border-radius:8px;border:1px solid transparent;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit}",
+      // 触控目标 ≥44px（相邻 8px，见 .dru-actions/.dru-tabs gap）：按钮统一 min-height + hover/active 反馈
+      ".dru-btn{min-height:44px;padding:10px 15px;border-radius:8px;border:1px solid transparent;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;transition:background .12s ease,border-color .12s ease,box-shadow .12s ease}",
       ".dru-btn:disabled{opacity:.55;cursor:default}",
       ".dru-btn-primary{background:#0969da;color:#ffffff;border-color:#0969da}",
       ".dru-btn-primary:hover:not(:disabled){background:#0860bd}",
+      ".dru-btn-primary:active:not(:disabled){background:#0757a8;border-color:#0757a8}",
       ".dru-btn-ghost{background:#ffffff;color:#1f2328;border-color:#d0d7de}",
-      ".dru-btn-ghost:hover:not(:disabled){background:#f6f8fa}",
+      ".dru-btn-ghost:hover:not(:disabled){background:#f6f8fa;border-color:#0969da}",
+      ".dru-btn-ghost:active:not(:disabled){background:#eaeef2}",
       ".dru-btn-danger{background:#ffffff;color:#cf222e;border-color:#cf222e}",
       ".dru-btn-danger:hover:not(:disabled){background:#fff0f1}",
-      ".dru-linkbtn{display:inline-block;padding:0;border:none;background:none;color:#0969da;font-size:12.5px;line-height:1.6;cursor:pointer;font-family:inherit;text-decoration:none}",
+      ".dru-btn-danger:active:not(:disabled){background:#ffdfe0}",
+      // 行内文字按钮：视觉高度不变（不破坏排版），用 ::after 把命中区扩到 ≥44px
+      ".dru-linkbtn{display:inline-block;position:relative;padding:0;border:none;background:none;color:#0969da;font-size:12.5px;line-height:1.7;cursor:pointer;font-family:inherit;text-decoration:none}",
+      ".dru-linkbtn::after{content:\"\";position:absolute;left:-8px;right:-8px;top:-12px;bottom:-12px}",
       ".dru-linkbtn:hover{text-decoration:underline}",
+      ".dru-linkbtn:active{color:#0550ae}",
       ".dru-tabs{display:flex;gap:8px;margin-bottom:12px}",
-      ".dru-tab{flex:1;padding:7px 0;text-align:center;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600;color:#57606a;background:#f6f8fa;border:1px solid #d0d7de;user-select:none}",
+      ".dru-tab{flex:1;min-height:44px;display:flex;align-items:center;justify-content:center;padding:8px 0;text-align:center;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600;color:#57606a;background:#f6f8fa;border:1px solid #d0d7de;user-select:none;transition:background .12s ease,border-color .12s ease}",
+      ".dru-tab:hover{background:#ffffff;border-color:#0969da;color:#0969da}",
       ".dru-tab.active{color:#0969da;background:#ffffff;border-color:#0969da}",
       ".dru-captcha{display:flex;align-items:stretch;gap:8px}",
       ".dru-captcha .dru-input{flex:1;min-width:0}",
-      ".dru-captcha-box{width:118px;height:42px;flex:none;border-radius:8px;border:1px solid #d0d7de;cursor:pointer;background:#f6f8fa;display:flex;align-items:center;justify-content:center;font-size:12px;color:#57606a;overflow:hidden}",
+      ".dru-captcha-box{width:118px;height:44px;flex:none;border-radius:8px;border:1px solid #d0d7de;cursor:pointer;background:#f6f8fa;display:flex;align-items:center;justify-content:center;font-size:12px;color:#57606a;overflow:hidden}",
       ".dru-captcha-box svg{display:block;width:100%;height:100%}",
       ".dru-user{display:flex;align-items:center;gap:10px;margin-bottom:12px}",
       ".dru-avatar{width:40px;height:40px;border-radius:50%;background:#0969da;color:#ffffff;display:flex;align-items:center;justify-content:center;font-size:17px;font-weight:700;flex-shrink:0}",
@@ -84,7 +94,7 @@ window.__ModuleLoader__.load({
       ".dru-status-line{display:flex;align-items:center;gap:8px;font-size:13px;color:#1f2328}",
       ".dru-dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex:none}",
       ".dru-dot-on{background:#1a7f37;box-shadow:0 0 6px rgba(26,127,55,.6)}",
-      ".dru-dot-off{background:#8c959f}",
+      ".dru-dot-off{background:#6e7781}",
       ".dru-meta{font-size:12px;color:#57606a;margin-top:6px;word-break:break-all}",
       ".dru-msg{font-size:12.5px;min-height:18px;margin-top:8px}",
       ".dru-msg-ok{color:#1a7f37}",
@@ -100,11 +110,12 @@ window.__ModuleLoader__.load({
       ".dru-restart-foot .dru-hint{flex:1;min-width:180px;margin:0}",
       // ── 用户反馈模块 ──
       ".dru-fb-tabs{display:flex;gap:8px;margin-bottom:10px}",
-      ".dru-fb-tab{flex:1;padding:6px 0;text-align:center;border-radius:8px;cursor:pointer;font-size:12.5px;font-weight:600;color:#57606a;background:#eaeef2;border:1px solid #d0d7de;user-select:none}",
+      ".dru-fb-tab{flex:1;min-height:44px;display:flex;align-items:center;justify-content:center;padding:8px 0;text-align:center;border-radius:8px;cursor:pointer;font-size:12.5px;font-weight:600;color:#57606a;background:#eaeef2;border:1px solid #d0d7de;user-select:none}",
       ".dru-fb-tab.active{color:#0969da;background:#ffffff;border-color:#0969da}",
       ".dru-fb-select{width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #d0d7de;background:#ffffff;color:#1f2328;font-size:13.5px;font-family:inherit}",
       ".dru-fb-textarea{width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #d0d7de;background:#ffffff;color:#1f2328;font-size:13.5px;font-family:inherit;resize:vertical;min-height:64px}",
-      ".dru-fb-textarea:focus{outline:none;border-color:#0969da;box-shadow:0 0 0 3px rgba(9,105,218,.15)}",
+      ".dru-fb-textarea:focus{border-color:#0969da;box-shadow:0 0 0 3px rgba(9,105,218,.28)}",
+      ".dru-fb-select:focus{border-color:#0969da;box-shadow:0 0 0 3px rgba(9,105,218,.28)}",
       ".dru-fb-item{border:1px solid #eaeef2;border-radius:8px;background:#ffffff;padding:10px 12px;margin-bottom:8px}",
       ".dru-fb-item-head{display:flex;align-items:center;gap:8px;margin-bottom:4px;flex-wrap:wrap}",
       ".dru-fb-badge{font-size:11px;border-radius:999px;padding:1px 8px;flex:none}",
@@ -114,14 +125,14 @@ window.__ModuleLoader__.load({
       ".dru-fb-cat{font-size:11px;border-radius:999px;padding:1px 8px;flex:none;color:#57606a;background:#f6f8fa;border:1px solid #d0d7de}",
       ".dru-fb-item-title{font-size:13px;font-weight:600;color:#1f2328;flex:1;min-width:120px}",
       ".dru-fb-item-content{font-size:12.5px;color:#57606a;white-space:pre-wrap;word-break:break-word;margin:4px 0}",
-      ".dru-fb-item-time{font-size:11px;color:#8c959f}",
+      ".dru-fb-item-time{font-size:11.5px;color:#57606a}",
       ".dru-fb-reply{border-top:1px dashed #eaeef2;margin-top:8px;padding-top:8px}",
       ".dru-fb-reply-row{display:flex;gap:6px;align-items:flex-start;margin-bottom:6px}",
       ".dru-fb-reply-who{font-size:12px;font-weight:600;color:#0969da;flex:none;width:76px}",
       ".dru-fb-reply-who.user{color:#57606a}",
       ".dru-fb-reply-text{font-size:12.5px;color:#1f2328;white-space:pre-wrap;word-break:break-word;flex:1}",
       ".dru-fb-reply-input{width:100%;box-sizing:border-box;padding:7px 10px;border-radius:8px;border:1px solid #d0d7de;background:#ffffff;font-size:12.5px;font-family:inherit;resize:vertical;min-height:44px}",
-      ".dru-fb-empty{font-size:12.5px;color:#8c959f;text-align:center;padding:14px 0}",
+      ".dru-fb-empty{font-size:12.5px;color:#57606a;text-align:center;padding:14px 0}",
       // ── 满意度弹窗（1 小时体验后，只弹一次） ──
       ".dru-popup{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:2147482000;display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box}",
       ".dru-popup-card{width:min(400px,calc(100vw - 48px));background:#ffffff;color:#1f2328;border:1px solid #d0d7de;border-radius:12px;box-shadow:0 24px 64px rgba(0,0,0,.45);font-size:14px;line-height:1.5;font-family:var(--dsw-font-family,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif);overflow:hidden}",
@@ -137,9 +148,9 @@ window.__ModuleLoader__.load({
       ".dru-popup-textarea{width:100%;box-sizing:border-box;padding:9px 11px;border-radius:8px;border:1px solid #d0d7de;background:#ffffff;color:#1f2328;font-size:13px;font-family:inherit;resize:vertical;min-height:56px;text-align:left}",
       ".dru-popup-invite{background:#f6f8fa;border:1px dashed #d0d7de;border-radius:8px;padding:12px;font-size:13px;color:#57606a;text-align:center;margin-bottom:12px}",
       ".dru-popup-actions{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-top:14px}",
-      ".dru-popup-foot{display:flex;justify-content:space-between;padding:10px 22px;border-top:1px solid #eaeef2;font-size:12px;color:#8c959f}",
-      ".dru-popup-foot button{border:none;background:none;color:#57606a;cursor:pointer;font-size:12px;font-family:inherit;padding:4px 6px}",
-      ".dru-popup-foot button:hover{color:#0969da}",
+      ".dru-popup-foot{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 16px;border-top:1px solid #eaeef2;font-size:12px;color:#57606a}",
+      ".dru-popup-foot button{min-height:44px;border:none;background:none;color:#57606a;cursor:pointer;font-size:12.5px;font-family:inherit;padding:10px 8px;border-radius:6px}",
+      ".dru-popup-foot button:hover{color:#0969da;background:#f6f8fa}",
       ".dru-popup .dru-msg{text-align:left}",
       ".dru-community-qr{display:block;width:220px;max-width:62vw;margin:0 auto;background:#ffffff;padding:10px;border-radius:10px;border:1px solid #d0d7de;box-sizing:content-box}",
       ".dru-restart-auto{display:flex;align-items:center;gap:8px;margin-top:10px;font-size:12.5px;color:#1a7f37;background:#dafbe1;border-radius:8px;padding:8px 10px}",
@@ -151,11 +162,63 @@ window.__ModuleLoader__.load({
       ".dru-ver-badge-new{color:#9a6700;background:#fff8c5;border:1px solid #eed888}",
       ".dru-ver-badge-ok{color:#1a7f37;background:#dafbe1;border:1px solid #aceebb}",
       ".dru-up-log{margin-top:8px;background:#0d1117;color:#e6edf3;border-radius:8px;padding:8px 10px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;line-height:1.5;white-space:pre-wrap;word-break:break-word;max-height:150px;overflow:auto}",
+      // 版本卡信息层级（0.6.9）：版本号大字 + 通道 chip + 指标行（已用时/无输出）+ 卡住告警
+      ".dru-ver-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}",
+      ".dru-ver-num{font-size:15px;font-weight:700;color:#1f2328}",
+      ".dru-ver-chip{font-size:11.5px;border-radius:999px;padding:2px 9px;color:#0a3069;background:#ddf4ff;border:1px solid #b6e3ff;white-space:nowrap}",
+      ".dru-ver-metrics{margin-top:9px;background:#ffffff;border:1px solid #d0d7de;border-radius:8px;padding:9px 11px}",
+      ".dru-ver-metric{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:12.5px;line-height:1.9;color:#1f2328}",
+      ".dru-ver-metric > span:first-child{color:#57606a}",
+      ".dru-stall{margin-top:9px;background:#fff8c5;border:1px solid #d4a72c;border-radius:8px;padding:10px 12px;font-size:12.5px;line-height:1.65;color:#6b5900}",
+      ".dru-stall b{color:#7d4e00}",
+      ".dru-spin{width:13px;height:13px;border-radius:50%;border:2px solid #d0d7de;border-top-color:#0969da;display:inline-block;vertical-align:-2px;animation:dru-spin .9s linear infinite}",
+      "@keyframes dru-spin{to{transform:rotate(360deg)}}",
+      // ── 🎯 邀请好友（0.6.9）：奖励前置（大字）→ 进度 → 邀请码/链接（一键复制）→ 折叠规则 → 记录 ──
+      ".dru-invite-hero{font-size:20px;line-height:1.4;font-weight:700;color:#1f2328;margin:2px 0 8px}",
+      ".dru-invite-hero em{font-style:normal;color:#0550ae}",
+      ".dru-invite-sub{font-size:13px;line-height:1.65;color:#57606a}",
+      ".dru-invite-prog{margin-top:12px;background:#ffffff;border:1px solid #d0d7de;border-radius:8px;padding:10px 12px}",
+      ".dru-invite-prog-top{display:flex;align-items:baseline;justify-content:space-between;gap:8px;flex-wrap:wrap;font-size:13px;font-weight:600;color:#1f2328}",
+      ".dru-invite-prog-top .n{font-size:15px;font-weight:700;color:#0550ae}",
+      ".dru-invite-bar{height:8px;border-radius:999px;background:#eaeef2;overflow:hidden;margin:9px 0 7px}",
+      ".dru-invite-bar-fill{height:100%;border-radius:999px;background:#0969da;transition:width .3s ease}",
+      ".dru-invite-next{font-size:12.5px;line-height:1.65;color:#57606a}",
+      ".dru-copy-row{margin-top:12px}",
+      ".dru-copy-row:first-child{margin-top:4px}",
+      ".dru-copy-label{font-size:12.5px;font-weight:600;color:#1f2328;margin-bottom:6px}",
+      ".dru-copy-box{display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:#ffffff;border:1px solid #d0d7de;border-radius:8px;padding:9px 11px}",
+      ".dru-code-val{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:19px;font-weight:700;letter-spacing:2.5px;color:#1f2328;flex:1;min-width:140px;word-break:break-all}",
+      ".dru-link-val{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;line-height:1.55;color:#1f2328;flex:1;min-width:180px;word-break:break-all;overflow-wrap:anywhere}",
+      ".dru-copy-btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;flex:none;min-height:44px;padding:10px 16px;border-radius:8px;border:1px solid #0969da;background:#0969da;color:#ffffff;font:600 13px/1.2 inherit;cursor:pointer;transition:background .12s ease,border-color .12s ease}",
+      ".dru-copy-btn:hover:not(:disabled){background:#0860bd;border-color:#0860bd}",
+      ".dru-copy-btn:active:not(:disabled){background:#0757a8;border-color:#0757a8}",
+      ".dru-copy-btn:disabled{opacity:.55;cursor:default}",
+      ".dru-copy-btn.copied{background:#1a7f37;border-color:#1a7f37}",
+      ".dru-empty{text-align:center;padding:20px 14px;background:#ffffff;border:1px dashed #d0d7de;border-radius:10px}",
+      ".dru-empty-icon{font-size:26px;line-height:1;margin-bottom:8px}",
+      ".dru-empty-title{font-size:13.5px;font-weight:600;color:#1f2328;margin-bottom:5px}",
+      ".dru-empty-sub{font-size:12.5px;line-height:1.7;color:#57606a;max-width:380px;margin:0 auto}",
+      ".dru-empty-actions{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-top:14px}",
+      ".dru-disclose{width:100%;box-sizing:border-box;min-height:44px;display:flex;align-items:center;justify-content:space-between;gap:10px;background:#ffffff;border:1px solid #d0d7de;border-radius:8px;padding:10px 12px;font:600 13px/1.3 inherit;color:#1f2328;cursor:pointer;text-align:left}",
+      ".dru-disclose:hover{background:#f6f8fa;border-color:#0969da}",
+      ".dru-disclose-caret{font-size:12px;font-weight:600;color:#57606a;flex:none}",
+      ".dru-rules{margin:10px 0 0;padding-left:20px;font-size:12.5px;line-height:1.8;color:#57606a}",
+      ".dru-rules li{margin-bottom:6px}",
+      ".dru-rules b{color:#1f2328}",
+      ".dru-rec{background:#ffffff;border:1px solid #eaeef2;border-radius:8px;padding:10px 12px;margin-bottom:8px}",
+      ".dru-rec-top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}",
+      ".dru-rec-who{font-size:13px;font-weight:600;color:#1f2328;flex:1;min-width:120px;word-break:break-all}",
+      ".dru-rec-when{font-size:12px;color:#57606a}",
+      ".dru-rec-tag{font-size:11.5px;border-radius:999px;padding:1px 9px;flex:none;white-space:nowrap}",
+      ".dru-rec-tag-ok{color:#116329;background:#dafbe1;border:1px solid #aceebb}",
+      ".dru-rec-tag-wait{color:#9a6700;background:#fff8c5;border:1px solid #eed888}",
+      ".dru-rec-sub{font-size:12px;color:#57606a;margin-top:5px;line-height:1.6}",
+      ".dru-rec-head{display:flex;gap:8px;font-size:11.5px;font-weight:600;color:#57606a;padding:0 4px 7px;border-bottom:1px solid #eaeef2;margin-bottom:9px}",
       // ── 📱 远程访问（一次性访问密钥 + 已授权设备管理） ──
       ".dru-access-flex{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-start;margin-top:10px}",
       ".dru-access-col{flex:1;min-width:230px;display:flex;flex-direction:column;gap:8px}",
       ".dru-qr-img{width:180px;height:180px;flex:none;border-radius:8px;border:1px solid #d0d7de;background:#ffffff;object-fit:contain}",
-      ".dru-qr-ph{width:180px;height:180px;flex:none;border-radius:8px;border:1px dashed #d0d7de;background:#f6f8fa;color:#8c959f;font-size:12px;display:flex;align-items:center;justify-content:center;text-align:center;padding:10px;box-sizing:border-box}",
+      ".dru-qr-ph{width:180px;height:180px;flex:none;border-radius:8px;border:1px dashed #d0d7de;background:#f6f8fa;color:#57606a;font-size:12px;display:flex;align-items:center;justify-content:center;text-align:center;padding:10px;box-sizing:border-box}",
       ".dru-url.big{font-size:13.5px;font-weight:600}",
       ".dru-cd{font-size:12px;color:#9a6700;margin-top:2px}",
       ".dru-cd-ok{color:#1a7f37}",
@@ -164,8 +227,8 @@ window.__ModuleLoader__.load({
       ".dru-dev-top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}",
       ".dru-dev-name{font-size:13px;font-weight:600;color:#1f2328;flex:1;min-width:130px}",
       ".dru-dev-meta{font-size:11.5px;color:#57606a}",
-      ".dru-dev-sub{font-size:11px;color:#8c959f;margin-top:3px}",
-      ".dru-dev-tag{font-size:10.5px;color:#8c959f;border:1px solid #d0d7de;border-radius:999px;padding:0 7px;flex:none;white-space:nowrap}",
+      ".dru-dev-sub{font-size:11.5px;color:#57606a;margin-top:4px}",
+      ".dru-dev-tag{font-size:11.5px;color:#57606a;border:1px solid #d0d7de;border-radius:999px;padding:0 7px;flex:none;white-space:nowrap}",
       ".dru-dev-tag-off{color:#cf222e;border-color:#ffb3b6;background:#fff0f1}",
       // Phase-5:端到端加密(E2EE)状态行 —— 启用=绿字绿点,未启用=灰字(纯文字状态行,不打扰)
       ".dru-e2ee-line{display:flex;align-items:center;gap:7px;margin-top:6px;font-size:12px;line-height:1.5;color:#57606a}",
@@ -175,6 +238,25 @@ window.__ModuleLoader__.load({
       ".dru-nav-remote{display:inline-flex;align-items:center;gap:6px;height:30px;margin:0 0 2px;padding:0 10px;border:1px solid #d0d7de;border-radius:8px;background:#ffffff;color:#0969da;font:500 12.5px/1 inherit;cursor:pointer;white-space:nowrap;user-select:none}",
       ".dru-nav-remote:hover:not(:disabled){background:#f0f6ff;border-color:#0969da}",
       ".dru-nav-remote-dot{position:absolute;top:-2px;right:-2px;width:8px;height:8px;border-radius:50%;background:#e5484d;box-shadow:0 0 0 2px #fff;pointer-events:none}",
+      // 侧栏入口与官方按钮同高（30px）；用 ::after 把命中区补到 ≥44px，不破坏与原按钮的对齐
+      ".dru-nav-remote::after{content:\"\";position:absolute;left:0;right:0;top:-7px;bottom:-7px}",
+      // ── 无障碍基线（0.6.9）────────────────────────────────────────────────
+      // 键盘焦点必须可见：放在样式表末尾，覆盖上面任何 outline:none（同特异性后者胜）
+      ".dru-settings-section :focus-visible,.dru-popup :focus-visible{outline:2px solid #0969da;outline-offset:2px}",
+      ".dru-settings-section [role=\"region\"]:focus-visible{outline-offset:-2px}",
+      ".dru-btn:focus-visible,.dru-copy-btn:focus-visible,.dru-tab:focus-visible,.dru-disclose:focus-visible{outline:2px solid #0969da;outline-offset:2px;box-shadow:0 0 0 4px rgba(9,105,218,.18)}",
+      // 尊重系统「减少动态效果」：关掉过渡与旋转动画（状态文字照常更新）
+      "@media (prefers-reduced-motion: reduce){",
+      "  .dru-btn,.dru-copy-btn,.dru-tab,.dru-disclose,.dru-invite-bar-fill,.dru-nav-remote,.dru-input,.dru-fb-tab,.dru-popup-rate button{transition:none !important}",
+      "  .dru-spin{animation:none !important;border-top-color:#0969da}",
+      "}",
+      // 窄屏（手机竖屏打开本机面板）：卡片内边距收紧、代码/链接不溢出
+      "@media (max-width:520px){",
+      "  .dru-card{padding:12px 12px}",
+      "  .dru-invite-hero{font-size:18px}",
+      "  .dru-copy-box{flex-direction:column;align-items:stretch}",
+      "  .dru-copy-btn{width:100%}",
+      "}",
     ].join("\n");
     document.head.appendChild(styleEl);
 
@@ -434,6 +516,62 @@ window.__ModuleLoader__.load({
       try { clearTimeout(t); } catch (e) { /* 忽略 */ }
     }
 
+    // ── 剪贴板（0.6.9 邀请区「一键复制」）────────────────────────────────────
+    /**
+     * 复制文本到剪贴板，返回 Promise<boolean>。
+     * 优先 Clipboard API；http 非安全上下文 / 旧浏览器里 navigator.clipboard 不存在
+     * → 退回隐藏 textarea + document.execCommand("copy")；两种都失败返回 false，
+     * 调用方**必须**在按钮旁给出可见提示（不能让用户以为"点了没反应"）。
+     */
+    function copyText(text) {
+      var s = text == null ? "" : String(text);
+      if (!s) return Promise.resolve(false);
+      var fallback = function () { return Promise.resolve(copyTextLegacy(s)); };
+      try {
+        if (navigator && navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+          return navigator.clipboard.writeText(s).then(function () { return true; }).catch(fallback);
+        }
+      } catch (e) { /* 落入兜底 */ }
+      return fallback();
+    }
+    /** 兜底复制：隐藏 textarea + execCommand（同步；不可用/被拒绝时返回 false）。 */
+    function copyTextLegacy(s) {
+      var ta = null;
+      try {
+        ta = document.createElement("textarea");
+        ta.value = s;
+        ta.setAttribute("readonly", "readonly");
+        ta.style.position = "fixed";
+        ta.style.top = "-1000px";
+        ta.style.left = "-1000px";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        try { ta.select(); } catch (e) { /* 某些环境无 select */ }
+        return !!(document.execCommand && document.execCommand("copy"));
+      } catch (e) {
+        return false;
+      } finally {
+        try { if (ta && ta.parentNode && ta.parentNode.removeChild) ta.parentNode.removeChild(ta); } catch (e) { /* 忽略 */ }
+      }
+    }
+    /** 毫秒 → 人话时长（"12 秒" / "1 分 05 秒" / "1 小时 02 分"）；用于更新「已用时」。 */
+    function fmtDuration(ms) {
+      var n = Number(ms);
+      var s = Math.max(0, Math.round((isFinite(n) ? n : 0) / 1000));
+      if (s < 60) return s + " 秒";
+      var m = Math.floor(s / 60);
+      if (m < 60) return m + " 分 " + (s % 60 < 10 ? "0" : "") + (s % 60) + " 秒";
+      return Math.floor(m / 60) + " 小时 " + (m % 60 < 10 ? "0" : "") + (m % 60) + " 分";
+    }
+    /** 手机号掩码（邀请记录里的好友手机号：面板只展示掩码，完整号码留在服务端）。 */
+    function maskPhoneLike(v) {
+      var s = String(v == null ? "" : v).trim();
+      if (!s) return "";
+      if (/^\d{11}$/.test(s)) return s.slice(0, 3) + "****" + s.slice(7);
+      if (/^\d{7,}$/.test(s)) return s.slice(0, 3) + "****" + s.slice(-2);
+      return s;
+    }
+
     /** 一次性访问密钥 / 已授权设备列表的自动重试状态（放在组件外：不随渲染重建）。 */
     var akeyRetry = { timer: null, attempt: 0 };
     var devRetry = { timer: null, attempt: 0 };
@@ -453,6 +591,13 @@ window.__ModuleLoader__.load({
      */
     var connFailRef = { v: 0 };
     var CONN_FAIL_VISIBLE = 3; // ≈ 2.5s × 3：既要够快让用户看见，又要避免一次抖动就报红
+    /**
+     * 「连接偏慢」的本地观察起点（0 = 不慢）——用于在用户干等时给一个轻量邀请入口。
+     * 只用既有 /dsh-remote/bridge-status 下发字段 + 本地计时，**不新增也不假设后端字段**；
+     * 观察不到就永远不显示（宁可不出现，也不误报）。
+     */
+    var slowConnTrack = { since: 0 };
+    var SLOW_CONNECT_HINT_MS = 90000; // 非 online 阶段持续 90s 才认为「明显偏慢」
     /** 连接阶段轮询节奏：未连通时 2.5s（自动推进），已连接后退避到 15s；页面隐藏时完全停下。 */
     var CONN_POLL_FAST_MS = 2500;
     var CONN_POLL_SLOW_MS = 15000;
@@ -956,15 +1101,18 @@ window.__ModuleLoader__.load({
                               h("div", { className: "dru-url", style: { marginTop: 10, textAlign: "left" } },
                                 h("span", null, popupInvite.link),
                                 h("button", { type: "button", onClick: function () {
-                                  try { navigator.clipboard.writeText(popupInvite.link).then(function () { setInviteCopied(true); setTimeout(function () { setInviteCopied(false); }, 1500); }); } catch (e) {}
+                                  copyText(popupInvite.link).then(function (done) {
+                                    setInviteCopied(done);
+                                    if (done) later(function () { setInviteCopied(false); }, 2000);
+                                  });
                                 } }, inviteCopied ? "已复制" : "复制邀请链接")
                               ),
                               h("div", { style: { marginTop: 8, fontSize: 12 } }, "把链接发给好友，注册时自动带上你的邀请码。")
                             )
                           : h("div", { style: { marginTop: 6, fontSize: 12 } },
                               popupInvite && popupInvite.code
-                                ? "邀请码 " + popupInvite.code + " 已生成：在设置面板 →「🎯 邀请好友赚会员」中复制邀请链接。"
-                                : "登录手机号账号后，在设置面板 →「🎯 邀请好友赚会员」中获取专属邀请链接。")
+                                ? "邀请码 " + popupInvite.code + " 已生成：在设置面板 →「🎯 邀请好友，一起用远程访问」里复制邀请链接。"
+                                : "登录手机号账号后，在设置面板 →「🎯 邀请好友，一起用远程访问」里获取专属邀请链接。")
                       )
                     : h("div", null,
                         h("div", { className: "dru-popup-actions" },
@@ -992,10 +1140,50 @@ window.__ModuleLoader__.load({
     // （原 🖥 已随入口迁移调整）；栏目导航 label 与栏目头部均使用它。
 
     // ── 版本与更新卡片（自管理：市场没有更新按钮，这里提供在线一键更新/彻底卸载） ──
-    // 数据来自 node 半新增的 /dsh-remote/self* 路由；逻辑均在插件 node 半实现，
+    // 数据来自 node 半的 /dsh-remote/self* 路由；逻辑均在插件 node 半实现，
     // 因此无论插件从「插件市场」还是 npx 安装，界面与行为完全一致。
+    //
+    // 【0.6.9 冻结契约】——**每个新字段都必须特性检测**，缺字段要优雅降级
+    // （否则面板会在旧 node 半上白屏/报错）：
+    //   GET  /dsh-remote/self               → { version, runtimeReady, channel? }
+    //   GET  /dsh-remote/self/update-log    → { running, log, failure?, channel?,
+    //                                           startedAt?, elapsedMs?, idleMs?, idleThresholdMs?, stalled? }
+    //   POST /dsh-remote/self/update         → { ok, channel? }
+    //   POST /dsh-remote/self/update/cancel  → { ok, killed, cleared }（旧 node 半无此路由 → 404 → 隐藏按钮并给一句人话）
+    //   failure.failCode 可能是 update_stalled（看门狗判定无输出）/ user_cancelled（用户主动取消）等
+    // 「已用时 / 无输出时长」在字段缺失时用本地观测兜底（startedAt/日志变化时间），保证旧宿主也看得见。
+    var UPDATE_IDLE_HINT_MS = 20000;   // 无新日志超过 20s → 灰字提示（不惊动用户）
+    var UPDATE_CANCEL_IDLE_MS = 90000; // 超过 90s 无变化 → 出现「取消并重试」（旧宿主无 idleThresholdMs 时的兜底）
+    /** 更新通道 → 人话（channel 也可能是具体版本号）。 */
+    var UPDATE_CHANNEL_COPY = { latest: "稳定版", beta: "预览版", next: "预览版", rc: "候选版" };
+    function updateChannelText(ch) {
+      var c = String(ch || "").trim();
+      if (!c) return "";
+      var friendly = UPDATE_CHANNEL_COPY[c];
+      if (friendly) return friendly + "（" + c + "）";
+      if (/^\d/.test(c)) return "指定版本（" + c + "）";
+      return c;
+    }
+    /**
+     * fail_code → 人话补一句。**只映射能确定的码**；未知码返回空串（不编造原因，
+     * 由服务端 detail 说明）。update_stalled 是 0.6.9 看门狗新增：更新进程长时间无输出。
+     */
+    var UPDATE_FAIL_COPY = {
+      update_stalled: "更新进程长时间没有响应，已自动换源重试；若长时间没有变化，可点「取消并重试」。",
+      user_cancelled: "更新已被取消，可以重新点「一键更新」再试一次。",
+      npx_cmd_unavailable: "本机找不到可用的安装命令（npx）：请先安装 Node.js，或重启一次 dsh web 后重试。",
+      node_missing: "本机没有找到 Node.js：请先安装 Node.js 后重试。",
+      node_too_old: "本机 Node.js 版本过低（需要 20 以上）：升级 Node.js 后重试。",
+      npm_unreachable: "连不上软件源：请检查网络后重试（面板会自动换源）。",
+      registry_timeout: "软件源响应超时：稍后重试即可（面板会自动换源）。",
+      platform_unsupported: "当前系统不支持自动更新：请按 README 手动安装。",
+      runtime_install_timeout: "运行环境安装超时：已自动重试，仍失败可点「取消并重试」。",
+    };
+    /** 更新进度的本地兜底（旧 node 半不下发进度字段时用）——放组件外，跨渲染保留。 */
+    var updTrack = { startedAt: 0, lastChangeAt: 0, lastLog: "" };
+
     function SelfManageCard() {
-      var verArr = useState(null); var ver = verArr[0]; var setVer = verArr[1];       // {version, runtimeReady}
+      var verArr = useState(null); var ver = verArr[0]; var setVer = verArr[1];       // {version, channel?, runtimeReady}
       var chkArr = useState(null); var chk = chkArr[0]; var setChk = chkArr[1];       // {current, latest, outdated}
       var chkBusyArr = useState(false); var chkBusy = chkBusyArr[0]; var setChkBusy = chkBusyArr[1];
       var upBusyArr = useState(false); var upBusy = upBusyArr[0]; var setUpBusy = upBusyArr[1];
@@ -1005,6 +1193,12 @@ window.__ModuleLoader__.load({
       var doneArr = useState(false); var updated = doneArr[0]; var setUpdated = doneArr[1]; // 本轮已更新完成（提示重启）
       var armArr = useState(false); var armed = armArr[0]; var setArmed = armArr[1];   // 彻底卸载二次确认
       var msgArr = useState(null); var selfMsg = msgArr[0]; var setSelfMsg = msgArr[1]; // {kind, text}
+      // 【0.6.9】更新可见性：进度快照（已用时/无输出/是否卡住）+ 取消按钮状态
+      var progArr = useState(null); var prog = progArr[0]; var setProg = progArr[1];
+      var tickArr = useState(0); var updTick = tickArr[0]; var setTick = tickArr[1];   // 1s 心跳：让「已用时」平滑走字
+      var cxBusyArr = useState(false); var cxBusy = cxBusyArr[0]; var setCxBusy = cxBusyArr[1];
+      var cxOkArr = useState(null); var cancelOk = cxOkArr[0]; var setCancelOk = cxOkArr[1]; // null=未知 true=可用 false=旧宿主无此接口
+      var cxMsgArr = useState(null); var cxMsg = cxMsgArr[0]; var setCxMsg = cxMsgArr[1];    // {kind, text}
 
       var loadVer = useCallback(function () {
         api("/dsh-remote/self").then(function (b) {
@@ -1022,59 +1216,98 @@ window.__ModuleLoader__.load({
         }).finally(function () { setChkBusy(false); });
       }, []);
 
-      // 轮询更新日志：点击一键更新后，每 2s 拉一次日志；直到 running=false 视为完成
-      var logTimer = useCallback(function (force) {
-        if (!force && updating) return;
-        api("/dsh-remote/self/update-log").then(function (b) {
-          if (b && b.ok) {
-            setLog(b.log || "");
-            if (!b.running) {
-              setUpdating(false);
-              setUpdated(true);
-              loadVer();
-              return;
-            }
-          }
-          setUpdating(true);
-        }).catch(function () { setUpdating(false); });
-      }, [updating, loadVer]);
+      /**
+       * 处理一次 /self/update-log 响应：刷新日志、进度指标、失败原因与版本；
+       * running=true → 继续跟踪；running=false → 收尾（进程结束 ≠ 更新成功）。
+       */
+      var applyUpdLog = useCallback(function (b) {
+        if (!b || !b.ok) return;
+        var now = Date.now();
+        var nextLog = typeof b.log === "string" ? b.log : "";
+        if (nextLog !== updTrack.lastLog) { updTrack.lastLog = nextLog; updTrack.lastChangeAt = now; }
+        setLog(nextLog);
+        var running = !!b.running;
+        var startedAt = Number(b.startedAt) > 0 ? Number(b.startedAt) : 0;
+        if (running && !updTrack.startedAt) updTrack.startedAt = startedAt || now;
+        if (!running) updTrack.startedAt = 0;
+        var hasIdle = isFinite(Number(b.idleMs));
+        setProg({
+          running: running,
+          at: now,
+          startedAt: startedAt || updTrack.startedAt || 0,
+          elapsedMs: isFinite(Number(b.elapsedMs)) ? Number(b.elapsedMs) : 0,
+          // 旧宿主没有 idleMs → 用「日志最后一次变化的本地时间」兜底
+          idleMs: hasIdle ? Number(b.idleMs) : (running && updTrack.lastChangeAt ? now - updTrack.lastChangeAt : 0),
+          idleThresholdMs: isFinite(Number(b.idleThresholdMs)) ? Number(b.idleThresholdMs) : 0,
+          stalled: b.stalled === true,
+          channel: typeof b.channel === "string" ? b.channel : ""
+        });
+        if (running) { setUpdating(true); return; }
+        setUpdating(false);
+        // 关键:进程结束 ≠ 更新成功。以前这里无条件显示"已更新完成"，
+        // 于是 spawn 失败（例如 npx 不可用）时界面只报成功、真实原因躺在日志里 ——
+        // 用户看到的就是"点了一键修复没反应"。现在按失败信息与版本是否变化如实反馈。
+        if (b.failure && b.failure.failCode === "user_cancelled") {
+          // 用户自己点的取消：不是错误，用中性提示，不刷红字
+          setUpdated(false);
+          setSelfMsg({ kind: "warn", text: UPDATE_FAIL_COPY.user_cancelled });
+        } else if (b.failure && b.failure.detail) {
+          setUpdated(false);
+          setSelfMsg({
+            kind: "err",
+            text: "更新失败：" + b.failure.detail + failCodeHint(b.failure.failCode, b.failure.detail) + "（可查看下方日志，或点「一键更新」重试）"
+          });
+        } else {
+          setUpdated(true);
+        }
+        loadVer();
+        doCheck();
+      }, [loadVer, doCheck]);
 
-      useEffect(function () { loadVer(); doCheck(); }, [loadVer, doCheck]);
+      /**
+       * fail_code → 人话（未知码返回空串：不编造原因，交给服务端 detail）。
+       * detail 已经说了同一件事时不重复刷一遍（0.6.9 的 update_stalled 就属于这种情况）。
+       */
+      function failCodeHint(code, detail) {
+        var txt = UPDATE_FAIL_COPY[String(code || "")];
+        if (!txt) return "";
+        var key = txt.split(/[，；。]/)[0];
+        if (detail && key && String(detail).indexOf(key) !== -1) return "";
+        return " ｜ " + txt;
+      }
+
+      // 一次性拉取更新状态：点击更新后立刻同步一次；面板打开时也探一次（更新可能是在别处点起的）
+      var logTimer = useCallback(function () {
+        return api("/dsh-remote/self/update-log").then(function (b) {
+          applyUpdLog(b);
+        }).catch(function () { /* 探针失败不影响面板 */ });
+      }, [applyUpdLog]);
+
+      useEffect(function () { loadVer(); doCheck(); logTimer(); }, [loadVer, doCheck, logTimer]);
+      // 更新进行中：每 2s 拉日志+进度；结束（running=false）时由 applyUpdLog 收尾并清掉定时器
       useEffect(function () {
-        if (!updating) return;
-        var iv = setInterval(function () {
-          api("/dsh-remote/self/update-log").then(function (b) {
-            if (!b || !b.ok) return;
-            setLog(b.log || "");
-            if (!b.running) {
-              clearInterval(iv);
-              setUpdating(false);
-              // 关键:进程结束 ≠ 更新成功。以前这里无条件显示"已更新完成"，
-              // 于是 spawn 失败（例如 npx 不可用）时界面只报成功、真实原因躺在日志里 ——
-              // 用户看到的就是"点了一键修复没反应"。现在按失败信息与版本是否变化如实反馈。
-              if (b.failure && b.failure.detail) {
-                setUpdated(false);
-                setSelfMsg({ kind: "err", text: "更新失败：" + b.failure.detail + "（可点「复制诊断信息」，或查看下方日志）" });
-              } else {
-                setUpdated(true);
-              }
-              loadVer();
-              doCheck();
-            }
-          }).catch(function () {});
-        }, 2000);
+        if (!updating) return undefined;
+        var iv = setInterval(function () { logTimer(); }, 2000);
         return function () { clearInterval(iv); };
-      }, [updating, loadVer, doCheck]);
+      }, [updating, logTimer]);
+      // 「已用时」走字：只在更新中开 1s 心跳（尊重 reduced-motion 也不影响，纯文本更新）
+      useEffect(function () {
+        if (!updating) return undefined;
+        var iv = setInterval(function () { setTick(function (v) { return v + 1; }); }, 1000);
+        return function () { clearInterval(iv); };
+      }, [updating]);
+      // 注：updTick 只用于触发重渲染（setTick 的引用是稳定的），不进依赖列表
 
       var doUpdate = function () {
         setUpBusy(true);
         setUpdated(false);
         setSelfMsg(null);
+        setCxMsg(null);
         post("/dsh-remote/self/update", {}).then(function (b) {
           if (b && b.ok) {
-            setSelfMsg({ kind: "ok", text: "更新已在后台开始，正在下载安装…（本页会实时显示进度日志）" });
+            setSelfMsg({ kind: "ok", text: "更新已在后台开始，正在下载安装…（本页会实时显示进度日志、已用时与通道）" });
             setUpdating(true);
-            logTimer(true);
+            logTimer();
           } else {
             var detail = String((b && (b.detail || b.error)) || "更新启动失败");
             // 另一种常见情况：node 半返回 ok:false + “已有更新在进行中” → 转为跟踪进度而非报错
@@ -1082,7 +1315,7 @@ window.__ModuleLoader__.load({
               if (lb && lb.ok && lb.running) {
                 setSelfMsg({ kind: "ok", text: "检测到已有一次更新正在进行，正在跟踪进度…" });
                 setUpdating(true);
-                logTimer(true);
+                logTimer();
               } else {
                 setSelfMsg({ kind: "err", text: detail });
               }
@@ -1091,6 +1324,40 @@ window.__ModuleLoader__.load({
         }).catch(function (e) {
           setSelfMsg({ kind: "err", text: "更新失败：" + e.message });
         }).finally(function () { setUpBusy(false); });
+      };
+
+      /**
+       * 取消更新：POST /dsh-remote/self/update/cancel（结束挂死的更新进程 + 清标记）。
+       * retry=true → 取消成功后立刻重新点一次「一键更新」（即按钮上的「取消并重试」）。
+       * 旧 node 半没有这个路由 → 404 → 隐藏按钮并给一句能照做的话（不把用户留在死胡同）。
+       */
+      var doCancelUpdate = function (retry) {
+        setCxBusy(true);
+        setCxMsg(null);
+        post("/dsh-remote/self/update/cancel", {}).then(function (b) {
+          if (!b || !b.ok) throw new Error((b && (b.detail || b.error)) || "取消失败");
+          setCancelOk(true);
+          setUpdating(false);
+          setUpdated(false);
+          setProg(null);
+          updTrack.startedAt = 0;
+          setCxMsg({
+            kind: b.cleared === false ? "warn" : "ok",
+            text: b.cleared === false
+              ? "取消请求已发出，但更新标记没能清掉：请刷新页面；若仍显示「正在更新」，重启一次 dsh web 即可。"
+              : ("已取消本次更新" + (b.killed === true ? "（更新进程已结束）" : "") + (retry ? "，正在重新开始…" : "，可以重新点「一键更新」再试一次。"))
+          });
+          loadVer();
+          if (retry && b.cleared !== false) doUpdate();
+        }).catch(function (e) {
+          if (e && e.status === 404) {
+            // 旧宿主：没有取消接口 → 永久隐藏该按钮，只留人话提示
+            setCancelOk(false);
+            setCxMsg({ kind: "warn", text: "当前插件版本还不支持一键取消更新：请刷新页面；若仍卡在「正在更新」，重启一次 dsh web 后重新点「一键更新」即可。" });
+          } else {
+            setCxMsg({ kind: "err", text: "取消失败：" + ((e && e.message) || "未知错误") + "（更新进程可能仍在运行；可稍后重试，或重启一次 dsh web）" });
+          }
+        }).finally(function () { setCxBusy(false); });
       };
 
       var doUninstall = function () {
@@ -1105,7 +1372,7 @@ window.__ModuleLoader__.load({
             // 优先展示服务端 detail（含 bridge 自启动/配置目录的逐项清理结果与重启提示）；
             // 兜底文案同样说明 bridge 自启动服务与本地配置目录会一并移除/清空
             var detail = b && b.detail ? String(b.detail) : "";
-            setSelfMsg({ kind: "ok", text: detail || "已彻底卸载：插件引用、bridge 自启动服务与本地配置目录（账号/密钥/运行时等）已一并移除并清空。请重启 dsh web 后完全生效（本栏目将消失）；如需再次使用，在插件市场重新安装即可。" });
+            setSelfMsg({ kind: "ok", text: detail || "已彻底卸载：插件引用、bridge 自启动服务与本地配置目录（账号/密钥/运行时等）已一并移除并清空。请重启 dsh web 后完全生效（本栏目将消失）；如需再次使用，在插件市场搜索「dsh-remote-web」重新安装，或执行 npx @mrrisega/dsh-remote。" });
           } else {
             setArmed(false);
             setSelfMsg({ kind: "err", text: "卸载失败：" + ((b && (b.error || b.detail)) || "未知错误") });
@@ -1119,19 +1386,67 @@ window.__ModuleLoader__.load({
       var outdated = !!(chk && chk.outdated && chk.latest && chk.latest !== chk.current);
       var currentV = (ver && ver.version) || (chk && chk.current) || "…";
       var runtimeReady = ver ? !!ver.runtimeReady : null;
+      // 通道：GET /self 的 channel 优先（字段可能不存在 → 不渲染任何通道 chip，旧宿主照常工作）
+      var channel = (ver && typeof ver.channel === "string" && ver.channel) || (prog && prog.channel) || "";
+      // 进度指标（字段缺失时用本地观测兜底）：已用时 / 无输出时长 / 是否卡住
+      var progRunning = !!(prog && prog.running);
+      var elapsedBase = prog && prog.elapsedMs > 0 ? prog.elapsedMs
+        : (prog && prog.startedAt ? Math.max(0, Date.now() - prog.startedAt) : 0);
+      var elapsedShown = prog && prog.at ? elapsedBase + Math.max(0, Date.now() - prog.at) : elapsedBase;
+      var idleShown = prog ? prog.idleMs + (prog.at ? Math.max(0, Date.now() - prog.at) : 0) : 0;
+      var cancelAfterMs = prog && prog.idleThresholdMs > 0 ? prog.idleThresholdMs : UPDATE_CANCEL_IDLE_MS;
+      // 「卡住」只采信服务端判定（stalled=true）；旧宿主没有该字段时退化为下面的「无输出」灰字提示，
+      // 不自己编一个「卡住」结论（避免误报）。
+      var stalled = !!(prog && prog.stalled);
+      var canCancel = updating && cancelOk !== false && ((prog && prog.stalled) || idleShown >= cancelAfterMs);
+      var idleHint = progRunning && !stalled && idleShown >= UPDATE_IDLE_HINT_MS;
 
       return h("div", { className: "dru-card", style: { marginTop: 2 } },
         h("h3", null, "🔄 版本与更新"),
-        h("div", { className: "dru-status-line" },
-          h("span", null, "插件版本 v" + currentV),
+        // ① 版本行：版本号（大字）+ 通道 chip + 新旧状态
+        h("div", { className: "dru-ver-head" },
+          h("span", { className: "dru-ver-num" }, "插件 v" + currentV),
+          channel ? h("span", { className: "dru-ver-chip", title: "当前更新通道：" + channel }, "通道 " + updateChannelText(channel)) : null,
           chk === null && chkBusy ? h("span", { className: "dru-meta", style: { margin: 0 } }, "（检查新版本中…）") : null,
           chk && outdated
             ? h("span", { className: "dru-ver-badge dru-ver-badge-new" }, "发现新版本 v" + chk.latest)
             : chk && !outdated ? h("span", { className: "dru-ver-badge dru-ver-badge-ok" }, "已是最新版本") : null
         ),
         h("div", { className: "dru-meta" },
-          runtimeReady === false ? "⚠ 桌面运行环境缺失（点击下方「一键更新」会自动补全并启动）" : runtimeReady === true ? "桌面运行环境正常" : "读取运行环境中…"
+          runtimeReady === false
+            ? "⚠ 后台服务运行环境缺失（点下方「一键更新」会自动补齐并启动，不用手动装）"
+            : runtimeReady === true ? "后台服务运行环境正常" : "正在读取运行环境…"
         ),
+        // ② 更新进行中：进度指标（已用时 / 距上次输出）+ 卡住告警（0.6.9 看门狗冻结契约）
+        updating || progRunning
+          ? h("div", { className: "dru-ver-metrics", role: "status" },
+              h("div", { className: "dru-ver-metric" },
+                h("span", null, "更新状态"),
+                h("span", null, h("span", { className: "dru-spin", "aria-hidden": "true" }), " 正在进行")
+              ),
+              h("div", { className: "dru-ver-metric" }, h("span", null, "已用时"), h("span", null, fmtDuration(elapsedShown))),
+              h("div", { className: "dru-ver-metric" },
+                h("span", null, "距上次输出"),
+                h("span", null, idleShown < 1500 ? "刚刚" : fmtDuration(idleShown))
+              ),
+              channel ? h("div", { className: "dru-ver-metric" }, h("span", null, "更新通道"), h("span", null, channel)) : null
+            )
+          : null,
+        stalled
+          ? h("div", { className: "dru-stall", role: "alert" },
+              h("b", null, "疑似卡住"),
+              "（已 " + Math.round(idleShown / 1000) + " 秒无输出），正在自动换源重试…",
+              "已经等了 " + fmtDuration(elapsedShown) + "；若长时间没有变化，可点下方「取消并重试」。",
+              cancelOk === false
+                ? h("div", { style: { marginTop: 6 } },
+                    "当前插件版本还不支持一键取消：可刷新页面；若仍卡在「正在更新」，重启一次 dsh web 后重新点「一键更新」即可。")
+                : null
+            )
+          : idleHint
+            ? h("div", { className: "dru-hint", style: { marginTop: 8 } },
+                "已 " + Math.round(idleShown / 1000) + " 秒没有新输出（总计 " + fmtDuration(elapsedShown) + "）：安装过程偶尔会安静一会儿，超过 " + Math.round(cancelAfterMs / 1000) + " 秒没变化会出现「取消并重试」。")
+            : null,
+        // ③ 操作区（主操作 / 检查 / 取消并重试 / 彻底卸载）
         h("div", { className: "dru-actions", style: { marginTop: 10 } },
           outdated
             ? h("button", { type: "button", className: "dru-btn dru-btn-primary", disabled: upBusy || unBusy || chkBusy || updating, onClick: doUpdate },
@@ -1139,6 +1454,15 @@ window.__ModuleLoader__.load({
             : h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: upBusy || unBusy || chkBusy || updating, onClick: doUpdate },
                 updating ? "正在更新…" : (ver && !ver.runtimeReady) ? "安装并启动（一键修复）" : "重新检查 / 修复"),
           h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: chkBusy || updating || upBusy, onClick: doCheck }, chkBusy ? "检查中…" : "检查更新"),
+          canCancel
+            ? h("button", {
+                type: "button",
+                className: "dru-btn dru-btn-danger",
+                disabled: cxBusy || upBusy,
+                title: "结束卡住的更新进程并清除更新标记，然后重新开始一次",
+                onClick: function () { doCancelUpdate(true); }
+              }, cxBusy ? "取消中…" : "取消并重试")
+            : null,
           h("button", {
             type: "button",
             className: "dru-btn dru-btn-danger",
@@ -1147,15 +1471,17 @@ window.__ModuleLoader__.load({
             onClick: doUninstall
           }, unBusy ? "卸载中…" : armed ? "⚠ 再点一次确认彻底卸载" : "彻底卸载")
         ),
+        cxMsg ? h("div", { className: "dru-msg dru-msg-" + cxMsg.kind }, cxMsg.text) : null,
         updated
           ? h("div", { className: "dru-msg dru-msg-ok" },
-              "✅ 更新已完成，最新代码已就位。请", h("strong", null, "重启 dsh web"), "后生效；桌面 bridge 会随系统自启自动运行新版本。")
+              "✅ 更新已完成，最新代码已就位。请", h("strong", null, "重启 dsh web"), "后生效；后台服务会随系统自启自动运行新版本。")
           : null,
+        // ④ 更新日志（失败时同样靠近上面的错误提示）
         log ? h("div", { className: "dru-up-log", title: "更新日志（尾部）" }, log) : null,
         selfMsg ? h("div", { className: "dru-msg dru-msg-" + selfMsg.kind }, selfMsg.text) : null,
         h("div", { className: "dru-hint", style: { marginTop: 8 } },
-          armed ? "⚠ 再次点击后即开始彻底卸载：① 移除 dsh web 配置中的插件引用与本地文件；② 停止并移除 bridge 自启动服务（macOS com.dshremote.bridge / Linux dsh-bridge / Windows 任务计划程序 dsh-remote-bridge）并结束残留进程；③ 清空本地配置目录（~/.dsh-remote：账号、设备密钥、固化运行时等）。此操作不可撤销，如需再次使用请在插件市场重新安装。" :
-            "检测新版、一键在线更新、彻底卸载都在本卡片完成。")
+          armed ? "⚠ 再次点击后即开始彻底卸载：① 移除 dsh web 配置中的插件引用与本地文件；② 停止并移除 bridge 自启动服务（即让「后台服务」不再开机自启：macOS com.dshremote.bridge / Linux dsh-bridge / Windows 任务计划程序 dsh-remote-bridge）并结束残留进程；③ 清空本地配置目录（~/.dsh-remote：账号、设备密钥、固化运行时等）。此操作不可撤销，如需再次使用：在插件市场搜索「dsh-remote-web」重新安装，或执行 npx @mrrisega/dsh-remote。" :
+            "检测新版、一键在线更新、彻底卸载都在本卡片完成；更新卡住时会出现「取消并重试」。")
       );
     }
 
@@ -1189,6 +1515,8 @@ window.__ModuleLoader__.load({
       var viewArr = useState("home"); var view = viewArr[0]; var setView = viewArr[1];   // home | feedback | invite
       var busyArr = useState(""); var busy = busyArr[0]; var setBusy = busyArr[1];
       var msgArr = useState(null); var message = msgArr[0]; var setMessage = msgArr[1];
+      // 注：邀请区复制反馈已迁到 viewstate 末端的 inviteCopied（0.6.9）；这个 hook 保留占位，
+      // 避免后续所有 hook 序号前移（本组件大量 useCallback/useEffect 依赖稳定序号）。
       var copiedArr = useState(false); var copied = copiedArr[0]; var setCopied = copiedArr[1];
 
       // 我的信息(个人中心)数据
@@ -1252,6 +1580,13 @@ window.__ModuleLoader__.load({
       // 并用短轮询自动推进到 online —— 用户不需要点按钮、也不需要刷新页面。
       var connArr = useState(null); var conn = connArr[0]; var setConn = connArr[1];
       var copiedDiagArr = useState(false); var copiedDiag = copiedDiagArr[0]; var setCopiedDiag = copiedDiagArr[1];
+
+      // ── 🎯 邀请视图（0.6.9 重排）状态：放在全部既有字段之后，保持既有 hook 序号不变 ──
+      var invLoadArr = useState(false); var inviteLoading = invLoadArr[0]; var setInviteLoading = invLoadArr[1]; // 记录/规则读取中
+      var invErrArr = useState(null); var inviteErr = invErrArr[0]; var setInviteErr = invErrArr[1];             // 记录读取失败原因（≠空记录）
+      var invRulesArr = useState(false); var inviteRulesOpen = invRulesArr[0]; var setInviteRulesOpen = invRulesArr[1]; // 活动规则默认折叠
+      var invCopyArr = useState(""); var inviteCopied = invCopyArr[0]; var setInviteCopied = invCopyArr[1];      // "" | "code" | "link"（复制成功反馈）
+      var invCopyErrArr = useState(null); var inviteCopyErr = invCopyErrArr[0]; var setInviteCopyErr = invCopyErrArr[1]; // 复制失败原因（就近提示）
 
       var refresh = useCallback(function () {
         setBusy("status");
@@ -1417,12 +1752,15 @@ window.__ModuleLoader__.load({
 
       var copyKeyUrl = function () {
         if (!(akey && akey.url)) return;
-        try {
-          navigator.clipboard.writeText(akey.url).then(function () {
-            setCopiedKey(true);
-            setTimeout(function () { setCopiedKey(false); }, 1500);
-          });
-        } catch (e) {}
+        // 统一走 copyText：剪贴板不可用（http 非安全上下文）时退回 execCommand；都失败就给一句人话
+        copyText(akey.url).then(function (done) {
+          if (!done) {
+            setAkeyMsg({ kind: "err", text: "复制失败：浏览器可能限制了剪贴板权限，请手动选中上面的链接复制。" });
+            return;
+          }
+          setCopiedKey(true);
+          later(function () { setCopiedKey(false); }, 2000);
+        });
       };
       /** 「直接打开」：浏览器新标签打开一次性访问地址（打开即扫码/点击进入）。 */
       var openKeyUrl = function () {
@@ -1689,8 +2027,8 @@ window.__ModuleLoader__.load({
               text: "状态读取失败",
               detail: "本机状态接口连续 " + connFailRef.v + " 次请求失败："
                 + ((e && e.message) ? e.message : String(e))
-                + "（面板读不到 bridge 状态，扫码/远程访问都不会推进）。可点「重试」，或刷新页面；若持续失败请把诊断信息发给客服。",
-              error: { code: "status_unreachable", message: "无法读取本机 bridge 状态（/dsh-remote/bridge-status 请求失败）" },
+                + "（面板读不到后台服务状态，扫码/远程访问都不会推进）。可点「重试」，或刷新页面；若持续失败请把诊断信息发给客服。",
+              error: { code: "status_unreachable", message: "无法读取本机后台服务状态（/dsh-remote/bridge-status 请求失败）" },
               retryable: true,
               attempts: connFailRef.v,
             });
@@ -1714,12 +2052,15 @@ window.__ModuleLoader__.load({
       var copyDiagnostics = function () {
         var text = (connInfo && connInfo.diagnostics) || "";
         if (!text) return;
-        try {
-          navigator.clipboard.writeText(text).then(function () {
-            setCopiedDiag(true);
-            later(function () { setCopiedDiag(false); }, 1500);
-          });
-        } catch (e) { /* 剪贴板不可用：文案里已给出日志路径，用户可自行查看 */ }
+        copyText(text).then(function (done) {
+          if (!done) {
+            // 剪贴板不可用：文案里已给出日志路径，用户可自行查看
+            setMsg("warn", "复制失败：浏览器可能限制了剪贴板权限；可展开下方日志路径自行查看。");
+            return;
+          }
+          setCopiedDiag(true);
+          later(function () { setCopiedDiag(false); }, 2000);
+        });
       };
 
       function setMsg(kind, text) { setMessage({ kind: kind, text: text }); }
@@ -1738,7 +2079,7 @@ window.__ModuleLoader__.load({
         setSt(cfg);
         var br = cfg && cfg.bridgeRestart;
         if (br && br.ok === false && br.status !== "running" && br.status !== "provisioning" && br.status !== "skipped") {
-          setMsg("warn", okText + "；但后台服务（bridge）未能自动重启："
+          setMsg("warn", okText + "；但后台服务未能自动重启："
             + ((br.detail || br.status) || "未知原因")
             + " —— 新账号可能收不到这台设备，请点下方「重启服务」或重启一次 dsh web。");
           return;
@@ -1944,7 +2285,7 @@ window.__ModuleLoader__.load({
         post(start ? "/dsh-remote/start" : "/dsh-remote/stop")
           .then(function (body) {
             setSt(body);
-            setMsg(body.ok ? "ok" : "err", body.ok ? (start ? "✅ bridge 已启动" + (body.pid ? " (pid=" + body.pid + ")" : "") : "bridge 已停止") : (body.detail || body.status || "操作失败"));
+            setMsg(body.ok ? "ok" : "err", body.ok ? (start ? "✅ 后台服务已启动" + (body.pid ? " (pid=" + body.pid + ")" : "") : "后台服务已停止") : (body.detail || body.status || "操作失败"));
           })
           .catch(function (e) { setMsg("err", (start ? "启动" : "停止") + "失败: " + e.message); })
           .finally(function () { setBusy(""); });
@@ -2011,23 +2352,36 @@ window.__ModuleLoader__.load({
             fbClearThreads();
             setPwdOpen(false);
             setSt(body); setSelfHost(""); setLocalKey("");
-            setMsg(body.ok ? "ok" : "err", body.ok ? "✅ 已切换到自建服务，bridge 已重启" : (body.error || (body.body && body.body.error) || "保存失败"));
+            setMsg(body.ok ? "ok" : "err", body.ok ? "✅ 已切换到自建服务，后台服务已重启" : (body.error || (body.body && body.body.error) || "保存失败"));
           })
           .catch(function (e) { setMsg("err", "保存失败: " + e.message); })
           .finally(function () { setBusy(""); });
       };
 
+      /**
+       * 拉取邀请视图数据：公共配置（邀请规则/试用天数）+ 我的邀请记录。
+       * 【0.6.9 修正】记录拉取失败**不再静默当成"没有记录"**：否则用户会以为
+       * "好友明明装好了却没记上"。失败时记下原因，由列表位置给出「重试」。
+       */
       var loadInvite = function () {
-        setBusy("invite");
+        setInviteLoading(true);
+        setInviteErr(null);
+        setInviteCopyErr(null);
         api("/dsh-remote/remote-url").then(function (b) {
           var pubBody = (b && b.publicConfig) || {};
           setPub(pubBody);
-        }).catch(function () {});
+        }).catch(function () { /* 规则取不到 → 用默认 n=3/days=15 兜底，不打扰 */ });
         api("/dsh-remote/invite-records").then(function (b) {
-          if (b && b.ok) setInviteData({ records: b.records || [], rewards: b.rewards || [] });
-          else setInviteData({ records: [], rewards: [] });
-        }).catch(function () { setInviteData({ records: [], rewards: [] }); })
-          .finally(function () { setBusy(""); });
+          if (b && b.ok) {
+            setInviteData({ records: Array.isArray(b.records) ? b.records : [], rewards: Array.isArray(b.rewards) ? b.rewards : [] });
+          } else {
+            setInviteData({ records: [], rewards: [] });
+            setInviteErr(String((b && (b.error || b.detail)) || "服务端未返回邀请记录"));
+          }
+        }).catch(function (e) {
+          setInviteData({ records: [], rewards: [] });
+          setInviteErr((e && e.message) ? String(e.message) : "网络错误");
+        }).finally(function () { setInviteLoading(false); });
       };
 
       var field = function (label, inputEl) {
@@ -2035,6 +2389,20 @@ window.__ModuleLoader__.load({
       };
       var input = function (attrs) { return h("input", Object.assign({ className: "dru-input", type: "text" }, attrs)); };
       var card = function (title, children) { return h("div", { className: "dru-card" }, title ? h("h3", null, title) : null, children); };
+      /**
+       * 轻量邀请入口（0.6.9）：额度将尽 / 连接偏慢时用的**文字链**层级入口——
+       * 与主 CTA（升级 PRO / 重试）并列但不抢焦点，不弹窗、不打断。
+       */
+      function renderInviteLink(label, title) {
+        return h("button", {
+          type: "button",
+          className: "dru-linkbtn",
+          style: { margin: "0 4px" },
+          title: title || label,
+          disabled: busy !== "",
+          onClick: function () { setView("invite"); loadInvite(); }
+        }, label);
+      }
 
       // ---------- 我的信息(个人中心) ----------
       function fmtDate(ts) {
@@ -2066,6 +2434,17 @@ window.__ModuleLoader__.load({
         else if (source === "trial") planText = "试用 PRO 会员 · 到期 " + fmtDate(a.trial_expires_at);
         else if (endsAt) planText = plan === "pro_max" ? "Pro Max 会员 · 到期 " + fmtDate(endsAt) : "PRO 会员 · 到期 " + fmtDate(endsAt);
         else planText = plan === "pro_max" ? "Pro Max 长期会员" : "PRO 长期会员";
+        // 【0.6.9】额度将尽时的轻量邀请入口：只依据服务端已下发的额度字段判断
+        //   · limit_enabled 且 percent ≥ 80（接近用尽）
+        //   · limit_enabled 但没下发 max_mbps（文案已显示「已限速」＝正在被限速）
+        // 判断不了（quota 缺失、不限量、会员）→ 不显示，绝不误报。
+        var quotaPctNum = Number(quotaPct);
+        var quotaTight = !!(quota && quota.limit_enabled && !isMember &&
+          ((isFinite(quotaPctNum) && quotaPctNum >= 80) || !quota.max_mbps));
+        // 邀请规则（公共配置下发；缺省时用与邀请页一致的兜底值，不编造）
+        var invRule = (pub && pub.invite_rule) || {};
+        var invRuleN = Number(invRule.n) > 0 ? Number(invRule.n) : 3;
+        var invRuleDays = Number(invRule.days) > 0 ? Number(invRule.days) : 15;
         return h("div", null,
           h("div", { className: "dru-user" },
             h("div", { className: "dru-avatar" }, (st.config.phone || "D").charAt(0).toUpperCase()),
@@ -2082,7 +2461,7 @@ window.__ModuleLoader__.load({
           h("div", { className: "dru-actions", style: { marginTop: 10 } },
             h("button", { type: "button", className: "dru-btn dru-btn-primary", style: { display: "inline-flex", alignItems: "center" }, disabled: busy !== "", title: "升级/续费（带登录态打开）", onClick: openUpgradeAuth },
               busy === "upgrade" ? "生成链接中…" : (!isMember ? "🚀 升级 PRO" : source === "trial" ? "🚀 转正式 PRO" : "🔄 续费会员")),
-            h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "", onClick: function () { setView("invite"); loadInvite(); } }, "🎯 邀请好友赚会员"),
+            h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "", onClick: function () { setView("invite"); loadInvite(); } }, "🎯 邀请好友得会员"),
             h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "", onClick: function () { setView("feedback"); } }, "💬 用户反馈"),
             h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "", onClick: togglePwdForm }, pwdOpen ? "收起修改密码" : "🔒 修改密码"),
             h("button", { type: "button", className: "dru-btn dru-btn-danger", disabled: busy !== "", onClick: function () { doLogout(false); } }, "退出登录")
@@ -2090,6 +2469,13 @@ window.__ModuleLoader__.load({
           h("div", { className: "dru-hint", style: { marginTop: 8 } },
             "升级/续费以带登录态方式打开：点击后生成一次性访问链接并直接跳转，无需重新登录。" +
             (endsAt && isMember ? "到期后如需继续使用会员权益，请在到期前续费。" : "")),
+          // 额度将尽 → 轻量邀请入口（文字链层级，不抢「升级 PRO」主 CTA）
+          quotaTight
+            ? h("div", { className: "dru-hint", style: { marginTop: 6 } },
+                "免费额度快用完了？也可以先",
+                renderInviteLink("🎯 邀请好友得会员", "邀请好友获得 PRO 会员奖励"),
+                "——每邀请满 " + invRuleN + " 位好友，得 " + invRuleDays + " 天 PRO 会员（详情见邀请页）。")
+            : null,
           pwdOpen ? renderResetPwdForm(false) : null
         );
       }
@@ -2134,46 +2520,240 @@ window.__ModuleLoader__.load({
         );
       }
 
-      // ---------- 邀请视图 ----------
+      // ---------- 🎯 邀请视图（0.6.9 重排：奖励大字 → 进度 → 邀请码/链接一键复制 → 折叠规则 → 记录） ----------
+      /** 体面空态：图标 + 标题 + 说明 + 可选操作（替代过去"一行灰字了事"）。 */
+      function emptyState(icon, title, sub, actions) {
+        return h("div", { className: "dru-empty" },
+          h("div", { className: "dru-empty-icon", "aria-hidden": "true" }, icon),
+          h("div", { className: "dru-empty-title" }, title),
+          sub ? h("div", { className: "dru-empty-sub" }, sub) : null,
+          actions && actions.length ? h("div", { className: "dru-empty-actions" }, actions) : null
+        );
+      }
+      /**
+       * 一键复制按钮：成功后按钮自身变绿并显示「已复制」2 秒；失败则在按钮旁（同一个 .dru-copy-row）
+       * 给出红字提示 —— 错误靠近出错位置，不让用户以为"点了没反应"。
+       */
+      function copyButton(key, text, label) {
+        var ok = inviteCopied === key;
+        return h("button", {
+          type: "button",
+          className: "dru-copy-btn" + (ok ? " copied" : ""),
+          disabled: !text,
+          "aria-label": label,
+          onClick: function () {
+            copyText(text).then(function (done) {
+              if (!done) {
+                setInviteCopied("");
+                setInviteCopyErr({ kind: key, text: "复制失败：请手动选中上面的文字复制（浏览器可能限制了剪贴板权限）" });
+                return;
+              }
+              setInviteCopyErr(null);
+              setInviteCopied(key);
+              later(function () { setInviteCopied(function (cur) { return cur === key ? "" : cur; }); }, 2000);
+            });
+          }
+        }, ok ? "✅ 已复制" : label);
+      }
+      /** 邀请码 / 邀请链接的一行（标签 + 值 + 复制按钮 + 就近错误提示）。 */
+      function copyRow(label, value, kind, hint) {
+        var isCode = kind === "code";
+        return h("div", { className: "dru-copy-row" },
+          h("div", { className: "dru-copy-label" }, label),
+          h("div", { className: "dru-copy-box" },
+            h("span", { className: isCode ? "dru-code-val" : "dru-link-val" }, value),
+            copyButton(kind, value, isCode ? "复制邀请码" : "复制邀请链接")
+          ),
+          hint ? h("div", { className: "dru-invite-sub", style: { marginTop: 6 } }, hint) : null,
+          // 复制失败提示紧贴这一次操作的行（错误靠近出错位置）
+          inviteCopyErr && inviteCopyErr.kind === kind
+            ? h("div", { className: "dru-msg dru-msg-err", style: { marginTop: 6 } }, inviteCopyErr.text)
+            : null
+        );
+      }
+      /** 邀请记录里的好友展示名：只用接口给的 invitee_phone（掩码），缺字段时降级，不编造。 */
+      function inviteeName(r) {
+        var phone = maskPhoneLike(r && r.invitee_phone);
+        if (phone) return phone;
+        var dev = r && r.device_id ? String(r.device_id) : "";
+        if (dev) return "好友（设备 " + (dev.length > 6 ? dev.slice(-6) : dev) + "）";
+        return "好友";
+      }
+      /** 一条邀请记录：谁 / 什么时候 / 是否已生效（时间或状态字段缺失时如实标注，不编造）。 */
+      function renderInviteRecords(records, ruleN) {
+        return h("div", null, records.map(function (r, i) {
+          var ts = r && (r.created_at || r.bound_at || r.at);
+          // 记录来自「有效邀请」接口：默认即已生效；若服务端给了 reward_granted:false → 标"待发放"
+          var pending = r && r.reward_granted === false;
+          return h("div", { key: (r && r.id != null ? String(r.id) : "rec-" + i), className: "dru-rec" },
+            h("div", { className: "dru-rec-top" },
+              h("span", { className: "dru-rec-who" }, inviteeName(r)),
+              h("span", { className: "dru-rec-tag " + (pending ? "dru-rec-tag-wait" : "dru-rec-tag-ok") },
+                pending ? "待发放奖励" : "已生效"),
+              h("span", { className: "dru-rec-when" }, ts ? fmtDate(ts) : "时间未知")
+            ),
+            h("div", { className: "dru-rec-sub" },
+              pending
+                ? "好友已完成设备绑定，奖励按规则结算（每满 " + ruleN + " 位发放一次）。"
+                : "好友已完成电脑端安装并绑定设备，已计入你的有效邀请。")
+          );
+        }));
+      }
+      /** 已到账奖励：每次奖励 = rule_days 天 PRO（时间字段缺失时只显示天数）。 */
+      function renderInviteRewards(rewards, ruleDays) {
+        if (!rewards.length) return null;
+        return h("div", { className: "dru-copy-row" },
+          h("div", { className: "dru-copy-label" }, "已到账奖励（" + rewards.length + " 次）"),
+          h("div", null, rewards.map(function (r, i) {
+            var days = r && (r.rule_days != null ? r.rule_days : ruleDays);
+            var ts = r && (r.created_at || r.at);
+            return h("div", { key: (r && r.id != null ? String(r.id) : "rw-" + i), className: "dru-rec" },
+              h("div", { className: "dru-rec-top" },
+                h("span", { className: "dru-rec-who" }, "+" + (days != null ? days : ruleDays) + " 天 PRO 会员"),
+                h("span", { className: "dru-rec-tag dru-rec-tag-ok" }, "已到账"),
+                h("span", { className: "dru-rec-when" }, ts ? fmtDate(ts) : "时间未提供")
+              )
+            );
+          }))
+        );
+      }
+      /** 活动规则：默认折叠，点开才显示（层级清晰，不再和奖励说明挤在一堆小字里）。 */
+      function renderInviteRules(n, days) {
+        return h("div", { className: "dru-card" },
+          h("button", {
+            type: "button",
+            className: "dru-disclose",
+            "aria-expanded": inviteRulesOpen ? "true" : "false",
+            onClick: function () { setInviteRulesOpen(!inviteRulesOpen); }
+          },
+            h("span", null, "活动规则"),
+            h("span", { className: "dru-disclose-caret" }, inviteRulesOpen ? "收起 ▲" : "展开 ▼")
+          ),
+          inviteRulesOpen
+            ? h("ol", { className: "dru-rules" }, [
+                h("li", null, "好友通过你的邀请链接注册（或在注册时填写你的邀请码），即与你绑定邀请关系。"),
+                h("li", null, "好友在这台电脑上装好后台服务并成功登录后，才计入 1 位", h("b", null, "有效邀请"), "；同一位好友只计一次。"),
+                h("li", null, "每累计 ", h("b", null, n + " 位"), "有效邀请，自动发放 ", h("b", null, days + " 天 PRO 会员"), "，在原到期时间上顺延（已是长期会员则保持长期）。"),
+                h("li", null, "奖励自动到账，无需申请：可在「我的邀请记录」下方看到「已到账奖励」。"),
+                h("li", null, "邀请码与邀请链接长期有效，随时可在本页复制；好友解绑或重装设备不会撤回已计入的邀请。"),
+                h("li", null, "规则与数值以本页面显示的为准（运营可能调整活动力度）。")
+              ])
+            : null
+        );
+      }
+
       function renderInvite() {
-        var rule = (pub && pub.invite_rule) || { n: 3, days: 15 };
+        var rule = (pub && pub.invite_rule) || {};
+        var ruleN = Number(rule.n) > 0 ? Number(rule.n) : 3;
+        var ruleDays = Number(rule.days) > 0 ? Number(rule.days) : 15;
+        var trialDays = Number(pub && pub.trial_days) > 0 ? Number(pub.trial_days) : 0; // 注册送礼（关闭时不下发/为 0）
         var code = (account && account.invite_code) || "";
         var base = (st && st.remoteUrl) || (pub && pub.app_url) || "https://n.risegao.cn:13443/app/";
-        var link = base.replace(/\/+$/, "") + "/?invite=" + encodeURIComponent(code);
-        var copyInvite = function () {
-          try { navigator.clipboard.writeText(link).then(function () { setCopied(true); setTimeout(function () { setCopied(false); }, 1500); }); } catch (e) {}
+        var link = code ? base.replace(/\/+$/, "") + "/?invite=" + encodeURIComponent(code) : "";
+        var loggedInSaaS = !!(st && st.config && st.config.phone);
+        var records = (inviteData && inviteData.records) || [];
+        var rewards = (inviteData && inviteData.rewards) || [];
+        var validCount = records.length;
+        // 进度：每 ruleN 位结算一次（与后端 onDeviceBound 的 floor(total/n) 语义一致）
+        var toward = ruleN > 0 ? validCount % ruleN : 0;
+        var nextGap = toward === 0 ? ruleN : ruleN - toward;
+        var pct = ruleN > 0 ? Math.round((toward / ruleN) * 100) : 0;
+        var copyLink = function () {
+          copyText(link).then(function (done) {
+            if (!done) { setInviteCopied(""); setInviteCopyErr("复制失败：请长按/手动选中上面的链接复制"); return; }
+            setInviteCopyErr(null);
+            setInviteCopied("link");
+            later(function () { setInviteCopied(""); }, 2000);
+          });
         };
+
         return h("div", null,
-          h("button", { type: "button", className: "dru-btn dru-btn-ghost", style: { width: "100%" }, onClick: function () { setView("home"); } }, "← 返回"),
-          card("🎯 邀请好友赚会员", [
-            h("div", { className: "dru-hint", style: { marginBottom: 8 } },
-              "每邀请 " + rule.n + " 位好友安装并注册，你获得 " + rule.days + " 天 PRO 会员（好友完成设备安装后计入有效邀请）。"),
-            code ? h("div", null,
-              h("div", { className: "dru-hint" }, "我的邀请码: " + code),
-              h("div", { className: "dru-url" },
-                h("span", null, link),
-                h("button", { type: "button", onClick: copyInvite }, copied ? "已复制" : "复制链接")
-              ),
-              h("div", { className: "dru-hint", style: { marginTop: 8 } },
-                "把链接发给好友，或把邀请码「" + code + "」告诉他们，注册时填写即可。")
-            ) : h("div", null,
-              h("div", { className: "dru-hint" }, "需要手机号账号登录后才能生成专属邀请链接。"),
-              h("button", { type: "button", className: "dru-btn dru-btn-primary", style: { width: "100%", marginTop: 10 }, disabled: busy !== "", onClick: function () {
-                setBusy("invite-refresh");
-                api("/dsh-remote/account").then(function (b) {
-                  if (b && b.ok && b.account && b.account.invite_code) { setAccount(b.account); setMsg("ok", "邀请码已生成"); }
-                  else setMsg("err", "获取邀请码失败，请稍后重试或先登录手机号账号");
-                }).catch(function (e) { setMsg("err", "获取邀请码失败：" + e.message); })
-                  .finally(function () { setBusy(""); });
-              } }, busy === "invite-refresh" ? "生成中…" : "获取邀请码")
-            ),
-            h("div", { className: "dru-hint", style: { marginTop: 10 } }, "有效邀请记录(登录可见):")
+          h("button", { type: "button", className: "dru-btn dru-btn-ghost", style: { width: "100%" }, onClick: function () { setView("home"); } }, "← 返回账号"),
+
+          // ① 奖励是什么（大字 + 一句人话）
+          card("🎯 邀请好友，一起用远程访问", [
+            h("div", { className: "dru-invite-hero" },
+              "邀请 ", h("em", null, ruleN + " 位"), "好友 → 你得 ", h("em", null, ruleDays + " 天 PRO 会员")),
+            h("div", { className: "dru-invite-sub" },
+              "好友用你的邀请链接注册，并在这台电脑上装好后台服务后计入；每满 " + ruleN + " 位自动到账，会员天数可累加"
+              + (trialDays > 0 ? "。好友自己注册即得 " + trialDays + " 天 PRO 试用，不用邀请也一样。" : "。")),
+            // 进度：已邀请 / 已到账 / 还差几位（数据全部来自接口，未登录或未加载时不编造数字）
+            loggedInSaaS
+              ? h("div", { className: "dru-invite-prog" },
+                  h("div", { className: "dru-invite-prog-top" },
+                    h("span", null, "已邀请 ", h("span", { className: "n" }, String(validCount)), " 位好友"),
+                    inviteErr ? null : h("span", null, "已到账 " + rewards.length + " 次（每次 " + ruleDays + " 天）")
+                  ),
+                  h("div", { className: "dru-invite-bar", role: "img", "aria-label": "距离下一次奖励的进度" },
+                    h("div", { className: "dru-invite-bar-fill", style: { width: pct + "%" } })),
+                  h("div", { className: "dru-invite-next" },
+                    inviteLoading
+                      ? "正在读取你的邀请记录…"
+                      : "本轮已累计 " + toward + "/" + ruleN + " 位，再邀请 " + nextGap + " 位即可获得下一次 " + ruleDays + " 天 PRO 会员。")
+                )
+              : null,
+            // ② 我的邀请码 / 邀请链接（一键复制）
+            code
+              ? h("div", null,
+                  copyRow("我的邀请码", code, "code", "好友注册时填这个码，或直接用下面的邀请链接（自动带上）。"),
+                  copyRow("我的邀请链接", link, "link", "链接较长，可一键复制后发给好友；好友打开即进入注册页。")
+                )
+              : loggedInSaaS
+                ? h("div", { style: { marginTop: 10 } },
+                    emptyState("🎫", "正在为你生成专属邀请码",
+                      "邀请码绑定你的手机号账号：好友通过它注册，奖励会自动记到这个账号上。（偶尔需要手动获取一次）",
+                      [h("button", {
+                        type: "button",
+                        className: "dru-btn dru-btn-primary",
+                        disabled: busy !== "",
+                        onClick: function () {
+                          setBusy("invite-refresh");
+                          api("/dsh-remote/account").then(function (b) {
+                            if (b && b.ok && b.account && b.account.invite_code) { setAccount(b.account); setMsg("ok", "邀请码已生成，可一键复制"); }
+                            else setMsg("err", "获取邀请码失败：请稍后重试（若仍未登录，请先在「🔑 账号」登录）");
+                          }).catch(function (e) { setMsg("err", "获取邀请码失败：" + e.message); })
+                            .finally(function () { setBusy(""); });
+                        }
+                      }, busy === "invite-refresh" ? "生成中…" : "获取我的邀请码")])
+                  )
+                : h("div", { style: { marginTop: 10 } },
+                    emptyState("🔑", "登录后即可获得你的专属邀请码",
+                      "邀请码绑定你的手机号账号：好友通过它注册，奖励会自动记到这个账号上。登录后回到本页即可复制分享。",
+                      [h("button", { type: "button", className: "dru-btn dru-btn-primary", onClick: function () { setView("home"); } }, "去登录")])
+                  )
           ]),
-          code ? card("我的邀请记录",
-            (inviteData && inviteData.records && inviteData.records.length)
-              ? h("div", { className: "dru-status-line" }, "已邀请 " + inviteData.records.length + " 人(有效绑定), 获得奖励 " + ((inviteData.rewards || []).length) + " 次")
-              : h("div", { className: "dru-hint" }, "暂无有效邀请记录。邀请好友安装并注册，完成设备绑定后即计入。")
-          ) : null
+
+          // ③ 邀请记录（谁 / 什么时候 / 是否已生效）
+          loggedInSaaS
+            ? card("我的邀请记录" + (inviteErr ? "" : "（" + validCount + "）"), [
+                inviteLoading
+                  ? h("div", { className: "dru-invite-sub" }, "正在读取邀请记录…")
+                  : inviteErr
+                    ? h("div", null,
+                        h("div", { className: "dru-msg dru-msg-err", style: { marginTop: 0 } }, "读取邀请记录失败：" + inviteErr),
+                        h("div", { className: "dru-actions", style: { marginTop: 8 } },
+                          h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: inviteLoading, onClick: loadInvite }, "重试")))
+                    : validCount === 0
+                      ? emptyState("📨", "还没有好友通过邀请安装",
+                          "把上面的邀请链接发给好友：好友注册并在电脑上装好后台服务后，会自动出现在这里。")
+                      : h("div", null, [
+                          h("div", { className: "dru-rec-head" },
+                            h("span", { style: { flex: "1" } }, "好友"),
+                            h("span", null, "状态"),
+                            h("span", null, "时间")),
+                          renderInviteRecords(records, ruleN),
+                          renderInviteRewards(rewards, ruleDays),
+                          h("div", { className: "dru-invite-sub", style: { marginTop: 6 } },
+                            "名单里的好友都已完成电脑端安装与设备绑定，所以都算有效邀请。")
+                        ])
+              ])
+            : null,
+
+          // ④ 活动规则（默认折叠）
+          renderInviteRules(ruleN, ruleDays),
+
+          // 复制失败等就地提示见各 copyRow（错误靠近出错位置）
+          message ? h("div", { className: "dru-msg dru-msg-" + message.kind }, message.text) : null
         );
       }
 
@@ -2202,6 +2782,18 @@ window.__ModuleLoader__.load({
         var dotOn = loggedInSaaS ? (connInfo ? connOnline : serviceRunning) : false;
         var dotCls = "dru-dot " + (dotOn ? "dru-dot-on" : "dru-dot-off");
 
+        // 【0.6.9】「连接偏慢」判定（只用既有字段 + 本地计时，不新增/不假设后端字段）：
+        //   ① 服务端下发 attempts ≥ 3（已经自动重试多次）；② 阶段文案里出现限速/带宽/较慢类提示；
+        //   ③ 本地观察到「非 online 阶段持续 ≥ SLOW_CONNECT_HINT_MS」。
+        // 连上（online）或未登录即清零；三者都不成立 → 不显示任何邀请入口（宁可不显示，也不误报）。
+        if (!loggedInSaaS || connPhase === "online") slowConnTrack.since = 0;
+        else if (!slowConnTrack.since) slowConnTrack.since = Date.now();
+        var connSlowText = String(connText || "") + " " + String((connInfo && connInfo.detail) || "");
+        var connSlow = loggedInSaaS && !!connInfo && connPhase !== "online" &&
+          (Number(connInfo.attempts) >= 3 ||
+            /限速|带宽|较慢|拥堵|拥塞/.test(connSlowText) ||
+            (slowConnTrack.since > 0 && Date.now() - slowConnTrack.since >= SLOW_CONNECT_HINT_MS));
+
         /**
          * 连接阶段区块：把「环境 → bridge 进程 → 中继注册」的自动推进过程如实展示出来，
          * 面向非技术用户——非 online 阶段一律说明「正在自动进行，无需操作」；
@@ -2229,16 +2821,25 @@ window.__ModuleLoader__.load({
               h("button", { type: "button", className: "dru-btn dru-btn-primary", disabled: busy !== "", onClick: retryConnect }, busy === "connect-retry" ? "重试中…" : "重试"),
               h("button", { type: "button", className: "dru-btn dru-btn-ghost", onClick: copyDiagnostics }, copiedDiag ? "已复制" : "复制诊断信息")));
             rows.push(h("div", { className: "dru-hint", style: { marginTop: 6 } },
-              "查看日志：bridge " + (connInfo.logPath || "") + " ，安装 " + (connInfo.installLogPath || "") + "（把「复制诊断信息」的内容发给客服可加速定位）"));
+              "查看日志：后台服务 " + (connInfo.logPath || "") + " ，安装 " + (connInfo.installLogPath || "") + "（把「复制诊断信息」的内容发给客服可加速定位）"));
             return h("div", null, rows);
           }
           // 非错误阶段：只解释「正在自动做什么」，并说明不需要任何操作
           if (connInfo.detail) rows.push(h("div", { className: "dru-hint", style: { marginTop: 6 } }, connInfo.detail));
           if (connInfo.installing || phase === "no_runtime") {
             rows.push(h("div", { className: "dru-hint", style: { marginTop: 4 } },
-              "首次安装会自动下载并配置，期间请不要关闭 DeepSeek；装完会自动启动 bridge，无需任何操作。"));
+              "首次安装会自动下载并配置，期间请不要关闭 DeepSeek；装完会自动启动后台服务，无需任何操作。"));
           }
           if (connInfo.deviceId) rows.push(h("div", { className: "dru-meta" }, "设备 ID：" + connInfo.deviceId));
+          // 【0.6.9】连接明显偏慢时的轻量邀请入口（不打断、不弹窗）：
+          // 判定只用既有字段 —— 服务端重试次数 attempts≥3、或阶段文案里出现限速/带宽/较慢类提示、
+          // 或本地观察「非 online 阶段持续 ≥90s」。判断不了就不显示（宁可不出现，也不误报）。
+          if (connSlow) {
+            rows.push(h("div", { className: "dru-hint", style: { marginTop: 8 } },
+              "连接比平时慢一些（仍在自动推进，无需操作）：等待时也可以",
+              renderInviteLink("🎯 邀请好友得会员", "连接偏慢时顺手邀请好友 —— 每满若干位得 PRO 会员奖励"),
+              "，好友装好后双方访问都会更快。"));
+          }
           rows.push(h("div", { className: "dru-actions", style: { marginTop: 8 } },
             h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "", onClick: retryConnect }, busy === "connect-retry" ? "立即重试中…" : "立即重试"),
             h("button", { type: "button", className: "dru-btn dru-btn-ghost", onClick: copyDiagnostics }, copiedDiag ? "已复制" : "复制诊断信息")));
@@ -2292,8 +2893,8 @@ window.__ModuleLoader__.load({
                 h("div", { className: "dru-hint", style: { marginTop: 4 } },
                   !serviceRunning
                     ? (connInfo && connPhase !== "online"
-                        ? "本机 bridge 正在自动准备中（" + connText + "）：连上后这个链接/二维码即可使用，无需其他操作。"
-                        : "本机 bridge 未运行：先在下方「🖥 Bridge 服务」卡启动。")
+                        ? "本机后台服务正在自动准备中（" + connText + "）：连上后这个链接/二维码即可使用，无需其他操作。"
+                        : "本机后台服务未运行：先在下方「🖥 后台服务」卡启动。")
                     : "打开链接/扫码进入即登录态；同设备重复扫码只更新授权，不新增设备。")
               )
             )
@@ -2482,13 +3083,15 @@ window.__ModuleLoader__.load({
                     "服务器地址由你自行部署决定：填写你自建的 dsh-remote 服务地址与访问密钥即可（不是上面的云端地址）。部署方法见 README「自建部署」一节；切回云端随时可登录恢复。")
                 )
           ),
-          // Bridge 状态
-          card("🖥 Bridge 服务",
+          // 后台服务（原「Bridge 服务」：面向非技术用户统一叫「后台服务」，卡内配一句人话解释）
+          card("🖥 后台服务",
             h("div", { className: "dru-status-line" },
               h("span", { className: "dru-dot " + (serviceRunning ? "dru-dot-on" : "dru-dot-off") }),
               h("span", null, st ? serviceStateText : "查询中…"),
               launchdPid ? h("span", { className: "dru-meta", style: { marginTop: 0 } }, "(pid=" + launchdPid + ")") : null
             ),
+            h("div", { className: "dru-hint", style: { marginTop: 6 } },
+              "「后台服务」＝装在这台电脑上、负责把手机和电脑连起来的小程序（内部名 bridge）。面板会自动安装、自动启动，一般不需要你手动操作；只有状态一直停在「已停止」时才需要点下面的按钮。"),
             // 自动连接进度（登录后由面板 2.5s 短轮询自动推进）：让用户在 bridge 卡也能一眼看到
             // 「到底走到哪一步了」——进程在跑≠能用，注册到中继才算。
             connInfo && connPhase && connPhase !== "no_account"
@@ -2496,21 +3099,21 @@ window.__ModuleLoader__.load({
               : null,
             h("div", { className: "dru-actions", style: { marginTop: 10 } },
               !serviceRunning
-                ? h("button", { type: "button", className: "dru-btn dru-btn-primary", disabled: busy !== "", onClick: function () { toggleBridge(true); } }, busy === "start" ? "启动中…" : "启动 bridge")
-                : h("button", { type: "button", className: "dru-btn dru-btn-danger", disabled: busy !== "", onClick: function () { toggleBridge(false); } }, busy === "stop" ? "停止中…" : "停止 bridge")
+                ? h("button", { type: "button", className: "dru-btn dru-btn-primary", disabled: busy !== "", onClick: function () { toggleBridge(true); } }, busy === "start" ? "启动中…" : "启动后台服务")
+                : h("button", { type: "button", className: "dru-btn dru-btn-danger", disabled: busy !== "", onClick: function () { toggleBridge(false); } }, busy === "stop" ? "停止中…" : "停止后台服务")
             ),
             h("div", { className: "dru-meta" }, st && st.config && st.config.deviceId ? "设备 ID：" + st.config.deviceId : "设备 ID：生成中"),
             h("div", { className: "dru-meta" }, st ? (st.service && (st.service.plistExists || st.service.serviceManager === "detached")
               ? (st.service.serviceManager === "detached"
                 ? (st.service.autostartTask
                     ? "自启动：已注册登录任务（任务计划程序 dsh-remote-bridge）"
-                    : "自启动：未注册登录任务（由面板在 dsh web 启动时自动拉起 bridge）")
+                    : "自启动：未注册登录任务（由面板在 dsh web 启动时自动拉起后台服务）")
                 : "自启动服务已安装")
               : "自启动服务未安装（启动时自动创建）") : ""),
             // 0.6.2：把「运行环境缺失 / launchd 崩溃循环」如实告诉用户，而不是显示「运行中」
             st && !serviceRuntimeReady
               ? h("div", { className: "dru-hint", style: { marginTop: 8 } },
-                  "🛠 插件市场只装「面板插件」，桌面运行环境（bridge）需要额外补装——已自动在后台安装，装完会自动启动 bridge，不用做任何操作。若超过几分钟仍未变成「运行中」，点上方版本卡的「一键更新」手动补全。")
+                  "🛠 在插件市场搜索「dsh-remote-web」装上的只是「面板插件」，这台电脑上的后台服务需要额外补装——已自动在后台安装，装完会自动启动，不用做任何操作。若超过几分钟仍未变成「运行中」，点上方版本卡的「一键更新」手动补全即可。")
               : serviceCrashing
                 ? h("div", { className: "dru-hint", style: { marginTop: 8 } },
                     "⚠️ 上一次启动失败（自启动入口失效），已自动清理失效自启动项并重新补装运行环境。稍候会自动恢复；仍失败请点「一键更新」。")
@@ -2520,13 +3123,15 @@ window.__ModuleLoader__.load({
                   "⚠️ 设备注册失败：" + (st.service.bindError.message || "未说明原因"),
                   h("div", { className: "dru-hint", style: { marginTop: 4 } },
                     st.service.bindError.code === "device_limit_exceeded"
-                      ? "已达本套餐设备数上限。若是同一台电脑重装，稍等片刻会自动顶替旧设备；仍未恢复请在手机端「设备管理」解绑旧设备（免费用户每月可解绑 3 次）后，回到这里点「启动 bridge」。"
+                      ? "已达本套餐设备数上限。若是同一台电脑重装，稍等片刻会自动顶替旧设备；仍未恢复请在手机端「设备管理」解绑旧设备（免费用户每月可解绑 3 次）后，回到这里点「启动后台服务」。"
                       : "请确认网络与账号状态后重试；仍未解决可点下方「彻底卸载」后重新安装。")
                 )
               : null
           ),
           // 关于 dsh-remote（v0.5+ 远程访问价值说明卡片）
           card("📖 关于 dsh-remote", [
+            // 一句话定位（面向非技术用户先讲清楚"这是什么"），下面 4 条为既有技术说明（文案受源码契约锁定）
+            h("div", { className: "dru-hint", style: { marginBottom: 6 } }, "📱 一句话：用手机随时接管这台电脑上的 DeepSeek Harness——装上即得专属加密地址，人在外面也能全功能操作（免内网穿透、免公网 IP、全程加密）。"),
             h("div", { className: "dru-hint", style: { marginBottom: 6 } }, "📱 远程访问：用手机或另一台电脑的浏览器，随时随地使用同一份 dsh web——人在哪都能用（免公网 IP、免内网穿透）；官方托管中继，4G/5G 即用，也可自建服务。"),
             h("div", { className: "dru-hint", style: { marginBottom: 6 } }, "🛠 电脑端一键安装：bridge 与「远程访问」面板一次到位——云端/自建切换、账号登录、bridge 启停、一次性扫码访问、已授权设备管理、意见反馈都在这里。"),
             h("div", { className: "dru-hint", style: { marginBottom: 6 } }, "🔒 安全与通道：HTTP / WebSocket 全量透传，一次性访问密钥认证，面板实时显示设备与已授权设备列表。"),
@@ -2535,7 +3140,7 @@ window.__ModuleLoader__.load({
             // 只保留结论式的说明句:不再单列「隐私说明: README… · docs/telemetry.md」那一行文档链接
             // (面板里堆文档链接既占地方又不像产品文案;完整字段清单在仓库 docs/telemetry.md)。
             h("div", { className: "dru-hint", style: { marginTop: 6 } },
-              "📊 匿名装机统计：只上报「装机/连接是否成功」这类事件（安装开始与失败原因、bridge 是否注册成功、是否首次远程打通）——"
+              "📊 匿名装机统计：只上报「装机/连接是否成功」这类事件（安装开始与失败原因、后台服务是否注册成功、是否首次远程打通）——"
               + "不含任何账号、手机号、会话或文件内容、主机名、路径、设备指纹与 IP；标识是本机随机 ID（重装即变）。"
               + "用环境变量 DSH_REMOTE_TELEMETRY=0 可完全关闭（不生成 ID、不发任何请求）。"),
             // 加入交流群（后台上传二维码后出现；点击弹出二维码大图便于扫码）
@@ -2610,7 +3215,8 @@ window.__ModuleLoader__.load({
           h("span", { className: "dru-settings-icon" }, "📱"),
           h("div", null,
             h("h2", { className: "dru-settings-title" }, "远程访问"),
-            h("div", { className: "dru-settings-sub" }, "通过手机或另一台电脑远程使用同一份 dsh web，人在哪都能用（免公网 IP）")
+            h("div", { className: "dru-settings-sub" }, "通过手机或另一台电脑远程使用同一份 dsh web，人在哪都能用（免公网 IP）"),
+            h("div", { className: "dru-settings-sub" }, "装上即得专属加密地址：人在外面也能用手机全功能接管这台电脑上的 DeepSeek Harness（免内网穿透、免公网 IP、全程加密）。")
           )
         ),
         h("div", { className: "dru-settings-body" },
@@ -2667,7 +3273,7 @@ window.__ModuleLoader__.load({
         ),
         // 常驻入口最底部：「重启 DeepSeek harness」按钮始终可达（首次安装/更新/排查都用它）
         h("div", { className: "dru-restart-foot" },
-          h("div", { className: "dru-hint" }, "重启 dsh web：仅在「刷新页面后仍看不到面板」时才需要。日常安装/更新插件已自动热加载，装完刷新页面即可；重启只影响 dsh web 本身，不影响 bridge 与手机端连接。"),
+          h("div", { className: "dru-hint" }, "重启 dsh web：仅在「刷新页面后仍看不到面板」时才需要。日常安装/更新插件已自动热加载，装完刷新页面即可；重启只影响 dsh web 本身，不影响后台服务与手机端连接。"),
           h("button", {
             type: "button",
             className: "dru-btn " + (restartPending ? "dru-btn-primary" : "dru-btn-ghost"),
