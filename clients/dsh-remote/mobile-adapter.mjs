@@ -57,6 +57,29 @@
  *   ② 折叠态同时认两个属性名,认不到就只信几何;③ 抽屉必须是"不是全屏的、真的在视口里的"元素,
  *   并加常驻看门狗:遮罩拦截时若没有任何抽屉在视口内,立刻摘掉(任何未来改名都不会再变成死局)。
  *
+ * ⚠️ 2026-09-19 手机端实测第二波修复(用户反馈,真机 390×844 + headless 复现):
+ *   A) 微信语音转文字会**提前发送半截话**:官方输入区是 Lexical contenteditable
+ *      ([data-composer-input]),它的 Enter 键位图自带的 IME 守卫只看
+ *      `isComposing || keyCode===229 || (官方 compositionend 后 **10ms** 窗口)` ——
+ *      而微信语音转文字没有标准的 compositionend 时序:实测 compositionend 之后 43ms 到达的
+ *      Enter 已经 isComposing=false 且超出 10ms 窗口 → 官方按"用户要发送"处理。
+ *      现在适配层在 **捕获阶段** 加了一层输入框专用守卫:① 任何宽度下,识别为"输入法确认"的
+ *      Enter 一律 stopPropagation(官方收不到 → 不会发送;不 preventDefault,IME 自己的提交不受影响);
+ *      ② ≤820px 时输入框里的 Enter **只换行不发送**(微信/Telegram 等手机 IM 的语义),
+ *      发送只由官方发送按钮负责 —— 对"没有标准时序"的输入法一并根治。
+ *      实测:守卫只 stopPropagation 时换行仍能插入、继续打字正常,点官方「发送」按钮仍能正常发出。
+ *   B) 打开抽屉后点任何东西都没反应 + 右边一个白色框:根因是 `isDrawer()` 的几何判定
+ *      只查 `r.right > 8`,而**向右滑出屏外的第三列**右边的坐标是很大的正数(实测 759),
+ *      于是"完全看不见的详情列"被判成"展开的详情列" → `dsh-ma-details-open` 常亮 →
+ *      那个空的 Details 面板(白色)滑进来盖住整屏,且它的 z-index(300) 与抽屉相同、
+ *      DOM 顺序在后 → **压住抽屉吃掉了抽屉里所有点击**;scrim 同时也常亮拦掉剩余区域。
+ *      现在:① `isDrawer()` 必须与视口**真正相交**(左右上下四边都查);
+ *      ② 详情列不再"官方说展开就滑进来":手机端滑动显示它的唯一开关是**用户在正文区点过一下**
+ *      (点工具行必然落在正文区)——"载入时官方就是展开的"多半是宽屏/上次会话遗留状态,
+ *      手机端一进来就弹一个空白白面板正是用户报的白框;点空白(遮罩)即收回这个意图;
+ *      ③ 遮罩不变量:只要遮罩在拦截点击而视口内没有任何可交互抽屉,立刻摘掉(800ms 看门狗 +
+ *      300ms 复核),且**只摘遮罩不动展开 class**(不破坏抽屉的滑入动画与"点一下就打开")。
+ *
  * 开关:环境变量 DSH_MOBILE_ADAPTER=0 整体关闭(默认开启)。
  */
 
@@ -86,7 +109,10 @@ const STYLE = `
      注意:不能给浮层设 will-change:transform / 持久 transform —— 官方把设置面板等
      fixed 弹层的 DOM 挂在侧栏子树里,transform 祖先会成为 fixed 的 containing block,
      导致弹层被限制在 84vw 侧栏宽内(实测 328px“抽屉感”,fix2 根因之一)。 */
-  div.pI_x6G_sidebarCol, div.dsh-ma-sidebar {
+  /* ⚠️ 全部加 :not(.dsh-ma-details):万一某列被同时标成抽屉与详情列(官方改版导致,2026-09-19 在
+     0.1.5-rc.2 上真的发生过:第三列里的 "Collapse right sidebar" 按钮被宽松探测命中),
+     详情列的定位/层级必须赢 —— 否则抽屉一展开,那一列会被拉到 left:0 盖住抽屉,用户点哪都没反应。 */
+  div.pI_x6G_sidebarCol:not(.dsh-ma-details), div.dsh-ma-sidebar:not(.dsh-ma-details) {
     position: fixed; left: 0; top: 0; bottom: 0; margin: 0;
     width: min(84vw, 340px); max-width: 92vw;
     z-index: 300; overflow: hidden;
@@ -95,8 +121,15 @@ const STYLE = `
     transform: translateX(-103%);
     transition: transform .22s var(--ds-ease-in-out, ease);
   }
-  html.dsh-ma-sidebar-open div.pI_x6G_sidebarCol,
-  html.dsh-ma-sidebar-open div.dsh-ma-sidebar { transform: none; }
+  html.dsh-ma-sidebar-open div.pI_x6G_sidebarCol:not(.dsh-ma-details),
+  html.dsh-ma-sidebar-open div.dsh-ma-sidebar:not(.dsh-ma-details) { transform: none; }
+  /* ⚠️ 抽屉展开时必须抬到详情列(第三列)之上 —— 两者同为 z-index:300 时按 DOM 顺序绘制,
+     而第三列在 frame 里排在侧栏**之后**,于是"详情列滑进来"会整块压住抽屉:
+     实测(2026-09-19 手机端)抽屉里每一行点下去命中的都是详情面板(_2ctAZa_empty),
+     用户表现为「展开左边抽屉,无法选择历史会话,点任何东西都没有反应」。
+     这里把抽屉抬到 310(>300 详情列,>290 遮罩):抽屉内的点击**永远**有效。 */
+  html.dsh-ma-sidebar-open div.pI_x6G_sidebarCol:not(.dsh-ma-details),
+  html.dsh-ma-sidebar-open div.dsh-ma-sidebar:not(.dsh-ma-details) { z-index: 310; }
 
   div.pI_x6G_detailsCol, div.pI_x6G_rightbarCol, div.dsh-ma-details, div.dsh-ma-rightbar {
     position: fixed; right: 0; top: 0; bottom: 0; margin: 0;
@@ -449,6 +482,114 @@ const SCRIPT = `(() => {
         }
       }
     } catch (e3) { /* 私有模式等:忽略 */ }
+
+    /* ================= 手机端输入框(输入法/IME)防误发 =================
+       用户实测反馈(2026-09-19,微信内置浏览器)：「用微信语音转文字输入时,它在自动整理文字的
+       过程中会直接触发输入框的发送」—— 半截话被发出去。
+
+       取证(真机官方 GUI 390×844 + CDP 注入 composition 复现):
+         · 官方输入区 = Lexical contenteditable,根元素带 data-composer-input / role=textbox /
+           aria-multiline / data-lexical-editor;官方键位图自己有一层 IME 守卫
+           'isComposingEvent(event, recentlyComposing) = event.isComposing || event.keyCode===229
+            || (composing || Date.now() < composingUntil)';但 compositionstart/end 只挂在编辑器根上,
+           **composingUntil 窗口只有 10ms**;
+         · 实测 compositionend → 43ms 后到达的 Enter:isComposing 已是 false、超出 10ms 窗口
+           → 官方把它当成"用户点了发送" → 真的发出 session/prompt(带半截话);
+         · 微信语音转文字的"自动整理"正是这个时序:它**没有标准的 compositionend 时序**
+           (确认键常在 compositionend 之后几十上百毫秒才到,isComposing 也常为 false),
+           所以官方那 10ms 窗口挡不住它。
+
+       本层策略(两条一起,第二条是主推):
+         ① **任何宽度**都装一层输入框专用守卫:识别出"这一下 Enter 其实是输入法确认"时,
+            在**捕获阶段** stopPropagation —— 官方那一层根本收不到这个 keydown,自然不会发送。
+            不改写事件、不 preventDefault:IME 自己的"提交候选/结束合成"动作照旧(乱 preventDefault
+            反而会让某些输入法提交不了文本)。
+            判定覆盖三种取证:event.isComposing===true / keyCode===229 / compositionend 之后 60ms 内。
+         ② **≤820px(手机)时输入框里的 Enter 一律不发送,只换行**;发送交给官方发送按钮
+            (微信/Telegram 等主流手机 IM 就是这个语义,用户按 Enter 的期望也是换行)。
+            这样"没有标准 compositionend 时序"的输入法被**整类根治**:不再依赖任何 IME 事件
+            来判断"能不能发",而是根本不给 Enter 发送语义。
+
+       实现要点(为什么是"捕获阶段 + stopPropagation"):
+         · 官方键位图挂在编辑器根(冒泡)与 React 根容器上;document 捕获阶段早于它们,
+           stopPropagation 之后官方与 React 都收不到 → 发送逻辑不执行;
+         · **只 stopPropagation、不 preventDefault**:浏览器默认动作不受影响,contenteditable 照旧
+           插入换行 —— 实测真机 390×844:官方不发送,换行正常插入,继续打字正常;
+           (若同时 preventDefault,则是"既不发也不换行",用户按 Enter 像坏了 —— 实测确认。)
+         · 组合键(Ctrl/Cmd+Enter = 官方"强制提交")不拦,保留桌面/外接键盘语义;
+         · **只作用于输入框**:命中判定走 [data-composer-input] /
+           [role=textbox][aria-multiline] / Lexical 根(data-lexical-editor);
+           其它地方(弹窗确认、表单提交、快捷键、侧栏搜索框)一律放行 —— 这是硬要求。
+         · 非 Enter 的按键不拦(含合成期的其余 keydown):官方发送只认 event.key === "Enter",
+           乱拦合成期的其它按键会伤到输入法自身(它与 Lexical 的合成记账有关)。
+       实测验证(官方 GUI 390×844,CDP Input.imeSetComposition + dispatchKeyEvent):
+         · 无守卫:compositionend 后 43ms 的 Enter → 真的发出(session/prompt) —— 复现用户 bug;
+         · 有守卫:同一时序 → 不发送;合成中(isComposing=true)的 Enter → 不发送;
+         · 有守卫 + 普通打字后按 Enter(手机窗口)→ 不发送,插入换行,可继续输入;
+         · 有守卫时点官方 button[aria-label="Send message"] → 正常发送 —— 发送按钮没被改坏。 */
+    (function installComposerEnterGuard() {
+      /* compositionend 之后多久内的 Enter 仍算"输入法确认":官方只有 10ms(实测 43ms 就漏),
+         这里取 60ms —— 几十毫秒级,只覆盖"合成刚结束"的那一下,毫秒级之外用户正常
+         打字后按 Enter 不受影响(手机端本来就是换行,不受此窗口影响)。 */
+      const IME_TAIL_MS = 60;
+      const COMPOSER_SEL = '[data-composer-input],[role="textbox"][aria-multiline="true"],[data-lexical-editor="true"]';
+      let composing = false;
+      let composingEndedAt = 0;
+
+      /** 事件目标是否落在官方输入框里;是则返回输入框宿主元素,否则 null。 */
+      function composerHost(node) {
+        try {
+          if (!node || typeof node.closest !== "function") return null;
+          const el = node.closest(COMPOSER_SEL);
+          if (!el) return null;
+          const ce = el.getAttribute("contenteditable");
+          if (ce === "false") return null;                                  // 非可编辑态 → 不需要守卫
+          if (ce === null && !el.hasAttribute("data-composer-input") && !el.hasAttribute("data-lexical-editor")) return null;
+          return el;
+        } catch (e) { return null; }
+      }
+      /** 先用 composedPath(兼容将来把输入区放进 shadow DOM 的改版),退回 e.target。 */
+      function composerOf(e) {
+        try {
+          if (typeof e.composedPath === "function") {
+            const path = e.composedPath();
+            if (path && path.length) {
+              for (let i = 0; i < path.length; i++) { if (composerHost(path[i])) return true; }
+              return false;
+            }
+          }
+        } catch (e2) { /* 忽略 */ }
+        return !!composerHost(e.target);
+      }
+      const isImeEnter = (e) => {
+        if (e.isComposing === true || e.keyCode === 229) return true;      // ① 标准 ② 部分安卓 IME 只给 229
+        if (composing) return true;                                        // ③ 合成进行中
+        return composingEndedAt !== 0 && (Date.now() - composingEndedAt) <= IME_TAIL_MS; // ④ 合成刚结束
+      };
+
+      try {
+        /* 捕获阶段监听:输入区自己的 composition 事件先经过 document,不受 stopPropagation 影响 */
+        document.addEventListener("compositionstart", function () { composing = true; composingEndedAt = 0; }, true);
+        document.addEventListener("compositionend", function () { composing = false; composingEndedAt = Date.now(); }, true);
+      } catch (e) { /* 忽略 */ }
+
+      try {
+        document.addEventListener("keydown", function (e) {
+          try {
+            if (!e || e.key !== "Enter") return;         // 官方发送只认 Enter;其它键一律不碰
+            if (!composerOf(e)) return;                  // 不是输入框 → 弹窗/表单/快捷键一律放行
+            const ime = isImeEnter(e);
+            if (!ime) {
+              if (e.ctrlKey || e.metaKey || e.altKey) return; // Ctrl/Cmd+Enter = 官方"强制提交",保留
+              if (!NARROW()) return;                          // 桌面宽屏:非 IME 的 Enter 保持官方语义(发送)
+            }
+            /* 只截断传播,不 preventDefault:
+               官方(以及 React 根容器)收不到这一下 → 不会走发送逻辑;默认动作保留 → 该换行就换行。 */
+            e.stopPropagation();
+          } catch (e2) { /* 守卫出错绝不能把页面弄挂 */ }
+        }, true);
+      } catch (e) { /* 忽略 */ }
+    })();
 
     /* ================= 鲸鱼挂件手机辅助(仅 ≤820 生效;挂件类名 .dshwv-* 稳定) ========= */
     let whaleGuardsOn = false;
@@ -990,22 +1131,61 @@ const SCRIPT = `(() => {
       };
       const overlayLayer = () => frame.querySelector('[data-shell-overlay]');
 
-      /* 第三列在官方 0.1.2-rc.1 叫 details、0.1.5-rc.2 起叫 rightbar —— 两个名字都认。 */
+      /* 第三列在官方 0.1.2-rc.1 叫 details、0.1.5-rc.2 起叫 rightbar —— 两个名字都认(真机两版都验过)。
+         ⚠️ 刻意**不**依赖本机第三方插件(dsh-better-sidebar)写的 data-rightbar-col / data-dsh-center-col 标记:
+            那不是官方契约,插件换版本或被卸载就会失灵。只认官方类名 + 结构。 */
       const THIRD_COL_RE = /details|rightbar/i;
+      const isThirdCol = (col, cls) => THIRD_COL_RE.test(cls);
+      /* ⚠️ 侧栏列的识别必须**排他 + 精确**,否则一列会被赋予两个身份(2026-09-19 在官方 0.1.5-rc.2 上实测到):
+         第三列(rightbar)里有一颗按钮 aria-label="Collapse right sidebar",旧代码的宽松探测
+         宽松探测 [aria-label*='sidebar' i] 把它当成了"这一列里有侧栏" → rightbar 同时挂上 dsh-ma-sidebar 与
+         dsh-ma-details → 抽屉一展开,html.dsh-ma-sidebar-open div.dsh-ma-sidebar{transform:none;z-index:310}
+         把 **rightbar** 也拉到 left:0 并盖在真抽屉之上(DOM 顺序在后) → 抽屉里点什么都命中详情面板,
+         就是用户报的"白框压住抽屉"。而且它是**间歇性**的:那颗按钮只在右栏面板挂载时才渲染,
+         实测 4 次启动里 3 次命中。现在的规则:
+           ① 已经判定为第三列(rightbar/details 类名)的列,**绝不是**抽屉列;
+           ② 类名含 sidebar 且不含 rightbar/details(0.1.2/0.1.5 的 pI_x6G_sidebarCol 都满足);
+           ③ 退到结构信号:列里有官方侧栏组件根 .hHd-Xa_root,或有**整串**匹配的官方侧栏开合按钮
+              (精确匹配,绝不再用 *="sidebar" 这种包含匹配 —— 那正是事故来源);
+           ④ 同时给 CSS 加了 :not(.dsh-ma-details) 兜底:万一将来又标重,详情列的样式也必须赢。 */
+      const SIDEBAR_RE = /sidebar/i;
+      const NOT_SIDEBAR_RE = /rightbar|right-bar|details/i;
+      const SIDEBAR_TOGGLE_SEL = '[aria-label="Open sidebar"], [aria-label="Close sidebar"], [aria-label="Collapse sidebar"], [aria-label="Expand sidebar"], [aria-label="打开侧边栏"], [aria-label="关闭侧边栏"], [aria-label="收起侧边栏"], [aria-label="展开侧边栏"]';
+      const isSidebarCol = (col, cls) => {
+        if (isThirdCol(col, cls)) return false;                       // ① 第三列绝不兼任抽屉列
+        if (SIDEBAR_RE.test(cls) && !NOT_SIDEBAR_RE.test(cls)) return true; // ② 类名
+        try {                                                          // ③ 结构兜底(类名前缀改名时)
+          if (col.querySelector(".hHd-Xa_root")) return true;
+          if (col.querySelector(SIDEBAR_TOGGLE_SEL)) return true;
+        } catch (e) { /* 忽略 */ }
+        return false;
+      };
       let sidebar = null, details = null, center = null;
       const cols = [...frame.children].filter((c) => c instanceof HTMLElement && !isOverlayLayer(c) && !isHandle(c));
+      /* 先把第三列认出来(它优先级最高、也最容易被误认),再从**剩下的**列里认抽屉与中央列。 */
       for (const col of cols) {
         const cls = typeof col.className === "string" ? col.className : "";
-        if (/sidebar/i.test(cls) || col.querySelector(".hHd-Xa_root, [aria-label*='侧边栏'], [aria-label*='sidebar' i]")) {
+        if (isThirdCol(col, cls)) { col.classList.add("dsh-ma-details"); details = details || col; }
+      }
+      for (const col of cols) {
+        if (col === details) continue;
+        const cls = typeof col.className === "string" ? col.className : "";
+        if (isSidebarCol(col, cls)) {
           col.classList.add("dsh-ma-sidebar"); sidebar = sidebar || col;
-        } else if (THIRD_COL_RE.test(cls)) {
-          col.classList.add("dsh-ma-details"); details = details || col;
         } else if (/center/i.test(cls)) {
           col.classList.add("dsh-ma-center"); center = center || col;
         }
       }
-      if (!sidebar && cols[0]) { cols[0].classList.add("dsh-ma-sidebar"); sidebar = sidebar || cols[0]; }
-      if (!center && cols[1]) { cols[1].classList.add("dsh-ma-center"); center = center || cols[1]; }
+      if (!sidebar) { const c = cols.find((x) => x !== details); if (c) { c.classList.add("dsh-ma-sidebar"); sidebar = c; } }
+      if (!center) { const c = cols.find((x) => x !== details && x !== sidebar); if (c) { c.classList.add("dsh-ma-center"); center = c; } }
+      /* 🔒 不变量:同一列绝不允许既是抽屉又是详情列。真出现(将来官方再改名)时**以详情列为准** ——
+         抽屉还能用汉堡按钮开合,而"自己盖住自己"的详情列会让抽屉彻底点不动。 */
+      if (sidebar && details && sidebar === details) {
+        sidebar.classList.remove("dsh-ma-sidebar");
+        sidebar = null;
+        const c = cols.find((x) => x !== details);
+        if (c) { c.classList.add("dsh-ma-sidebar"); sidebar = c; }
+      }
       /* 兜底:只在**剩下的候选列**里取最后一个（overlay/把手/已认领的列都已排除）——
          命中不到就老实放弃（details=null），绝不再把全屏层当抽屉。 */
       if (!details) {
@@ -1027,7 +1207,21 @@ const SCRIPT = `(() => {
         const s = String(v).trim().toLowerCase();
         return !(s === "" || s === "false" || s === "0" || s === "off" || s === "no");
       };
-      const collapsed = () => truthyAttr(frame, "data-sidebar-collapsed");
+      /* 侧栏折叠态。官方 0.1.2-rc.1 只在**折叠时**写 data-sidebar-collapsed,展开时把属性**移除**
+         (实测:窄屏抽屉展开后 frame 上完全没有该属性);也兼容带值写法(=false/=true)与反向的
+         data-sidebar-open。所以"属性不在"有两种含义 ——"展开"或"官方根本不叫这个名字" ——必须区分:
+           · 只要**见过**它出现过(sidebarAttrSeen),就说明这个名字是活的 → 之后的"不在" = 展开;
+           · 从没见过 → 认不到 → **当作收起**(0.6.9-beta.2 加入的兜底):离屏抽屉盖在内容上、
+             遮罩跟着下闸才是真正会困住用户的形态,收起态至少还能用汉堡按钮打开。
+         ⚠️ 注意 collapsed()/expanded() 只是"官方属性怎么表达"的**猜测**,只能用来**跟随官方**;
+            "抽屉此刻是不是开着"适配层自己有确定答案(html 上的 dsh-ma-sidebar-open / 几何),
+            凡是要据此做动作的地方(如自动收抽屉)都必须用后者 —— 见下面 autoClose 委托。 */
+      let sidebarAttrSeen = false;
+      const collapsed = () => {
+        if (frame.hasAttribute("data-sidebar-collapsed")) { sidebarAttrSeen = true; return truthyAttr(frame, "data-sidebar-collapsed"); }
+        if (frame.hasAttribute("data-sidebar-open")) { sidebarAttrSeen = true; return !truthyAttr(frame, "data-sidebar-open"); }
+        return !sidebarAttrSeen;
+      };
       const expanded = () => !collapsed();
 
       /* 遮罩:点击 = 点官方 toggle(走官方 store,无私有状态) */
@@ -1037,6 +1231,7 @@ const SCRIPT = `(() => {
       scrim.addEventListener("click", (e) => {
         e.stopPropagation();
         userWantsOpen = false;                    // 用户明确要关(遮罩的作用就是关抽屉)
+        centerTouchedAt = 0; detailsSticky = false; // 顺带收回"要看详情"的意图(下次在正文里点一下即可恢复)
         const t = toggleOf();
         if (t) { t.click(); }
         /* 兜底 + 保险:无论官方 toggle 在不在,都确保"点空白处"能关掉/不再拦截 */
@@ -1063,30 +1258,47 @@ const SCRIPT = `(() => {
 
       /* 侧栏是否**真的**滑进了视口。这是"遮罩能不能拦截点击"的最后一道保险：
          只要官方属性语义与我们理解的不一致，光看属性就可能误判；而遮罩一旦拦截整屏，
-         用户看到的就是"整屏阴影 + 点哪都没反应"。以实测几何为准，误判也不会挡住用户。 */
-      const inView = (el) => {
-        if (!el) return false;
-        try { const r = el.getBoundingClientRect(); return !!r && r.right > 8 && r.width > 40; }
-        catch (e2) { return false; }
-      };
+         用户看到的就是"整屏阴影 + 点哪都没反应"。以实测几何为准（isDrawer），误判也不会挡住用户。 */
       /* 抽屉必须"像抽屉"：不是全屏层（overlay 层/主内容区都被排除在外）、不是拖拽把手、
-         此刻真的在视口里。任一不满足 → 它就不该让遮罩拦截点击（0.1.5 事故的结构性防线）。 */
+         **与视口真正相交**。任一不满足 → 它就不该让遮罩拦截点击（0.1.5 事故的结构性防线）。
+         ⚠️ 2026-09-19 手机实测第二波:旧实现只查 r.right > 8,这对"向右滑出屏外"的第三列是
+            **恒真**的 —— 抽屉滑出时右边坐标是很大的正数(实测 left=400,right=759,width=358),
+            于是"完全看不见、一个像素都没露"的第三列被判成"展开的详情列":
+              · dsh-ma-details-open 常亮 → 那个空的 Details 面板(白框)滑进来盖住整屏;
+              · 它的 z-index(300) 与侧栏相同、DOM 顺序在侧栏之后 → 压住抽屉,抽屉里所有点击
+                都命中详情面板(实测 elementFromPoint 命中 _2ctAZa_empty);
+              · 同时 scrim 常亮 → 剩下没被盖住的地方也被拦掉。
+            用户看到的就是「展开左边抽屉,无法选择历史会话,点任何东西都没反应 + 右边一个白框」。
+            现在四边都查:必须与视口有实质重叠,整体滑出(左/右/上/下)一律不算"在视口里"。 */
       const isDrawer = (el) => {
         if (!el || isOverlayLayer(el) || isHandle(el)) return false;
         try {
           const r = el.getBoundingClientRect();
-          if (!r || r.width <= 40 || r.right <= 8) return false;
-          return r.width < window.innerWidth * 0.98; // 全屏宽 = 主界面，不是抽屉
+          if (!r || r.width <= 40 || r.height <= 20) return false;
+          const vw = window.innerWidth || 0;
+          const vh = window.innerHeight || 0;
+          if (vw > 0 && r.left >= vw - 8) return false; // 整体在视口右侧之外(滑出的抽屉) —— 旧版漏的就是这条
+          if (r.right <= 8) return false;               // 整体在视口左侧之外
+          if (vh > 0 && r.top >= vh - 8) return false;  // 整体在视口下方之外
+          if (r.bottom <= 8) return false;              // 整体在视口上方之外
+          return r.width < vw * 0.98;                   // 全屏宽 = 主界面，不是抽屉
         } catch (e2) { return false; }
       };
       const sidebarInView = () => isDrawer(sidebar || document.querySelector(".dsh-ma-sidebar"));
       const detailsInView = () => isDrawer(details || document.querySelector(".dsh-ma-details, .dsh-ma-rightbar"));
       /* 第三列折叠态:官方 0.1.2-rc.1 是 data-details-collapsed,0.1.5-rc.2 起是 data-rightbar-collapsed;
-         两个都认;都不存在(未来再改名)时**不当作展开**,只由几何判定决定(见 detailsInView)。 */
+         两个都认;都不存在(未来再改名)时**不当作展开**(见下面 detailsAttrLive)。 */
       const detailsCollapsed = () =>
         truthyAttr(frame, "data-details-collapsed") || truthyAttr(frame, "data-rightbar-collapsed");
       const detailsAttrKnown = () =>
         frame.hasAttribute("data-details-collapsed") || frame.hasAttribute("data-rightbar-collapsed");
+      /* 官方这两个属性都是"折叠时才写,展开时**移除**"(实测 0.1.2-rc.1:展开态下属性消失)。
+         所以"属性不在"既可能是"展开",也可能是"官方改名了,我们根本不认识这个属性"——必须区分:
+           · 只要**见过**它出现过(detailsSeenCollapsed),就说明这个名字是活的 → 之后的"不在"= 展开;
+           · 从没见过 → 不认识 → 一律不认(绝不把未知结构当成"展开的详情列",这是白框事故的根因)。
+         data-rightbar-fullscreen 一并算作"这个名字是活的"的旁证(0.1.5 起第三列的另一种开合表达)。 */
+      const detailsAttrLive = () =>
+        detailsAttrKnown() || detailsSeenCollapsed || frame.hasAttribute("data-rightbar-fullscreen");
       /* 状态来源（按优先级）：
          ① 用户意图 userWantsOpen —— 点菜单按钮打开 / 点遮罩关闭，期间**不被几何判定推翻**；
          ② 官方 frame 的 data 属性 —— 用户没表达意图时（初始、官方自己切换）以它为准。
@@ -1095,6 +1307,43 @@ const SCRIPT = `(() => {
             现在只让几何判定决定**遮罩能否拦截点击**（最后一道保险），不再否决用户的展开意图。 */
       let userWantsOpen = null; // null=未表达意图（跟随官方）; true/false=用户已明确开/关
       let scrimTimer = 0, scrimWatchdog = 0;
+      /* ---- 详情列(第三列)在手机端的显示条件 ----------------------------------------
+         ⚠️ 为什么不能"官方属性说展开就滑进来"(2026-09-19 白框事故的根因之一):
+            详情列在手机端是**离屏浮层**,我们自己的 CSS 用 translateX(103%) 把它推到屏幕右侧外面,
+            到底显不显示**完全由 dsh-ma-details-open 决定**。所以几何永远无法充当"要不要打开"的依据
+            (它永远在屏外);反过来,旧实现用带缺陷的几何判定去决定是否滑入,就把
+            "官方在宽屏/上次会话遗留的展开态(attr 缺失或 =false)"读成"现在就该显示",
+            于是手机一载入就滑出一个**空的白色 Details 面板**盖住界面。
+         现在的规则(唯一一条,很保守):
+           官方说得清"此刻是展开的" **且** 用户在**主内容列**里点过至少一次 → 才滑入。
+           为什么要求"用户点过主内容列":官方表达展开的方式有两种 —— 属性被移除,或写成 =false
+           (实测 0.1.2-rc.1 是"收起才写属性";0.1.5 起第三列改名 rightbar,写法可能与旧版不同)。
+           "载入时官方就是展开的"多半是宽屏/上次会话留下的状态,手机端一进来就弹一个空白白面板
+           正是用户报的那个白框;而"用户在正文里点了一下"是**可靠且唯一的**用户意图信号
+           (点工具行必然落在主内容列里)。这样两种写法都能正确处理,也不需要猜官方的时序。
+           注:用户点过之后,官方若把属性收回(=收起),下面的 !detailsCollapsed() 立刻让它退出 ——
+           关掉详情面板也是即时的。 */
+      let detailsSeenCollapsed = false;  // 是否见过官方写出折叠态(证明这个属性名是活的)
+      /* 手机端显示详情列的**唯一**依据:用户在主内容列里的点击(见下面 click 委托)。
+         · centerTouchedAt:最近一次点击时间 —— 点工具行后官方通常在同一帧内把详情置为展开,
+           给一个几秒窗口足够覆盖"点击 → 官方改属性 → 我们收到通知"的时序;
+         · detailsSticky:一经用户动作显示过就粘住(官方没说收起之前不自己缩回去),
+           否则那些 700/1600/…/12000ms 的兜底 re-sync 会在窗口过期后把面板又收起来。 */
+      const CENTER_TOUCH_MS = 8000;
+      let centerTouchedAt = 0;
+      let detailsSticky = false;
+      /* scrim 的"到底有没有在拦"以浏览器算出来的 pointer-events 为准(class 只是我们的意图) */
+      const scrimBlocks = () => {
+        const html = document.documentElement;
+        if (!html.classList.contains("dsh-ma-scrim-on")) return false;
+        try {
+          const cs = window.getComputedStyle && scrim ? window.getComputedStyle(scrim) : null;
+          const pe = cs && cs.pointerEvents;
+          if (typeof pe === "string" && pe !== "") return pe === "auto";
+        } catch (e2) { /* 忽略 */ }
+        return true; // 认不出实际样式 → 以 class 为准(保守:当成在拦)
+      };
+      const anyDrawerInView = () => sidebarInView() || detailsInView();
       /* 遮罩闸门：**只有此刻真的看得见抽屉**才允许拦截点击。
          抽屉是滑入动画（.22s），所以同步判定必然"还看不见" —— 那一瞬间不下闸即可，
          真正的下闸交给下一帧与动画结束后的复核（applyScrim），既不误拦也不影响手感。
@@ -1109,6 +1358,19 @@ const SCRIPT = `(() => {
         try { document.documentElement.classList.toggle("dsh-ma-scrim-on", scrimShouldBeOn()); }
         catch (e2) { /* 忽略 */ }
       };
+      /* 🔒 不变量(硬要求):遮罩只要在拦截点击,视口内就必须**存在**至少一层可交互抽屉;
+         否则立刻摘掉遮罩。它不看任何判定链(属性/几何/class)的自洽性,只认"实际在拦 + 实际没有抽屉"
+         这一对事实 —— 任何未来官方改名、结构变化都不会再变成"点哪都没反应"的死局。
+         注意:**只摘遮罩,不动 dsh-ma-sidebar-open** —— 抽屉是滑入动画,动画途中本来就"还没进视口",
+         顺手摘掉展开 class 会让抽屉永远打不开(0.6.6-beta.3 的回归点)。 */
+      const enforceScrimInvariant = () => {
+        try {
+          if (!scrimBlocks()) return false;
+          if (anyDrawerInView()) return false;
+          document.documentElement.classList.remove("dsh-ma-scrim-on");
+          return true;
+        } catch (e2) { return false; }
+      };
       /* 看门狗:遮罩一旦在拦截点击,就必须**始终**有抽屉在视口里;否则立刻摘掉。
          它防的是"未来官方再改名/再改结构"导致的同类死局 —— 用户被遮罩困住的代价太高,
          宁可多这一个每 800ms 的轻量校验（没有遮罩时自会停表）。 */
@@ -1116,6 +1378,7 @@ const SCRIPT = `(() => {
         if (scrimWatchdog) return;
         try {
           scrimWatchdog = setInterval(() => {
+            if (enforceScrimInvariant()) { /* 不变量被触发:已摘掉遮罩 */ }
             applyScrim();
             const html = document.documentElement;
             if (!html.classList.contains("dsh-ma-scrim-on") && !html.classList.contains("dsh-ma-sidebar-open") && !html.classList.contains("dsh-ma-details-open")) {
@@ -1129,27 +1392,68 @@ const SCRIPT = `(() => {
         document.documentElement.classList.toggle("dsh-ma-sidebar-open", open);
         /* 汉堡按钮**始终可见**：以前判定为"展开"时会把它 display:none 隐藏，
            于是判定一旦出错（或遮罩因异常常亮），用户既点不动内容、也没有任何入口 —— 死局。
-           保持可见 + 点它可开可关（见其 click 处理），任何异常状态下都留一条出路。 */
+           保持可见 + 点它可开可关（见其 click 处理），任何异常状态下都留一条出路。
+           它的 z-index(320) 高于抽屉(310)/详情列(300)/遮罩(290) —— 判定怎么错都点得到。 */
         if (hamburger) hamburger.style.display = "";
-        /* 第三列(详情/rightbar):属性说展开 **且** 真的是个在视口里的抽屉,才算展开。
-           ⚠️ 这里就是 2026-09-19 的根因点:旧版只判属性 + inView,而官方 0.1.5 把属性改名后,
-           被误标成 details 的 overlay 层(全屏)满足 inView → 遮罩常亮。现在多了 isDrawer 的结构约束。 */
-        const dOpen = detailsAttrKnown() ? (!detailsCollapsed() && detailsInView()) : detailsInView();
+        /* 第三列(详情/rightbar)在手机端要不要滑进来:
+           ① 属性说不清(官方未来再改名) → **不显示**,绝不靠几何去猜
+              (0.1.5 事故:被误标成 details 的 overlay 层/滑出屏外的列满足"几何可见" → 遮罩常亮 + 白框);
+           ② 见过官方写出折叠态 → 证明 details/rightbar 里有一个属性名是活的(见 detailsAttrLive);
+           ③ 官方收起 → 立刻退出,并复位"用户要看详情"的粘性标记(下次点正文即可恢复)。 */
+        if (detailsCollapsed()) { detailsSeenCollapsed = true; detailsSticky = false; }
+        const touchedRecently = centerTouchedAt !== 0 && (Date.now() - centerTouchedAt) <= CENTER_TOUCH_MS;
+        const dOpen = detailsAttrLive() && !detailsCollapsed() && (touchedRecently || detailsSticky);
+        if (dOpen) detailsSticky = true;
         document.documentElement.classList.toggle("dsh-ma-details-open", dOpen);
         // 遮罩:同步先按当前几何下闸(抽屉已在视口内时无延迟),再在动画开始/结束后复核两次
         applyScrim();
         try {
           if (typeof requestAnimationFrame === "function") requestAnimationFrame(applyScrim);
           clearTimeout(scrimTimer);
-          scrimTimer = setTimeout(applyScrim, 300);
+          scrimTimer = setTimeout(() => { enforceScrimInvariant(); applyScrim(); }, 300);
         } catch (e2) { /* 忽略 */ }
         armScrimWatchdog();
       };
+      /* 用户在主内容列里点一下 → 视为"他要看详情"(手机端显示详情列的唯一开关)。
+         为什么必须由用户动作来解锁:官方表达"详情展开"的方式有两种 —— 属性被移除,或写成 =false,
+         而"载入时官方就是展开的"多半是宽屏/上次会话留下的状态;手机端一进来就滑出一个空白白面板
+         正是用户报的那个白框。点了正文之后才显示,两种写法都能正确处理,也不用去猜官方时序;
+         用户点空白(遮罩)即收回这个意图(见 scrim 的 click 处理)。
+         只认主内容列(.dsh-ma-center),不认抽屉/菜单/适配层自己的 UI —— 不会误触发。 */
       try {
-        new MutationObserver(sync).observe(frame, {
-          attributes: true,
-          attributeFilter: ["data-sidebar-collapsed", "data-details-collapsed", "data-rightbar-collapsed", "data-rightbar-fullscreen"],
-        });
+        document.addEventListener("click", (e) => {
+          try {
+            if (!NARROW()) return;
+            const t = e.target;
+            if (!t || !t.closest) return;
+            if (t.closest(".dsh-ma-sidebar, .dsh-ma-scrim, .dsh-ma-hamburger, .dsh-ma-fab, .dsh-ma-menu")) return;
+            if (!t.closest(".dsh-ma-center, .pI_x6G_centerCol")) return;
+            centerTouchedAt = Date.now();
+            /* 只有"官方此刻就说详情是展开的"才需要立刻重算 —— 否则这一下点击改变不了任何显示,
+               白跑一次 sync()(它要读几次 getBoundingClientRect)。官方稍后把详情置为展开时,
+               frame 属性观察器会再触发一次 sync,那时 centerTouchedAt 已经记下了用户意图。 */
+            if (detailsCollapsed()) return;
+            sync();
+          } catch (e2) { /* 忽略 */ }
+        }, true);
+      } catch (e2) { /* 忽略 */ }
+      try {
+        /* 观察 frame 的**全部属性**,再在回调里按名字筛(2026-09-19 手机实测后的加固):
+           官方 0.1.5-rc.2 起表达抽屉开合的属性改过名(details→rightbar),将来还可能再改;
+           用 attributeFilter 白名单就会"官方自己开了抽屉、适配层不知道" → 遮罩/class 与实际不符。
+           这里改成名字级正则:任何含 sidebar/details/rightbar/collapsed/expand/open/fullscreen/shell
+           的属性变动都会触发一次 sync —— 涵盖官方已知的两种命名(details / rightbar)与任何未来改名,
+           而 window.addEventListener("resize"/"orientationchange") 与 700ms~12s 的兜底 re-sync
+           继续覆盖"官方只改内联 gridTemplateColumns 而不动属性"的情况。 */
+        const FRAME_ATTR_RE = /sidebar|details|rightbar|collapsed|expand|open|fullscreen|shell/i;
+        new MutationObserver((records) => {
+          try {
+            for (let i = 0; i < records.length; i++) {
+              const n = records[i].attributeName;
+              if (n && FRAME_ATTR_RE.test(n)) { sync(); return; }
+            }
+          } catch (e3) { sync(); }
+        }).observe(frame, { attributes: true });
       } catch (e2) { /* 退化:仅在下次 boot 同步 */ }
       // 几何变化（旋转屏幕 / 窗口缩放 / 侧栏动画结束）也要重算，否则会把 boot 时的判定一直沿用
       try {
@@ -1160,20 +1464,46 @@ const SCRIPT = `(() => {
       sync();
       /* 兜底复核:官方模块异步挂载、字体/主题切换都会改尺寸 —— 断点各复核一次遮罩闸门。 */
       [400, 1200, 3000].forEach((ms) => setTimeout(applyScrim, ms));
-      /* 窄屏抽屉:点选会话(激活行)/点侧栏内「新建会话」后自动收起(官方不做;适配层点官方 toggle)。
-         仅当:窄屏 && 抽屉展开 && 点击发生在侧栏抽屉内;行内「⋯」按钮 stopPropagation 不会误触。 */
+      /* 窄屏抽屉:点选会话/在工作区里新建会话/进 Task Board 后自动收起(官方不做;适配层点官方 toggle)。
+         ⚠️ 2026-09-19 回归(用户实测「选择工作区之后抽屉没有收回去」)根因就在这个闸门上:
+            旧写法 if (!NARROW() || !expanded()) return; 用**官方属性**判断"抽屉是不是开着",
+            而官方表达"展开"的方式恰恰是**把 data-sidebar-collapsed 移除** —— 于是抽屉一打开,
+            expanded() 就变成 false(属性名认不到时更恒为 false),委托第一行直接 return,
+            **所有**自动收起全部失效。现在改成用适配层自己的确定状态:
+              · html.dsh-ma-sidebar-open —— 我们标记的展开态(汉堡按钮/官方切换都会走到 sync);
+              · sidebarInView() —— 抽屉此刻**真的**在视口里(几何兜底,class 丢了也认)。
+            两者任一成立就认为"抽屉开着,该收"。 */
+      const drawerIsOpenNow = () =>
+        document.documentElement.classList.contains("dsh-ma-sidebar-open") || sidebarInView();
+      /* 点完就该收起抽屉的交互(基于 2026-09-19 真机 DOM 取证,只列**导航/切换上下文**的动作):
+           · 会话行:div.YDXeBa_sessionRow[role="treeitem"][aria-selected]      → 切会话
+           · 新建会话:aria-label="New session" / "New session in <工作区>"      → 新会话(后者=选择工作区并进入)
+           · Task Board:aria-label="Task Board" / [data-dsh-taskboard-entry]    → 切到任务板主视图
+         明确**不**收起的(都是"就地操作",收起会把用户正在看的东西一起收掉):
+           · 工作区行本身 div.YDXeBa_projectRow[role="treeitem"][aria-expanded](无 aria-selected)
+             —— 官方源码里它是 disclosure:onClick: onToggle → setGroupExpanded(group.key, !expanded),
+             真机实测点 wikiStore:aria-expanded false→true、会话行 6→11 条。点它=展开/折叠该工作区的
+             会话列表(用户正要看里面的会话),收抽屉会让"展开→看不到"。
+             (用户说的"选择工作区"在抽屉里的真实入口是行内那颗 ⊕「New session in <工作区>」,
+              它属于"新建会话"那一类,已被上面的选择器覆盖并有用例。)
+           · 行内「⋯」Workspace actions / 展开折叠 / 滚动 / 勾选:都不是导航。 */
+      const AUTO_CLOSE_SEL = [
+        '[role="treeitem"][aria-selected]',
+        '[aria-label*="新建会话"]',
+        '[aria-label*="New session" i]',
+        '[aria-label*="Task Board" i]',
+        '[data-dsh-taskboard-entry]',
+      ].join(",");
       if (!drawerAutoCloseOn) {
         drawerAutoCloseOn = true;
         document.addEventListener("click", (e) => {
           try {
-            if (!NARROW() || !expanded()) return;
+            if (!NARROW() || !drawerIsOpenNow()) return;
             const t = e.target;
             if (!t || !t.closest) return;
             if (t.closest(".dsh-ma-scrim, .dsh-ma-hamburger")) return;
-            if (!t.closest(".dsh-ma-sidebar")) return; // 只处理抽屉内的点选
-            const row = t.closest('[role="treeitem"][aria-selected]');
-            const isNew = t.closest('[aria-label*="新建会话"], [aria-label*="New session" i]');
-            if (!row && !isNew) return;
+            if (!t.closest(".dsh-ma-sidebar")) return;       // 只处理抽屉内的点选
+            if (!t.closest(AUTO_CLOSE_SEL)) return;          // 只认"导航/切换"类,就地操作不收起
             userWantsOpen = false;
             const togg = toggleOf();
             if (togg) setTimeout(() => { try { togg.click(); } catch (e5) { /* ignore */ } }, 0);
