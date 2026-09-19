@@ -259,8 +259,9 @@ html[data-dsh-ma-fs="3"] { --dsh-ma-fs-scale: 1.32; -webkit-text-size-adjust: 13
    用户至少还能从这里"返回设备列表"自救(这是 2026-09-19 死局的兜底出口)。 */
 button.dsh-ma-fab {
   position: fixed;
-  right: max(10px, env(safe-area-inset-right));
-  bottom: calc(16px + env(safe-area-inset-bottom));
+  /* 位置由 JS 计算后写 inline left/top（默认右上角，可拖动；见 SCRIPT 里的 fabPos）；
+     CSS 只给尺寸/层级/指针语义 —— 用 left/top 而不是 right/bottom，拖动才不会被"贴边"钉住。 */
+  left: auto; top: auto; right: 10px; bottom: auto;
   z-index: 400;
   width: 46px; height: 46px; padding: 0;
   display: flex; align-items: center; justify-content: center;
@@ -270,10 +271,12 @@ button.dsh-ma-fab {
   border: .5px solid var(--dsw-alias-border-l3, rgba(127,127,127,.3));
   box-shadow: 0 2px 12px rgba(0,0,0,.2);
   color: var(--dsw-alias-label-primary, #111);
-  cursor: pointer; touch-action: manipulation;
+  cursor: grab; touch-action: none; /* 触屏拖动不被页面滚动抢走 */
+  user-select: none; -webkit-user-select: none;
   -webkit-tap-highlight-color: transparent;
 }
 button.dsh-ma-fab:active { transform: scale(.94); }
+button.dsh-ma-fab.dsh-ma-fab-dragging { cursor: grabbing; transform: scale(1.06); }
 button.dsh-ma-fab .dsh-ma-fab-lock {
   position: absolute; top: -3px; right: -3px;
   font-size: 12px; line-height: 1; padding: 2px 3px; border-radius: 999px;
@@ -283,6 +286,7 @@ button.dsh-ma-fab .dsh-ma-fab-lock {
 /* 菜单卡片:fixed 贴右下，最大高度受限可滚动 */
 div.dsh-ma-menu {
   position: fixed;
+  /* 打开时按悬浮按钮的位置重算（按钮在上半屏→菜单挂下方；靠左→左对齐），见 placeMenu() */
   right: max(10px, env(safe-area-inset-right));
   bottom: calc(70px + env(safe-area-inset-bottom));
   z-index: 401;
@@ -688,11 +692,64 @@ const SCRIPT = `(() => {
         '<div class="dsh-ma-menu-note">返回后可重新选择设备；端到端加密需在设备列表页重新解锁（会话密钥只存在本机内存里，刷新即失效）。</div>';
       document.body.appendChild(menu);
 
+      /* ---- 悬浮按钮的位置：默认**右上角**（原来在右下角，正好压住输入框的发送按钮）；
+              可拖动，位置按"最近的角 + 距边偏移"记忆 —— 旋转屏幕/换窗口宽度都不会跑到屏幕外。 ---- */
+      const FAB_KEY = "dsh-ma-fab-pos";
+      const FAB_SIZE = 46, FAB_EDGE = 10;
+      const readFabPos = () => {
+        try {
+          const raw = window.localStorage && window.localStorage.getItem(FAB_KEY);
+          const p = raw ? JSON.parse(raw) : null;
+          if (p && (p.h === "left" || p.h === "right") && (p.v === "top" || p.v === "bottom")
+            && typeof p.dx === "number" && typeof p.dy === "number") return p;
+        } catch (e) { /* 忽略 */ }
+        return null;
+      };
+      const defaultFabPos = () => ({ h: "right", v: "top", dx: FAB_EDGE, dy: FAB_EDGE });
+      let fabPos = readFabPos() || defaultFabPos();
+      const fabXY = (pos) => {
+        const vw = window.innerWidth || 360, vh = window.innerHeight || 640;
+        return {
+          left: pos.h === "left" ? pos.dx : vw - FAB_SIZE - pos.dx,
+          top: pos.v === "top" ? pos.dy : vh - FAB_SIZE - pos.dy,
+        };
+      };
+      const clampFabXY = (xy) => {
+        const vw = window.innerWidth || 360, vh = window.innerHeight || 640;
+        return {
+          left: Math.max(4, Math.min(xy.left, vw - FAB_SIZE - 4)),
+          top: Math.max(4, Math.min(xy.top, vh - FAB_SIZE - 4)),
+        };
+      };
+      const applyFabPos = () => {
+        const xy = clampFabXY(fabXY(fabPos));
+        fab.style.left = Math.round(xy.left) + "px";
+        fab.style.top = Math.round(xy.top) + "px";
+        return xy;
+      };
+      const saveFabPos = () => {
+        try { window.localStorage && window.localStorage.setItem(FAB_KEY, JSON.stringify(fabPos)); } catch (e) { /* 忽略 */ }
+      };
+      /** 拖动落点 → "最近的角 + 偏移"（保留用户的意图，同时保证换尺寸后仍在屏内）。 */
+      const fabPosFromXY = (xy) => {
+        const vw = window.innerWidth || 360, vh = window.innerHeight || 640;
+        const h = xy.left + FAB_SIZE / 2 < vw / 2 ? "left" : "right";
+        const v = xy.top + FAB_SIZE / 2 < vh / 2 ? "top" : "bottom";
+        return {
+          h: h, v: v,
+          dx: h === "left" ? Math.max(0, xy.left) : Math.max(0, vw - FAB_SIZE - xy.left),
+          dy: v === "top" ? Math.max(0, xy.top) : Math.max(0, vh - FAB_SIZE - xy.top),
+        };
+      };
+
       const fab = document.createElement("button");
       fab.type = "button";
       fab.className = "dsh-ma-fab";
-      fab.setAttribute("aria-label", "远程控制菜单");
+      fab.setAttribute("aria-label", "远程控制菜单（可拖动）");
+      fab.title = "远程控制：字号 / 加密状态 / 返回设备列表（可拖动移动位置）";
       fab.innerHTML = '<span class="dsh-ma-fab-ico">字</span><span class="dsh-ma-fab-lock" data-role="lock">🔒</span>';
+      fab.style.left = Math.round(clampFabXY(fabXY(fabPos)).left) + "px";
+      fab.style.top = Math.round(clampFabXY(fabXY(fabPos)).top) + "px";
       document.body.appendChild(fab);
 
       const fsRange = menu.querySelector('input[type="range"]');
@@ -743,13 +800,80 @@ const SCRIPT = `(() => {
       [600, 2000, 5000].forEach((ms) => setTimeout(renderE2ee, ms)); // shim 可能晚于本层挂牌
 
       /* ---- 交互 ---- */
+      /* 菜单跟随按钮：按钮在上半屏 → 菜单挂在它下方；按钮靠左 → 菜单左对齐（都不超出视口）。 */
+      const placeMenu = () => {
+        try {
+          const r = fab.getBoundingClientRect();
+          const vw = window.innerWidth || 360, vh = window.innerHeight || 640;
+          const mr = menu.getBoundingClientRect();
+          const mw = mr.width || Math.min(vw * 0.86, 320);
+          const mh = mr.height || 300;
+          const GAP = 8, EDGE = 8;
+          menu.style.top = "auto"; menu.style.bottom = "auto";
+          if (r.top + r.height / 2 < vh / 2) {
+            menu.style.top = Math.round(Math.max(EDGE, Math.min(r.bottom + GAP, vh - mh - EDGE))) + "px";
+          } else {
+            menu.style.bottom = Math.round(Math.max(EDGE, vh - r.top + GAP)) + "px";
+          }
+          menu.style.left = "auto"; menu.style.right = "auto";
+          if (r.left + r.width / 2 < vw / 2) {
+            menu.style.left = Math.round(Math.max(EDGE, Math.min(r.left, vw - mw - EDGE))) + "px";
+          } else {
+            menu.style.right = Math.round(Math.max(EDGE, Math.min(vw - r.right, vw - mw - EDGE))) + "px";
+          }
+        } catch (e) { /* 定位失败不影响功能（退回 CSS 默认位置） */ }
+      };
       const closeMenu = () => { menu.hidden = true; };
-      const openMenu = () => { renderE2ee(); menu.hidden = false; };
+      const openMenu = () => { renderE2ee(); menu.hidden = false; placeMenu(); };
+      let suppressClickUntil = 0; // 拖完的那一下不要当成"点击打开菜单"
+      let tapHandledAt = 0;        // 轻点已在 pointerup 里处理过（避免 click 再翻一次）
+      const toggleMenu = () => { if (menu.hidden) openMenu(); else closeMenu(); };
       fab.addEventListener("click", (e) => {
         e.stopPropagation(); e.preventDefault();
-        if (menu.hidden) openMenu(); else closeMenu();
+        if (Date.now() < suppressClickUntil) return;      // 刚拖完 → 不算点击
+        if (Date.now() - tapHandledAt < 800) return;      // 轻点已在 pointerup 处理 → 不重复开合
+        toggleMenu();                                     // 键盘/老浏览器兜底
       });
       menu.addEventListener("click", (e) => e.stopPropagation());
+
+      /* ---- 拖动：pointer 事件 + 指针捕获（手指拖出按钮范围也不断线）；拖动阈值 6px 区分"点击"与"拖动" ---- */
+      let fabDrag = null;
+      fab.addEventListener("pointerdown", (e) => {
+        if (e.button !== undefined && e.button !== 0) return; // 只认左键/单指
+        const xy = clampFabXY(fabXY(fabPos));
+        fabDrag = { id: e.pointerId, sx: e.clientX, sy: e.clientY, ox: xy.left, oy: xy.top, moved: false };
+        try { if (fab.setPointerCapture) fab.setPointerCapture(e.pointerId); } catch (e2) { /* 老浏览器忽略 */ }
+        // ⚠️ 这里**不能** preventDefault：实测它会连带掐掉随后的 click 事件（Chrome 触摸语义），
+        //    结果是"按钮点了没反应"。防滚动交给 CSS 的 touch-action:none，轻点交给 pointerup 处理。
+      });
+      fab.addEventListener("pointermove", (e) => {
+        if (!fabDrag || e.pointerId !== fabDrag.id) return;
+        const dx = e.clientX - fabDrag.sx, dy = e.clientY - fabDrag.sy;
+        if (!fabDrag.moved && Math.abs(dx) + Math.abs(dy) < 6) return; // 阈值内视为点击（细微抖动不挪位）
+        if (!fabDrag.moved) { fabDrag.moved = true; fab.classList.add("dsh-ma-fab-dragging"); closeMenu(); }
+        const xy = clampFabXY({ left: fabDrag.ox + dx, top: fabDrag.oy + dy });
+        fab.style.left = Math.round(xy.left) + "px";
+        fab.style.top = Math.round(xy.top) + "px";
+      });
+      const endFabDrag = (e) => {
+        if (!fabDrag || (e && e.pointerId !== undefined && e.pointerId !== fabDrag.id)) return;
+        const moved = fabDrag.moved;
+        fabDrag = null;
+        try { fab.classList.remove("dsh-ma-fab-dragging"); } catch (e2) { /* 忽略 */ }
+        if (!moved) {
+          // 轻点（没超过拖动阈值）→ 在这里开合菜单：pointerdown 不再 preventDefault 之后，
+          // 触摸场景的 click 并不总是可靠地跟上来，pointerup 才是稳的那个点。
+          tapHandledAt = Date.now();
+          toggleMenu();
+          return;
+        }
+        fabPos = fabPosFromXY(clampFabXY({ left: parseFloat(fab.style.left) || 0, top: parseFloat(fab.style.top) || 0 }));
+        saveFabPos();
+        suppressClickUntil = Date.now() + 400; // 拖动结束后的 click 事件不算"点开菜单"
+      };
+      fab.addEventListener("pointerup", endFabDrag);
+      fab.addEventListener("pointercancel", endFabDrag);
+      fab.addEventListener("lostpointercapture", endFabDrag);
       if (fsRange) {
         fsRange.addEventListener("input", (e) => { e.stopPropagation(); setLevel(Number(fsRange.value), true); });
         fsRange.addEventListener("click", (e) => e.stopPropagation());
@@ -770,6 +894,10 @@ const SCRIPT = `(() => {
         if (t === fab || (t && t.closest && t.closest(".dsh-ma-menu, .dsh-ma-fab"))) return;
         closeMenu();
       });
+      try {
+        window.addEventListener("resize", () => { applyFabPos(); if (!menu.hidden) placeMenu(); }, { passive: true });
+        window.addEventListener("orientationchange", () => { applyFabPos(); if (!menu.hidden) placeMenu(); }, { passive: true });
+      } catch (e9) { /* 忽略 */ }
       const devEl = menu.querySelector(".dsh-ma-menu-dev");
       if (devEl) {
         const d = deviceIdOfPath();

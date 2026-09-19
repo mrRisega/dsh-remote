@@ -362,3 +362,80 @@ test("多端适配：悬浮按钮与字号样式的 CSS 必须在 @media(max-wid
   assert.match(out, /html\[data-dsh-ma-fs="3"\]/, "字号档位样式也应在媒体查询之外（电脑端同样生效）");
   assert.match(out, /z-index:\s*40[01]/, "悬浮按钮/菜单层级要高于遮罩(290)，遮罩异常时仍是自救出口");
 });
+
+// ── 悬浮按钮位置：默认右上角 + 可拖动（2026-09-19 用户反馈） ──────────────────────
+// 现场：按钮原来固定在右下角，**正好压住输入框的发送按钮**；用户要求默认挪到右上角并支持拖动。
+
+test("悬浮按钮：默认在右上角（不再压住输入区的发送按钮）", () => {
+  const env = runAdapter(harness({ width: 390 }));
+  const fab = findFab(env);
+  assert.ok(fab, "悬浮按钮应存在");
+  // 默认 = 距右上角各 10px：left = 390 - 46 - 10 = 334，top = 10
+  assert.equal(fab.style.top, "10px", "默认应贴右上角（top 小）");
+  assert.equal(fab.style.left, "334px", "默认应贴右上角（left 靠右）");
+});
+
+test("悬浮按钮：拖动后位置改变并持久化，且拖完那一下不算点击", () => {
+  const env = runAdapter(harness({ width: 390 }));
+  const fab = findFab(env);
+  const menu = findMenu(env);
+  // 起始为默认右上角 (334,10)；按下点 (340,20) → 拖到 (140,420)：位移 -200/+400
+  fab.dispatch("pointerdown", { pointerId: 7, clientX: 340, clientY: 20 });
+  fab.dispatch("pointermove", { pointerId: 7, clientX: 140, clientY: 420 }); // 位移远超 6px 阈值
+  fab.dispatch("pointerup", { pointerId: 7, clientX: 140, clientY: 420 });
+  assert.equal(fab.style.left, "134px", "按手指位移平移（抓住哪就从哪拖，不瞬移到指尖）");
+  assert.equal(fab.style.top, "410px", "按手指位移平移");
+  const saved = JSON.parse(env.win.localStorage.getItem("dsh-ma-fab-pos") || "null");
+  assert.ok(saved && saved.h && saved.v, "位置应被持久化（按最近的角 + 偏移）");
+  assert.equal(saved.h, "left", "落点在左半屏 → 记成左锚");
+  assert.equal(saved.v, "bottom", "落点在下半屏 → 记成下锚");
+  assert.equal(saved.dx, 134, "左锚的偏移 = 距左边距离");
+  assert.equal(saved.dy, 344, "下锚的偏移 = 距下边距离（800-46-410）");
+  // 拖完紧接着的 click 不应打开菜单（否则拖到一半就弹菜单，很难用）
+  fab.dispatch("click");
+  assert.equal(menu.hidden, true, "拖动结束后的 click 不得当作点击打开菜单");
+});
+
+test("悬浮按钮：轻点（pointerdown+pointerup 不移动）开合菜单 —— 触屏的主路径", () => {
+  const env = runAdapter(harness({ width: 390 }));
+  const fab = findFab(env);
+  const menu = findMenu(env);
+  assert.equal(menu.hidden, true, "初始应收起");
+  // 触摸路径：pointerdown → pointerup（无位移）→ 菜单应当开；不能再依赖 click（曾被 preventDefault 掐掉）
+  fab.dispatch("pointerdown", { pointerId: 3, clientX: 340, clientY: 30 });
+  fab.dispatch("pointerup", { pointerId: 3, clientX: 340, clientY: 30 });
+  assert.equal(menu.hidden, false, "轻点应打开菜单");
+  // 再轻点一次 → 收起
+  fab.dispatch("pointerdown", { pointerId: 4, clientX: 340, clientY: 30 });
+  fab.dispatch("pointerup", { pointerId: 4, clientX: 340, clientY: 30 });
+  assert.equal(menu.hidden, true, "再轻点应收起");
+  // 位置不应被"轻点"改动
+  assert.equal(fab.style.left, "334px", "轻点不得移动按钮");
+});
+
+test("悬浮按钮：位置跨会话记忆（读 localStorage），越界会被夹回视口内", () => {
+  const env = harness({ width: 390 });
+  env.win.localStorage.setItem("dsh-ma-fab-pos", JSON.stringify({ h: "left", v: "top", dx: 12, dy: 34 }));
+  runAdapter(env);
+  const fab = findFab(env);
+  assert.equal(fab.style.left, "12px", "左锚 → 用 dx");
+  assert.equal(fab.style.top, "34px", "上锚 → 用 dy");
+
+  // 越界（dx 巨大）→ 夹回屏内：left ≤ 390-46-4
+  const env2 = harness({ width: 390 });
+  env2.win.localStorage.setItem("dsh-ma-fab-pos", JSON.stringify({ h: "left", v: "top", dx: 9999, dy: 0 }));
+  runAdapter(env2);
+  assert.equal(findFab(env2).style.left, "340px", "越界位置必须被夹进视口（不能跑到屏幕外）");
+});
+
+test("悬浮按钮：菜单跟随按钮位置（按钮在上半屏 → 菜单挂下方；靠左 → 左对齐）", () => {
+  const env = runAdapter(harness({ width: 390 }));
+  const fab = findFab(env);
+  const menu = findMenu(env);
+  fab._rect = { left: 20, top: 12, right: 66, bottom: 58, width: 46, height: 46 }; // 左上角
+  fab.dispatch("click");
+  assert.equal(menu.hidden, false, "点击应打开菜单");
+  assert.equal(menu.style.top, "66px", "按钮在上半屏 → 菜单挂在按钮下方（bottom+8）");
+  assert.equal(menu.style.left, "20px", "按钮靠左 → 菜单左对齐到按钮");
+  assert.equal(menu.style.right, "auto", "左对齐时不应残留 right");
+});
