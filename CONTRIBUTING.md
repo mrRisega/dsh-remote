@@ -55,6 +55,13 @@ non-negotiables, because each of them has already broken something in production
    (`PLUGIN_LEGACY_IDS`) stay — they let machines that installed the old name migrate cleanly.
 6. **Market copy says "highlights", never "selling points".** Descriptions must stay factual
    and checkable against the code, and must touch only our own entry.
+7. **This repo is public — keep `CHANGELOG.md` and commit messages reader-facing.** Write what
+   *users* will notice, not how it was implemented: no internal function names, selectors,
+   line numbers, severity labels (P1/F2), incident write-ups, or "self-introduced regression"
+   post-mortems. Keep one release section under a screen; fold a round's `-beta.N` previews into
+   a single entry. Internal detail belongs in commit bodies of the closed-source repo or in
+   `../dsh-relay-internal/release-notes-internal/`. Full rules: **§8 of
+   [docs/release-and-market.md](docs/release-and-market.md)**.
 
 ## Architecture
 
