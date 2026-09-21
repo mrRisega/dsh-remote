@@ -82,6 +82,11 @@ async function plantInstallation(tempHome, opts = {}) {
     await mkdir(path.join(relayDir, "clients", "dsh-remote"), { recursive: true });
     await writeFile(path.join(relayDir, ".dsh-config.json"), JSON.stringify({
       phone: "13800000000", password: "pw", device_id: "dev", device_private_key: "pk", local_key: "lk",
+      // ⚠️ api_url 必须显式指向本地不可达端口 —— 缺了它会回落到 DEFAULT_API(生产中继),
+      // 而插件 boot 时会跑 reportInstallOnce → relayToken → bridgeSecretOf → fetch /api/public-config,
+      // 于是这个「卸载」用例会去打**生产**。测试期网络护栏会把它拦成 ENETUNREACH(所以不会真污染),
+      // 但那意味着用例是在「断网」分支上通过的,而不是它声称的场景。
+      api_url: "http://127.0.0.1:1",
     }));
     await writeFile(path.join(relayDir, "dsh-setup.mjs"), "// runtime stub");
     await writeFile(path.join(relayDir, "clients", "dsh-remote", "dsh-bridge.mjs"), "// bridge stub");

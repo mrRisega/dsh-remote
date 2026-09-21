@@ -17,7 +17,19 @@
 //       图形验证码+短信验证码 表单（手机号预填当前输入、可改），成功后本地登出并提示「请用新密码登录」
 //     · 登录要求图形验证码；注册要求两次密码 + 图形验证码
 //     · 📱 远程访问卡：一次性访问密钥（扫码/直接打开/复制 + 到期倒计时自动刷新）与已授权设备管理
+//     · 🤖 微信机器人通道：与「☁️ 云端服务 / 🖥 自建服务」并列的**第三个 tab**（条形 tab 由 home 与
+//       wechat 两个视图共用，所以切过去还能切回来）；不再是独立的 settings.section 栏目 ——
+//       业主口径：「不要给它单独弄一个菜单，直接放到面板里面」（0.6.11）
+//       🔒 登录门（业主口径）：微信通道要求**已注册并登录**，未登录不渲染这个 tab；若会话在
+//          tab 开着的时候过期，view 复位回 home（兜底 effect + 分派条件），绝不留空面板。
+//       🧭 首屏导览：内容体最上面三行讲清用途（推送 / 回数字拍板 / 微信里交代任务），
+//          排在「连接微信机器人」按钮之前 —— 它是绑定的理由，又不把按钮挤出首屏。
+//       ✨ 动效引导：未绑定时「连接」按钮做很慢的呼吸（.dru-wx-attn），
+//          prefers-reduced-motion:reduce 下关闭；状态从不靠动效单独表达。
 //     · bridge 状态与启停开关 + 关于 dsh-remote 说明卡片
+//     · 🧰 账号卡「更多」：只收纳（用户关掉邀请引导之后的）「升级 / 带新用户」两个入口 ——
+//       主界面只剩一个入口，减少营销露出；**档位规格数字（Mbps / GB / 价格）一律不展示**
+//       （0.6.11 业主口径：「插件面板里面不要展示『更多』里的 PRO 版本流量带宽」）
 //   - 首次安装引导：设置页「远程访问」栏目（官方导航 navCell）旁小红点（localStorage dsh-remote-seen-dot 控制）
 //   - shell.overlay：满意度弹窗（安装体验至少 1 小时后弹出，只弹一次）
 // 所有数据经同源 /dsh-remote/* 宿主路由读写（node 半提供）。
@@ -229,6 +241,41 @@ window.__ModuleLoader__.load({
       ".dru-restart-alert-sub{font-size:12px;color:var(--dru-warn-fg-2);margin-top:4px;line-height:1.6}",
       ".dru-restart-foot{margin-top:14px;padding-top:12px;border-top:1px solid var(--dru-border-soft);display:flex;gap:10px;align-items:center;flex-wrap:wrap}",
       ".dru-restart-foot .dru-hint{flex:1;min-width:180px;margin:0}",
+      // ── 🤖 微信机器人（「📱 远程访问」面板里的第三个 tab：微信机器人通道） ──
+      // 主 tab 上的微信绿泡泡（#07c160 = 微信品牌绿）。纯装饰 → 节点上带 aria-hidden，
+      // 可访问名字来自同一 tab 里的文字标签（不靠颜色/图标单独表意）。
+      // font-variant-emoji:text：让 💬 走文字字形，color 才吃得进去（系统彩色 emoji 忽略 color）；
+      // 老浏览器不认这条 CSS → 退化成系统彩色 emoji，图标仍在、可用性不受影响。
+      // 内嵌态的内容体只多一个 class 钩子（不再套一层 .dru-settings-section，见 WeChatBotSection）。
+      ".dru-wx-ico{flex:none;font-size:15px;line-height:1;color:#07c160;font-variant-emoji:text}",
+      ".dru-wx-embed{display:flex;flex-direction:column;gap:14px}",
+      // 首屏「这功能是干什么用的」三行导览：未绑定时就摆在最上面（它正是绑定的理由），
+      // 但必须**不把「连接」按钮挤出首屏** —— 所以是紧凑小字卡片（12px / 行高 1.5 / 无大内边距），
+      // 不是宣传大横幅。所有颜色只引用既有 --dru-* 令牌。
+      ".dru-wx-intro{display:flex;flex-direction:column;gap:4px;background:var(--dru-surface-2);border:1px solid var(--dru-border-soft);border-radius:10px;padding:10px 12px;margin:0}",
+      ".dru-wx-intro-title{font-size:12.5px;font-weight:700;color:var(--dru-fg)}",
+      ".dru-wx-intro-row{font-size:12px;line-height:1.5;color:var(--dru-fg-muted)}",
+      // 未绑定时的**动效引导**（业主口径「动效引导」）：主按钮走很慢的呼吸光晕（2.8s/次，
+      // 不闪烁、不改布局、不位移），旁边那颗装饰小圆点同步呼吸。
+      // 无障碍铁律：① prefers-reduced-motion:reduce 直接关掉动画（见下面媒体查询）；
+      // ② 状态**绝不靠动效单独表达** —— 按钮文字「连接微信机器人」与同一卡片里的文字提示
+      //    本身就说明了要做什么，动效只是多余的强调；③ 纯装饰小圆点带 aria-hidden。
+      ".dru-wx-attn{animation:dru-wx-breathe 2.8s ease-in-out infinite}",
+      "@keyframes dru-wx-breathe{0%,100%{box-shadow:0 0 0 0 var(--dru-accent-tint)}50%{box-shadow:0 0 0 6px var(--dru-accent-tint-border)}}",
+      ".dru-wx-cta{display:flex;align-items:flex-start;gap:8px;font-size:12.5px;line-height:1.6;color:var(--dru-fg);margin-top:8px}",
+      ".dru-wx-attn-dot{flex:none;width:8px;height:8px;margin-top:6px;border-radius:50%;background:var(--dru-accent);animation:dru-wx-pulse 2.8s ease-in-out infinite}",
+      "@keyframes dru-wx-pulse{0%,100%{opacity:.35}50%{opacity:1}}",
+      // 动效一律可关：系统开了「减弱动态效果」就不再有任何动画（状态仍由文字完整表达）。
+      "@media (prefers-reduced-motion: reduce){.dru-wx-attn,.dru-wx-attn-dot{animation:none}}",
+      // 二维码是 bridge 下发的 data: URL（qrcode_svg），**不是**外部资源、也不引任何 QR 库；
+      // 白底是必须的：微信扫码对深色底上的低对比码识别率差。
+      ".dru-wx-qr{display:block;width:200px;height:200px;margin:10px auto 0;background:#fff;border:1px solid var(--dru-border);border-radius:10px;padding:10px;box-sizing:content-box}",
+      // 配对码输入行：输入框吃满剩余宽度，提交按钮不换行（窄屏下 input 的 min-width:0 很关键）
+      ".dru-wx-code{display:flex;gap:8px;align-items:stretch;margin-top:8px}",
+      ".dru-wx-code .dru-input{flex:1;min-width:0;letter-spacing:2px;font-size:16px}",
+      ".dru-wx-code .dru-btn{flex:none}",
+      // 绑定进行中的阶段行（扫码/等待确认）：小圆点 + 文案，不靠颜色单独表意
+      ".dru-wx-phase{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--dru-fg);margin-top:10px}",
       // ── 用户反馈模块 ──
       ".dru-fb-tabs{display:flex;gap:8px;margin-bottom:10px}",
       ".dru-fb-tab{flex:1;min-height:44px;display:flex;align-items:center;justify-content:center;padding:8px 0;text-align:center;border-radius:8px;cursor:pointer;font-size:12.5px;font-weight:600;color:var(--dru-fg-muted);background:var(--dru-surface-3);border:1px solid var(--dru-border-ctl);user-select:none}",
@@ -324,6 +371,16 @@ window.__ModuleLoader__.load({
       ".dru-disclose{width:100%;box-sizing:border-box;min-height:44px;display:flex;align-items:center;justify-content:space-between;gap:10px;background:var(--dru-surface-2);border:1px solid var(--dru-border-ctl);border-radius:8px;padding:10px 12px;font:600 13px/1.3 inherit;color:var(--dru-fg);cursor:pointer;text-align:left}",
       ".dru-disclose:hover{background:var(--dru-hover);border-color:var(--dru-accent)}",
       ".dru-disclose-caret{font-size:12px;font-weight:600;color:var(--dru-fg-muted);flex:none}",
+      // ── 🧰 「更多」收纳体（0.6.10）：账号卡把档位明细与营销入口收在这一层里 ──
+      // 折叠时只有一个 .dru-disclose 入口（见账号卡）；展开才出现内容 —— 主界面默认干净。
+      // 内容体始终在 DOM 里（收起时用 hidden 隐藏），这样触发按钮的 aria-controls 永远指向真实元素。
+      ".dru-more-body{margin-top:8px;background:var(--dru-surface-2);border:1px solid var(--dru-border-soft);border-radius:8px;padding:10px 12px}",
+      ".dru-more-head{font-size:12px;font-weight:700;color:var(--dru-fg);margin:0 0 5px}",
+      ".dru-more-row{font-size:12.5px;line-height:1.75;color:var(--dru-fg-muted)}",
+      ".dru-more-row + .dru-more-row{margin-top:4px}",
+      ".dru-more-row b{color:var(--dru-fg)}",
+      ".dru-more-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}",
+      ".dru-more-actions .dru-btn{flex:1 1 190px}",
       ".dru-rules{margin:10px 0 0;padding-left:20px;font-size:12.5px;line-height:1.8;color:var(--dru-fg-muted)}",
       ".dru-rules li{margin-bottom:6px}",
       ".dru-rules b{color:var(--dru-fg)}",
@@ -580,6 +637,30 @@ window.__ModuleLoader__.load({
     }
     function inviteTipDismiss() {
       try { localStorage.setItem(INVITE_TIP_KEY, "1"); } catch (e) { /* 忽略 */ }
+    }
+
+    // ── 🧰 营销入口「收纳进更多」的记忆（0.6.10）────────────────────────────
+    // 产品口径（用户原话）：新用户第一次进面板**必须**看得见「升级 PRO / 带新用户换会员」
+    // 两个入口，否则不知道有这两个功能；用户把它们**关掉之后**，再收进账号卡的「更多」里，
+    // 「让整个功能使用界面更加清爽，将商业化的逻辑稍微隐藏到深一层」。
+    //
+    // 触发信号**复用已有的那一个**：邀请引导气泡右上角的 ✕（见 renderInviteTip）。它天然就是
+    // 「用户看到了、并且关掉了」的表达，不再另造一个竞争状态（两个开关会互相打架）。
+    //
+    // 🔒 键名与 INVITE_TIP_KEY **并列、不复用**：老键一个字节都不改，含义仍然是「气泡已关」；
+    //    这里另外记一笔「营销入口已收纳」。两者是同一次点击触发的**两个概念**（气泡 ≠ 收纳），
+    //    分开存才能在日后单独调整其中一个而不会互相污染。
+    // localStorage 不可用（隐私模式/被禁）时与老键同款降级：读不到 = 没收纳（宁可多显示一次，
+    // 也不报错、更不把功能藏起来 —— 藏了用户就找不到升级入口了）。
+    var MKT_MORE_KEY = "dsh-remote-marketing-more-v1";
+    // 「更多」的 DOM id：触发按钮用 aria-controls 指向内容体（内容体始终在 DOM 里，收起时 hidden）。
+    var MKT_MORE_TOGGLE_ID = "dru-account-more";
+    var MKT_MORE_BODY_ID = "dru-account-more-body";
+    function mktMoreWasFolded() {
+      try { return localStorage.getItem(MKT_MORE_KEY) === "1"; } catch (e) { return false; }
+    }
+    function mktMoreFold() {
+      try { localStorage.setItem(MKT_MORE_KEY, "1"); } catch (e) { /* 忽略 */ }
     }
     /** 给单个设置页导航栏目按钮挂红点（幂等）。 */
     function dotInject(cell) {
@@ -924,8 +1005,6 @@ window.__ModuleLoader__.load({
       pro: { mbps: 5, gb: 20, price: 20, name: "PRO" },
       pro_max: { mbps: 10, gb: 60, price: 30, name: "Pro Max" }
     };
-    /** 免费档口径（与 PLAN_FACTS 同源）：仅在服务端没下发 plans.free 时兜底。 */
-    var FREE_FACTS = { mbps: 1, gb: 1 };
     /**
      * 取第一个**合法数值**：未定义 / null / 空串 / 非数字 → 跳到下一个候选。
      * 全都没命中 → null（由调用方决定兜底）。
@@ -1917,7 +1996,7 @@ window.__ModuleLoader__.load({
 
       var statusArr = useState(null); var st = statusArr[0]; var setSt = statusArr[1];
       var modeArr = useState("saas"); var mode = modeArr[0]; var setMode = modeArr[1];   // saas | local
-      var viewArr = useState("home"); var view = viewArr[0]; var setView = viewArr[1];   // home | feedback | invite
+      var viewArr = useState("home"); var view = viewArr[0]; var setView = viewArr[1];   // home | feedback | invite | wechat
       var busyArr = useState(""); var busy = busyArr[0]; var setBusy = busyArr[1];
       var msgArr = useState(null); var message = msgArr[0]; var setMessage = msgArr[1];
       // 注：邀请区复制反馈已迁到 viewstate 末端的 inviteCopied（0.6.9）；这个 hook 保留占位，
@@ -1995,6 +2074,13 @@ window.__ModuleLoader__.load({
       // 🎁 邀请收益引导气泡的「已关闭」态（同样追加在末尾，不动既有 hook 序号）。
       // 初值直接读 localStorage：已关闭过就不再出现，不闪一下再消失。
       var tipDismissedArr = useState(inviteTipWasDismissed()); var inviteTipDismissed = tipDismissedArr[0]; var setInviteTipDismissed = tipDismissedArr[1];
+      // 🧰 营销入口的「已收纳」态（同样追加在末尾，不动既有 hook 序号）：
+      //   初值 = 新键已记住 **或** 老用户早就关过邀请气泡 —— 老键含义不变（仍是「气泡已关」），
+      //   只是它同样表达了「用户已经看到并关掉了」，据此把两个营销入口收进「更多」；
+      //   老用户不会因为这次改版又被打扰一遍，新用户（没关过）照旧看得见两个入口。
+      var mktFoldArr = useState(mktMoreWasFolded() || inviteTipWasDismissed()); var mktFolded = mktFoldArr[0]; var setMktFolded = mktFoldArr[1];
+      // 「更多」这一层当前是否展开：纯界面态，不持久化（下次进面板回到收起，主界面保持干净）。
+      var moreOpenArr = useState(false); var moreOpen = moreOpenArr[0]; var setMoreOpen = moreOpenArr[1];
 
       var refresh = useCallback(function () {
         setBusy("status");
@@ -2394,6 +2480,16 @@ window.__ModuleLoader__.load({
           try { document.removeEventListener("visibilitychange", onVisible); } catch (e) { /* 忽略 */ }
         };
       }, [view, mode, loggedIn]);
+
+      // 🔒 微信机器人通道的登录门**兜底**（防御式）：第三个 tab 只在已登录时渲染，正常路径下
+      // view 不可能停在 "wechat" 而人已登出。但会话可能**在微信 tab 开着的时候过期**（换账号/
+      // 被踢下线/退出登录）—— 此时既不能继续渲染微信内容，更不能把用户丢在一个空面板上：
+      // 立刻把 view 复位回 home（登录/账号卡就在那里）。
+      // ⚠️ 必须是无条件调用的 hook（hook 序号稳定），所以判断写在回调里，不能围着它加 if。
+      // 同一帧的兜底还有底部的 view 分派：signed-out 时它**直接渲染 home**，不会先闪一帧空白。
+      useEffect(function () {
+        if (view === "wechat" && !loggedIn) setView("home");
+      }, [view, loggedIn]);
 
       /**
        * 连接阶段轮询：GET /dsh-remote/bridge-status（node 半在返回前自动补装运行环境 / 拉起 bridge /
@@ -2850,9 +2946,16 @@ window.__ModuleLoader__.load({
             h("button", {
               type: "button",
               className: "dru-tip-close",
-              "aria-label": "关闭邀请奖励提示",
-              title: "不再提示",
-              onClick: function () { inviteTipDismiss(); setInviteTipDismissed(true); }
+              // 这一次点击现在有两层效果（0.6.10）：不再提示 + 把两个营销入口收进账号卡「更多」。
+              // 名称/提示里把后果说清楚 —— 用户按下去的是一件事，界面变的是两处，别让他莫名其妙。
+              "aria-label": "关闭邀请奖励提示（「升级」与「带新用户」入口将收进「更多」）",
+              title: "不再提示：「升级」与「带新用户」入口收进「更多」",
+              onClick: function () {
+                inviteTipDismiss();          // 老键：气泡已关（含义不变）
+                setInviteTipDismissed(true);
+                mktMoreFold();               // 新键：营销入口已收纳
+                setMktFolded(true);
+              }
             }, "✕")
           )
         );
@@ -2880,35 +2983,20 @@ window.__ModuleLoader__.load({
           fromServer: !!obj
         };
       }
-      /** 免费档带宽（用于「免费档的 N 倍」）：plans.free.max_mbps 优先，其次 quota.max_mbps，最后常量。 */
-      function freeMbpsOf() {
-        var srvFree = pub && pub.plans && pub.plans.free && typeof pub.plans.free === "object" ? pub.plans.free : null;
-        return firstNum([srvFree && srvFree.max_mbps, srvFree && srvFree.mbps, quota && quota.max_mbps, FREE_FACTS.mbps]);
-      }
+      // 【0.6.11 删除】`planSpecText()` / `freeMbpsOf()` 已随「更多」里的档位明细（renderPlanDetail）
+      // 一起删掉：面板从此**不再渲染任何 Mbps / GB / 价格数字**（业主口径：「插件面板里面不要展示
+      // 『更多』里的 PRO 版本流量带宽，我看你把数字都展示出来了」）。
+      // 特意**保留** planFactsOf() / PLAN_FACTS / firstNum()：planFactsOf 仍被 upgradePath() 用来取
+      // 档位**展示名**（PRO / Pro Max，服务端不下发名字），它们仍然可达，不是死代码。
       /**
-       * 套餐规格文案（**先特性检测** pub.plans / pub.prices，取不到才走 PLAN_FACTS 常量）。
-       * 支持形态：字符串（整段规格文案）｜{ max_mbps, monthly_gb } + prices[key]（线上真形状）
-       *          ｜{ mbps, gb, price }（旧形状，兼容保留）。
-       * dimension="bandwidth" 时带带宽；服务端已下发本档数字 → **不再写**「免费档的 N 倍」相对说法
-       * （相对说法只在常量兜底时才有意义，否则会和权威数字并用自相矛盾）。
-       */
-      function planSpecText(key, dimension) {
-        var srvStr = pub && pub.plans ? pub.plans[key] : null;
-        if (typeof srvStr === "string" && srvStr) return srvStr;
-        var f = planFactsOf(key);
-        if (dimension !== "bandwidth") return f.gb + " GB/月，¥" + f.price + "/月";
-        var spec = f.mbps + " Mbps";
-        if (!f.fromServer) {
-          var freeMbps = freeMbpsOf();
-          var times = freeMbps && freeMbps > 0 ? Math.round(f.mbps / freeMbps) : 0;
-          if (times > 1) spec += "（免费档的 " + times + " 倍）";
-        }
-        return spec + " · " + f.gb + " GB/月，¥" + f.price + "/月";
-      }
-      /**
-       * 转化那条路的套餐键与文案（dimension = "size" 流量维度 | "bandwidth" 带宽维度，
+       * 转化那条路的套餐键与文案（dimension = "size" 额度维度 | "bandwidth" 带宽维度，
        * 后者用于「连接偏慢」场景）。免费 → 升 PRO；PRO → 升 Pro Max；Pro Max 无更高档 → null（只剩拉新路）。
-       * label / title 同源（都走 planSpecText），服务端下发了 pub.plans 也不会自相矛盾。
+       *
+       * 【0.6.10】这里只给**定性**措辞（更快 / 额度更多），不再把「5 Mbps · 20 GB/月，¥20/月」写在
+       * 按钮和 title 上 —— 主界面不摆具体数值（业主口径：外面写死带宽数字与设计语言冲突）。
+       * 【0.6.11】面板里已经**没有**任何地方摆精确规格了（renderPlanDetail 按业主口径删除，
+       * 见下）；所以 title 里也不再指路「档位规格见账号卡『更多』」——那块已经不存在。
+       * label / title 仍然同源（同一句 gain），服务端下发了 pub.plans 也不会自相矛盾。
        */
       function upgradePath(dimension) {
         var plan = account ? account.plan : "free";
@@ -2916,11 +3004,13 @@ window.__ModuleLoader__.load({
         var key = !isMemberNow ? "pro" : plan === "pro" ? "pro_max" : "";
         if (!key) return null; // 已是 Pro Max：没有更高档，不显示「升级」这条
         var name = planFactsOf(key).name; // 展示名只来自本地常量（服务端不下发）
-        var spec = planSpecText(key, dimension);
+        // 定性收益按维度分：慢 → 讲带宽更高、连接更快；额度将尽 → 讲额度更多、不再被限速。
+        var gain = dimension === "bandwidth" ? "带宽更高、连接更快" : "额度更多、不再被限速";
         return {
           key: key,
-          label: "🚀 升级 " + name + "：" + spec,
-          title: "升级到 " + name + "：" + spec + "（带登录态打开套餐页，会员流量按自然月计量）"
+          gain: gain,
+          label: "🚀 升级 " + name + "：" + gain,
+          title: "升级到 " + name + "：" + gain + "（带登录态打开套餐页，会员额度按自然月计量，档位规格与价格以套餐页为准）"
         };
       }
       /**
@@ -2935,7 +3025,9 @@ window.__ModuleLoader__.load({
        *   · 邀请：每 n 位**新用户** → 邀请人得 days 天 PRO（invite_rule {n:1, days:3}）
        *   · 被邀请人**没有任何额外奖励**（trial_days = 0）→ 绝不写「双方都得」
        *   · 计入条件：对方用你的链接**注册新账号** + 在电脑上**装好 dsh-remote-web 并上线**
-       *   · 会员按自然月计量：3 天是**会员时长**，不是流量（不写「3 天能拿 20GB」）
+       *   · 会员按自然月计量：3 天是**会员时长**、不是额度（不写「3 天能拿 20GB」）
+       *   · 【0.6.10】这块只给**定性**措辞（更快 / 额度更多）
+       *   · 【0.6.11】具体 Mbps / GB / 价格**全面板都不再出现**（原「更多」里的档位明细已按业主口径删除）
        * kind = "quota"（额度将尽/已限速）| "slow"（连接偏慢，带宽维度措辞）
        *
        * 关闭态（invite_rule.n / days 配成 0）与单路收敛：
@@ -2946,10 +3038,18 @@ window.__ModuleLoader__.load({
       function renderDualPath(kind) {
         var r = inviteRuleOf();
         var isSlow = kind === "slow";
-        // 慢 → 带宽维度措辞（5 Mbps / 免费档的 5 倍）；额度将尽 → 流量维度措辞（20 GB/月）
+        // 慢 → 带宽维度措辞（带宽更高、连接更快）；额度将尽 → 额度维度措辞（额度更多）。
+        // 【0.6.10】两路都只给**定性**说法，具体数值（5 Mbps / 20 GB/月 / ¥20）不出现。
+        // 【0.6.11】这些数字现在**面板里哪儿都没有**了（原「更多」里的档位明细已删，见 renderAccount 上方注释）。
         var up = upgradePath(isSlow ? "bandwidth" : "size");
         var inviteOk = !r.off;
         if (!up && !inviteOk) return null; // 两路都没有 → 整块不显示（会员 + 拉新关闭）
+        // 【0.6.10】用户已经关掉过引导（＝营销入口已收纳进账号卡「更多」）→ 这块整体不渲染。
+        // 它存在的唯一目的就是「在用户正在疼的时刻当场给出这两条营销路」；既然用户已经明确
+        // 关掉过营销提示，就不该在这里再摆一遍（否则「收纳」名不副实）。留一个没有按钮的空壳
+        // 更不行 —— 与上面「两路都没有」同款处理：要么给得出路，要么整块不出现。
+        // 出路没有断：账号卡「更多」入口始终在，里面的两条入口原样可用。
+        if (mktFolded) return null;
         var twoWay = !!up && inviteOk;
         var inviteLabel = "🎁 带 " + r.n + " 位新用户：换 " + r.days + " 天 PRO";
         var inviteTitle = "带 " + r.n + " 位还没注册过的新用户（用你的链接注册 + 装好电脑端并上线）→ 你得 " + r.days + " 天 PRO";
@@ -2965,7 +3065,7 @@ window.__ModuleLoader__.load({
           : up
             ? (isSlow
                 ? "免费档带宽有限：排队、跨网、高峰期会被限速，这是慢的主因；升级带宽可直接改善。"
-                : "免费额度用完会被限速；升级套餐即可继续用（会员流量按自然月计量）。")
+                : "免费额度用完会被限速；升级套餐即可继续用（会员额度按自然月计量）。")
             : "带一位还没注册过的新用户，换 " + r.days + " 天 PRO：对方用你的邀请链接注册新账号 + 在电脑上装好 dsh-remote-web 并上线后自动到账。";
         return h("div", { className: "dru-dual" },
           h("div", { className: "dru-dual-title" }, title),
@@ -2997,7 +3097,7 @@ window.__ModuleLoader__.load({
                 "拉新这条路是", h("b", null, "交换"), "：对方", h("b", null, "用你的邀请链接注册新账号"), "，并在电脑上",
                 h("b", null, "装好 dsh-remote-web 并上线"), "后，", h("b", null, r.days + " 天 PRO 自动到账"),
                 "；只有你得奖，对方没有额外奖励（对方必须是还没注册过的新用户才计入）。",
-                isSlow ? "会员按自然月计量，" + r.days + " 天是会员时长、不是流量。" : "")
+                isSlow ? "会员按自然月计量，" + r.days + " 天是会员时长、不是额度。" : "")
             : null
         );
       }
@@ -3007,6 +3107,13 @@ window.__ModuleLoader__.load({
         if (!ts) return "—";
         try { var d = new Date(Number(ts)); return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0"); } catch (e) { return "—"; }
       }
+      // 【0.6.11 删除】上面这里原本是 renderPlanDetail()：账号卡「更多」里的档位明细
+      // （「PRO：5 Mbps · 20 GB/月，¥20/月」那一行 + 「当前：带宽 ≈N Mbps」）。
+      // 业主口径：「插件面板里面不要展示『更多』里的 PRO 版本流量带宽，我看你把数字都展示出来了。
+      // 在本地的设置面板里面，把这个功能删掉。」→ 整块连标题「套餐与额度」一起删掉。
+      // 「更多」里只留下面那两个**折叠的营销入口**（升级 PRO / 带新用户换会员），业主仍要它们收在这里。
+      // 🔒 顺带更强的一条不变量：整个面板从此不渲染任何 Mbps / GB / 价格数字
+      //    （「已限速 / 不限速」仍由服务端 quota.limit_enabled / quota.max_mbps 驱动，但只给定性措辞）。
       function renderAccount() {
         var a = account;
         var plan = a ? a.plan : "free";
@@ -3014,19 +3121,28 @@ window.__ModuleLoader__.load({
         var isMember = plan === "pro" || plan === "pro_max";
         var endsAt = a && (a.plan_ends_at || a.trial_expires_at) ? Number(a.plan_ends_at || a.trial_expires_at) : 0;
         var quotaPct = quota && quota.limit_enabled ? quota.percent : null;
+        var quotaPctNum = Number(quotaPct);
         var planText;
-        // 免费档文案只依据**服务端实际下发的额度数据**，不猜具体数值：
-        //   · 中继压根不限制（自建）→ 只说“免费用户”，不显示任何限制
+        // 【0.6.10】首屏额度行：**不提档位、不提带宽数值**，只给一句中性的「还剩多少额度」。
+        // 业主口径：「外面关于流量的说明，不要叫『流量剩余』，就说『剩余额度』；咱也别说它是『流量』，
+        // 就说是『额度』」「那个地方也不要展示『Pro会员什么什么额度』、『普通用户什么什么额度』，
+        // 首页面都不展示会员相关的信息」。
+        // 数值仍然**只来自服务端下发**（quota-absent.test.mjs 的硬约束：服务端没说的限制一个字都不许编）：
+        //   · 中继压根不提供额度（自建）→ 不编造任何限制，只说「未获取到额度信息」
         //   · 中继报告不限量         → 如实说明
-        //   · 中继报告限量           → 显示用量；带宽值服务端有下发才写
+        //   · 中继报告限量           → 显示剩余百分比（percent 是「已用」，剩余 = 100 - 已用）
+        //   · 服务端只说限量、没给用量 → 不猜数字，只给状态句
         if (!isMember) {
           if (quota && quota.limit_enabled) {
-            var speedText = quota.max_mbps ? "带宽 ≈" + quota.max_mbps + "Mbps" : "已限速";
-            planText = "免费额度: " + speedText + (quotaPct !== null ? " · 本月流量已用 " + quotaPct + "%" : "");
+            var remainText = (quotaPct !== null && isFinite(quotaPctNum))
+              ? "剩余额度 " + Math.max(0, Math.round(100 - quotaPctNum)) + "%"
+              : "额度用量未下发";
+            // max_mbps 没下发而 limit_enabled 为真 → 服务端口径就是「正在限速」，如实说（定性，不带数值）
+            planText = quota.max_mbps ? remainText : "已限速 · " + remainText;
           } else if (quota) {
-            planText = "免费用户 · 当前不限速、不限流量";
+            planText = "当前不限速、不限额度";
           } else {
-            planText = "免费用户";
+            planText = "未获取到额度信息";
           }
         }
         else if (source === "trial") planText = "试用 PRO 会员 · 到期 " + fmtDate(a.trial_expires_at);
@@ -3038,7 +3154,7 @@ window.__ModuleLoader__.load({
         // 判断不了（quota 缺失、不限量、会员）→ 不显示，绝不误报。
         // 注意：会员（PRO / Pro Max）的额度不吃这条免费档判断，所以「升级」永远不会弹给付费用户，
         // 但连接偏慢那条（renderConnectBlock）对会员同样成立 —— 会员也会遇到慢，那时只剩拉新路。
-        var quotaPctNum = Number(quotaPct);
+        // （quotaPctNum 在上面额度文案处已算好，这里直接复用。）
         var quotaTight = !!(quota && quota.limit_enabled && !isMember &&
           ((isFinite(quotaPctNum) && quotaPctNum >= 80) || !quota.max_mbps));
         // 拉新关闭态（invite_rule.n / days = 0）→ 账号卡入口整体隐藏，不留点进去没内容的入口
@@ -3047,42 +3163,104 @@ window.__ModuleLoader__.load({
         // 计算一次给按钮的 aria-describedby 用（气泡没渲染时不能指向不存在的 id）。
         var invTipOn = !invOff && !inviteTipDismissed;
         var invTipRule = invTipOn ? inviteRuleOf() : null;
+        // 【0.6.10】营销入口「在哪一层」的四个开关（口径：新用户第一次看得见，用户关掉后收进「更多」）：
+        //   · 没关过（mktFolded=false）→ 「升级 PRO」与「带新用户换会员」摆在账号卡正面（与今天一致）
+        //   · 关过（mktFolded=true）   → 正面只留一个「更多」，两条入口搬进「更多」里
+        // 两个边界：
+        //   · invOff（运营关掉拉新）→ 拉新入口**整体不渲染**，收纳前后都不出现
+        //     （老注释：否则会点进一个没有内容的邀请页）
+        //   · 付费用户的按钮是「续费 / 转正式 PRO」—— 那是账号维护、不是营销露出，收纳后仍留在正面：
+        //     把付费用户的续费入口藏进「更多」是真实风险（续费靠它，:3096-3098 的到期日也靠它提醒）
+        var showUpsellOnFace = !mktFolded || isMember;
+        var showInviteOnFace = !invOff && !mktFolded;
+        var showUpsellInMore = mktFolded && !isMember;
+        var showInviteInMore = mktFolded && !invOff;
         return h("div", null,
           h("div", { className: "dru-user" },
             h("div", { className: "dru-avatar" }, (st.config.phone || "D").charAt(0).toUpperCase()),
             h("div", null,
               h("div", { className: "mail" }, st.config.phone),
-              h("div", { className: "plan" }, plan === "pro_max" ? "Pro Max 会员" : plan === "pro" ? "PRO 会员" : "免费用户")
+              // 【0.6.10】首屏不再挂档位标签（业主口径：「首页面都不展示会员相关的信息」）。
+              // 只给**已付费**用户留一个最小、非促销的状态字样（PRO / Pro Max —— 没有「会员」二字、
+              // 没有额度、没有升级引导）：付费用户需要一眼看出自己是付费档，而下面那条状态行
+              // （「PRO 会员 · 到期 …」）讲的是**功能性**的到期时间，不是营销。
+              // 免费用户这里什么都不显示 —— 把「免费档」当标签挂在脸上，正是要减少的营销露出。
+              isMember ? h("div", { className: "plan" }, plan === "pro_max" ? "Pro Max" : "PRO") : null
             )
           ),
-          // 套餐状态（免费额度 / 会员到期日）
+          // 额度状态：不限量说明 / 剩余额度百分比 / 会员到期日。
+          // 首屏只说「还剩多少」，不提档位名、不写带宽数值（数值在下面「更多」里）。
           h("div", { className: "dru-status-line", style: { marginTop: 10 } },
             h("span", { className: "dru-dot " + (isMember ? "dru-dot-on" : "dru-dot-off") }),
             h("span", null, planText)
           ),
           h("div", { className: "dru-actions", style: { marginTop: 10 } },
-            h("button", { type: "button", className: "dru-btn dru-btn-primary", style: { display: "inline-flex", alignItems: "center" }, disabled: busy !== "", title: "升级/续费（带登录态打开）", onClick: openUpgradeAuth },
-              busy === "upgrade" ? "生成链接中…" : (!isMember ? "🚀 升级 PRO" : source === "trial" ? "🚀 转正式 PRO" : "🔄 续费会员")),
-            // 拉新关闭 → 入口整体隐藏（否则会点进一个没有内容的邀请页）
+            // 升级/续费：免费用户这条是**营销入口**，用户关掉引导后搬进「更多」；
+            // 付费用户的续费/转正入口始终留在正面（账号维护，不是营销露出）。
+            showUpsellOnFace
+              ? h("button", { type: "button", className: "dru-btn dru-btn-primary", style: { display: "inline-flex", alignItems: "center" }, disabled: busy !== "", title: "升级/续费（带登录态打开）", onClick: openUpgradeAuth },
+                  busy === "upgrade" ? "生成链接中…" : (!isMember ? "🚀 升级 PRO" : source === "trial" ? "🚀 转正式 PRO" : "🔄 续费会员"))
+              : null,
+            // 拉新入口：invOff（运营关掉拉新）整体隐藏，收纳前后都不出现（否则会点进一个没有内容的邀请页）；
+            // 用户收纳过后搬进「更多」。
             // 按钮文字自带可访问名称；气泡在屏时用 aria-describedby 把「能得多少」也读出来。
-            invOff ? null : h("button", {
+            showInviteOnFace ? h("button", {
               type: "button",
               className: "dru-btn dru-btn-ghost",
               disabled: busy !== "",
               title: invTipRule ? "带 " + invTipRule.n + " 位新用户可得 " + invTipRule.days + " 天 PRO 会员" : "带新用户换会员",
               "aria-describedby": invTipOn ? INVITE_TIP_ID : undefined,
               onClick: function () { setView("invite"); loadInvite(); }
-            }, "🎁 带新用户换会员"),
+            }, "🎁 带新用户换会员") : null,
             h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "", onClick: function () { setView("feedback"); } }, "💬 用户反馈"),
             h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "", onClick: togglePwdForm }, pwdOpen ? "收起修改密码" : "🔒 修改密码"),
             h("button", { type: "button", className: "dru-btn dru-btn-danger", disabled: busy !== "", onClick: function () { doLogout(false); } }, "退出登录")
           ),
-          // 🎁 邀请收益引导气泡：紧贴上面那排按钮（不遮挡按钮、窄屏独占一行）
+          // 🎁 邀请收益引导气泡：紧贴上面那排按钮（不遮挡按钮、窄屏独占一行）。
+          // 它的 ✕ 同时是「营销入口收纳」的触发信号（0.6.10）：点过之后两个入口搬进下面的「更多」。
           renderInviteTip(),
           h("div", { className: "dru-hint", style: { marginTop: 8 } },
             "升级/续费以带登录态方式打开：点击后生成一次性访问链接并直接跳转，无需重新登录。" +
             (endsAt && isMember ? "到期后如需继续使用会员权益，请在到期前续费。" : "")),
-          // 额度将尽 / 已被限速 → 🔀 双路块：升级套餐（转化）or 带新用户换会员时长（拉新）
+          // 🧰 「更多」：主界面上唯一常驻的那一个营销入口（0.6.10）—— 收纳态下正面不再摆按钮行的一部分。
+          // 折叠时它就是一个 .dru-disclose 按钮：命中区 ≥44px、键盘可聚焦（焦点环见样式表末尾的
+          // :focus-visible 基线），开合状态用「展开 ▼ / 收起 ▲」**文字**加箭头表达，不靠颜色区分。
+          // 无障碍：aria-expanded 表达开合，aria-controls 指向下面的内容体（内容体始终在 DOM 里、
+          // 收起时 hidden，所以 aria-controls 永远指向一个真实存在的元素，不指向空气）。
+          h("button", {
+            type: "button",
+            id: MKT_MORE_TOGGLE_ID,
+            className: "dru-disclose",
+            style: { marginTop: 10 },
+            "aria-expanded": moreOpen ? "true" : "false",
+            "aria-controls": MKT_MORE_BODY_ID,
+            onClick: function () { setMoreOpen(!moreOpen); }
+          },
+            h("span", null, "更多"),
+            h("span", { className: "dru-disclose-caret", "aria-hidden": "true" }, moreOpen ? "收起 ▲" : "展开 ▼")
+          ),
+          h("div", {
+            id: MKT_MORE_BODY_ID,
+            className: "dru-more-body",
+            hidden: !moreOpen
+          },
+            // 【0.6.11】这里**不再**有「套餐与额度」标题与档位明细（renderPlanDetail 已删）：
+            // 业主口径 —— 本地面板不展示 PRO 的带宽/流量/价格数字。「更多」只剩下面两个折叠入口。
+            // 用户收纳过之后，两条营销入口就住在这里（正面不再摆它们）
+            (showUpsellInMore || showInviteInMore)
+              ? h("div", { className: "dru-more-actions" },
+                  showUpsellInMore
+                    ? h("button", { type: "button", className: "dru-btn dru-btn-primary", disabled: busy !== "", title: "升级/续费（带登录态打开）", onClick: openUpgradeAuth },
+                        busy === "upgrade" ? "生成链接中…" : "🚀 升级 PRO")
+                    : null,
+                  showInviteInMore
+                    ? h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "", title: "带新用户换会员", onClick: function () { setView("invite"); loadInvite(); } }, "🎁 带新用户换会员")
+                    : null)
+              : null
+          ),
+          // 额度将尽 / 已被限速 → 🔀 双路块：升级套餐（转化）or 带新用户换会员时长（拉新）。
+          // 用户收纳过（mktFolded）时 renderDualPath 自己返回 null —— 那两条路这时都在「更多」里，
+          // 这里不再重复摆一遍（也不留一个没有按钮的空壳块）。
           quotaTight ? renderDualPath("quota") : null,
           pwdOpen ? renderResetPwdForm(false) : null
         );
@@ -3276,7 +3454,7 @@ window.__ModuleLoader__.load({
                 h("li", null, "对方还要在这台电脑上", h("b", null, "装好 dsh-remote-web 并成功上线"), "，才计入 1 位", h("b", null, "有效邀请"), "；同一位新用户只计一次。"),
                 h("li", null, h("b", null, "奖励只发给邀请人"), "：你得 ", h("b", null, days + " 天 PRO"), "，被邀请的新用户没有额外的邀请奖励（注册送礼与邀请无关）。"),
                 h("li", null, "奖励自动到账，无需申请：可在「我的邀请记录」下方看到「已到账奖励」，在原到期时间上顺延（已是长期会员则保持长期）。"),
-                h("li", null, h("b", null, days + " 天是会员时长、不是流量"), "：会员流量按自然月计量，天数是按天顺延的会员有效期。"),
+                h("li", null, h("b", null, days + " 天是会员时长、不是额度"), "：会员额度按自然月计量，天数是按天顺延的会员有效期。"),
                 h("li", null, "邀请码与邀请链接长期有效，随时可在本页复制；新用户解绑或重装设备不会撤回已计入的邀请。"),
                 h("li", null, "规则与数值以本页面显示的为准（运营可能调整活动力度）。")
               ])
@@ -3659,14 +3837,69 @@ window.__ModuleLoader__.load({
       }
 
       // ---------- 主视图 ----------
+      /**
+       * 主 Tab 的公共属性：视觉态（.active）与语义态（aria-selected）**同源**，不会说一套做一套；
+       * tabIndex=0 + Enter/Space → 键盘可操作（主 Tab 是面板的导航，不能只能点鼠标）。
+       * ⚠️ 与既有 tab 条（登录/注册、反馈 tab）保持同一形态：可点的 <div>，不改成 <button>
+       *    （那些 tab 已经是这样；换形态会让同一种控件在面板里出现两种外观与焦点行为）。
+       * 无障碍：文字标签**始终在**（选中态另有 border + 底色），不靠颜色单独表意。
+       */
+      function mainTabProps(active, onPick) {
+        return {
+          className: "dru-tab" + (active ? " active" : ""),
+          role: "tab",
+          "aria-selected": active ? "true" : "false",
+          tabIndex: 0,
+          onClick: onPick,
+          onKeyDown: function (e) {
+            var k = e && e.key;
+            if (k === "Enter" || k === " " || k === "Spacebar") { e.preventDefault(); onPick(); }
+          }
+        };
+      }
+      /**
+       * 主 Tab 条（☁️ 云端服务 / 🖥 自建服务 / 💬 微信机器人通道）。
+       *
+       * ⚠️ 必须抽成函数、由 **home 与 wechat 两个视图共用**：这条 strip 原来长在 renderHome() 里，
+       *    而切到微信 tab 后 renderHome() 不再渲染 —— 只长在 renderHome() 里就等于「进了微信页
+       *    就再也回不去」（面板只有一个 settings.section 栏目，没有别的返回入口）。
+       *
+       * 选中态：模式两个 tab 只在 view !== "wechat" 时选中；微信 tab 只在 view === "wechat" 时选中。
+       * 点模式 tab 时一并把 view **复位成 home**（否则从微信页点「自建服务」会切了 mode 却留在微信页）。
+       *
+       * 🔒 登录门（业主口径：微信通道**要求已注册并登录**）：未登录时**不渲染**这第三个 tab。
+       *    登录态来自 st.config（phone / hasLocalKey），登录成功后 st 更新即重新渲染 ——
+       *    tab 当场出现，**不需要刷新页面**；登出/会话过期则当场消失（view 的兜底见 RemoteControlSection
+       *    里那条复位 effect 与底部的 view 分派）。除登录态外，不为任何其它理由隐藏它。
+       */
+      function renderMainTabs() {
+        var isLocal = mode === "local";
+        var onWeChat = view === "wechat";
+        return h("div", { className: "dru-tabs", style: { marginTop: 4 }, role: "tablist", "aria-label": "远程访问功能切换" },
+          h("div", mainTabProps(!onWeChat && !isLocal, function () { setMode("saas"); setView("home"); setMessage(null); }), "☁️ 云端服务"),
+          h("div", mainTabProps(!onWeChat && isLocal, function () { setMode("local"); setView("home"); setMessage(null); }), "🖥 自建服务"),
+          // 微信绿泡泡：纯装饰（可读名字来自同 tab 的文字标签），所以 aria-hidden；
+          // U+FE0E（变体选择符-15）强迫 💬 走**文字字形**，否则系统彩色 emoji 会忽略 color（见 .dru-wx-ico）。
+          // 🔒 只有已登录才渲染这个 tab（见上面的登录门说明）。
+          loggedIn
+            ? h("div", mainTabProps(onWeChat, function () { setView("wechat"); setMessage(null); }),
+                h("span", { className: "dru-wx-ico", "aria-hidden": "true" }, "💬\uFE0E"),
+                "微信机器人通道")
+            : null
+        );
+      }
+      /** 微信机器人 tab 的内容：直接复用 WeChatBotSection（embedded=省掉外层 settings-section 壳）。 */
+      function renderWeChat() {
+        return h("div", null,
+          renderMainTabs(),
+          h(WeChatBotSection, { embedded: true })
+        );
+      }
       function renderHome() {
         var isLocal = mode === "local";
         return h("div", null,
-          // 连接模式主 Tab(云端服务 / 自建服务,二选一)
-          h("div", { className: "dru-tabs", style: { marginTop: 4 } },
-            h("div", { className: "dru-tab" + (!isLocal ? " active" : ""), onClick: function () { setMode("saas"); setMessage(null); } }, "☁️ 云端服务"),
-            h("div", { className: "dru-tab" + (isLocal ? " active" : ""), onClick: function () { setMode("local"); setMessage(null); } }, "🖥 自建服务")
-          ),
+          // 连接模式主 Tab(云端服务 / 自建服务 / 微信机器人通道；最后一个是 0.6.11 从独立栏目搬进来的)
+          renderMainTabs(),
           // 云端 tab：📱 远程访问（一次性扫码访问 + 已授权设备）+ 账号（手机号登录，官方托管）
           !isLocal ? h("div", null,
             renderAccessCard(),
@@ -3923,7 +4156,15 @@ window.__ModuleLoader__.load({
                 )
               )
             : null,
-          view === "feedback" ? renderFeedback() : view === "invite" ? renderInvite() : renderHome()
+          // view 分派：wechat（第三个主 tab，内容自带 tab 条）| feedback | invite | home
+          // 🔒 微信通道要求已登录：若 view 还停在 "wechat" 而登录态已失效（会话中途过期），
+          //    这里**直接回落到 home**（渲染账号/登录卡）—— 绝不留一个空面板；上一条 effect
+          //    会把 view 正式复位成 home，两者一致。
+          view === "wechat" && loggedIn ? renderWeChat()
+            : view === "wechat" ? renderHome()
+            : view === "feedback" ? renderFeedback()
+            : view === "invite" ? renderInvite()
+            : renderHome()
         ),
         // 常驻入口最底部：「重启 DeepSeek harness」按钮始终可达（首次安装/更新/排查都用它）
         h("div", { className: "dru-restart-foot" },
@@ -3939,19 +4180,512 @@ window.__ModuleLoader__.load({
       );
     }
 
+    // ══ 🤖 微信机器人（「📱 远程访问」面板里的第三个 tab：微信机器人通道） ═════════
+    // 【0.6.11 业主口径】「不要给它单独弄一个菜单，直接放到面板里面。在面板里单开一个
+    // table 页，命名为『微信机器人通道』，并增加上微信的绿泡泡小图标，点开后可以进行绑定设置。」
+    // → 不再注册第二个 settings.section 栏目（只有 📱 远程访问 一个），本组件由 renderWeChat()
+    //    以 embedded=true 作为**子组件**渲染（见 renderMainTabs / renderWeChat）。
+    // 数据全部来自同源 /dsh-remote/wechat/*（宿主半边代理 bridge 的控制面）。
+    //
+    // ⚠️ 令牌铁律：本组件**只**渲染 bridge 已脱敏的字段；不请求、不拼接、不缓存任何 token
+    //    （宿主半边还有第二道按键名过滤，见 lib/index.js 的 scrubWeChatTokens）。
+    // ⚠️ 状态模型（规格 §9）：只有**两态** —— 已绑定 / 未绑定。last_error / channel_running /
+    //    cooldown_ms 只是**提示**，绝不渲染成第三种绑定状态（否则用户会以为要重新绑定）。
+    // ⚠️ 主题不变量：--dru-* 令牌只声明在 .dru-settings-section / .dru-popup / .dru-nav-remote 上。
+    //    · 独立态（embedded=false）：本组件就是那个根 → 必须 className=dru-settings-section + data-dru-theme；
+    //    · 内嵌态（embedded=true）：外层 .dru-settings-section 是 RemoteControlSection 的根（已带
+    //      data-dru-theme），这里**再嵌一层 settings-section 就是套娃**（嵌套 region + 双份内边距），
+    //      所以省掉外壳与标题行；令牌照旧从外层祖先继承，不新增任何令牌声明点。
+    var WECHAT_STATUS_PATH = "/dsh-remote/wechat/status";
+    var WECHAT_POLL_INTERVAL_MS = 1500;
+    /** 面板侧请求超时：必须**大于**宿主代理给 bind/poll 的 40s，否则面板会先掐掉一次正常的等待扫码。 */
+    var WECHAT_POLL_TIMEOUT_MS = 45000;
+    /**
+     * 见到这些状态即**停止**绑定轮询：
+     *   · confirmed / already_bound / failed —— 有结论了；
+     *   · expired / verify_code_blocked / expired-giveup / verify-blocked —— bridge 已在内部换过
+     *     新二维码（或已放弃），面板手里这张已经作废、用户扫不出任何东西。继续轮询等于等一个
+     *     不可能发生的扫码，所以改为「如实告知 + 给一个刷新二维码的按钮」。
+     *   · idle —— bridge 侧已经没有进行中的绑定。
+     * 未列出的状态（wait / scaned / need_verifycode / unknown…）继续轮询；unknown 按可重试处理（§3）。
+     */
+    var WECHAT_POLL_STOP = ["idle", "confirmed", "already_bound", "failed", "expired", "expired-giveup", "verify-blocked", "verify_code_blocked"];
+
+    /** 绑定阶段 → 人话（每句自带文字结论，不靠颜色单独表意）。 */
+    function wechatPhaseText(phase) {
+      switch (phase) {
+        case "wait": return "等待手机扫码…";
+        case "scaned": return "已扫码，请在手机上点「确认」；手机若显示了数字配对码，请填到下面。";
+        case "need_verifycode": return "请在手机上查看数字配对码，填到下面并提交。";
+        case "confirmed": return "绑定成功。";
+        case "already_bound": return "这个微信机器人以前绑过，已视为绑定成功。";
+        case "expired": return "二维码已过期（后台服务已自动换过一张，你手上这张已作废）。";
+        case "expired-giveup": return "二维码连续失效，绑定流程已停止。";
+        case "verify-blocked": return "配对码多次不正确，绑定流程已停止。";
+        case "verify_code_blocked": return "配对码不正确，请输入手机上最新显示的那一串数字。";
+        case "unknown": return "对方返回了无法识别的状态，还在继续等待…";
+        default: return "正在进行绑定…";
+      }
+    }
+
+    /** 把宿主半边的失败体解出来：code 用于分流，text 是给人看的原文（宿主已逐种情形写了人话）。 */
+    function wechatErrOf(e) {
+      var body = e && e.body;
+      return {
+        code: body && body.code ? String(body.code) : "",
+        text: (e && e.message) ? String(e.message) : "本机后台服务没有响应，请稍后重试。"
+      };
+    }
+
+    /** 时间戳 → 本地可读时间（拿不到就空串，绝不显示 Invalid Date）。 */
+    function wechatTimeText(ms) {
+      var n = Number(ms);
+      if (!Number.isFinite(n) || n <= 0) return "";
+      try { return new Date(n).toLocaleString(); } catch (e) { return ""; }
+    }
+
+    /** 冷却剩余毫秒 → 「约 N 分钟」（快照值；状态刷新时更新）。 */
+    function wechatCooldownText(ms) {
+      var n = Number(ms);
+      if (!Number.isFinite(n) || n <= 0) return "";
+      if (n < 60_000) return "不到 1 分钟";
+      return "约 " + Math.round(n / 60_000) + " 分钟";
+    }
+
+    /**
+     * 🤖 微信机器人绑定面板。
+     * @param {{embedded?: boolean}} [props] embedded=true（远程访问面板里的「微信机器人通道」tab）
+     *   → 省掉外层 .dru-settings-section 壳与标题行（避免 settings-section 套娃）；默认独立渲染。
+     *   ⚠️ embedded **只**影响返回的 JSX，绝不影响 hooks：hooks 全部无条件、两态同一顺序
+     *   （在 hooks 之前 early return 会让 hook 序号错位 —— 那是 React 的硬错误）。
+     */
+    function WeChatBotSection(props) {
+      var embedded = !!(props && props.embedded);
+
+      // 🎨 主题：必须是**第一个** hook（与 RemoteControlSection 同款）—— 根节点的 data-dru-theme
+      // 决定整套 --dru-* 令牌走深色还是亮色；放在其它 hook 之前可保证 hook 序号稳定。
+      var theme = useSyncExternalStore(themeSubscribe, themeGet);
+
+      var stArr = useState(null); var wx = stArr[0]; var setWx = stArr[1];              // /wechat/status 的脱敏字段
+      var loadArr = useState(true); var loading = loadArr[0]; var setLoading = loadArr[1];
+      var failArr = useState(null); var fail = failArr[0]; var setFail = failArr[1];    // {code,text} 代理失败
+      var bindArr = useState(null); var bind = bindArr[0]; var setBind = bindArr[1];    // {svg,url,message} 正在绑定
+      var phaseArr = useState(""); var phase = phaseArr[0]; var setPhase = phaseArr[1]; // wait|scaned|need_verifycode|…
+      var askArr = useState(false); var askCode = askArr[0]; var setAskCode = askArr[1]; // 是否弹配对码输入
+      var codeArr = useState(""); var verifyCode = codeArr[0]; var setVerifyCode = codeArr[1];
+      var pauseArr = useState(false); var pollPaused = pauseArr[0]; var setPollPaused = pauseArr[1];
+      var busyArr = useState(""); var busy = busyArr[0]; var setBusy = busyArr[1];
+      var msgArr = useState(null); var message = msgArr[0]; var setMessage = msgArr[1]; // {kind,text}
+      var okArr = useState(false); var confirmUnbind = okArr[0]; var setConfirmUnbind = okArr[1];
+      var tickArr = useState(0); var tick = tickArr[0]; var setTick = tickArr[1];       // 递增即重新拉状态
+
+      var refresh = useCallback(function () { setTick(function (n) { return n + 1; }); }, []);
+
+      // 拉状态：读不到就**如实报错**（含 code），绝不无限转圈 —— 控制面缺失/版本旧是必然会遇到的情况。
+      useEffect(function () {
+        var alive = true;
+        setLoading(true);
+        api(WECHAT_STATUS_PATH).then(function (b) {
+          if (!alive) return;
+          setWx(b && typeof b === "object" ? b : {});
+          setFail(null);
+        }).catch(function (e) {
+          if (!alive) return;
+          setWx(null);
+          setFail(wechatErrOf(e));
+        }).finally(function () { if (alive) setLoading(false); });
+        return function () { alive = false; };
+      }, [tick]);
+
+      // 绑定状态刷新：面板开着时每 30s 重读一次（健康提示/冷却剩余会随时间变），
+      // 但**只在没有进行中的绑定**时做，免得和 1.5s 的绑定轮询叠在一起。
+      useEffect(function () {
+        if (bind) return undefined;
+        var iv = setInterval(function () {
+          if (typeof document !== "undefined" && document.hidden) return;
+          setTick(function (n) { return n + 1; });
+        }, 30_000);
+        return function () { clearInterval(iv); };
+      }, [bind]);
+
+      /** 推进一步绑定状态机。终态/失败都会**停下轮询**，把结论交给用户。 */
+      var pollOnce = useCallback(function () {
+        return api("/dsh-remote/wechat/bind/poll", undefined, WECHAT_POLL_TIMEOUT_MS).then(function (r) {
+          var next = r && r.state ? String(r.state) : "wait";
+          setPhase(next);
+          if (r && r.need_verify_code) setAskCode(true);
+          if (next === "confirmed" || next === "already_bound") {
+            setAskCode(false);
+            setMessage({
+              kind: "ok",
+              text: next === "confirmed"
+                ? "已绑定 ✅ 之后需要你拍板、任务报错或停下时会推到你的微信。"
+                : "这个微信机器人以前绑过（无需重复绑定），现在就能用。"
+            });
+            setBind(null);
+            setPhase("");
+            setTick(function (n) { return n + 1; }); // 重读状态：拿 bot_id / 绑定时间
+            return;
+          }
+          if (next === "failed" || next === "expired-giveup" || next === "verify-blocked" || next === "idle") {
+            setAskCode(false);
+            setPollPaused(true);
+            setMessage({ kind: "err", text: (r && r.error) ? String(r.error) : wechatPhaseText(next) });
+            return;
+          }
+          if (next === "expired" || next === "verify_code_blocked") {
+            setAskCode(false);
+            setPollPaused(true); // 二维码已被 bridge 换掉，继续轮询没意义
+            setMessage({ kind: "warn", text: wechatPhaseText(next) + "点「刷新二维码」重新拿一张。" });
+            return;
+          }
+          if (next === "need_verifycode") setAskCode(true);
+          setMessage(null);
+        }).catch(function (e) {
+          // 代理层失败（后台服务没跑/密钥不匹配/超时…）：停轮询 + 原文照登，绝不无声空转。
+          setPollPaused(true);
+          setMessage({ kind: "err", text: wechatErrOf(e).text });
+        });
+      }, []);
+
+      // ▶ 绑定轮询：一次**只有一个请求在飞**，两次之间隔 ~1.5s（bridge 那边是长轮询，
+      //   并发调用会对同一个二维码重复打腾讯接口）。终态、暂停、卸载都会立刻停。
+      useEffect(function () {
+        if (!bind || pollPaused || WECHAT_POLL_STOP.indexOf(phase) >= 0) return undefined;
+        var stopped = false;
+        var timer = null;
+        var schedule = function () {
+          timer = setTimeout(function () {
+            if (stopped) return;
+            if (typeof document !== "undefined" && document.hidden) { schedule(); return; } // 后台标签页不空转
+            pollOnce().then(function () { if (!stopped) schedule(); });
+          }, WECHAT_POLL_INTERVAL_MS);
+        };
+        schedule();
+        return function () { stopped = true; if (timer !== null) { clearTimeout(timer); timer = null; } };
+      }, [bind, phase, pollPaused, pollOnce]);
+
+      /** 开始/刷新绑定：向 bridge 取一张新二维码（旧会话会被 bridge 取消）。 */
+      var startBind = useCallback(function () {
+        setBusy("start"); setMessage(null); setFail(null); setAskCode(false);
+        setVerifyCode(""); setPollPaused(false); setPhase("wait");
+        return post("/dsh-remote/wechat/bind/start").then(function (r) {
+          if (!r || r.ok === false) {
+            setBind(null);
+            setMessage({ kind: "err", text: (r && r.error) ? String(r.error) : "后台服务没有返回二维码，请稍后重试。" });
+            return;
+          }
+          setBind({
+            svg: String(r.qrcode_svg || ""),
+            url: String(r.qrcode_url || ""),
+            message: String(r.message || "")
+          });
+          setMessage({ kind: "ok", text: String(r.message || "请用手机微信扫描二维码完成绑定。") });
+        }).catch(function (e) {
+          setBind(null);
+          setMessage({ kind: "err", text: wechatErrOf(e).text });
+        }).finally(function () { setBusy(""); });
+      }, []);
+
+      /** 取消本次绑定：先停面板侧轮询，再通知 bridge（顺序反了会出现「点了取消还在轮询」）。 */
+      var cancelBind = useCallback(function () {
+        setBusy("cancel"); setPollPaused(true);
+        return post("/dsh-remote/wechat/bind/cancel").then(function () {
+          setBind(null); setPhase(""); setAskCode(false); setVerifyCode("");
+          setMessage({ kind: "warn", text: "已取消这次连接，没有绑定任何微信机器人。" });
+        }).catch(function (e) {
+          // 面板侧照样停：否则用户会以为还在扫。但要如实说明 bridge 那边没确认。
+          setBind(null); setPhase(""); setAskCode(false); setVerifyCode("");
+          setMessage({ kind: "warn", text: "本页面已停止这次连接。后台服务的取消请求没成功：" + wechatErrOf(e).text });
+        }).finally(function () { setBusy(""); });
+      }, []);
+
+      /** 提交手机微信上显示的数字配对码。 */
+      var submitCode = useCallback(function () {
+        var code = String(verifyCode || "").trim();
+        if (!/^[0-9]{1,8}$/.test(code)) {
+          setMessage({ kind: "err", text: "请输入手机微信上显示的数字配对码（1~8 位数字）。" });
+          return;
+        }
+        setBusy("verify"); setMessage(null);
+        return post("/dsh-remote/wechat/bind/verify", { code: code }).then(function () {
+          setAskCode(false); setVerifyCode(""); setPollPaused(false);
+          setMessage({ kind: "ok", text: "配对码已提交，正在等手机确认…" });
+        }).catch(function (e) {
+          setMessage({ kind: "err", text: wechatErrOf(e).text });
+        }).finally(function () { setBusy(""); });
+      }, [verifyCode]);
+
+      /** 解绑（二次确认后才走到这里）：停轮询 → notifystop → 删凭据，全在 bridge 侧完成。 */
+      var doUnbind = useCallback(function () {
+        setBusy("unbind"); setMessage(null);
+        return post("/dsh-remote/wechat/unbind").then(function (r) {
+          setConfirmUnbind(false);
+          var ne = r && r.notify_error ? String(r.notify_error) : "";
+          setMessage({
+            kind: "ok",
+            text: "已解绑 ✅ 之后不会再向你推送微信通知与回执。" + (ne ? "（腾讯侧下线通知没送到：" + ne + "；不影响解绑结果）" : "")
+          });
+          setTick(function (n) { return n + 1; });
+        }).catch(function (e) {
+          setConfirmUnbind(false);
+          setMessage({ kind: "err", text: wechatErrOf(e).text });
+        }).finally(function () { setBusy(""); });
+      }, []);
+
+      var bound = !!(wx && wx.bound);
+      var binding = !!bind;
+      var expiredLike = phase === "expired" || phase === "verify_code_blocked";
+      var canResume = pollPaused && WECHAT_POLL_STOP.indexOf(phase) < 0;
+      var msgKind = message ? (message.kind === "ok" ? "ok" : message.kind === "warn" ? "warn" : "err") : "";
+      var body = [];
+
+      // ── 首屏「这功能是干什么用的」导览（业主口径：先讲清用途，它就是绑定的理由） ──────────
+      // 位置：内嵌内容体的**最上面**，在「连接微信机器人」按钮之前（DOM 顺序也一样）——
+      // 第一次进来的人先看懂用途，再决定要不要绑。三行 + 一行小标题，紧凑小字，
+      // 不会把连接按钮挤出首屏（见 .dru-wx-intro 的样式注释）。
+      // 只讲**产品真的会做的事**（推送 / 回数字拍板 / 微信里交代任务），不写承诺以外的话。
+      // 已绑定态同样保留：它是常驻的用途说明（不是一次性引导气泡），不占用任何按钮。
+      var intro = h("div", { className: "dru-wx-intro", role: "note", "aria-label": "微信机器人通道能做什么" },
+        h("div", { className: "dru-wx-intro-title" }, "绑定后能做什么"),
+        h("div", { className: "dru-wx-intro-row" }, "· 任务完成 / 出错 / 停下时**推送**到微信 —— 不用守着电脑。"),
+        h("div", { className: "dru-wx-intro-row" }, "· 需要你拍板时，在微信里**回一个数字**就完成决定（放行 / 拒绝 / 选哪个）。"),
+        h("div", { className: "dru-wx-intro-row" }, "· 也可以**直接在微信里交代任务**，并对同一个任务继续追问。")
+      );
+
+      if (loading && !wx && !fail) {
+        // 只在**第一次**读状态时转圈；失败或读到结果后立刻换成具体内容（不留永久 spinner）。
+        body.push(h("div", { className: "dru-card" },
+          h("div", { className: "dru-status-line" },
+            h("span", { className: "dru-spin", "aria-hidden": "true" }),
+            h("span", null, "正在读取本机微信通道状态…")
+          )
+        ));
+      } else if (fail) {
+        body.push(h("div", { className: "dru-card" },
+          h("h3", null, "⚠️ 读不到本机微信通道"),
+          h("div", { className: "dru-msg dru-msg-err" }, fail.text),
+          fail.code ? h("div", { className: "dru-meta" }, "原因代码：" + fail.code) : null,
+          h("div", { className: "dru-actions", style: { marginTop: 10 } },
+            h("button", {
+              type: "button",
+              className: "dru-btn dru-btn-primary",
+              disabled: busy !== "",
+              onClick: refresh
+            }, busy !== "" ? "重试中…" : "重试")
+          )
+        ));
+      } else if (binding) {
+        body.push(h("div", { className: "dru-card" },
+          h("h3", null, "扫码绑定"),
+          h("div", { className: "dru-hint" }, "请用手机微信「扫一扫」扫描下面的二维码。扫码后手机上会显示一串数字配对码，回到这里填进去即可完成绑定。"),
+          bind.svg
+            ? h("img", { className: "dru-wx-qr", src: bind.svg, alt: "微信机器人绑定二维码", width: 200, height: 200 })
+            : h("div", { className: "dru-msg dru-msg-warn" }, "后台服务没有返回可显示的二维码图片。点「刷新二维码」重新取一张。"),
+          h("div", { className: "dru-wx-phase", role: "status", "aria-live": "polite" },
+            h("span", { className: "dru-dot " + (phase === "scaned" || phase === "need_verifycode" ? "dru-dot-on" : "dru-dot-off"), "aria-hidden": "true" }),
+            h("span", null, wechatPhaseText(phase))
+          ),
+          askCode
+            ? h("div", { className: "dru-field", style: { marginTop: 12 } },
+                h("label", { htmlFor: "dru-wx-verify-code" }, "手机微信上显示的数字配对码"),
+                h("div", { className: "dru-wx-code" },
+                  h("input", {
+                    id: "dru-wx-verify-code",
+                    className: "dru-input",
+                    type: "text",
+                    inputMode: "numeric",
+                    autoComplete: "off",
+                    maxLength: 8,
+                    placeholder: "例如 123456",
+                    value: verifyCode,
+                    "aria-label": "手机微信上显示的数字配对码",
+                    onChange: function (e) { setVerifyCode(String(e.target.value || "").replace(/[^0-9]/g, "")); }
+                  }),
+                  h("button", {
+                    type: "button",
+                    className: "dru-btn dru-btn-primary",
+                    disabled: busy !== "" || !verifyCode,
+                    onClick: submitCode
+                  }, busy === "verify" ? "提交中…" : "提交配对码")
+                )
+              )
+            : null,
+          h("div", { className: "dru-actions", style: { marginTop: 10 } },
+            h("button", {
+              type: "button",
+              className: "dru-btn dru-btn-ghost",
+              disabled: busy !== "",
+              onClick: startBind
+            }, busy === "start" ? "获取中…" : (expiredLike ? "刷新二维码" : "换一张二维码")),
+            canResume
+              ? h("button", {
+                  type: "button",
+                  className: "dru-btn dru-btn-ghost",
+                  disabled: busy !== "",
+                  onClick: function () { setPollPaused(false); setMessage({ kind: "ok", text: "继续等待扫码…" }); }
+                }, "继续等待")
+              : null,
+            h("button", {
+              type: "button",
+              className: "dru-btn dru-btn-danger",
+              disabled: busy !== "",
+              onClick: cancelBind
+            }, busy === "cancel" ? "取消中…" : "取消连接")
+          )
+        ));
+      } else if (bound) {
+        // 规格 §9：**只有两态**。这一行是「已绑定 · 健康提示」，两种取值都明确带「已绑定」；
+        // 健康只由「最近一次推送是否失败」决定，**不参与绑定状态**（通道没在跑等情形另起一行说明，不冒充第三种状态）。
+        var healthy = !wx.last_error;
+        body.push(h("div", { className: "dru-card" },
+          h("h3", null, "已绑定"),
+          h("div", { className: "dru-status-line" },
+            h("span", { className: "dru-dot " + (healthy ? "dru-dot-on" : "dru-dot-off"), "aria-hidden": "true" }),
+            h("span", null, healthy ? "已绑定 · 连接正常" : "已绑定 · 最近一次推送失败")
+          ),
+          h("div", { className: "dru-hint", style: { marginTop: 6 } },
+            "上面的「连接正常 / 推送失败」只是**健康提示**，不改变绑定状态 —— 不需要为此重新扫码绑定。"),
+          h("div", { className: "dru-meta" }, "机器人 ID：" + (wx.bot_id ? String(wx.bot_id) : "（后台服务未下发）")),
+          h("div", { className: "dru-meta" }, "绑定时间：" + (wechatTimeText(wx.bound_at) || "（后台服务未下发）")),
+          wechatTimeText(wx.connected_at) ? h("div", { className: "dru-meta" }, "最近上线：" + wechatTimeText(wx.connected_at)) : null,
+          Number(wx.pending_replies) > 0 ? h("div", { className: "dru-meta" }, "等待你回复的通知：" + Number(wx.pending_replies) + " 条") : null,
+          wx.last_error ? h("div", { className: "dru-msg dru-msg-warn", role: "status", "aria-live": "polite" }, "⚠️ 最近一次推送失败：" + String(wx.last_error)) : null,
+          Number(wx.cooldown_ms) > 0
+            ? h("div", { className: "dru-msg dru-msg-warn" }, [
+                "⏳ 微信侧会话超时，后台已按官方做法退避（还剩 " + wechatCooldownText(wx.cooldown_ms) + "）。",
+                h("br"),
+                h("b", null, "这段时间里机器人不工作：你发消息它不会回，任务通知也不会推。"),
+                h("br"),
+                "想马上恢复：先「解绑」再重新「连接微信机器人」（换绑会拿到新凭据，冷却会立即清掉）；或者等倒计时走完。",
+                h("br"),
+                "绑定状态本身没问题，不用管它 —— 只是暂时不能聊。"
+              ])
+            : null,
+          !wx.channel_running
+            ? h("div", { className: "dru-msg dru-msg-warn" }, "提示：后台服务的微信通道当前没有在运行（绑定状态不受影响）。到「📱 远程访问」面板重启后台服务后会自动恢复。")
+            : null,
+          wx.disabled
+            ? h("div", { className: "dru-msg dru-msg-warn" }, "提示：微信通道已按配置关闭（环境变量 DSH_WECHAT=0）。凭据仍在，重新开启后会继续推送。")
+            : null,
+          confirmUnbind
+            ? h("div", { className: "dru-hint", style: { marginTop: 10 } },
+                "解绑后：所有微信通知与回执都会**立即停止**，需要重新扫码才能恢复。确定要解绑吗？")
+            : null,
+          h("div", { className: "dru-actions", style: { marginTop: 10 } },
+            confirmUnbind
+              ? [
+                  h("button", {
+                    key: "unbind-yes",
+                    type: "button",
+                    className: "dru-btn dru-btn-danger",
+                    disabled: busy !== "",
+                    onClick: doUnbind
+                  }, busy === "unbind" ? "解绑中…" : "确认解绑"),
+                  h("button", {
+                    key: "unbind-no",
+                    type: "button",
+                    className: "dru-btn dru-btn-ghost",
+                    disabled: busy !== "",
+                    onClick: function () { setConfirmUnbind(false); setMessage(null); }
+                  }, "先不解绑")
+                ]
+              : h("button", {
+                  type: "button",
+                  className: "dru-btn dru-btn-ghost",
+                  disabled: busy !== "",
+                  onClick: function () { setConfirmUnbind(true); setMessage(null); }
+                }, "解绑"),
+            h("button", {
+              type: "button",
+              className: "dru-btn dru-btn-ghost",
+              disabled: busy !== "",
+              onClick: refresh
+            }, "刷新状态")
+          )
+        ));
+      } else {
+        body.push(h("div", { className: "dru-card" },
+          h("h3", null, "未绑定"),
+          // 怎么绑（**文字**先行）：动效只是多余的强调，状态与操作从不靠动效单独表达。
+          // 装饰小圆点（纯装饰 → aria-hidden）与主按钮同步做很慢的呼吸，prefers-reduced-motion 下全部关掉。
+          h("div", { className: "dru-wx-cta" },
+            h("span", { className: "dru-wx-attn-dot", "aria-hidden": "true" }),
+            h("span", null, "还没连接：点下面的「连接微信机器人」，用手机微信扫一扫即可完成绑定。")
+          ),
+          h("div", { className: "dru-hint" }, "连接一个微信机器人后，DSH 会在这些时刻给你发一条微信：需要你放行的工具调用、agent 的提问与「计划待批」、任务报错、任务停下。"),
+          h("div", { className: "dru-hint", style: { marginTop: 6 } }, "消息里带编号选项，**回一个数字**就能放行 / 拒绝 / 选择 —— 不用打开电脑。"),
+          h("div", { className: "dru-hint", style: { marginTop: 6 } }, "消息只经腾讯官方通道往返你这台电脑，面板里永远不会显示机器人的令牌；随时可以在这里解绑。"),
+          h("div", { className: "dru-actions", style: { marginTop: 10 } },
+            h("button", {
+              type: "button",
+              // 未绑定 + 空闲时才呼吸：这份动效的作用就是把人引到「连接」上；
+              // 一点下去（busy）立刻停，绑定成功后这个按钮本身就不再渲染（已绑定态走状态卡）。
+              className: "dru-btn dru-btn-primary" + (busy === "" ? " dru-wx-attn" : ""),
+              disabled: busy !== "",
+              onClick: startBind
+            }, busy === "start" ? "正在获取二维码…" : "连接微信机器人"),
+            h("button", {
+              type: "button",
+              className: "dru-btn dru-btn-ghost",
+              disabled: busy !== "",
+              onClick: refresh
+            }, "刷新状态")
+          )
+        ));
+      }
+
+      // 状态变化的播报位（无障碍：读屏软件靠 aria-live 感知，不依赖颜色）。两态共用同一个节点。
+      var liveMsg = h("div", { className: "dru-msg" + (msgKind ? " dru-msg-" + msgKind : ""), role: "status", "aria-live": "polite" },
+        message ? message.text : "");
+      var bodyNode = h("div", { className: "dru-settings-body" }, body);
+
+      // 内嵌态（「微信机器人通道」tab）：**省掉**外层 .dru-settings-section 壳与标题行 ——
+      // 外层已经有 RemoteControlSection 的 .dru-settings-section（带 data-dru-theme/令牌），
+      // 再嵌一层就是 settings-section 套娃（双内边距 + 嵌套 region），而 tab 的文字标签已经
+      // 给出可访问名字。壳与标题行只是**装饰性**的栏目头，内容体/按钮一个不改。
+      // 导览（intro）永远排在最前面 → 在「连接」按钮之前（DOM 顺序亦然），未绑定时先讲用途。
+      if (embedded) {
+        return h("div", { className: "dru-wx-embed", role: "region", "aria-label": "微信机器人通道", "data-dru-theme": theme },
+          intro,
+          bodyNode,
+          liveMsg
+        );
+      }
+      // 独立态（仍被保留：组件可单独挂在别的槽里，两态的 hooks 完全一致，见上面的签名注释）
+      return h("div", { className: "dru-settings-section", role: "region", "aria-label": "微信机器人", "data-dru-theme": theme },
+        h("div", { className: "dru-settings-head" },
+          h("span", { className: "dru-settings-icon", "aria-hidden": "true" }, "🤖"),
+          h("div", null,
+            h("h2", { className: "dru-settings-title" }, "微信机器人"),
+            h("div", { className: "dru-settings-sub" }, "把关键节点推到微信，并让你在微信里回一个数字就完成放行 / 拒绝 / 选择。")
+          )
+        ),
+        intro,
+        bodyNode,
+        liveMsg
+      );
+    }
+
     // ── 插件入口 ─────────────────────────────────────────────────────────────
     var inject = ["slots"];
     function apply(ctx) {
       // 面板入口迁移：从侧边栏（sidebar.footer.action）移入「设置」页官方扩展点
       // settings.section（列表槽，由 ui-settings-general 在 sidebar.settings 下声明）。
       // order 30 > Agent 预设(20)，栏目落在「Agent 预设」下方；label 即栏目名（📱 远程访问）。
+      // 【0.6.11】本插件在这个槽里**只有一个栏目**（📱 远程访问）：🤖 微信机器人原先以 order 31
+      // 注册成第二个栏目，业主口径「不要给它单独弄一个菜单，直接放到面板里面」→ 已改成面板里的
+      // 第三个 tab（renderMainTabs / renderWeChat）。不要再往这个槽里加第二个 register。
       ctx.slots.inject("settings.section", function () {
-        return ctx.slots.register({
+        var d1 = ctx.slots.register({
           name: "settings.section",
           id: "dsh-remote",
           order: 30,
           label: function () { return "📱 远程访问"; }
         }, RemoteControlSection);
+        return function () {
+          if (typeof d1 === "function") d1();
+        };
       });
       ctx.slots.inject("shell.overlay", function () {
         return ctx.slots.register({ name: "shell.overlay", id: "dsh-feedback-popup", order: 90 }, FeedbackPopup);

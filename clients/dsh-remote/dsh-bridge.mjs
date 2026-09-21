@@ -23,7 +23,11 @@
  *     bridge 转发时:Host 由 fetch/ws 自动取上游 authority(127.0.0.1:3080,满足 loopback 围栏),
  *     显式剥离 Origin、Sec-Fetch-*、Cookie、Referer 等浏览器标记,保证通过 dsh web 的信任围栏。
  *
- *   ── WebSocket 透传(覆盖 /api/events.mux|host 下行流) ──
+ *   ── WebSocket 透传(覆盖 /api/remote.mux|host 下行流) ──
+ *     ⚠️ 修正(2026-09-20):此处原写 /api/events.mux —— 该路径在本版 DSH 里**不存在**
+ *     (全包 grep 零命中),真路径是 /api/remote.mux(@deepseek-ai/dsh-api-gateway 的
+ *     REMOTE_STREAM_MUX_PATH)。线上未出问题是因为本文件对路径**透明透传**、由浏览器决定
+ *     请求哪个路径;但错的注释会把后来者带沟里(微信通道订阅事件流时会照着它写)。
  *     → { "id", "type":"ws-open", "path", "headers":{...} }      ← { "id","type":"ws-open","ok":true|false,"code"?,"reason"? }
  *     → { "id", "type":"ws-msg",  "data":<文本|base64>, "binary"? }
  *     ← { "id", "type":"ws-msg",  "data":<文本|base64>, "binary"? }
@@ -86,6 +90,10 @@ import {
   parseWsE2eeParams,
   writeE2eeStateFile
 } from "./e2ee-client.mjs";
+// 微信机器人通道(编排层):绑定控制面 + 出站通知路由 + 入站长轮询。
+// ⚠️ 微信流量只走「腾讯 ilink ↔ 本机」,**不经我们的 relay**;DSH 事件走本机回环。
+// 总开关 DSH_WECHAT=0(默认开启);未绑定时只起控制面,不起长轮询。
+import { createWeChatRuntime } from "./wechat-runtime.mjs";
 
 // ---------- 强制直连:清除代理环境变量 ----------
 // 家庭网络常配 Clash 等代理(127.0.0.1:7890),node 的 ws/fetch 会继承
@@ -107,6 +115,8 @@ const CONFIG_PATH = process.env.DSH_BRIDGE_CONFIG || DEFAULT_CONFIG;
 const TUNNEL_URL = (process.env.DSH_BRIDGE_TUNNEL_URL || "").replace(/\/+$/, "");
 const TUNNEL_HEARTBEAT_MS = Math.max(100, Number(process.env.DSH_BRIDGE_HEARTBEAT_MS) || 15_000);
 const UPSTREAM = process.env.DSH_BRIDGE_UPSTREAM || "http://127.0.0.1:3080";
+// 微信机器人通道总开关:DSH_WECHAT=0 关闭(默认开启)。控制面只 bind 回环,且必须带 bridge_secret。
+const WECHAT_DISABLED = String(process.env.DSH_WECHAT || "") === "0";
 // 默认云端服务地址（dsh-remote setup 会显式传入；自建模式无需账号 API）
 const API_BASE = (process.env.DSH_BRIDGE_API || "https://n.risegao.cn:13443/relay-api").replace(/\/+$/, "");
 const EMAIL = process.env.DSH_BRIDGE_EMAIL || "";
@@ -117,7 +127,11 @@ const TOKEN = process.env.DSH_BRIDGE_TOKEN || "";
 
 // ---------- 本机稳定指纹(同机重装识别;供服务端自动顶替旧设备) ----------
 
-/** 读取与安装无关的机器级唯一值:macOS IOPlatformUUID / Linux machine-id。 */
+/**
+ * 读取与安装无关的机器级唯一值：macOS IOPlatformUUID / Linux machine-id / Windows MachineGuid。
+ * 用途只有一个：同机卸载重装后被服务端认成同一台设备（自动顶替旧设备记录）。
+ * 拿到的值**只在本机哈希**（见 machineFingerprint），原文绝不上报。
+ */
 function machineUniqueId() {
   if (process.env.DSH_BRIDGE_MACHINE_FP) return String(process.env.DSH_BRIDGE_MACHINE_FP).slice(0, 64);
   if (process.platform === "darwin") {
@@ -133,8 +147,26 @@ function machineUniqueId() {
         if (s) return s;
       } catch { /* 继续 */ }
     }
+  } else if (process.platform === "win32") {
+    // Windows 既没有 IOPlatformUUID 也没有 machine-id，取注册表 MachineGuid
+    //（Windows 安装时生成、之后稳定）—— 语义与 Linux 的 machine-id 一致：都是"每次安装一个"，
+    // 所以"重装 dsh-remote 后仍认成同一台设备"这个唯一用途完全成立。
+    //
+    // 为什么不用 PowerShell/WMI 的 Win32_ComputerSystemProduct.UUID：
+    //   · reg.exe 恒定存在于 System32，启动约 20ms；PowerShell 启动要几百毫秒；
+    //   · PowerShell 在受限语言模式 / AppLocker 的企业机器上可能被策略直接禁掉，
+    //     而拿不到指纹时只能退回 hostname（用户一改主机名就被当成新设备）—— 正是要修的问题；
+    //   · 走 spawnSync 传数组参数，不经过 cmd.exe，因而没有引号/空格/中文路径的转义坑。
+    try {
+      const r = spawnSync("reg", ["query", "HKLM\\SOFTWARE\\Microsoft\\Cryptography", "/v", "MachineGuid"],
+        { encoding: "utf8", timeout: 5000, windowsHide: true });
+      const m = r && r.status === 0
+        ? /MachineGuid\s+REG_SZ\s+([0-9a-fA-F-]{16,})/.exec(String(r.stdout || ""))
+        : null;
+      if (m && m[1]) return m[1];
+    } catch { /* 兜底 */ }
   }
-  return ""; // 读不到(如容器) → 回退宿主名指纹
+  return ""; // 读不到(如容器/受限环境) → 回退宿主名指纹
 }
 /** 稳定指纹:机器唯一值哈希;同机卸载重装后不变。 */
 function machineFingerprint() {
@@ -216,7 +248,15 @@ function hardenFile(file) {
   try { fs.chmodSync(file, 0o600); } catch { /* POSIX 上失败不致命 */ }
   if (process.platform !== "win32") return;
   const who = [process.env.USERDOMAIN, process.env.USERNAME].filter(Boolean).join("\\");
-  if (!who) return;
+  // 两个环境变量都取不到时**绝不能静默返回**：那会让人以为文件已加固，实际仍是继承 ACL。
+  // 正常 Windows 会话不会走到这里（USERNAME 必然存在），但受限令牌/服务账户下有可能。
+  if (!who) {
+    if (!hardenWarned) {
+      hardenWarned = true;
+      console.warn(`⚠️ 无法收紧文件权限（USERDOMAIN/USERNAME 均未设置）：${file}`);
+    }
+    return;
+  }
   let r;
   try {
     r = spawnSync("icacls", [file, "/inheritance:r", "/grant:r", `${who}:F`],
@@ -1158,6 +1198,70 @@ async function initE2ee(token) {
   }
 }
 
+/**
+ * 启动微信通道(控制面 + 已绑定时的事件通知/入站长轮询)。
+ *
+ * ★ 为什么**不 await**、且放在 connectTunnel 之后:
+ *   微信侧是"锦上添花"的能力(发通知)。它必须**永远不能**拖慢或拖挂远程访问本身 ——
+ *   所以先让隧道连上,再 fire-and-forget 起微信;任何异常只记日志,不冒泡、不 exit。
+ *   与 e2ee/mobile-adapter 的定位一致:主链路优先。
+ */
+/** 给没自带前缀的微信日志补上 `[wechat] `;已带的原样返回(避免双重前缀)。 */
+function tagWeChat(m) {
+  const s = String(m);
+  return s.startsWith("[") ? s : `[wechat] ${s}`;
+}
+
+let wechatRuntime = null;
+function startWeChat() {
+  if (WECHAT_DISABLED) {
+    console.log("[bridge] 微信通道已禁用(DSH_WECHAT=0)");
+    return;
+  }
+  try {
+    const relayDir = path.dirname(CONFIG_PATH);
+    const cfg = loadLocalConfig();
+    wechatRuntime = createWeChatRuntime({
+      relayDir,
+      upstream: UPSTREAM,
+      cookieOf: harnessCookieOf,
+      secret: process.env.DSH_BRIDGE_SECRET || (typeof cfg.bridge_secret === "string" ? cfg.bridge_secret : ""),
+      // 模块自己的消息已带 `[wechat]` / `[wechat/events]` 前缀,这里**不能再加一次**
+      // (真机日志里出现过 `[wechat] [wechat] 控制面已就绪`)。没前缀的兜底补一个。
+      logger: {
+        info: (m) => console.log(tagWeChat(m)),
+        warn: (m) => console.warn(tagWeChat(m)),
+        error: (m) => console.warn(tagWeChat(m)),
+        debug: () => {},
+        // WeChatChannel 构造时会给 token 登记脱敏;这里保持同样契约(日志不落 token)
+        addSecret: () => {}
+      }
+    });
+    wechatRuntime.start().catch((e) => {
+      console.warn(`[bridge] 微信通道启动失败(不影响远程访问): ${redactText(e)}`);
+    });
+  } catch (e) {
+    console.warn(`[bridge] 微信通道初始化失败(不影响远程访问): ${redactText(e)}`);
+    wechatRuntime = null;
+  }
+}
+
+/** 优雅退出微信通道(notifystop + 关控制面)。失败只记日志。 */
+async function stopWeChat() {
+  const rt = wechatRuntime;
+  wechatRuntime = null;
+  if (!rt) return;
+  try {
+    await rt.stop();
+  } catch (e) {
+    console.warn(`[bridge] 微信通道停止失败(忽略): ${redactText(e)}`);
+  }
+}
+
+function redactText(e) {
+  return String(e && e.message ? e.message : e).slice(0, 200);
+}
+
 async function runTunnel() {
   const token = await resolveToken();
   if (!token) {
@@ -1169,6 +1273,8 @@ async function runTunnel() {
   await initE2ee(token);
   await registerDeviceInAccount(token);
   connectTunnel(token);
+  // 隧道已发起后再起微信:主链路优先,微信永不阻塞远程访问
+  startWeChat();
   setTimeout(() => {
     console.log(`[bridge] 隧道模式运行中(上游 ${UPSTREAM},Ctrl-C 退出)`);
   }, 1000);
@@ -1180,6 +1286,27 @@ async function main() {
     console.error("[bridge] 缺少 DSH_BRIDGE_TUNNEL_URL:隧道模式是唯一模式(请设 relay-router 地址)");
     process.exit(1);
   }
+  // ⚠️ 本文件此前**一个 process.on 都没有** —— 被 launchd/systemd/schtasks 杀掉时,
+  // 微信长轮询不会收到信号,腾讯侧会一直以为通道在线(notifystop 永远不发)。
+  // 只注册在 main() 里(被测试 import 时不污染测试进程)。
+  let shuttingDown = false;
+  const shutdown = async (sig) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[bridge] 收到 ${sig},正在优雅退出...`);
+    await stopWeChat();
+    process.exit(0);
+  };
+  process.on("SIGTERM", () => { shutdown("SIGTERM"); });
+  process.on("SIGINT", () => { shutdown("SIGINT"); });
+  // 【Windows 的关键一条】Windows 上 process.kill() 是**无条件 TerminateProcess**：
+  // 上面的 SIGTERM/SIGINT 处理函数在 Windows 上**永远不会被执行**，
+  // 于是 notifystop（微信通道下线通知）永远发不出去，腾讯侧一直以为通道还在线。
+  // watcher 通过 IPC 发来的 shutdown 消息是 Windows 上唯一能真正跑到的优雅退出路径
+  //（POSIX 上也一并走这条，比信号更可靠）。见 src/lifecycle.mjs 的 stopChildGracefully。
+  process.on("message", (m) => {
+    if (m && m.type === "shutdown") shutdown("IPC shutdown");
+  });
   return runTunnel();
 }
 

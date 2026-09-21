@@ -28,7 +28,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync, execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { childStopped } from "./clients/dsh-remote/src/lifecycle.mjs";
+import { childStopped, stopChildGracefully } from "./clients/dsh-remote/src/lifecycle.mjs";
 
 const THIS_DIR = path.dirname(fileURLToPath(import.meta.url)); // 本包目录（仓库或 node_modules）
 const IS_NPM_INSTALL = THIS_DIR.includes(`${path.sep}node_modules${path.sep}`);
@@ -41,7 +41,9 @@ const IS_NPM_INSTALL = THIS_DIR.includes(`${path.sep}node_modules${path.sep}`);
 const CONFIG_DIR = process.env.DSH_RELAY_DIR || path.join(os.homedir(), ".dsh-remote");
 const CONFIG_PATH = path.join(CONFIG_DIR, ".dsh-config.json");
 // 默认云端服务地址（服务商 SaaS 入口；自建用户用 --server/--key 指向自己的 router）
-const DEFAULT_API = "https://n.risegao.cn:13443/relay-api";
+// DSH_RELAY_DEFAULT_API 可覆盖（测试脚本指向本地死端口，避免兜底路径打到生产）。
+const DEFAULT_API = String(process.env.DSH_RELAY_DEFAULT_API || "").trim()
+  || "https://n.risegao.cn:13443/relay-api";
 const DEFAULT_APP_URL = "https://n.risegao.cn:13443/app/";
 const REPO_URL = "https://github.com/mrRisega/dsh-remote";
 
@@ -87,7 +89,7 @@ function findDepWs(startDir) {
 }
 
 /** 同步运行时文件时一并覆盖的客户端脚本（bridge 会把这些直接发给手机/桌面，必须与装置器一致）。 */
-const RUNTIME_CLIENT_FILES = ["mobile-adapter.mjs", "dsh-bridge.mjs", "e2ee-shim.mjs", "e2ee-client.mjs", "e2ee-shim-script.js", "mobile-adapter.test.mjs"];
+const RUNTIME_CLIENT_FILES = ["mobile-adapter.mjs", "dsh-bridge.mjs", "e2ee-shim.mjs", "e2ee-client.mjs", "e2ee-shim-script.js", "mobile-adapter.test.mjs", "wechat-channel.mjs", "dsh-events.mjs", "wechat-runtime.mjs"];
 
 /**
  * 把"客户端脚本"补齐到配置目录。
@@ -273,7 +275,15 @@ function hardenFile(file) {
   try { fs.chmodSync(file, 0o600); } catch { /* POSIX 上失败不致命 */ }
   if (process.platform !== "win32") return;
   const who = [process.env.USERDOMAIN, process.env.USERNAME].filter(Boolean).join("\\");
-  if (!who) return;
+  // 两个环境变量都取不到时**绝不能静默返回**：那会让人以为文件已加固，实际仍是继承 ACL。
+  // 正常 Windows 会话不会走到这里（USERNAME 必然存在），但受限令牌/服务账户下有可能。
+  if (!who) {
+    if (!hardenWarned) {
+      hardenWarned = true;
+      console.warn(`⚠️ 无法收紧文件权限（USERDOMAIN/USERNAME 均未设置）：${file}`);
+    }
+    return;
+  }
   let r;
   try {
     r = spawnSync("icacls", [file, "/inheritance:r", "/grant:r", `${who}:F`],
@@ -406,22 +416,74 @@ function pidAlive(pid) {
  * 注册 Windows 登录任务（幂等：先删再建）。
  * /DELAY 0000:15：登录后等 15 秒再起，避免与桌面环境抢启动时机
  * （watcher 本身就会等 dsh web 的 3080 端口，晚起没有任何副作用）。
- * ⚠️ 已知限制（如实告知，不假装完美）：ONLOGON 任务在用户会话里运行，登录时会有一个控制台窗口；
- * 想彻底隐藏需要"不管用户是否登录都运行"(存密码/S4U) 或第三方隐藏器，都需要额外凭据或依赖，
- * 故这里只做「能自启」，并在安装汇总里说明用户可在任务计划程序里勾「隐藏」。
+ *
+ * 【修复「黑色空白命令行窗口」】早期版本把 `node dsh-setup.mjs run` 直接交给任务计划程序，
+ * 并把它当成"只能忍受"的限制 —— 这不是限制，是 bug：
+ *   · 任务计划程序在**交互会话**里启动进程，不会给 CREATE_NO_WINDOW，
+ *     控制台程序（node.exe）于是必然弹出一个黑色空白窗口；用户关掉它 = 杀掉 watcher，
+ *     而 dsh web 的自愈轮次又会把它拉回来 → 表现为"窗口关不掉、一直重开"，体验极差。
+ *   · 零依赖的彻底隐藏办法：任务只负责起 `wscript.exe`，脚本里用
+ *     `WScript.Shell.Run cmd, 0, False`（窗口样式 0 = 不显示；不等待 = node 成为独立进程）。
+ *     wscript.exe 与 VBScript 是 Windows 自带组件，**不需要凭据、不需要 S4U/存密码、
+ *     不需要第三方隐藏器**（旧注释误判为必须付出这些代价，实测不成立）。
+ *   · watcher 仍由它自己写 `.dsh-watcher.pid`，所以 pid 判活/幂等完全不受这层包装影响。
+ *   · 极少数机器被组策略禁用 Windows Script Host → 注册失败时自动退回直接启动，
+ *     保证「能自启」这条底线不丢（代价是那种机器上仍会有窗口，但不至于完全没自启）。
+ * 旧版本注册的可见任务会被这里的 /Delete + /Create 一并迁移成隐藏形式（重装/一键更新即生效）。
  */
 let winTaskCache = null;
+
+/** 隐藏启动器(.vbs)路径：放配置目录，随重装覆盖。 */
+function winHiddenLauncherPath() {
+  return path.join(CONFIG_DIR, "launch-hidden.vbs");
+}
+
+/**
+ * 生成隐藏启动器 —— `wscript.exe //B <此文件>` 会在完全隐藏的窗口里执行
+ * `"<node>" "<setup>" run`。
+ * 转义要点：VBScript 的字符串字面量内嵌 `"` 要写成 `""`，故先把整个命令行的引号翻倍。
+ */
+function writeWinHiddenLauncher(node, setup) {
+  const vbsPath = winHiddenLauncherPath();
+  const commandLine = `"${node}" "${setup}" run`; // 真正要执行的命令行
+  const literal = commandLine.replace(/"/g, '""'); // 嵌进 VBS 字符串字面量后
+  const src = [
+    "' dsh-remote 自动生成（勿手改，重装会覆盖）",
+    "' 隐藏启动 bridge 守护：窗口样式 0 = 不显示窗口；False = 不等待，node 成为独立进程。",
+    `CreateObject("WScript.Shell").Run "${literal}", 0, False`,
+    "",
+  ].join("\r\n");
+  fs.mkdirSync(CONFIG_DIR, { recursive: true });
+  fs.writeFileSync(vbsPath, src, "utf8");
+  return vbsPath;
+}
 
 function writeWindowsTask() {
   const node = NODE_BIN;
   const setup = runtimeSetupPath();
-  const tr = `"${node}" "${setup}" run`;
+  // 首选 wscript 包装（无黑窗）；写不了 .vbs 就退回直接启动（有窗，但保底能自启）
+  let direct = `"${node}" "${setup}" run`;
+  let tr = direct;
+  let hidden = false;
+  try {
+    tr = `wscript.exe //B "${writeWinHiddenLauncher(node, setup)}"`;
+    hidden = true;
+  } catch (e) {
+    console.warn(`⚠️ 无法生成隐藏启动器（${e.message}），自启动时会显示命令行窗口。`);
+  }
   if (tr.length > 255) {
     console.log(`⚠️ 自启动命令过长（${tr.length} 字符，schtasks 上限 261）：${tr}`);
     console.log("   建议把 dsh-remote 装到更短的路径，或用 `dsh-remote run` 手动运行 bridge。");
   }
   schtasks(["/Delete", "/TN", WIN_TASK_NAME, "/F"]); // 幂等清理（不存在也只是非 0 退出，不影响后续
-  const created = schtasks(["/Create", "/TN", WIN_TASK_NAME, "/TR", tr, "/SC", "ONLOGON", "/DELAY", "0000:15", "/F"]);
+  let created = schtasks(["/Create", "/TN", WIN_TASK_NAME, "/TR", tr, "/SC", "ONLOGON", "/DELAY", "0000:15", "/F"]);
+  if (!created.ok && hidden) {
+    // 组策略禁用 Windows Script Host 等 → 退回直接启动，别让"自启"整个失效
+    console.warn(`⚠️ 隐藏方式注册失败（${(created.stderr || created.stdout).trim() || `退出码 ${created.code}`}），改用直接启动。`);
+    tr = direct;
+    hidden = false;
+    created = schtasks(["/Create", "/TN", WIN_TASK_NAME, "/TR", tr, "/SC", "ONLOGON", "/DELAY", "0000:15", "/F"]);
+  }
   if (!created.ok) {
     winTaskCache = false;
     console.warn(`⚠️ 自启动任务注册失败: ${(created.stderr || created.stdout).trim() || `schtasks 退出码 ${created.code}`}`);
@@ -542,7 +604,11 @@ function spawnDetachedBridge() {
     const child = spawn(NODE_BIN, [runtimeSetupPath(), "run"], {
       detached: true,
       stdio: ["ignore", out, out],
-      env: process.env
+      env: process.env,
+      // Windows 上 detached 即 DETACHED_PROCESS：子进程**不继承父控制台**，
+      // 控制台程序（node.exe）会因此拿到一个**全新的可见窗口**。
+      // 必须显式 windowsHide 才会带上 CREATE_NO_WINDOW（POSIX 上该选项被忽略）。
+      windowsHide: true
     });
     child.unref();
     fs.closeSync(out);
@@ -953,7 +1019,7 @@ async function runBridge() {
     const fp = accountFingerprint(cfg);
     if (!childStopped(bridgeProc) && bridgeAccountFp && bridgeAccountFp !== fp) {
       console.log("[dsh-remote] 账号配置已变化 → 重启 bridge 让新账号生效...");
-      try { bridgeProc.kill(); } catch { /* 已退出 */ }
+      await stopChildGracefully(bridgeProc); // 先请它优雅退出，跑完微信通道下线通知
       bridgeAccountFp = "";
       return; // 下一轮（10s 内）用新配置重新拉起
     }
@@ -987,9 +1053,11 @@ async function runBridge() {
       for (const k of ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "no_proxy", "NO_PROXY"]) {
         delete childEnv[k];
       }
+      // stdio 的第 4 个 fd 是 IPC 通道：Windows 上 kill() 是**无条件终止**，信号处理函数不会执行，
+      // 只有它能让我们在停 bridge 之前请它跑完退出钩子（notifystop）—— 见 stopChildGracefully。
       bridgeProc = spawn(NODE_BIN,
         [path.join(THIS_DIR, "clients/dsh-remote/dsh-bridge.mjs")],
-        { env: childEnv, stdio: "inherit" });
+        { env: childEnv, stdio: ["inherit", "inherit", "inherit", "ipc"] });
       bridgeProc.on("exit", () => {
         removePidFile(BRIDGE_PID_FILE);
         console.log("[dsh-remote] bridge 退出，等待重启...");
@@ -1001,7 +1069,7 @@ async function runBridge() {
       setTimeout(() => { starting = false; }, 5000);
     } else if (!alive && bridgeProc && bridgeProc.exitCode === null) {
       console.log("[dsh-remote] dsh web 离线，停止 bridge...");
-      bridgeProc.kill();
+      await stopChildGracefully(bridgeProc); // 同上：Windows 上 kill() 跑不到退出钩子
     }
   };
 
@@ -1011,7 +1079,17 @@ async function runBridge() {
     const cleanup = () => { removePidFile(WATCHER_PID_FILE); removePidFile(BRIDGE_PID_FILE); };
     process.on("exit", cleanup);
     for (const sig of ["SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"]) {
-      try { process.on(sig, () => { cleanup(); process.exit(0); }); } catch { /* 该信号在本平台不可注册 */ }
+      try {
+        process.on(sig, () => {
+          // 先请 bridge 优雅退出，再给自己留出它跑完退出钩子（notifystop）的时间。
+          // 尤其重要：Windows 上 kill() 是无条件终止，bridge 根本没有机会做收尾。
+          if (bridgeProc && bridgeProc.connected) {
+            try { bridgeProc.send({ type: "shutdown" }); } catch { /* 通道已断，只能随父进程一起被回收 */ }
+          }
+          cleanup();
+          setTimeout(() => process.exit(0), 3000);
+        });
+      } catch { /* 该信号在本平台不可注册 */ }
     }
   }
 
@@ -1478,27 +1556,39 @@ function ensurePatchActivation(patchFile, pluginLocalDir, pkgFile, opts = {}) {
         ? pkg.dsh.profile.bundles.filter((b) => PLUGIN_ALL_IDS.includes(b)) : [];
     } catch { return []; }
   };
-  // 插件已在 bundles 时默认**不**写 patch 行（两条激活路径互斥，否则 duplicate id 崩树）。
-  // 但有两个例外必须主动改写激活点：
-  //   · forcePatch：源码已被我们换成本地这份（升级场景）→ 必须转 patch 行才能热加载；
-  //   · 插件市场形态（bundles 里的条目由包管理器管）→ 保持 bundles，不碰。
+  // ★★ 稳定形态 = **只由 `dsh.profile.bundles` 激活**,我们**不再往 patch 里写激活行**。
+  //
+  // 2026-09-22 实测事故:`duplicate loader entry id: dsh-remote-web` →
+  //   `dsh: plugin tree failed to load` → **dsh web 启动即挂**(用真实启动复现)。
+  // 根因是**两处激活同时存在**:
+  //   (a) 插件自带的 bundle 在 `package.json` 的 `dsh.profile.bundles` 里;
+  //   (b) 我们写进 profile `cordis.patch.yml` 的激活行又声明了同一个 id。
+  //
+  // 旧实现走的是**反方向**——"删 bundles 条目、留 patch 行"(见下方已删的 removeBundleEntry 调用),
+  // 还为此写了复杂的回滚。但**自动维护流程会把插件自带 bundle 周期性写回**,
+  // 于是"删了又回来"→ 又变两处 → 再次崩。只要方向是反的,这个 bug 就会反复出现。
+  //
+  // 所以现在改成:**bundle 归包管理器/维护流程管,我们绝不动它**;
+  // 我们只保证自己**不再制造第二个激活点**,并顺手把历史遗留的重复 patch 行清掉。
   const inBundles = pkgBundles();
-  if (inBundles.length && !opts.forcePatch) {
+  if (inBundles.length) {
+    const stripped = stripPluginEntries(original);
+    if (stripped !== original) {
+      writePatchDocument(patchFile, stripped);
+      console.log("✅ 已移除 profile patch 中与本插件重复的激活行（激活统一走 dsh.profile.bundles，避免 duplicate id 崩树）");
+      return { ok: true, changed: true, bundleOnly: true, basePatch: original };
+    }
     return { ok: false, reason: "插件已由 dsh.profile.bundles 声明（保持单一激活点，不写 patch 行）", changed: false, bundleOnly: true, basePatch: original };
   }
-  if (inBundles.length && opts.forcePatch) {
-    // 自己动手摘掉 bundles 条目（不依赖调用方的执行顺序），再走 patch 行激活
-    removeBundleEntry(pkgFile);
-    if (pkgBundles().length) {
-      return { ok: false, reason: "无法移除 dsh.profile.bundles 中的本插件条目", changed: false, basePatch: original };
-    }
-  }
+  // 到这里说明 bundles 里没有本插件 —— 此时 patch 行是**唯一**激活点,必须写(升级/热加载场景)。
+  // `forcePatch` 仍然保留语义:它只影响"bundles 为空时"的行为,不再能覆盖上面那条硬约束。
   const base = validatePatchBase(original);
   if (!base.ok) return { ok: false, reason: base.reason, changed: false, basePatch: original };
   const hasOurRow = base.insertedIds.some((id) => PLUGIN_ALL_IDS.includes(id));
   if (hasOurRow) {
-    const bundleRemoved = removeBundleEntry(pkgFile);
-    if (bundleRemoved) console.log("✅ 已从 dsh.profile.bundles 移除重复激活点（激活统一走 patch 行）");
+    // ⚠️ 走到这里说明 **bundles 里没有本插件**(上面 inBundles 为空的早退已排除两处激活的形态),
+    //   所以 patch 行就是唯一激活点,可以安心保留它 —— 这里**不再**去动 bundles。
+    //   (旧实现在这里调 removeBundleEntry,方向是反的:见本函数顶部注释。)
     // 已有条目也要**自我修正**：配置目录变了（换安装方式 / 之前写错）时 relayDir 必须跟着更新，
     // 否则面板会一直去旧目录找 .dsh-config.json（表现就是"未登录 / 空配置"）。
     const want = pluginBlock(CONFIG_DIR);
@@ -1516,7 +1606,7 @@ function ensurePatchActivation(patchFile, pluginLocalDir, pkgFile, opts = {}) {
       }
       console.warn("⚠️ 激活行的 relayDir 与当前配置目录不一致，但未能安全改写（保持原样）");
     }
-    return { ok: true, changed: bundleRemoved, basePatch: original };
+    return { ok: true, changed: false, basePatch: original };
   }
   // 写前再次校验我们的块本身可解析（id 行必须能被 parsePatchInsertIds 认出来）
   // ⚠️ relayDir 必须传**配置目录**(CONFIG_DIR, 即 ~/.dsh-remote),不是插件安装目录:
@@ -1539,13 +1629,9 @@ function ensurePatchActivation(patchFile, pluginLocalDir, pkgFile, opts = {}) {
     writePatchDocument(patchFile, original); // 回滚
     return { ok: false, reason: "写入后校验失败，已回滚", changed: false, basePatch: original };
   }
-  removeBundleEntry(pkgFile); // 单一激活点：bundles 里不能再有本插件
-  // 双保险：上面那次移除若没生效（并发写 package.json / 解析失败），**回滚本次 patch 行**，
-  // 宁可退回 bundles 形态（需重启）也绝不留"两处激活"→ dsh web 启动会 duplicate id 崩掉。
-  if (pkgBundles().length) {
-    writePatchDocument(patchFile, original);
-    return { ok: false, reason: "bundles 条目未能移除，已回滚 patch 行以免重复激活", changed: false, bundleOnly: true, basePatch: original };
-  }
+  // ⚠️ 这里**不再** removeBundleEntry:能走到这行说明 bundles 里本来就没有本插件
+  //   (inBundles 为空的早退已保证),删是空操作;而且方向是反的 —— 见函数顶部注释。
+  //   写前/写后双校验已经确保"我们的 id 在 patch 里恰好一次",这就是唯一激活点。
   return { ok: true, changed: true, basePatch: original };
 }
 
@@ -1785,8 +1871,14 @@ function removeBundleEntry(pkgFile) {
 }
 
 /**
- * 把我们手上这份插件包落到 profile 并激活（唯一激活点 = patch 行 → 热加载）。
- * 两条路径共用：① 无依赖或 file: 依赖（我们自己管源码）；② 市场装法但本地版本更新。
+ * 把我们手上这份插件包落到 profile 并激活。
+ *
+ * ★ 2026-09-22 方向反转：激活点**优先由 `dsh.profile.bundles` 承担**，我们不再写 patch 行。
+ *   旧实现为了"装完即热加载"而摘掉 bundles、改走 patch 行；但**自动维护流程会把插件自带
+ *   bundle 周期性写回** bundles，于是"删了又回来"→ 两处激活 → dsh web 启动即
+ *   `duplicate loader entry id: dsh-remote-web` 崩树。
+ *   现在稳定方向 = **bundle 归包管理器管、我们不动它**；代价是失去热加载，
+ *   由**安装器随后触发的重启**来让新版生效（`hotPatch:false` → 调用方会重启）。
  * @returns {{hotPatch:boolean, changed:boolean, basePatch?:string}|undefined}
  */
 function activateLocalCopy(profileDir, pkgFile, patchFile, pluginDir, patch, pkg, opts = {}) {
@@ -1821,11 +1913,13 @@ function activateLocalCopy(profileDir, pkgFile, patchFile, pluginDir, patch, pkg
   declarePluginDep(pkgFile);                        // file: 依赖(包管理器 install 不误删)
   const r = ensurePatchActivation(patchFile, pluginLocalDir, pkgFile, { forcePatch: !!opts.forcePatch });
   if (r.ok) {
-    console.log(`✅ 插件已就绪: ${pluginLocalDir}${opts.forcePatch ? "（激活点已转为 patch 行，装完即热加载）" : ""}`);
+    // 走到这里 = 插件**不在** bundles,所以 patch 行是唯一激活点,可以热加载。
+    console.log(`✅ 插件已就绪: ${pluginLocalDir}（激活点为本插件的 patch 行，装完即热加载）`);
     return { hotPatch: true, changed: r.changed, basePatch: r.basePatch };
   }
   if (r.bundleOnly) {
-    console.log("ℹ 该插件已由 dsh.profile.bundles 声明（保持单一激活点，不重复写入 patch 行）");
+    // 稳定形态：bundle 归包管理器管，我们不写第二个激活点。代价是无热加载 → 调用方会重启。
+    console.log("ℹ 插件已由 dsh.profile.bundles 激活（保持单一激活点，不重复写 patch 行；重启后生效）");
   } else {
     console.warn(`⚠️ 无法写入 patch 激活行（${r.reason}），改为 bundles 形态（需重启 dsh web 生效）`);
     ensureBundleEntry(pkgFile);

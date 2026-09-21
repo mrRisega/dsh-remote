@@ -89,7 +89,8 @@ function loadPlugin(opts = {}) {
   class MutationObserverMock { constructor() {} observe() {} disconnect() {} }
 
   const localStorage = {
-    _store: new Map(),
+    // opts.localStorageSeed：预置 key/value（如 dsh-remote-marketing-more-v1=1 → 营销入口已收纳进「更多」）
+    _store: new Map(Object.entries(opts.localStorageSeed || {})),
     getItem(k) { return this._store.has(k) ? this._store.get(k) : null; },
     setItem(k, v) { this._store.set(k, String(v)); },
     removeItem(k) { this._store.delete(k); },
@@ -407,6 +408,55 @@ test("E2EE 徽标：未登录 / host 未下发 e2ee → 不打扰（不渲染状
   const oldHost = loadPlugin();
   oldHost.states[0] = stateWith({ running: true });
   assert.equal(e2eeLine(oldHost.render()), undefined, "未下发 service.e2ee 时不应渲染状态行");
+});
+
+test("「更多」只收纳营销入口：档位规格数字（Mbps / GB / 价格）不再出现在账号卡里", () => {
+  // 收纳态（localStorage 里记着用户关掉过引导）＝「更多」里会出现那两条折叠入口的场景
+  const plugin = loadPlugin({ localStorageSeed: { "dsh-remote-marketing-more-v1": "1" } });
+  plugin.states[0] = { config: { phone: "13800000000", deviceId: "dev-x" }, service: { running: true } };
+  let tree = plugin.render();
+
+  // 真实用户路径：点披露按钮展开「更多」
+  const toggle = find(tree, (n) => n.props?.id === "dru-account-more");
+  assert.ok(toggle, "账号卡应有「更多」披露按钮");
+  assert.equal(toggle.props["aria-expanded"], "false", "默认收起");
+  toggle.props.onClick();
+  tree = plugin.render();
+  const body = find(tree, (n) => n.props?.className === "dru-more-body");
+  assert.ok(body, "「更多」内容体应在 DOM 里");
+  assert.equal(body.props.hidden, false, "点击后应展开（hidden=false）");
+
+  // 【0.6.11】档位明细整块删除：标题「套餐与额度」、PRO / Pro Max 规格行、价格与结论句都不再渲染
+  assert.ok(!textHas(body, "套餐与额度"), "「套餐与额度」标题应删除");
+  assert.ok(!textHas(body, "Mbps"), "不得再渲染带宽数值（业主口径：本地面板不展示 PRO 版本流量带宽）");
+  assert.ok(!textHas(body, "GB"), "不得再渲染流量数值");
+  assert.ok(!textHas(body, "¥"), "不得再渲染价格");
+  assert.ok(!textHas(body, "以套餐页为准"), "随档位明细一起删掉的结论句不得残留");
+  // 整张账号卡同样一个规格数字都不许有
+  assert.ok(!textHas(tree, "Mbps"), "账号卡里不得出现 Mbps");
+  assert.ok(!textHas(tree, "¥"), "账号卡里不得出现价格");
+
+  // 但两条**折叠的营销入口**仍在（业主只要数字走，入口留着）
+  const upsell = find(body, (n) => n.type === "button" && (n.children || []).some((c) => typeof c === "string" && c.includes("升级 PRO")));
+  const invite = find(body, (n) => n.type === "button" && (n.children || []).some((c) => typeof c === "string" && c.includes("带新用户换会员")));
+  assert.ok(upsell, "「更多」里应保留「🚀 升级 PRO」入口");
+  assert.ok(invite, "「更多」里应保留「🎁 带新用户换会员」入口");
+  assert.equal(typeof upsell.props.onClick, "function");
+  assert.equal(typeof invite.props.onClick, "function");
+
+  // 源码级：函数与其调用都删掉了（不留死代码）。
+  // ⚠️ 断言「代码形态」而不是裸标识符 —— 注释里**故意**留着「这里原本是什么、为什么删」的说明
+  //    （与 settings-entry.test.mjs 的同款约定：注释里允许出现说明文字）。
+  assert.doesNotMatch(SOURCE, /function renderPlanDetail\(/, "renderPlanDetail 函数必须删除");
+  assert.doesNotMatch(SOURCE, /^\s*renderPlanDetail\(\),/m, "renderPlanDetail 的调用点必须删除");
+  assert.doesNotMatch(SOURCE, /function planSpecText\(/, "planSpecText 定义必须删除");
+  assert.doesNotMatch(SOURCE, /planSpecText\("/, "planSpecText 的调用必须删除");
+  assert.doesNotMatch(SOURCE, /function freeMbpsOf\(/, "freeMbpsOf 定义必须删除");
+  assert.doesNotMatch(SOURCE, /=\s*freeMbpsOf\(\)/, "freeMbpsOf 的调用必须删除");
+  assert.doesNotMatch(SOURCE, /var FREE_FACTS\s*=/, "FREE_FACTS 定义必须删除（只被 freeMbpsOf 使用）");
+  assert.doesNotMatch(SOURCE, /" Mbps"|" GB\/月，¥"/, "不得残留渲染规格数字的字符串拼接");
+  // 不变量仍在：planFactsOf 仍被 upgradePath 用来取档位展示名（不是死代码）
+  assert.match(SOURCE, /var name = planFactsOf\(key\)\.name;/);
 });
 
 test("E2EE 徽标（源码级约束）：client 含徽标字段/文案与 reason 映射表", () => {

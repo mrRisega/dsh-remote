@@ -189,6 +189,23 @@ test("入口迁移：注册 settings.section 栏目（id/order/label），移除
   assert.equal(plugin.registered.has("dsh-remote-panel"), false, "浮动配置面板不应再注册");
 });
 
+test("入口迁移：settings.section 里**只有一个**栏目（id=dsh-remote）——微信机器人不再是第二个栏目", () => {
+  const plugin = loadPlugin();
+  // 再跑一次 inject 回调（宿主重开设置页会重跑），断言不会冒出第二个栏目
+  plugin.injects.get("settings.section")();
+  const sections = [...plugin.metas.values()].filter((m) => m.name === "settings.section");
+  assert.deepEqual(sections.map((m) => m.id), ["dsh-remote"],
+    `settings.section 只应有 dsh-remote 一个栏目，实际：${sections.map((m) => m.id).join(",")}`);
+  assert.equal(plugin.metas.has("dsh-remote-wechat"), false,
+    "「🤖 微信机器人」不得再注册成独立栏目（0.6.11：搬进面板的第三个 tab「微信机器人通道」）");
+  assert.doesNotMatch(SOURCE, /dsh-remote-wechat/, "源码里也不得残留第二个栏目的 id");
+  // 搬进去之后仍然存在：面板 tab 条里的第三个 tab + 微信绿泡泡图标（行为断言见 wechat-bot-ui.test.mjs）
+  assert.match(SOURCE, /"微信机器人通道"/, "微信机器人 tab 必须在面板里");
+  assert.match(SOURCE, /dru-wx-ico/, "微信 tab 必须带绿泡泡图标 class");
+  // 槽注入次数仍是两次（settings.section + shell.overlay），没有偷偷加第三个 inject
+  assert.equal(plugin.injects.size, 2, `inject 的槽名应仍是 settings.section + shell.overlay，实际：${[...plugin.injects.keys()].join(",")}`);
+});
+
 test("登录态账号区：无「切换账号」，有「退出登录」，头部/关于卡文案为「远程访问」", () => {
   const plugin = loadPlugin();
   plugin.states[0] = { config: { phone: "13800000000", deviceId: "dev-test" }, service: { running: false } };

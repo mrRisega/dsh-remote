@@ -82,8 +82,12 @@ function shQuote(s) {
 
 /** 默认配置目录（可被 entry config 的 relayDir / DSH_RELAY_DIR 环境变量覆盖）。 */
 const DEFAULT_RELAY_DIR = process.env.DSH_RELAY_DIR || join(homedir(), ".dsh-remote");
-// 默认云端服务地址（SaaS 入口；自建用户在设置页/面板切换）
-const DEFAULT_API = "https://n.risegao.cn:13443/relay-api";
+// 默认云端服务地址（SaaS 入口；自建用户在设置页/面板切换）。
+// DSH_RELAY_DEFAULT_API 只改「配置里根本没写 api_url」时的兜底：测试脚本把它指向本地死端口，
+// 这样任何**在临时目录被拆掉之后**才跑到的后台请求（如装机上报的重试）都不会打生产。
+// 真实事故形态见 test/wechat-bind-telemetry.test.mjs 的注释：用例拆目录 → 读到空配置 → 回落生产。
+const DEFAULT_API = String(process.env.DSH_RELAY_DEFAULT_API || "").trim()
+  || "https://n.risegao.cn:13443/relay-api";
 const DEFAULT_APP_URL = "https://n.risegao.cn:13443/app/";
 
 /**
@@ -102,7 +106,15 @@ function hardenFile(file) {
   try { fs.chmodSync(file, 0o600); } catch { /* POSIX 上失败不致命 */ }
   if (process.platform !== "win32") return;
   const who = [process.env.USERDOMAIN, process.env.USERNAME].filter(Boolean).join("\\");
-  if (!who) return;
+  // 两个环境变量都取不到时**绝不能静默返回**：那会让人以为文件已加固，实际仍是继承 ACL。
+  // 正常 Windows 会话不会走到这里（USERNAME 必然存在），但受限令牌/服务账户下有可能。
+  if (!who) {
+    if (!hardenWarned) {
+      hardenWarned = true;
+      console.warn(`⚠️ 无法收紧文件权限（USERDOMAIN/USERNAME 均未设置）：${file}`);
+    }
+    return;
+  }
   let r;
   try {
     r = spawnSync("icacls", [file, "/inheritance:r", "/grant:r", `${who}:F`],
@@ -2441,7 +2453,7 @@ const PLUGIN_ID = "dsh-remote-web";
 const PLUGIN_LEGACY_IDS = ["dsh-remote-ui"];
 const PLUGIN_ALL_IDS = [PLUGIN_ID, ...PLUGIN_LEGACY_IDS];
 /** 插件自身发布版本（与 dsh-remote 根包同步递增）。 */
-const PLUGIN_VERSION = "0.6.9";
+const PLUGIN_VERSION = "0.6.10-beta.1";
 const UPDATE_LOG = ".dsh-update.log";
 const UPDATE_MARKER = ".dsh-update-running";
 
@@ -3517,8 +3529,10 @@ function ensureConnection(relayDir, opts = {}) {
 //     重装即变，不可跨机器关联）；
 //   · 只发白名单事件（TELEMETRY_EVENT_NAMES）与白名单 fail_code（TELEMETRY_FAIL_CODES），
 //     原始错误文本一律不透传（它可能含路径/主机名）；
-//   · 允许的字段**只有**：install_id / 事件名 / fail_code / 版本号 / os(process.platform) /
-//     arch(process.arch) / node(仅主版本号)——唯一构造点是 telemetryEventOf()；
+//   · 允许的字段**只有**：install_id / 事件名 / fail_code / 插件版本 / **宿主 DSH 版本** /
+//     **更新通道** / os(process.platform) / arch(process.arch) / node(仅主版本号)——唯一构造点是
+//     telemetryEventOf()。宿主版本与通道都是**非识别性的版本串**（形如 0.1.5-rc.2 / beta），
+//     它们回答的是"这个插件跑在哪个 DSH 上、走的哪条发布通道"，不指向任何个人或机器；
 //   · 禁止采集（代码与 docs/telemetry.md 双写死）：手机号、邮箱、账号 ID、任何会话内容或文件内容、
 //     真实 hostname / 用户名 / 文件路径、密码与密钥、设备指纹(machine_fp)、原始 IP、精确地理位置；
 //   · 可关闭：DSH_REMOTE_TELEMETRY=0 → 完全关闭（不生成 install_id、不落任何文件、不发任何请求）；
@@ -3526,14 +3540,24 @@ function ensureConnection(relayDir, opts = {}) {
 //
 // 契约（服务端冻结）：POST <api_url>/api/telemetry/events，headers
 //   { content-type: application/json, x-dsh-client: dsh-remote/<PLUGIN_VERSION> }（无 Authorization），
-//   body { install_id, source: "plugin", events: [{ name, at, version, os, arch, node, fail_code? }] }，
+//   body { install_id, source: "plugin", events: [{ name, at, version, harness_version, channel, os, arch, node, fail_code? }] }，
 //   单批 ≤ 20 条、body ≤ 32KB。
+//   `version` = 插件自身版本；`harness_version` = 插件**运行所在的 DSH 宿主**版本（运行时探测，未知为 ""），
+//   两者都不是一回事 —— 2026-09 生产问题的根因就是只有前者、答不出"是不是 DSH 兼容性问题"。
+//   `harness_version` / `channel` 必须匹配服务端 TELEMETRY_MISC_RE = /^[A-Za-z0-9._-]{0,32}$/，
+//   否则会被服务端**静默清空**：所以这里先自判，不合法就发 ""（未知），绝不发一个被改写过的值。
 
-/** 事件名白名单：只用这些，其它一律不发。 */
+/**
+ * 事件名白名单：只用这些，其它一律不发。
+ * 2026-09 新增 wechat_bound / wechat_unbound：微信机器人通道的**绑定态跳变**（两态模型，
+ * 见 docs/wechat-bot-channel.md §9）—— 这一对该不该有人用、用了之后会不会掉，此前完全看不见。
+ * 与服务端 TELEMETRY_EVENTS 必须**逐字对齐**（少一个 = 服务端静默丢弃，事件看起来"没上报"）。
+ */
 const TELEMETRY_EVENT_NAMES = new Set([
   "install_started", "install_failed", "runtime_ready", "bridge_started", "bridge_registered",
   "tunnel_disconnected", "first_remote_ok", "plugin_loaded", "panel_opened", "harness_restart",
   "update_started", "update_failed",
+  "wechat_bound", "wechat_unbound",
 ]);
 /**
  * fail_code 白名单 —— **必须与服务端 TELEMETRY_FAIL_CODES 完全一致**。
@@ -3711,8 +3735,91 @@ function telemetryMarkOnce(relayDir, name) {
 }
 
 /**
+ * 微信通道「上次观测到的 bound」的跨进程记忆键（与 first_remote_ok 共用同一份
+ * .telemetry-once.json，0600）。**刻意不新增第二个落盘机制**：这份文件就是本文件里
+ * "跨进程只记一次/只记一个值"的既有约定，绑定的基线属于同一类事实。
+ * 取值：1 = 上次看到已绑定，0 = 上次看到未绑定，键不存在 = **从未观测过**（null）。
+ */
+const TELEMETRY_WECHAT_BOUND_KEY = "wechat_bound_state";
+/**
+ * 读回绑定的基线（上次观测值）。键不存在 / 文件缺失 / 损坏 → null（= 从未观测）。
+ * 这里**不能**把 null 当成 false：null 是"没观测过"（首次观测要播种基线、不发事件），
+ * false 是"观测过且未绑定"（之后的 true 才算跳变）。两者混淆会系统性虚高绑定数。
+ */
+function telemetryWeChatBoundBaseline(relayDir) {
+  const v = telemetryOnceFlags(relayDir)[TELEMETRY_WECHAT_BOUND_KEY];
+  if (v === 1 || v === true) return true;
+  if (v === 0 || v === false) return false;
+  return null;
+}
+/** 落盘本次观测到的 bound（0600，写不进去静默）。写失败 → 退化为"每次都是首次观测"：宁可少报，绝不重复计数。 */
+function telemetryMarkWeChatBound(relayDir, bound) {
+  try {
+    if (!telemetryDirReady(relayDir)) return;
+    writeFileSync(join(relayDir, TELEMETRY_ONCE_FILE),
+      JSON.stringify({ ...telemetryOnceFlags(relayDir), [TELEMETRY_WECHAT_BOUND_KEY]: bound ? 1 : 0 }), { mode: 0o600 });
+  } catch { /* 非关键 */ }
+}
+
+/**
+ * 版本类字符串的清洗。服务端只接受 TELEMETRY_MISC_RE = /^[A-Za-z0-9._-]{0,32}$/，
+ * 不匹配的字符串字段会被**静默清空**（数据看起来"没上报"而不是"上报错了"）。
+ * 所以这里先判：合法且非空 → 原样发；否则发 ""（= 未知）。
+ * **绝不改造原始值**——被截断/替换过的版本号比"未知"更糟：它会污染归因，且无从分辨。
+ */
+const TELEMETRY_TOKEN_RE = /^[A-Za-z0-9._-]{1,32}$/;
+function telemetryToken(v) {
+  const s = String(v ?? "");
+  return TELEMETRY_TOKEN_RE.test(s) ? s : "";
+}
+
+/**
+ * 宿主（DSH / DeepSeek Harness）版本 —— **运行时经验获取，不猜、不硬编码**。
+ *
+ * 为什么必须有（2026-09 生产问题）：注册 48 人只有 27 人成功，但这个问题当天**答不出来** ——
+ * 遥测里的 `version` 是**插件自己**的版本，插件跑在哪个 DSH 上从来没上报过。这类数据**不能回填**，
+ * 只能从改版后的新装机开始积累。
+ *
+ * 取值来源（唯一）：本进程的**主模块** process.argv[1]。dsh CLI 的入口是 `<pkg>/lib/bin.js`
+ * （bin 名 `dsh` → 软链 → `<...>/@deepseek-ai/dsh/lib/bin.js`），而 DSH 自己就是用
+ * `<pkg>/lib/../package.json` 读版本的（dsh/lib/bin.js 的 readVersion()），所以"入口的上一级
+ * package.json"是**宿主保证的布局**，不是我们的假设。
+ * 本机实测（dsh 0.1.5-rc.2，真实 `dsh web` 进程的 argv）：
+ *   argv[1] = /opt/homebrew/bin/dsh（软链）
+ *   → realpathSync = /opt/homebrew/lib/node_modules/@deepseek-ai/dsh/lib/bin.js
+ *   → ../package.json = { "name": "@deepseek-ai/dsh", "version": "0.1.5-rc.2" } → 采到 "0.1.5-rc.2"
+ * 为什么不用另外三条路（都实测过）：
+ *   · 环境变量：DSH 进程**不设置任何 DSH_* 版本变量**（实测 `ps eww`：只有 PATH/HOME/proxy 那几个，
+ *     连 DSH_HOME 都没有）→ 无从取值；
+ *   · 起 `dsh --version` 子进程：要拉起一个 node（慢），PATH 里没有 dsh 时还要兜底，且**可能挂住** ——
+ *     违反"遥测不得阻塞/挂起"的前提，直接排除；
+ *   · cordis 上下文 / 模块解析：宿主只 provide 了 `dshHomePath`，没有版本服务；profile 的
+ *     node_modules 里也**没有** @deepseek-ai/dsh（实测），require.resolve 够不到宿主包。
+ * 代价只是读一个本地小 JSON：不起进程、不联网、不可能挂住。任何异常 / 非 dsh 启动
+ * （Electron、被嵌入、直接 node 跑别的脚本、测试进程）→ 返回 ""（未知），绝不抛、绝不阻塞遥测。
+ */
+const HARNESS_PACKAGE_NAME = "@deepseek-ai/dsh";
+
+/** 由主模块路径解析宿主版本；读不到 / 不是 DSH / 版本串不合法（含空）→ ""。 */
+function harnessVersionFromEntry(entry) {
+  try {
+    const real = realpathSync(String(entry || ""));   // 软链（/opt/homebrew/bin/dsh）先落回真实文件，否则"上一级"会指错目录
+    const manifest = JSON.parse(readFileSync(join(dirname(real), "..", "package.json"), "utf8"));
+    if (!manifest || manifest.name !== HARNESS_PACKAGE_NAME) return "";  // 不是 DSH 启动（如 Electron / 测试进程）
+    return telemetryToken(manifest.version);
+  } catch {
+    return "";                                        // 非关键：读不到就是"未知"
+  }
+}
+
+/** 本进程运行所在的宿主版本（未知 = ""）。每次调用现读：事件量很小，且绝不该缓存出过期结论。 */
+function harnessVersion() {
+  return harnessVersionFromEntry(process.argv[1]);
+}
+
+/**
  * 【唯一的 payload 构造点】把事件名 + 少量上下文编译成一条遥测事件。
- * 字段仅限契约白名单：name / fail_code / at / version / os / arch / node。
+ * 字段仅限契约白名单：name / fail_code / at / version / harness_version / channel / os / arch / node。
  * 这里**绝不**写入手机号、邮箱、账号 ID、会话或文件内容、hostname、用户名、文件路径、
  * 密码/密钥、machine_fp、IP、地理位置等任何可识别信息（见 docs/telemetry.md「不采集什么」）。
  * 返回 null = 事件名不在白名单 → 调用方一律不发。
@@ -3722,7 +3829,9 @@ function telemetryEventOf(name, extra = {}) {
   const ev = {
     name,
     at: Date.now(),
-    version: PLUGIN_VERSION,
+    version: PLUGIN_VERSION,                                    // 插件自身版本（≠ 宿主版本）
+    harness_version: harnessVersion(),                          // 宿主 DSH 版本（运行时探测；未知 = ""）
+    channel: telemetryToken(UPDATE_TAG),                        // 更新通道 latest/beta（与"一键更新"同源；未知 = ""）
     os: process.platform,                                       // 仅平台名（darwin/linux/win32），非主机名
     arch: process.arch,                                         // 仅架构（arm64/x64）
     node: String(process.versions?.node || "").split(".")[0],   // 仅主版本号，如 "22"
@@ -4004,6 +4113,55 @@ function telemetryStop(relayDir) {
   } catch { /* 静默 */ }
 }
 
+/**
+ * 微信机器人通道的**绑定态跳变** → 匿名遥测（两态模型：未绑定 / 已绑定，见 docs/wechat-bot-channel.md §9）。
+ *
+ * 触发点：每一次把面板请求代理到 bridge 控制面之后顺手调用一次（本文件唯一的调用点）——
+ *   **不新增定时器、不新增轮询**，只复用面板本来就会发生的读取节奏。
+ *
+ * 只报**跳变**：
+ *   unbound → bound    = wechat_bound
+ *   bound   → unbound  = wechat_unbound
+ * 稳态（连续多次读到同一个 bound）**一条都不发**：面板在扫码/绑定期间会反复轮询 status，
+ * 若按"每次读到 bound:true 就记一条"，同一台机器的一次绑定会被刷成几十条，指标直接失去意义。
+ *
+ * ★ 首次观测**不是**跳变：进程启动后第一次读到这个文件时，若它已经是 bound:true，说明这次绑定
+ *   可能发生在几天前（宿主/面板过一段时间才会被打开）—— 此时只**播种基线**、不发事件。
+ *   把"启动时就已经绑好"当成新绑定，会把历史存量每天都虚报一遍（这是最容易做错、也最难发现的一种虚高）。
+ *   基线与"是否观测过"记在既有的跨进程文件 .telemetry-once.json（0600，与 first_remote_ok 同一份）：
+ *   复用已有持久化约定，既不另造机制，也绝不去写 bridge 拥有的 .wechat-state.json。
+ *
+ * 隐私边界：只取 `bound` 一个布尔量，事件本体仍是 telemetryEventOf() 那 9 个字段（版本/os/arch/node…）。
+ *   **绝不**上报 bot_id、bot_token、被绑定的微信用户标识、手机号或 .wechat-state.json 里的任何其它字段
+ *   ——这些字段在本函数里连读都不读。
+ * 静默边界：文件缺失 / 内容损坏 / 权限不足 / 半写（JSON 截断）= **本次没有观测**，
+ *   既不抛异常进面板路由，也**不当作 unbound**（把它当 unbound 会在下次读到 false→true 之外的假跳变）。
+ * 开关：DSH_REMOTE_TELEMETRY=0 → 直接返回，连文件都不读、连基线都不落（与其余遥测同一语义）。
+ *
+ * @returns {boolean|null} 本次观测到的 bound；未观测（开关关闭 / 读不出）为 null
+ */
+function telemetryObserveWeChat(relayDir) {
+  try {
+    if (!telemetryEnabled()) return null;          // 关闭：零读取、零落盘、零请求
+    let state = null;
+    try {
+      state = JSON.parse(readFileSync(join(relayDir, WECHAT_STATE_FILE), "utf8"));
+    } catch {
+      return null;                                  // 缺失 / 损坏 / 半写：本次没有观测（不是 unbound）
+    }
+    if (!state || typeof state !== "object" || typeof state.bound !== "boolean") return null;
+    const bound = state.bound;
+    const baseline = telemetryWeChatBoundBaseline(relayDir);
+    if (baseline === bound) return bound;           // 稳态：不重复计数
+    telemetryMarkWeChatBound(relayDir, bound);      // 先落基线再入队：宁可丢一条，也绝不重复计数
+    if (baseline === null) return bound;            // 首次观测：只播种基线（见上方 ★）
+    telemetryRecord(relayDir, bound ? "wechat_bound" : "wechat_unbound");
+    return bound;
+  } catch {
+    return null;                                    // 遥测异常绝不冒泡到面板 / bridge 流程
+  }
+}
+
 /** 内部接口（仅供本仓库测试与隐私审计；不属于插件对外契约，也不被面板/浏览器半使用）。 */
 export const __telemetryInternals = {
   enabled: telemetryEnabled,
@@ -4015,8 +4173,18 @@ export const __telemetryInternals = {
   // 归因函数也暴露出来：Windows 装机失败此前全落到 unknown，需要能被用例逐条锁住
   failCodeFromText: (text) => telemetryFailCodeFromText(text),
   failCodeFromError: (e) => telemetryFailCodeFromError(e),
+  // 宿主版本探测与字符串清洗也暴露出来：这两条是"能不能答出兼容性问题"的关键，
+  // 必须能被用例逐条锁住（含未知/非法值的降级行为）。
+  harnessVersion: () => harnessVersion(),
+  harnessVersionFromEntry: (entry) => harnessVersionFromEntry(entry),
+  harnessToken: (v) => telemetryToken(v),
+  updateTag: UPDATE_TAG,
   eventNames: [...TELEMETRY_EVENT_NAMES],
   failCodes: [...TELEMETRY_FAIL_CODES],
+  // 微信通道绑定态观测（跳变判定 + 基线落盘）也暴露出来：这是"首次观测 != 跳变"这条
+  // 最容易被写错、且写错就会让绑定数系统性虚高的规则，必须能被用例直接逐条锁住。
+  observeWeChat: (relayDir) => telemetryObserveWeChat(relayDir),
+  wechatBoundBaseline: (relayDir) => telemetryWeChatBoundBaseline(relayDir),
   queueMax: TELEMETRY_QUEUE_MAX,
   batchMax: TELEMETRY_BATCH_MAX,
   bodyMax: TELEMETRY_BODY_MAX,
@@ -4102,6 +4270,235 @@ function maybeReportInstall(relayDir, opts = {}) {
   // 认证走 relayTokenWithReason（60s token 缓存 + 并发合并），因此启动/登录/轮询多次调用
   // 也只会打一次 device-login，不会放大企业端认证请求。
   reportInstallOnce(relayDir, null, opts).catch(() => { /* 静默失败：不影响 UI */ });
+}
+
+// ---------- 微信机器人通道（bridge 控制面代理） ----------
+//
+// 微信通道**不在本进程里**：它跑在 bridge（clients/dsh-remote/wechat-runtime.mjs）中，那里只
+// bind 127.0.0.1 的控制面。发现方式与鉴权（docs/wechat-bot-channel.md §3/§8/§10）：
+//   · 端口：<relayDir>/.wechat-control.json = {port,pid,started_at,header} —— **不含任何密钥**；
+//   · 密钥：<relayDir>/.dsh-config.json 的 bridge_secret（与 bridge 同源），放进
+//     `x-dsh-bridge-secret` 头，**只在宿主进程内使用，绝不下发浏览器**。
+//
+// 本半边只做代理：面板 → /dsh-remote/wechat/* → 控制面 /wechat/*。转发回来的一切按键名再脱敏一次
+// （任何名字含 token 的字段一律丢弃）——bridge 侧已有 sanitizeAccount，这里是第二道闸门，
+// 即使上游某天回归了漏脱敏、或新增了字段，浏览器也拿不到 bot_token（§8「面板 API 永不回显 token」）。
+const WECHAT_CONTROL_FILE = ".wechat-control.json";
+const WECHAT_CONTROL_HEADER = "x-dsh-bridge-secret";
+/**
+ * 微信通道的**面板状态文件** `{ bound, bot_id, bound_at, connected_at, last_push_ok_at, last_error }`
+ * （bridge 侧写、0600；绑定模型只有「已绑定 / 未绑定」两态，见 docs/wechat-bot-channel.md §9）。
+ * 宿主半边**只读不写** —— 它是 bridge 的财产；本半边只借 `bound` 这一个布尔量做匿名遥测的跳变判定
+ * （其余字段一个都不读、更不可能外发，见下方 telemetryObserveWeChat 的隐私边界）。
+ */
+const WECHAT_STATE_FILE = ".wechat-state.json";
+
+/** 控制面单次调用超时（本地回环，正常在毫秒级；超时 = bridge 卡住或端口被别的东西占了）。 */
+function wechatControlTimeoutMs() {
+  const n = Number(process.env.DSH_WECHAT_CONTROL_TIMEOUT_MS || 0);
+  return Number.isFinite(n) && n > 0 ? n : 6000;
+}
+/**
+ * `GET /wechat/bind/poll` 是**长轮询**（bridge 侧一次可以挂到 35s 才回，见 wechat-channel.mjs 的
+ * QR_LONG_POLL_TIMEOUT_MS）。对这一个路由沿用「短超时」会制造**假超时**——bridge 明明在正常等待
+ * 扫码，面板却报「后台服务卡住了」，用户会去重启一个完全正常的后台服务。故只给它放宽，
+ * 其余路由一律短超时（那种超时是真的卡住了）。
+ */
+const WECHAT_POLL_TIMEOUT_MS = 40_000;
+
+/** pid 是否还活着（EPERM = 存在但属于别人 → 视为活着）。 */
+function wechatProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return !!(e && e.code === "EPERM");
+  }
+}
+
+/**
+ * 读控制面发现文件。**不抛**：任何异常都翻成 {error:{code,error}} —— 因为每种失败对应的用户动作
+ * 都不同（启动后台服务 / 重启 / 一键更新），绝不能塌成一句「失败」。
+ * @returns {{port:number,pid:number}|{error:{code:string,error:string}}}
+ */
+function readWeChatControl(relayDir) {
+  let raw;
+  try {
+    raw = readFileSync(join(relayDir, WECHAT_CONTROL_FILE), "utf8");
+  } catch {
+    return {
+      error: {
+        code: "no_control_file",
+        error: "本机后台服务还没有运行微信机器人通道（找不到发现文件），通常是两个原因之一：后台服务没启动，或它的版本比面板旧、不支持微信机器人。请先到「📱 远程访问」面板启动后台服务；若已在运行，点那里的「一键更新」升级后再回到本页。",
+      },
+    };
+  }
+  let info = null;
+  try { info = JSON.parse(raw); } catch { info = null; }
+  const port = info && Number.isInteger(info.port) ? info.port : 0;
+  if (!info || typeof info !== "object" || port <= 0 || port > 65535) {
+    return {
+      error: {
+        code: "bad_control_file",
+        error: `微信机器人通道的发现文件（${WECHAT_CONTROL_FILE}）内容无法识别，可能是写入中断或文件损坏。到「📱 远程访问」面板重启一次后台服务即可重建它，然后回到本页重试。`,
+      },
+    };
+  }
+  // 发现文件是**上一次**进程写下的：bridge 退出后它会残留。这时如实说「残留」，
+  // 而不是让用户对着「连接被拒绝」去猜——两种情况的处置动作不一样。
+  const pid = Number.isInteger(info.pid) && info.pid > 0 ? info.pid : 0;
+  if (pid && !wechatProcessAlive(pid)) {
+    return {
+      error: {
+        code: "stale_control_file",
+        error: `微信机器人通道的发现文件是上一次后台服务留下的（进程 ${pid} 已不在），现在没有进程在监听。到「📱 远程访问」面板启动/重启后台服务后回到本页重试。`,
+      },
+    };
+  }
+  return { port, pid };
+}
+
+/**
+ * 递归丢弃任何**名字里含 token** 的字段（§8：面板 API 永不回显 bot_token）。
+ * 只按键名过滤，其它字段照原样透传 —— 面板需要的字段一个不少。
+ */
+function scrubWeChatTokens(value, depth = 0) {
+  if (depth > 6 || value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map((v) => scrubWeChatTokens(v, depth + 1));
+  const out = {};
+  for (const key of Object.keys(value)) {
+    if (/token/i.test(key)) continue;
+    out[key] = scrubWeChatTokens(value[key], depth + 1);
+  }
+  return out;
+}
+
+/**
+ * 把一次面板请求代理到 bridge 控制面。
+ *
+ * @param {string} relayDir 配置目录
+ * @param {string} routePath 控制面路径（如 "/wechat/status"）
+ * @param {{method?:string, body?:any, timeoutMs?:number}} [init]
+ * @returns {Promise<{ok:true, body:any}|{ok:false, status:number, code:string, error:string}>}
+ *   失败一律带**各不相同**的人话文案（code 供面板/测试分流）；绝不把密钥或上游原始错误回给浏览器。
+ */
+async function wechatControlCall(relayDir, routePath, init) {
+  const ctl = readWeChatControl(relayDir);
+  if (ctl.error) return { ok: false, status: 503, code: ctl.error.code, error: ctl.error.error };
+
+  const secret = readBridgeSecret(relayDir);
+  if (!secret) {
+    // 没有密钥就不能调用控制面（bridge 侧同样会 403）。如实说是「本机还没拿到设备密钥」，
+    // 而不是伪装成连接故障——此时用户要做的动作是去登录 / 一键更新，不是重启。
+    return {
+      ok: false,
+      status: 503,
+      code: "no_secret",
+      error: "本机配置里还没有设备密钥（bridge_secret），无法安全地调用后台服务的微信通道。请先到「📱 远程访问」面板登录一次（密钥会自动补齐），或点那里的「一键更新」重装运行环境，然后回到本页重试。",
+    };
+  }
+
+  const opts = init || {};
+  const timeoutMs = Number(opts.timeoutMs) > 0 ? Number(opts.timeoutMs) : wechatControlTimeoutMs();
+  const hasBody = opts.body !== undefined && opts.body !== null;
+  const headers = { accept: "application/json", [WECHAT_CONTROL_HEADER]: secret };
+  if (hasBody) headers["content-type"] = "application/json";
+
+  let res;
+  try {
+    res = await fetch(`http://127.0.0.1:${ctl.port}${routePath}`, {
+      method: opts.method || "GET",
+      headers,
+      body: hasBody ? JSON.stringify(opts.body) : undefined,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (e) {
+    const name = String((e && e.name) || "");
+    const cause = String((e && e.cause && e.cause.code) || (e && e.code) || "");
+    if (name === "TimeoutError" || name === "AbortError" || /timeout/i.test(name)) {
+      return {
+        ok: false,
+        status: 504,
+        code: "timeout",
+        error: `等待后台服务的微信通道响应超时（超过 ${Math.round(timeoutMs / 1000)} 秒）。它可能正忙、卡住了，或端口被别的东西占住了。稍后重试；一直这样请到「📱 远程访问」面板重启后台服务。`,
+      };
+    }
+    if (cause === "ECONNREFUSED") {
+      return {
+        ok: false,
+        status: 502,
+        code: "refused",
+        error: "后台服务的微信通道没有在监听（连接被拒绝）——多半是它刚刚重启完，或者已经退出了。等几秒再试；仍未恢复请到「📱 远程访问」面板重启后台服务。",
+      };
+    }
+    return {
+      ok: false,
+      status: 502,
+      code: "unreachable",
+      error: `连接后台服务的微信通道失败${cause ? `（${cause}）` : ""}。请确认「📱 远程访问」面板里的后台服务正在运行，然后重试。`,
+    };
+  }
+
+  let text = "";
+  try { text = await res.text(); } catch { text = ""; }
+  let body = null;
+  try { body = text ? JSON.parse(text) : null; } catch { body = null; }
+  const upstreamError = body && typeof body === "object" && typeof body.error === "string" ? body.error : "";
+
+  // 鉴权/版本这类「上游说不出缘由」的失败，由本半边给出可据以行动的文案；
+  // 上游自己的业务错误（配对码不合法、二维码取不到…）则原样透传——那是写给用户看的原文。
+  if (res.status === 401) {
+    return {
+      ok: false,
+      status: 502,
+      code: "unauthorized",
+      error: "后台服务拒绝了这次调用（设备密钥不匹配）。密钥可能刚被轮换，或后台服务是用旧密钥启动的。到「📱 远程访问」面板点一次「一键更新」补齐并重启后台服务，然后回到本页重试。",
+    };
+  }
+  if (res.status === 403) {
+    return {
+      ok: false,
+      status: 502,
+      code: "forbidden",
+      error: "后台服务没有配置设备密钥，因此关闭了微信通道的控制面（这是安全默认：没有密钥就拒绝一切，而不是放行）。到「📱 远程访问」面板点「一键更新」补齐运行环境与密钥后重试。",
+    };
+  }
+  if (res.status === 404) {
+    return {
+      ok: false,
+      status: 502,
+      code: "no_such_route",
+      error: "后台服务不认识这个微信通道接口，说明它比当前面板旧。到「📱 远程访问」面板点「一键更新」升级后台服务，然后回到本页重试。",
+    };
+  }
+  if (!res.ok) {
+    return {
+      ok: false,
+      status: 502,
+      code: `upstream_${res.status}`,
+      error: upstreamError || `后台服务的微信通道返回了 HTTP ${res.status}，没有给出原因。稍后重试；一直这样点「📱 远程访问」里的「一键更新」升级后台服务。`,
+    };
+  }
+  if (body === null || typeof body !== "object") {
+    return {
+      ok: false,
+      status: 502,
+      code: "bad_response",
+      error: "后台服务的微信通道返回了无法解析的内容（不是 JSON），多半是版本不匹配。到「📱 远程访问」面板点「一键更新」升级后台服务后重试。",
+    };
+  }
+  return { ok: true, body: scrubWeChatTokens(body) };
+}
+
+/** 代理一次微信通道调用并回写响应（成功体原样透传；失败体统一 {ok:false, code, error}）。 */
+async function sendWeChatProxy(relayDir, res, routePath, init) {
+  const r = await wechatControlCall(relayDir, routePath, init);
+  // 匿名遥测：顺手观测一次绑定态（只认跳变，稳态不重复计数；DSH_REMOTE_TELEMETRY=0 时是零副作用 no-op）。
+  // 放在这里而不是只放 status 路由：bind/verify 与 unbind 也会让 bridge 改写状态文件，
+  // 那时面板可能还没轮到下一次轮询 —— 把观测点挂在唯一的代理出口上，六条路由一个不漏。
+  telemetryObserveWeChat(relayDir);
+  if (r.ok) return sendJson(res, 200, r.body);
+  return sendJson(res, r.status, { ok: false, code: r.code, error: r.error });
 }
 
 function registerRoutes(ctx, relayDir) {
@@ -4291,6 +4688,59 @@ function registerRoutes(ctx, relayDir) {
         const connect = await composeConnect(relayDir);
         telemetryObserveConnect(relayDir, connect); // 匿名遥测：同 bridge-status（去重后不会重复计数）
         sendJson(res, 200, { ok: true, retried: true, action: action && action.action ? action.action : "none", connect });
+      },
+    },
+    // ── 🤖 微信机器人通道（设置页「🤖 微信机器人」栏目） ──────────────────────
+    // 这六条只做代理：真正的协议与扫码状态机在 bridge 里（docs/wechat-bot-channel.md §3/§10）。
+    // 失败一律是 5xx + {ok:false, code, error:<人话>}：面板按 code/文案分流，绝不塌成「失败」两个字。
+    // 路由与契约一一对应，不多也不少（多出来的字段都可能变成 bot_token 的泄漏面）。
+    {
+      method: "GET",
+      path: "/dsh-remote/wechat/status",
+      handler: async (_req, res) => {
+        await sendWeChatProxy(relayDir, res, "/wechat/status");
+      },
+    },
+    {
+      method: "POST",
+      path: "/dsh-remote/wechat/bind/start",
+      handler: async (_req, res) => {
+        await sendWeChatProxy(relayDir, res, "/wechat/bind/start", { method: "POST" });
+      },
+    },
+    {
+      method: "GET",
+      path: "/dsh-remote/wechat/bind/poll",
+      handler: async (_req, res) => {
+        // 长轮询：只有这一条放宽超时（理由见 WECHAT_POLL_TIMEOUT_MS）
+        await sendWeChatProxy(relayDir, res, "/wechat/bind/poll", { timeoutMs: WECHAT_POLL_TIMEOUT_MS });
+      },
+    },
+    {
+      method: "POST",
+      path: "/dsh-remote/wechat/bind/verify",
+      handler: async (req, res) => {
+        // 只转发手机微信上那串数字配对码；不认识的字段一律不带过去（控制面只认 {code}）。
+        const body = await readJsonBody(req);
+        if (body.__parseError) {
+          return sendJson(res, 400, { ok: false, code: "bad_request", error: "配对码提交的数据不是合法 JSON，请重新输入。" });
+        }
+        const code = String(body.code == null ? "" : body.code).trim();
+        await sendWeChatProxy(relayDir, res, "/wechat/bind/verify", { method: "POST", body: { code } });
+      },
+    },
+    {
+      method: "POST",
+      path: "/dsh-remote/wechat/bind/cancel",
+      handler: async (_req, res) => {
+        await sendWeChatProxy(relayDir, res, "/wechat/bind/cancel", { method: "POST" });
+      },
+    },
+    {
+      method: "POST",
+      path: "/dsh-remote/wechat/unbind",
+      handler: async (_req, res) => {
+        await sendWeChatProxy(relayDir, res, "/wechat/unbind", { method: "POST" });
       },
     },
     {

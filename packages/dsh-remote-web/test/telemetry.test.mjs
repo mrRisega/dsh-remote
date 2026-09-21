@@ -15,9 +15,10 @@
 //
 // 手法与 connect-loop.test.mjs 一致：真实分支 + PATH 上的假 launchctl/pgrep/ps/npx，绝不碰本机真实服务。
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import http from "node:http";
 import { chmodSync, existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -36,7 +37,9 @@ async function waitFor(fn, { timeout = 5000, step = 10 } = {}) {
   }
 }
 
-const ALLOWED_EVENT_KEYS = new Set(["name", "at", "version", "os", "arch", "node", "fail_code"]);
+const ALLOWED_EVENT_KEYS = new Set(["name", "at", "version", "harness_version", "channel", "os", "arch", "node", "fail_code"]);
+/** 服务端 TELEMETRY_MISC_RE 的等价物：不匹配的字符串字段会被服务端静默清空。 */
+const SERVER_MISC_RE = /^[A-Za-z0-9._-]{0,32}$/;
 /** 禁止出现在遥测 payload 里的字段/取值（隐私边界；见 docs/telemetry.md「不采集什么」）。 */
 const FORBIDDEN = [
   "phone", "password", "passwd", "email", "token", "secret", "authorization", "bearer",
@@ -236,6 +239,11 @@ function assertContractRequest(req, { eventNames, failCodes }) {
     assert.equal(typeof ev.os, "string");
     assert.equal(typeof ev.arch, "string");
     assert.match(String(ev.node), /^\d+$/, "node 只能是主版本号数字字符串");
+    // 宿主 DSH 版本 + 更新通道：每条事件都必须带；值必须过服务端字符类（否则服务端会静默清空）
+    assert.equal(typeof ev.harness_version, "string", "每条事件必须带 harness_version（未知 = 空串，但不能缺字段）");
+    assert.equal(typeof ev.channel, "string", "每条事件必须带 channel（未知 = 空串，但不能缺字段）");
+    assert.match(ev.harness_version, SERVER_MISC_RE, "harness_version 必须匹配服务端 TELEMETRY_MISC_RE");
+    assert.match(ev.channel, SERVER_MISC_RE, "channel 必须匹配服务端 TELEMETRY_MISC_RE");
     if (ev.name === "install_failed" || ev.name === "update_failed") {
       assert.ok(failCodes.includes(ev.fail_code), "fail_code 必须在白名单内：" + ev.fail_code);
     }
@@ -365,9 +373,170 @@ test("隐私审计：对抗性 extra 字段（手机号/hostname/machine_fp/路�
     for (const bad of ["phone", "password", "hostname", "machine_fp", "username", "device_id", "\\bip\\b", "path"]) {
       assert.ok(!new RegExp(bad).test(body), "payload 构造点里不得出现禁止字段：" + bad);
     }
-    for (const allowed of ["name", "at", "version", "os", "arch", "node", "fail_code"]) {
+    for (const allowed of ["name", "at", "version", "harness_version", "channel", "os", "arch", "node", "fail_code"]) {
       assert.ok(body.includes(allowed), "payload 构造点应只含白名单字段：" + allowed);
     }
+  } finally { await env.restore(); relay.srv.close(); }
+});
+
+// ─────────────── 宿主 DSH 版本 + 更新通道（答得出"是不是 DSH 兼容性问题"） ───────────────
+//
+// 现场（2026-09）：注册 48 人只有 27 人成功，但"是不是兼容性问题"当天**答不出来** —— 遥测里的
+// `version` 是**插件自己**的版本，插件跑在哪个 DSH 上从来没上报过；这类数据**不能回填**，
+// 所以必须先埋上。下面锁死：
+//   ① 宿主版本是**运行时经验取到**的（按真实 dsh 启动形态：argv[1] → 上一级 package.json）；
+//   ② 未知/非法一律退化为空串（绝不猜、绝不抛、绝不改造原始值 —— 改写过的版本号比"未知"更糟）；
+//   ③ 通道 latest/beta 可分（否则预发用户与稳定用户混在一起，同样答不出问题）；
+//   ④ 既有事件名与既有字段一字不改。
+
+const INDEX_URL = new URL("../lib/index.js", import.meta.url).href;
+
+/** 造一个**真实布局**的假 DSH 宿主：<root>/package.json + <root>/lib/bin.js（argv[1] 会指向它）。 */
+async function fakeHarness(root, { name = "@deepseek-ai/dsh", version = "9.9.9-rc.1", entry = "" } = {}) {
+  const lib = path.join(root, "lib");
+  await mkdir(lib, { recursive: true });
+  await writeFile(path.join(root, "package.json"), JSON.stringify({ name, version, type: "module" }));
+  const entryFile = path.join(lib, "bin.js");
+  await writeFile(entryFile, entry);
+  return entryFile;
+}
+
+/** 子进程里按"真实 dsh 启动形态"跑一遍：argv[1] = 宿主 lib/bin.js，把一条事件打成 JSON。 */
+function payloadOfHost(entryFile, extraEnv = {}) {
+  return JSON.parse(execFileSync(process.execPath, [entryFile], {
+    encoding: "utf8", env: { ...process.env, ...extraEnv },
+  }).trim());
+}
+
+/** 假宿主入口的内容：像真 dsh 一样"主模块就是自己的 lib/bin.js"，插件在同一个进程里被装载。 */
+const PRINT_EVENT = `
+const m = await import(${JSON.stringify(INDEX_URL)});
+console.log(JSON.stringify(m.__telemetryInternals.eventOf("plugin_loaded")));
+`;
+
+test("宿主版本：运行时从主模块解析（argv[1] → 上一级 package.json）；未知一律空串且不抛", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "dsh-harness-"));
+  try {
+    const pkgDir = path.join(root, "pm", "node_modules", "@deepseek-ai", "dsh");
+    const entry = await fakeHarness(pkgDir, { version: "0.1.5-rc.2" });
+    assert.equal(TELEMETRY.harnessVersionFromEntry(entry), "0.1.5-rc.2", "应取到宿主 package.json 里的 version");
+    // 真实形态：`/opt/homebrew/bin/dsh` 是**软链** —— 不先 realpath 就会去读错的"上一级"
+    const link = path.join(root, "dsh");
+    try {
+      await symlink(entry, link);
+      assert.equal(TELEMETRY.harnessVersionFromEntry(link), "0.1.5-rc.2", "argv[1] 是软链时必须先落回真实文件");
+    } catch (e) {
+      if (e?.code !== "EPERM") throw e;   // Windows 无权限建软链 → 跳过该断言（macOS/Linux 覆盖真实形态）
+    }
+    // 未知的四条路：不存在 / 空 / 不是 DSH / 清单损坏
+    assert.equal(TELEMETRY.harnessVersionFromEntry(path.join(root, "nope", "bin.js")), "", "入口不存在 → 空串");
+    assert.equal(TELEMETRY.harnessVersionFromEntry(""), "", "空路径 → 空串");
+    assert.equal(TELEMETRY.harnessVersionFromEntry(undefined), "", "undefined → 空串（绝不抛）");
+    const other = await fakeHarness(path.join(root, "other"), { name: "not-dsh-at-all", version: "1.2.3" });
+    assert.equal(TELEMETRY.harnessVersionFromEntry(other), "", "非 DSH 启动（Electron/嵌入/别的脚本）绝不猜版本");
+    await writeFile(path.join(root, "other", "package.json"), "{ 这不是 JSON");
+    assert.equal(TELEMETRY.harnessVersionFromEntry(other), "", "清单损坏 → 空串，且不得抛");
+    // 本进程（测试进程 argv[1] = 本用例文件）→ 不可判定 = 空串；事件照常构造
+    assert.equal(TELEMETRY.harnessVersion(), "", "宿主不可判定时必须退化为空串（不是猜、不是抛）");
+    assert.equal(TELEMETRY.eventOf("plugin_loaded").harness_version, "", "取不到宿主版本也要照常构造事件（空串）");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("payload：宿主版本与通道按真实启动形态进事件；beta 可区分；非法值发空串不改写", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "dsh-harness-e2e-"));
+  try {
+    const dshRoot = path.join(root, "node_modules", "@deepseek-ai", "dsh");
+    const entry = await fakeHarness(dshRoot, { version: "0.1.5-rc.2", entry: PRINT_EVENT });
+    const stable = payloadOfHost(entry);
+    assert.equal(stable.harness_version, "0.1.5-rc.2", "★宿主版本必须真的进 payload（这正是今天答不出来的那个数）");
+    // 通道由**本插件当前版本**推导：预发版 → beta，正式版 → latest（见 lib/index.js 的 updateChannel）。
+    // ⚠️ 不能硬编码 "latest" —— 那样每次切到 beta 发版、这条用例必红，而产品行为其实完全正确。
+    // 这里真正要守的不变量是「通道与当前版本自洽」（以及下面「beta 装机必须能与稳定版区分」）。
+    const pluginVersion = TELEMETRY.eventOf("plugin_loaded").version;
+    assert.equal(stable.channel, /-/.test(String(pluginVersion)) ? "beta" : "latest",
+      `通道必须与当前插件版本自洽（预发→beta / 正式→latest）；当前版本 ${pluginVersion}`);
+    assert.equal(stable.version, TELEMETRY.eventOf("plugin_loaded").version, "插件自身版本字段保持不变（两个 version 不是一回事）");
+    assert.equal(payloadOfHost(entry, { DSH_UPDATE_TAG: "beta" }).channel, "beta", "★beta 装机必须能与稳定版区分开");
+    assert.equal(payloadOfHost(entry, { DSH_UPDATE_TAG: "1.2.3-beta.1" }).channel, "1.2.3-beta.1", "显式指定版本号也要如实上报");
+    // 非 DSH 宿主：字段仍在（契约形状不变），值为空串 —— 降级而不是丢字段 / 报错
+    const plain = await fakeHarness(path.join(root, "plain"), { name: "some-other-cli", version: "9.9.9", entry: PRINT_EVENT });
+    assert.equal(payloadOfHost(plain).harness_version, "", "非 DSH 宿主 → 空串（不猜一个错的版本上去）");
+    // 服务端字符类不合法的版本串（semver 构建元数据 / 注入式取值）：发空串，绝不改造后发出去
+    const weird = await fakeHarness(path.join(root, "weird"), { version: "1.2.3+build/../../etc", entry: PRINT_EVENT });
+    const w = payloadOfHost(weird);
+    assert.equal(w.harness_version, "", "非法字符 → 空串（不改写、不截断、不拼接）");
+    assert.match(w.channel, SERVER_MISC_RE, "非法宿主版本不得把其他字段带坏");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("清洗：只放行服务端字符类（[A-Za-z0-9._-] ≤32），其余发空串且绝不改造原始值", () => {
+  const t = TELEMETRY.harnessToken;
+  for (const ok of ["0.1.5-rc.2", "latest", "beta", "1.2.3", "2", "a".repeat(32)]) {
+    assert.equal(t(ok), ok, "合法值必须**原样**保留：" + ok);
+  }
+  for (const bad of ["1.2.3+build.7", "1.2.3/../etc", "mac.local hostname", "真.1.2.3", "a".repeat(33), " 1.2.3", "1.2.3 ", "", " ", "1.2.3\n"]) {
+    assert.equal(t(bad), "", "非法值必须发空串（不得截断/改写）：" + JSON.stringify(bad));
+  }
+  assert.equal(t(undefined), "", "undefined → 空串");
+  assert.equal(t(null), "", "null → 空串");
+  // 清洗后必须 100% 落在服务端字符类里（否则服务端会静默把它抹成空 —— 数据看起来像"没上报"）
+  for (const v of ["0.1.5-rc.2", "1.2.3+build", "a".repeat(33), "", "真", undefined]) {
+    assert.ok(SERVER_MISC_RE.test(t(v)), "清洗后的值必须 100% 落在服务端字符类内：" + JSON.stringify(v));
+  }
+});
+
+test("冻结契约：既有事件名与既有字段一字不改（本次只新增 harness_version / channel）", () => {
+  // 【本次改动】白名单**末尾追加** wechat_bound / wechat_unbound（微信机器人通道的绑定态跳变，
+  // 见 wechat-bind-telemetry.test.mjs）；既有 12 个名字一字未动、顺序未动，
+  // 服务端 TELEMETRY_EVENTS 同步追加同样两个名字。
+  //
+  // 这条断言的本意是「**既有**事件名/字段不许删改」，而不是"白名单永远不许变长"：
+  // 所以正确改法是**在预期集合里追加新名字**（下面那条 deepEqual 仍是全等比对，
+  // 任何删除 / 改名 / 重排 / 未声明的追加都会红），而不是把它弱化成"包含即可"。
+  // 为了把「既有项一个都不能少」这条不变量显式钉死（而不是只靠全等比对间接保证），
+  // 再单独比一次**前缀**：前 12 项必须与冻结前的历史名单逐字相同、顺序相同。
+  const FROZEN_EVENT_NAMES = [
+    "install_started", "install_failed", "runtime_ready", "bridge_started", "bridge_registered",
+    "tunnel_disconnected", "first_remote_ok", "plugin_loaded", "panel_opened", "harness_restart",
+    "update_started", "update_failed",
+  ];
+  assert.deepEqual(TELEMETRY.eventNames.slice(0, FROZEN_EVENT_NAMES.length), FROZEN_EVENT_NAMES,
+    "既有 12 个事件名一字不能改、不能删、不能重排（只允许在末尾追加新事件）");
+  assert.deepEqual(TELEMETRY.eventNames, [...FROZEN_EVENT_NAMES, "wechat_bound", "wechat_unbound"],
+    "事件名白名单只允许在末尾追加：本次追加微信通道的绑定/解绑，其余必须与服务端字面量冻结对齐");
+  const ev = TELEMETRY.eventOf("bridge_registered");
+  assert.deepEqual(Object.keys(ev), ["name", "at", "version", "harness_version", "channel", "os", "arch", "node"],
+    "字段白名单：既有的 7 个一个不少，只多 harness_version / channel");
+  assert.match(String(ev.version), /^\d+\.\d+\.\d+/, "version 仍是插件自身版本（非宿主版本）");
+  assert.equal(ev.os, process.platform);
+  assert.equal(ev.arch, process.arch);
+  assert.match(String(ev.node), /^\d+$/);
+  assert.ok(!("fail_code" in ev), "fail_code 仍只出现在 *_failed 事件上");
+  assert.equal(TELEMETRY.eventOf("user_login"), null, "白名单外事件名照旧不发");
+  // 通道与"一键更新"同源：面板看到的通道 = 上报的通道（两处口径必须是一处）
+  assert.equal(ev.channel, TELEMETRY.updateTag);
+});
+
+test("flush 路径：宿主版本/通道经磁盘队列读回后仍在，并随批次真实送达", async () => {
+  const relay = await startFakeRelay();
+  const env = await setup();
+  try {
+    await writeConfig(env.relayDir, relay.port);
+    // 模拟上一进程落盘的队列（含新字段）—— 重启前的事件不能丢归因
+    await writeFile(path.join(env.relayDir, ".telemetry-queue.json"), JSON.stringify({
+      v: 1,
+      events: [{
+        name: "harness_restart", at: Date.now() - 3000, version: "0.0.0-test",
+        harness_version: "0.1.5-rc.2", channel: "beta", os: process.platform, arch: process.arch, node: "22",
+      }],
+    }), { mode: 0o600 });
+    boot(env.relayDir);   // 装载即读回磁盘队列并补发
+    const sent = await waitFor(() => (relay.telemetry.length ? relay.telemetry : false));
+    assert.ok(sent, "遗留队列必须在下次装载时补发");
+    const ev = sent[0].body.events.find((e) => e.name === "harness_restart");
+    assert.equal(ev.harness_version, "0.1.5-rc.2", "磁盘读回后宿主版本不得丢");
+    assert.equal(ev.channel, "beta", "磁盘读回后通道不得丢");
+    assertContractRequest(sent[0], { eventNames: TELEMETRY.eventNames, failCodes: TELEMETRY.failCodes });
   } finally { await env.restore(); relay.srv.close(); }
 });
 
@@ -390,6 +559,10 @@ test("开关：DSH_REMOTE_TELEMETRY=0 → 零请求零文件（连 install_id �
       assert.equal(TELEMETRY.installId(env.relayDir), null, "关闭后不得生成 install_id");
       assert.equal(TELEMETRY.queueOf(env.relayDir).length, 0);
       assert.equal(TELEMETRY.record(env.relayDir, "install_started"), false, "关闭后不得入队");
+      // 新增的宿主版本/通道字段不改变开关语义：关闭 = 连"带新字段的事件"也不入队、不出机器
+      assert.equal(TELEMETRY.record(env.relayDir, "plugin_loaded"), false, "关闭后带新字段的事件同样不得入队");
+      assert.equal(relay.count("/api/telemetry/events"), 0, "关闭后不得出现任何带 harness_version/channel 的请求");
+      assert.equal(relay.telemetry.some((r) => r.raw.includes("harness_version")), false, "关闭后不得有任何新字段上过网络");
     } finally { host.close(); routes.dispose(); }
   } finally { await env.restore(); relay.srv.close(); }
 });
@@ -602,6 +775,20 @@ test("面板可见性：关于卡片写明「匿名统计 + 关闭方式」，�
   for (const line of ["不采集什么", "如何关闭", "hostname", "machine_fp", "IP", "DSH_REMOTE_TELEMETRY=0"]) {
     assert.ok(doc.includes(line), "docs/telemetry.md 必须覆盖：" + line);
   }
+  // 【本次改动】wechat_bound / wechat_unbound 已同步写进公开披露文档（docs/telemetry.md
+  // 的「事件名白名单」小节 + 微信通道绑定/解绑的语义与分母边界），因此这里**恢复成硬断言**：
+  // 每一个能出机器的事件名都必须在披露文档里逐条列出，没有豁免。
   for (const name of TELEMETRY.eventNames) assert.ok(doc.includes(name), "docs/telemetry.md 必须列出事件：" + name);
+  // 【本次改动】披露文档不只要列出名字，还必须写明这两条事件的**语义与分母边界** ——
+  // 否则看板上的"绑定数/存量"会被读成服务端的实时台账：
+  //   ① 它们是客户端上报的事件（不是服务端的实时存量）；
+  //   ② 首次观测到 bound:true 不算绑定事件（这条规则写错就会把历史存量每天虚报一遍）。
+  for (const line of [
+    "首次观测不算绑定",
+    "客户端上报的事件，不是服务端的实时存量",
+    "bot_id",
+  ]) {
+    assert.ok(doc.includes(line), "docs/telemetry.md 必须写明微信通道事件的口径边界：" + line);
+  }
   for (const code of TELEMETRY.failCodes) assert.ok(doc.includes(code), "docs/telemetry.md 必须列出失败码：" + code);
 });

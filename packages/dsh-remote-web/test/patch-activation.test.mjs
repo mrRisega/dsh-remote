@@ -182,21 +182,34 @@ test("回归护栏：plugin 子命令必须把激活结果 return 给 setup（�
   assert.match(src, /pluginResult\.hotPatch/, "应据 hotPatch 判断是否走热挂载形态");
 });
 
-test("硬约束：源码归我们时**必须**把激活点从 bundles 转成 patch 行（否则热加载失效、且两处并存会崩）", () => {
-  // 事故复盘：patch 行与插件自带 bundle patch 同时生效时，dsh web 启动即
-  //   TypeError: duplicate loader entry id: dsh-remote-web
-  //   Error: dsh: plugin tree failed to load: failed to apply loader entry include (cordis:include)
-  // 所以两条激活路径必须互斥。而当装置器**要把本地这份源码装进去**时（升级/自装），
-  // 正确做法不是"保持 bundles"，而是**摘掉 bundles 条目 + 写 patch 行**：
-  //   · 只留 bundles → 只在启动时读取，装完看不到新版、也拿不到热加载（实测踩到）；
-  //   · 两处并存 → 启动即崩。
+test("★ 硬约束(2026-09-22 **方向反转**)：bundles 已在时**不得**再写 patch 行", () => {
+  // 【为什么反转 —— 这是一条被推翻的既有硬约束,不是"测试写松了"】
+  //   旧约束是「源码归我们时**必须**把激活点从 bundles 转成 patch 行」,理由是**热加载**
+  //   (装完即生效、不用重启)。但它在真实环境里暴露了代价:
+  //     自动维护流程会把插件自带 bundle **周期性写回** `dsh.profile.bundles`,
+  //     于是"删 bundles、留 patch"这个方向被不断撤销 → 又变两处激活 → dsh web 启动即
+  //       TypeError: duplicate loader entry id: dsh-remote-web
+  //       Error: dsh: plugin tree failed to load: failed to apply loader entry include
+  //   —— 注意:这不是"插件不生效",是**整个 dsh 起不来**(面板/市场都在那个进程里,
+  //      用户没有任何自助修复入口)。2026-09-22 用真实启动复现。
+  //
+  //   所以方向反转为:**bundle 归包管理器管、我们不动它**;我们只保证自己不写第二个激活点,
+  //   并把历史遗留的重复 patch 行清掉。
+  //   代价:失去热加载 → 由安装器随后触发的重启让新版生效
+  //        (activateLocalCopy 在此形态下返回 hotPatch:false,调用方会重启)。
   const profile = makeProfile({ bundles: [...PLUGIN_BUNDLES, "dsh-remote-web"] });
   const relay = join(profile, "relay");
   try {
-    const out = installPlugin(profile, relay);
-    assert.match(out, /激活点已转为 patch 行/, "应把激活点转成 patch 行（热加载）");
-    assert.equal((readPatch(profile).match(/- id: dsh-remote-web/g) || []).length, 1, "应恰好写一条 patch 行");
-    assert.ok(!readBundles(profile).includes("dsh-remote-web"), "bundles 条目必须被摘掉（单一激活点）");
+    installPlugin(profile, relay);
+    assert.equal(
+      (readPatch(profile).match(/- id: dsh-remote-web/g) || []).length,
+      0,
+      "bundles 已在时**不得**再写 patch 行 —— 那会造出第二个激活点,dsh web 启动即崩"
+    );
+    assert.ok(
+      readBundles(profile).includes("dsh-remote-web"),
+      "bundles 条目必须**保留**(那是包管理器/维护流程管的激活点,我们不去动它)"
+    );
   } finally { cleanup(profile); }
 });
 

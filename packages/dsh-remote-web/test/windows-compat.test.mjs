@@ -23,6 +23,7 @@
 import assert from "node:assert/strict";
 import http from "node:http";
 import { spawn, spawnSync } from "node:child_process";
+import * as nodeFs from "node:fs";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -476,9 +477,125 @@ test("测试隔离：套件不得访问任何外部地址（生产限流会被�
   const src = readFileSync(guard, "utf8");
   assert.ok(/ENETUNREACH/.test(src), "护栏应阻断外部请求");
   assert.ok(/LOCAL_HOST/.test(src), "护栏应只放行本地地址");
+  // 第二道闸：兜底默认地址也必须能被测试指向本地。
+  // 用例拆掉临时目录之后，仍在飞的后台请求（装机上报失败重试）会读到**空配置**并回落到
+  // 「默认云端地址」→ 打生产 /api/public-config。光靠逐用例写 api_url 挡不住（重试发生在拆卸之后），
+  // 所以常量本身必须认 DSH_RELAY_DEFAULT_API，且测试脚本统一指到本地死端口。
+  const loopback = /DSH_RELAY_DEFAULT_API=http:\/\/127\.0\.0\.1:\d+/;
+  for (const name of ["test:plugin", "test:bridge"]) {
+    assert.match(String(pkg.scripts[name]), loopback, `${name} 必须把兜底默认地址指向本地死端口`);
+  }
+  assert.match(INDEX_SRC, /process\.env\.DSH_RELAY_DEFAULT_API/,
+    "插件半的 DEFAULT_API 必须可被 DSH_RELAY_DEFAULT_API 覆盖（否则兜底路径会打生产）");
+  assert.match(SETUP_SRC, /process\.env\.DSH_RELAY_DEFAULT_API/,
+    "安装器的 DEFAULT_API 必须可被 DSH_RELAY_DEFAULT_API 覆盖（同一份语义）");
 });
 
 test("前端：平台文案不再默认 macOS（Windows 用户看不懂「自启动服务」）", () => {
   assert.ok(/serviceManager === "detached"/.test(CLIENT_SRC), "面板应识别 Windows 的 detached 模式");
   assert.match(CLIENT_SRC, /Windows 任务计划程序 dsh-remote-bridge/, "卸载说明要写明 Windows 侧会删掉什么");
+});
+
+// ─────────────── ⑧ Windows：不得弹出黑色空白命令行窗口 ───────────────
+
+/**
+ * 复刻 VBScript 的字符串字面量求值：`"""a""b"` → `"a"b`。
+ * 规则：s[0] 是开引号；正文从 s[1] 起扫，`""` = 一个字面量引号，孤立 `"` = 结束。
+ * 用它把生成的 .vbs **反解回真正会被执行的命令行** —— 这样断言的是"转义可往返"，
+ * 而不是"正则看着像"（正则对多一个少一个引号完全不敏感，那正是最容易犯的错）。
+ */
+function evalVbsLiteral(s) {
+  assert.equal(s[0], '"', "VBS 字符串字面量必须以双引号开头");
+  let i = 1;
+  let out = "";
+  while (i < s.length) {
+    if (s[i] === '"') {
+      if (s[i + 1] === '"') { out += '"'; i += 2; continue; }
+      return { value: out, end: i };
+    }
+    out += s[i];
+    i += 1;
+  }
+  throw new Error("VBS 字符串字面量未闭合");
+}
+
+test("win32：登录任务经 wscript+VBS 隐藏启动（旧版会弹黑色空白命令行窗口）", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "dsh-win-launcher-"));
+  try {
+    const src = SETUP_SRC.slice(
+      SETUP_SRC.indexOf("function winHiddenLauncherPath()"),
+      SETUP_SRC.indexOf("function writeWindowsTask()"),
+    );
+    const make = new Function("CONFIG_DIR", "fs", "path",
+      `${src}\nreturn { winHiddenLauncherPath, writeWinHiddenLauncher };`);
+    const { winHiddenLauncherPath, writeWinHiddenLauncher } = make(dir, nodeFs, path);
+
+    // 用「空格 + 中文 + 括号」的路径：Windows 上最常见的翻车形状
+    const node = "C:\\Program Files\\nodejs\\node.exe";
+    const setup = path.join(dir, "张三", "My App (x64)", "dsh-setup.mjs");
+    const vbsPath = writeWinHiddenLauncher(node, setup);
+    assert.equal(vbsPath, winHiddenLauncherPath(), "启动器应落在配置目录");
+    assert.ok(existsSync(vbsPath), "必须真的写出 .vbs");
+
+    const vbs = readFileSync(vbsPath, "utf8").replace(/\r\n/g, "\n");
+    const line = vbs.split("\n").find((l) => l.includes(".Run "));
+    assert.ok(line, "应调用 WScript.Shell.Run");
+    // 窗口样式 0 = 完全隐藏；第三参 False = 不等待（node 成为独立进程，任务计划程序不被拖住）
+    assert.ok(/,\s*0,\s*False\s*$/.test(line), `Run 必须是 (cmd, 0, False)，实际：${line}`);
+    assert.ok(!/\bTrue\b/.test(vbs), "不得等待子进程");
+
+    // 转义可往返：反解出的命令行必须与目标命令行**逐字节相等**
+    const at = line.indexOf(".Run ");
+    const q = line.indexOf('"', at);
+    const { value } = evalVbsLiteral(line.slice(q));
+    assert.equal(value, `"${node}" "${setup}" run`, "VBS 字面量转义必须可往返（内嵌引号写成两个）");
+    assert.ok(value.includes("My App (x64)"), "含空格/括号的路径必须完整保留");
+    assert.ok(value.includes("张三"), "中文路径必须完整保留");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("win32：注册的是 wscript，且隐藏方式不可用时回退直接启动（保住「能自启」底线）", () => {
+  const fn = SETUP_SRC.slice(SETUP_SRC.indexOf("function writeWindowsTask()"),
+    SETUP_SRC.indexOf("/** 查询 Windows 登录任务是否已注册"));
+  assert.ok(/tr = `wscript\.exe \/\/B "\$\{writeWinHiddenLauncher\(node, setup\)\}"`/.test(fn),
+    "任务命令行必须是 wscript.exe //B <vbs>");
+  assert.ok(/无法生成隐藏启动器/.test(fn), "写不了 .vbs 要如实告警，不能静默");
+  // 组策略禁用 Windows Script Host 等 → 注册失败必须回退，否则自启动整条失效
+  assert.ok(/if \(!created\.ok && hidden\)/.test(fn), "隐藏方式注册失败必须有回退分支");
+  assert.ok(/tr = direct;/.test(fn), "回退必须换回直接命令行");
+  assert.ok(/let direct = `"\$\{node\}" "\$\{setup\}" run`/.test(fn), "直接命令行形态应保留");
+  // 旧版本注册的可见任务：/Delete + /Create 必须仍然成对，否则升级后旧任务残留
+  assert.ok(/schtasks\(\["\/Delete", "\/TN", WIN_TASK_NAME, "\/F"\]\)/.test(fn), "必须先删旧任务（迁移可见任务）");
+});
+
+test("win32：所有 detached 子进程都必须带 windowsHide（否则必弹新的黑色窗口）", () => {
+  // 根因：Windows 上 detached 即 DETACHED_PROCESS —— 子进程**不继承父控制台**，
+  // 控制台程序（node.exe）于是拿到一个全新的可见窗口。只有 windowsHide（CREATE_NO_WINDOW）
+  // 能压掉它。做成全仓不变量检查，防止以后新增 detached spawn 时再犯同一个错。
+  const files = { "dsh-setup.mjs": SETUP_SRC, "lib/index.js": INDEX_SRC };
+  let checked = 0;
+  for (const [name, src] of Object.entries(files)) {
+    const re = /\b(spawn|spawnSync)\s*\(/g;
+    let m;
+    while ((m = re.exec(src))) {
+      let i = re.lastIndex - 1;
+      let depth = 0;
+      let end = i;
+      for (; i < src.length; i += 1) {
+        if (src[i] === "(") depth += 1;
+        else if (src[i] === ")") { depth -= 1; if (!depth) { end = i; break; } }
+      }
+      const call = src.slice(m.index, end + 1);
+      if (!/detached:\s*true/.test(call)) continue;
+      // POSIX 专属（/bin/sh、launchctl…）在 Windows 上根本不会执行，不适用
+      if (/\/bin\/sh|\/bin\/bash|launchctl|systemctl/.test(call)) continue;
+      checked += 1;
+      const lineNo = src.slice(0, m.index).split("\n").length;
+      assert.ok(/windowsHide:\s*true/.test(call),
+        `${name}:${lineNo} 的 detached spawn 缺 windowsHide → Windows 上会弹黑色窗口`);
+    }
+  }
+  assert.ok(checked >= 3, `至少应检查到 3 处 detached spawn，实际 ${checked}（切片/匹配可能失效）`);
 });
