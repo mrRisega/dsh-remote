@@ -3,10 +3,11 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
-## [0.6.10-beta.1] - 2026-09-22
+## [0.6.10-beta.2] - 2026-09-22
 
 > 预发版（只发 npm `beta` 通道，`latest` 仍是 0.6.9）。本轮主线是**微信机器人通道**：
 > 电脑上的 DSH 可以直接用微信遥控 —— 任务要审批、做完了、出错了都推到微信里，并且能直接回话继续。
+> （0.6.10-beta.1 的内容已并入本条；beta.2 补了一处 macOS 机器识别修复。）
 
 ### 微信机器人通道（新）
 
@@ -27,6 +28,13 @@ All notable changes to dsh-remote are documented here. This project follows
 - **改了电脑名字不再被当成新设备**：改为读取系统里稳定的机器标识，设备列表不会再堆出重复条目。
 - 退出时能正常发出"微信通道已下线"的通知（此前 Windows 上这条通知永远发不出去）。
 - 取不到当前用户名时，会明确提示配置文件**没有**完成权限加固，而不是默默跳过。
+
+### macOS
+
+- **机器识别也修好了**：以前 bridge 由系统（launchd）拉起时，读机器标识的命令**找不到**
+  （系统的 PATH 里没有它所在的目录），于是悄悄退化成"按电脑名字识别"—— 改一次电脑名字就会被
+  当成新设备。现在改用绝对路径调用，不再赌环境变量。
+  （这与上面 Windows 那条是同一个问题的两面；手机上的既有远程地址不受影响。）
 
 ### 远程面板
 

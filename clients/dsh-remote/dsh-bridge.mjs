@@ -135,11 +135,17 @@ const TOKEN = process.env.DSH_BRIDGE_TOKEN || "";
 function machineUniqueId() {
   if (process.env.DSH_BRIDGE_MACHINE_FP) return String(process.env.DSH_BRIDGE_MACHINE_FP).slice(0, 64);
   if (process.platform === "darwin") {
-    try {
-      const out = execSync("ioreg -rd1 -c IOPlatformExpertDevice", { encoding: "utf8", timeout: 5000 });
-      const m = /"IOPlatformUUID"\s*=\s*"([^"]+)"/.exec(out);
-      if (m && m[1]) return m[1];
-    } catch { /* 兜底 */ }
+    // ⚠️ 必须用**绝对路径**：由 launchd 拉起时 PATH 来自 plist（实测 /usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin），
+    // **不含 /usr/sbin** —— 而 ioreg 恰好就在那里。用裸名会得到
+    // "/bin/sh: ioreg: command not found"（真机日志实测），于是这里静默返回 ""，
+    // 指纹退化成 hostname 哈希：用户改一次主机名就被服务端当成新设备 —— 与 Windows 那条是同一个 bug。
+    for (const ioreg of ["/usr/sbin/ioreg", "ioreg"]) {
+      try {
+        const out = execSync(`${ioreg} -rd1 -c IOPlatformExpertDevice`, { encoding: "utf8", timeout: 5000 });
+        const m = /"IOPlatformUUID"\s*=\s*"([^"]+)"/.exec(out);
+        if (m && m[1]) return m[1];
+      } catch { /* 换下一个候选 */ }
+    }
   } else if (process.platform === "linux") {
     for (const f of ["/etc/machine-id", "/var/lib/dbus/machine-id"]) {
       try {
@@ -157,14 +163,20 @@ function machineUniqueId() {
     //   · PowerShell 在受限语言模式 / AppLocker 的企业机器上可能被策略直接禁掉，
     //     而拿不到指纹时只能退回 hostname（用户一改主机名就被当成新设备）—— 正是要修的问题；
     //   · 走 spawnSync 传数组参数，不经过 cmd.exe，因而没有引号/空格/中文路径的转义坑。
-    try {
-      const r = spawnSync("reg", ["query", "HKLM\\SOFTWARE\\Microsoft\\Cryptography", "/v", "MachineGuid"],
-        { encoding: "utf8", timeout: 5000, windowsHide: true });
-      const m = r && r.status === 0
-        ? /MachineGuid\s+REG_SZ\s+([0-9a-fA-F-]{16,})/.exec(String(r.stdout || ""))
-        : null;
-      if (m && m[1]) return m[1];
-    } catch { /* 兜底 */ }
+    // 同样不赌 PATH：优先 System32 下的绝对路径，取不到再退回裸名（macOS 那条就是这么栽的）。
+    const regCandidates = [];
+    if (process.env.SystemRoot) regCandidates.push(`${process.env.SystemRoot}\\System32\\reg.exe`);
+    regCandidates.push("reg");
+    for (const reg of regCandidates) {
+      try {
+        const r = spawnSync(reg, ["query", "HKLM\\SOFTWARE\\Microsoft\\Cryptography", "/v", "MachineGuid"],
+          { encoding: "utf8", timeout: 5000, windowsHide: true });
+        const m = r && r.status === 0
+          ? /MachineGuid\s+REG_SZ\s+([0-9a-fA-F-]{16,})/.exec(String(r.stdout || ""))
+          : null;
+        if (m && m[1]) return m[1];
+      } catch { /* 换下一个候选 */ }
+    }
   }
   return ""; // 读不到(如容器/受限环境) → 回退宿主名指纹
 }

@@ -42,11 +42,13 @@ function loadMachineUniqueId({
   assert.ok(!/稳定指纹/.test(src), "切片不应越过 machineUniqueId 的边界");
 
   const calls = [];
+  const execCalls = [];
   const fakeSpawnSync = (cmd, args, opts) => {
     calls.push({ cmd, args, opts });
     if (regThrows) throw new Error("spawn EPERM");
     return reg;
   };
+  const fakeExecSync = (cmd) => { execCalls.push(String(cmd)); return ioreg; };
   const fakeFs = {
     readFileSync: (f) => {
       if (f in machineIdFiles) return machineIdFiles[f];
@@ -55,8 +57,8 @@ function loadMachineUniqueId({
   };
   const make = new Function("process", "execSync", "spawnSync", "fs", "os",
     `${src}\nreturn machineUniqueId;`);
-  const fn = make({ platform, env }, () => ioreg, fakeSpawnSync, fakeFs, {});
-  return { fn, calls };
+  const fn = make({ platform, env }, fakeExecSync, fakeSpawnSync, fakeFs, {});
+  return { fn, calls, execCalls };
 }
 
 test("win32：机器指纹取注册表 MachineGuid（改主机名不再被当成新设备）", () => {
@@ -100,12 +102,38 @@ test("机器指纹：darwin/linux 两条老分支没有被改坏", () => {
     ioreg: '    "IOPlatformUUID" = "AAAA-BBBB-CCCC"\n',
   });
   assert.equal(darwin.fn(), "AAAA-BBBB-CCCC", "darwin 仍读 ioreg 的 IOPlatformUUID");
+  assert.match(darwin.execCalls[0], /^\/usr\/sbin\/ioreg /,
+    "★必须用绝对路径调 ioreg：launchd 的 plist PATH 不含 /usr/sbin，用裸名会 command not found,",
+  );
 
   const linux = loadMachineUniqueId({
     platform: "linux",
     machineIdFiles: { "/etc/machine-id": "0123456789abcdef\n" },
   });
   assert.equal(linux.fn(), "0123456789abcdef", "linux 仍读 /etc/machine-id（并去掉换行）");
+});
+
+test("★回归：子进程一律用绝对路径优先，不赌 PATH（launchd 的 PATH 不含 /usr/sbin 的真实事故）", () => {
+  // 事故（2026-09-22 真机日志）：bridge 由 launchd 拉起，plist 给的 PATH 是
+  // /usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin —— 没有 /usr/sbin，而 ioreg 在那里。
+  // 日志里出现 `/bin/sh: ioreg: command not found`，指纹**静默**退化成 hostname 哈希：
+  // 用户改一次主机名就被服务端当成新设备。这类"PATH 假设"必须用绝对路径堵死。
+  const mac = loadMachineUniqueId({ platform: "darwin", ioreg: 'x "IOPlatformUUID" = "U1"\n' });
+  mac.fn();
+  assert.match(mac.execCalls[0], /^\/usr\/sbin\/ioreg /, "darwin：首个候选必须是 /usr/sbin/ioreg");
+
+  // 绝对路径取不到时仍要退回裸名（别把别的机型的 macOS 弄死）
+  const macFallback = loadMachineUniqueId({ platform: "darwin", ioreg: "" });
+  assert.equal(macFallback.fn(), "", "两次都拿不到 → 空串（不是抛）");
+  assert.equal(macFallback.execCalls.length, 2, "应依次尝试绝对路径与裸名");
+  assert.match(macFallback.execCalls[1], /^ioreg /, "第二个候选是裸名");
+
+  // Windows 同理：SystemRoot 可用时优先 System32 的绝对路径
+  const win = loadMachineUniqueId({ platform: "win32", env: { SystemRoot: "C:\\Windows" } });
+  win.fn();
+  assert.equal(win.calls[0].cmd, "C:\\Windows\\System32\\reg.exe", "win32：应优先 System32 下的绝对路径");
+  assert.deepEqual(win.calls[0].args, ["query", "HKLM\\SOFTWARE\\Microsoft\\Cryptography", "/v", "MachineGuid"]);
+  assert.equal(win.calls[0].opts.windowsHide, true, "绝对路径候选同样必须 windowsHide");
 });
 
 test("机器指纹：拿不到机器唯一值时才退回宿主名哈希（这正是要修的退化路径）", () => {
