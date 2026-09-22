@@ -40,7 +40,6 @@ import {
   extractInboundText,
   extractFromUserId,
   handleCommand,
-  HELP_TEXT,
   classifyInbound,
   formatCompletion,
   isDestructiveTool,
@@ -934,21 +933,48 @@ export class WeChatRuntime {
    * 那等于把人骗到一个他做不到的清单上,然后每次尝试都吃一次拒绝。
    */
   #helpText() {
-    if (this.#can("assign")) return HELP_TEXT; // 付费档:完整清单
-    const lines = [
-      "【DSH 微信通道 · 通知版】",
-      "现在能用的:",
-      "· 回数字(如 1)回执最近一条需要你拍板的消息",
-      "· /stop 中断当前会话正在跑的回合",
-      "· /status 查看绑定与推送状态",
-      "· /quiet 暂停推送(回复任意消息恢复)",
-      "· /unbind 解除微信绑定",
-      "",
-      "会员功能(开通后可用):",
-      "· 直接发一句话 = 给当前任务派活",
-      "· /new 开新任务、/ls 列出会话、/use <编号> 切换会话、/summary 重发最近结论"
+    // ★ 逐条**按实际能力**生成,不再用"档位名"或"有没有粗粒度 assign"来猜。
+    //
+    // 为什么必须改(2026-09-23,后台可配权限之后才暴露):管理员可以把 caps 配得很细 ——
+    // 只勾细粒度 `assign.new` 而不勾粗粒度根 `assign` 时,旧的 `#can("assign")` 返回**假**,
+    // 于是**付费用户**拿到一份写着"你没有这些功能"的免费档帮助;
+    // 反过来(勾了粗根又关掉某个子能力)则会把做不到的指令列成"你能用的"。
+    // 两个方向都违反业主红线「话术与权限必须一致、不多承诺」。
+    // 现在每一行都挂一个判据,能不能用由 `#can(...)` **逐条**决定。
+    const canNew = this.#can("assign.new");
+    const canContinue = this.#can("assign.continue");
+    const rows = [
+      { ok: this.#can("approve"), text: "· 回数字(如 1)回执最近一条需要你拍板的消息" },
+      { ok: this.#can("stop"), text: "· /stop 中断当前会话正在跑的回合" },
+      { ok: this.#can("status"), text: "· /status 查看绑定与推送状态" },
+      { ok: true, text: "· /quiet 暂停推送(回复任意消息恢复)" }, // 本地开关,不需要任何能力
+      { ok: true, text: "· /unbind 解除微信绑定" },
+      // 「接着当前任务聊」与「开新任务」是**两个独立能力**(业主 2026-09-22 拍板把 assign 拆成两半),
+      // 所以这里也拆成两行、各自判各自的:免费用户会看到第一行可用、第二行落在会员区。
+      // ⚠️ 行内**不要**再写"会员功能"三个字 —— 那是下面分区标题的专属词,
+      //    混进可用段会让"会员区之前不得出现 /new"这类结构断言失准(读起来也乱)。
+      { ok: canContinue, text: "· 直接发一句话 = 接着当前任务聊" },
+      { ok: canNew, text: "· /new <任务> 开新任务(直接发一句话也行)" },
+      { ok: this.#can("sessions"), text: "· /ls 列出会话、/use <编号> 切换会话" },
+      { ok: this.#can("summary"), text: "· /summary 重发最近结论" }
     ];
-    if (this.appUrl) lines.push("", `👉 开通并查看设备列表:${this.appUrl}`);
+    const usable = rows.filter((r) => r.ok);
+    const locked = rows.filter((r) => !r.ok);
+    // 「通知版」这个标签说的是**档位画像**,不是"有缺项" —— 判据必须是
+    // "他有没有能在微信里**干活**的能力"(开新任务 / 管会话 / 要小结)。
+    // ⚠️ 曾经写成 `locked.length ? 通知版 : ...`:后台把 caps 配细之后,
+    //    一个能开新任务的付费用户只要缺了 summary 就会被标成"通知版" —— 那是错的画像。
+    const workCaps = ["assign.new", "sessions", "summary"];
+    const isNoticeOnly = !workCaps.some((c) => this.#can(c));
+    const lines = [
+      `【DSH 微信通道${isNoticeOnly ? " · 通知版" : ""}】`,
+      "现在能用的:",
+      ...usable.map((r) => r.text)
+    ];
+    if (locked.length) {
+      lines.push("", "会员功能(开通后可用):", ...locked.map((r) => r.text));
+      if (this.appUrl) lines.push("", `👉 开通并查看设备列表:${this.appUrl}`);
+    }
     return lines.join("\n");
   }
 
@@ -1033,9 +1059,21 @@ export class WeChatRuntime {
       await this.reply(from, this.#helpText());
       return;
     }
-    // 其余交给上游的通用处理 —— ⚠️ 字段是 `replyText`,不是 text。
+    // 未知指令:**绝不静默**,而且必须用**按档位分层**的帮助。
+    //
+    // ⚠️ 这里以前直接透传上游 `handleCommand()` 的 replyText,而它拼的是**静态** HELP_TEXT ——
+    //    那份清单把 `/new`、`/ls`、`/use`、`/summary` 与"直接发一句话"一并列成"你能用的"。
+    //    免费用户敲错一个字,拿到的就是这张会员清单:照着做 → 再吃一次拒绝,
+    //    于是"打错命令"被理解成"这功能坏了"。业主红线是「话术与权限必须一致、不多承诺」,
+    //    而 `#helpText()` 存在的唯一理由就是按档位如实分层(见它的注释)。
+    //    另外把用户敲的那条**原样回显** —— 他才知道是哪个字打错了。
+    if (cmd) {
+      await this.reply(from, `不认识这条指令:${cmd}\n\n${this.#helpText()}`);
+      return;
+    }
+    // 兜底:理论上到不了(入站非空文本必带 command),但绝不静默吞掉
     const r = handleCommand(cmd, args);
-    await this.reply(from, (r && r.replyText) || "可用指令:/new /ls /use /stop /status /summary /help /quiet /unbind");
+    await this.reply(from, (r && r.replyText) || "可用指令:/help");
   }
 
   // ── v2:会话遥控 ────────────────────────────────────────────────────────
@@ -1433,7 +1471,9 @@ export class WeChatRuntime {
         summary,
         sessionId: sid,
         hanging: !summary
-      }, this.#can("assign") ? {} : { continuationHint: this.#continuationHint() });
+      // 判据是 **assign.new**(能不能开新任务),不是粗粒度 assign:
+      // 后台只勾细粒度 assign.new 时,粗根判假 → 会给一个**能派活**的用户塞"接着交代属于会员功能"
+      }, this.#can("assign.new") ? {} : { continuationHint: this.#continuationHint() });
       built = { text: c.text, replyable: false, eventId: "" };
     } else if (
       formatterKind === "approval" &&
@@ -1610,8 +1650,13 @@ export class WeChatRuntime {
       `本月 ${limit} 条消息额度已用 ${used} 条，还剩 ${remain} 条。`,
       `额度按自然月计算，下个月 1 号自动归零（重新给满 ${limit} 条）。`
     ];
-    if (!this.#can("assign")) {
-      lines.push("", "在微信里直接派活属于会员能力；开通后可继续使用（你能用的能力以 App 内展示为准）。");
+    if (!this.#can("assign.new")) {
+      // 按**实际缺的那一项**说,不笼统说"派活是会员能力":
+      // 还能接着当前会话聊的人被这么说,会以为自己在微信里什么都做不了 ——
+      // 少承诺同样是一种"话术与权限不一致"。
+      lines.push("", this.#can("assign.continue")
+        ? "在微信里开新任务属于会员能力；接着当前任务回复仍然可用（你能用的能力以 App 内展示为准）。"
+        : "在微信里直接派活属于会员能力；开通后可继续使用（你能用的能力以 App 内展示为准）。");
     }
     if (this.appUrl) lines.push("", `👉 打开 App：${this.appUrl}`);
     return lines.join("\n");

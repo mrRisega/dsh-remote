@@ -1477,3 +1477,137 @@ test("★ 多审批 + 提醒混排:回执仍按 FIFO 走审批(提醒不参与�
     await ilink.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// 未知指令:绝不静默,而且帮助文案必须**按档位分层**
+//
+// 原先这条路径透传上游的静态 HELP_TEXT —— 那份清单把 /new、/ls、/use、/summary 与
+// "直接发一句话"一并列成"你能用的"。免费用户敲错一个字,拿到的就是这张**会员清单**,
+// 照着做再吃一次拒绝,于是"打错命令"被理解成"这功能坏了"。
+// 业主红线:话术与权限必须一致、不多承诺。
+// ---------------------------------------------------------------------------
+
+test("★ 免费用户敲未知指令:要回显命令 + 给**分层**帮助,不得把会员指令列成『你能用的』", async () => {
+  const ilink = await fakeIlink();
+  try {
+    const sub = makeFakeSubscriber();
+    const { rt } = await boundRuntime(ilink, { subscriber: sub, tier: "free" });
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "/reusme" } }] });
+    const t = lastText(ilink.state);
+    assert.ok(t, "★未知指令绝不能静默(一个字都不回 = 用户以为机器人死了)");
+    assert.match(t, /不认识这条指令:\/reusme/, "必须原样回显他敲的那条,他才知道哪个字打错了");
+    assert.match(t, /现在能用的/, "必须给分层帮助(免费档的『现在能用的』)");
+    assert.match(t, /会员功能/, "会员指令要明确归到『会员功能』下");
+    // 关键:不能把会员指令混进"能用"的那一段
+    const usable = t.split("会员功能")[0];
+    assert.ok(!/\/new/.test(usable), "★『现在能用的』里不得出现 /new(免费档做不到)");
+    assert.ok(!/\/ls/.test(usable), "★『现在能用的』里不得出现 /ls");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★ 付费用户敲未知指令:给完整清单(不因修免费档把付费档的信息也砍掉)", async () => {
+  const ilink = await fakeIlink();
+  try {
+    const sub = makeFakeSubscriber();
+    const { rt } = await boundRuntime(ilink, { subscriber: sub, tier: "pro" });
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "/reusme" } }] });
+    const t = lastText(ilink.state);
+    assert.match(t, /不认识这条指令:\/reusme/);
+    assert.match(t, /\/new/, "付费档应当看到 /new");
+    assert.match(t, /\/ls/, "付费档应当看到 /ls");
+    assert.ok(!/会员功能/.test(t), "付费档不该再出现『会员功能』这段(他就是会员)");
+  } finally {
+    await ilink.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 细粒度权益(后台可配权限之后才可能出现)
+//
+// 管理员可以只勾细粒度 `assign.new` 而**不勾**粗粒度根 `assign`。旧代码拿
+// `#can("assign")` 当"是不是付费用户"的代理 —— 那种配置下返回假,于是**付费用户**
+// 拿到免费档的帮助、完成小结后被塞"接着交代属于会员功能"、额度提醒里被告知
+// "派活是会员能力"。三处都在对已经付了钱的人说不成立的话。
+// ---------------------------------------------------------------------------
+
+/** 只给细粒度 assign.new、不给粗根 assign 的付费权益包。 */
+const FINE_GRAINED_PRO = Object.freeze({
+  rev: "rev-fine", plan: "pro",
+  caps: ["notify", "approve", "status", "stop", "assign.new", "sessions"],
+  limits: { messages_per_month: 0 }
+});
+
+test("★★ 细粒度权益(只有 assign.new、没有粗根 assign)的付费用户:帮助不得降级成免费档", async () => {
+  const ilink = await fakeIlink();
+  try {
+    const { rt } = await boundRuntime(ilink, {
+      subscriber: makeFakeSubscriber(), tier: "pro", entitlements: FINE_GRAINED_PRO
+    });
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "/help" } }] });
+    const t = lastText(ilink.state);
+    assert.ok(!/通知版/.test(t), "★他能开新任务,不该被标成通知版(旧判据看粗根 assign 会误判)");
+    assert.match(t, /\/new/, "他确实有 assign.new,帮助里必须出现 /new");
+    assert.match(t, /\/ls/, "他确实有 sessions,帮助里必须出现 /ls");
+    // 确实没有的才落在会员区
+    const locked = t.split("会员功能")[1] || "";
+    assert.match(locked, /summary/, "没有 summary 的才该落在会员区");
+    assert.ok(!/\/new/.test(locked), "★已经有的能力绝不能落在会员区(那是少承诺,同样是不一致)");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★ 细粒度权益用户的完成小结:不得塞『接着交代下一步属于会员功能』", async () => {
+  const ilink = await fakeIlink();
+  try {
+    const { rt } = await boundRuntime(ilink, {
+      subscriber: makeFakeSubscriber(), tier: "pro", entitlements: FINE_GRAINED_PRO
+    });
+    await rt.notify({ kind: NODE_KINDS.TURN_END, sessionId: "s1", reason: "completed", at: 1 });
+    const t = lastText(ilink.state);
+    assert.ok(!/属于会员功能/.test(t), "★他有 assign.new,不该被告知接着交代是会员功能");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★ 细粒度权益用户的额度提醒:不得把他已经有的能力说成会员能力", async () => {
+  const ilink = await fakeIlink();
+  try {
+    // limits=2 → 阈值 min(ceil(1.6)=2, max(1,0)=1) = 1,发一条就到线(不必真发 85 条)
+    // ⚠️ caps 必须含 assign.continue:quotaRuntime 预设了当前会话,纯文本派活走的是"接着聊"这条路;
+    //    缺了它会被直接拒掉、用量不涨,提醒根本不会触发(前提就不成立)。
+    const { rt } = await quotaRuntime(ilink, {
+      caps: ["notify", "approve", "status", "stop", "assign.continue", "assign.new", "sessions"],
+      limits: { messages_per_month: 2 }
+    });
+    await sendTask(rt, "派活");
+    await waitFor(() => quotaNotices(ilink.state).length === 1);
+    const t = quotaNotices(ilink.state)[0] || "";
+    assert.ok(t, "前提:提醒确实发出来了");
+    assert.ok(!/开新任务属于会员能力/.test(t), "★他有 assign.new,不该被告知开新任务是会员能力");
+    assert.ok(!/派活属于会员能力/.test(t), "★同上");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★ 免费档(有 assign.continue 没 assign.new)的额度提醒:只说缺的那一项,不否定他还能接着聊", async () => {
+  const ilink = await fakeIlink();
+  try {
+    const { rt } = await quotaRuntime(ilink, {
+      caps: ["notify", "approve", "status", "stop", "assign.continue"],
+      limits: { messages_per_month: 2 }
+    });
+    await sendTask(rt, "接着聊");
+    await waitFor(() => quotaNotices(ilink.state).length === 1);
+    const t = quotaNotices(ilink.state)[0] || "";
+    assert.ok(t, "前提:提醒确实发出来了");
+    assert.match(t, /开新任务属于会员能力/, "缺的是开新任务,就只说这一项");
+    assert.match(t, /接着当前任务回复仍然可用/, "★他确实还能接着聊 —— 不说不成立的话");
+  } finally {
+    await ilink.close();
+  }
+});
