@@ -4475,7 +4475,10 @@ window.__ModuleLoader__.load({
       // 已绑定态同样保留：它是常驻的用途说明（不是一次性引导气泡），不占用任何按钮。
       var wxPlan = (wx && wx.plan) ? String(wx.plan) : "free";
       var wxIsPaid = wxPlan !== "free";
-      var wxCaps = (wx && Array.isArray(wx.caps) && wx.caps.length) ? wx.caps : null;
+      // ★ 判据是「wx.caps 是不是数组」,**空数组也算权威**(与服务端/bridge 同一口径):
+      //   通道下发 `caps: []` = 后台把这一档清空了(契约 §4.1)。若当成"没给"而回退本地面板镜像,
+      //   面板就会展示出一个用户**实际没有**的能力清单 —— 展示与判定分叉,正是业主红线。
+      var wxCaps = (wx && Array.isArray(wx.caps)) ? wx.caps : null;
       var wxHas = function (cap) {
         var list = wxCaps || (wxIsPaid ? WECHAT_PAID_CAPS : WECHAT_FREE_CAPS);
         return list.some(function (c) { return c === cap || cap.indexOf(c + ".") === 0; });
@@ -4487,8 +4490,14 @@ window.__ModuleLoader__.load({
           var text = row.free || row.paid;
           if (!text) return;
           var ok = wxHas(row.cap);
+          // ★ 锁定的说法要看**当前档位**：
+          //   · 免费用户看到一个用不了的能力 → 「（会员）」是准确的（这正是升级理由）
+          //   · 付费用户看到一个用不了的能力 → 那是**后台把他的这项关了**，
+          //     再写「（会员）」就是对着会员说"这是会员功能"，纯属胡话。
+          //     改成「（当前套餐不含）」，与后台配置保持一致（业主：话术与权限必须一致）。
+          var lockNote = wxIsPaid ? "（当前套餐不含）" : "（会员）";
           capRows.push(h("div", { className: "dru-wx-intro-row", key: "cap" + i },
-            (ok ? "✅ " : "🔒 ") + text + (ok ? "" : "（会员）")));
+            (ok ? "✅ " : "🔒 ") + text + (ok ? "" : lockNote)));
         });
       } else {
         WECHAT_CAP_LABELS.forEach(function (row, i) {
@@ -4496,10 +4505,24 @@ window.__ModuleLoader__.load({
           if (text) capRows.push(h("div", { className: "dru-wx-intro-row", key: "cap" + i }, "· " + text));
         });
       }
-      var quotaRow = (!wxIsPaid && WECHAT_FREE_MSGS_PER_MONTH > 0)
+      // ★ 额度也必须是**通道实际在用的那一份**（`wx.limits`，来自服务端权益包）：
+      //   写死镜像的话，后台把免费额度从 20 改成 5，面板仍会说"20 条" ——
+      //   用户按面板的承诺去发，第 6 条就被拦，只会认为产品坏了。
+      //   拿不到 `wx.limits`（旧版 bridge / 状态没读到）才退回本地面板镜像。
+      var wxLimitMsgs = (wx && wx.limits && typeof wx.limits.messages_per_month === "number")
+        ? Number(wx.limits.messages_per_month)
+        : WECHAT_FREE_MSGS_PER_MONTH;
+      // 不再按"是不是付费"决定显不显示：付费档也可能是有限额度（后台可配），
+      // 一律「额度 > 0 就如实写出来，0 = 不限就不提」。
+      // 用量同理：**没有这个字段就不说** —— 旧版 bridge 不上报用量，补一句
+      // 「本月已用 0 条」等于替用户编了一个事实（他可能已经用掉 8 条）。
+      var wxUsed = (wx && typeof wx.messages_used_this_month === "number")
+        ? Number(wx.messages_used_this_month)
+        : null;
+      var quotaRow = (wxLimitMsgs > 0)
         ? h("div", { className: "dru-wx-intro-row" },
-            "· 免费版每月 " + WECHAT_FREE_MSGS_PER_MONTH + " 条消息额度"
-            + (wx ? "（本月已用 " + Number(wx.messages_used_this_month || 0) + " 条）" : ""))
+            "· 每月 " + wxLimitMsgs + " 条消息额度"
+            + (wxUsed === null ? "" : "（本月已用 " + wxUsed + " 条）"))
         : null;
       var intro = h("div", { className: "dru-wx-intro", role: "note", "aria-label": "微信机器人通道能做什么" },
         h("div", { className: "dru-wx-intro-title" },

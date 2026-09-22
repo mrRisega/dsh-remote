@@ -105,6 +105,8 @@ async function boundRuntime(ilink, opts = {}) {
     limitTable: opts.limitTable,
     entitlements: opts.entitlements,
     appUrl: opts.appUrl,
+    // 可控时钟:额度用量按自然月归零,「跨月再提醒」必须能确定性地测(不能真等一个月)
+    clock: opts.clock,
     logger: quietLogger()
   });
   // 替换订阅器:本文件测编排,不测 DSH 协议(那是 dsh-events.test.mjs 的职责)
@@ -143,6 +145,26 @@ const lastText = (state) => {
     ? last.msg.item_list[0].text_item.text
     : "";
 };
+
+/** 已经发出去的全部文本(按发送顺序)。用于"这类消息发过几条"的断言。 */
+const allTexts = (state) =>
+  state.sends
+    .map((s) => (s && s.msg && s.msg.item_list && s.msg.item_list[0] && s.msg.item_list[0].text_item
+      ? s.msg.item_list[0].text_item.text
+      : ""))
+    .filter(Boolean);
+
+/** 等一个"最终会成立"的条件(有上限,不会挂死)。fire-and-forget 的路径用它消掉时序抖动。 */
+async function waitFor(pred, { tries = 100, ms = 10 } = {}) {
+  for (let i = 0; i < tries; i += 1) {
+    if (pred()) return true;
+    await new Promise((r) => setTimeout(r, ms));
+  }
+  return pred();
+}
+
+/** 给"**不该**发生的事"留一段结算时间(证明否定命题时用)。 */
+const settle = () => new Promise((r) => setTimeout(r, 60));
 
 // ── ① 词表翻译 ────────────────────────────────────────────────────────────
 
@@ -1101,6 +1123,356 @@ test("绑定态只有 bound/unbound 两态:未绑定时通道不启动、绑定�
     rt2.subscriber = makeFakeSubscriber();
     assert.equal(await rt2.startChannel(), true);
     await rt2.stop();
+  } finally {
+    await ilink.close();
+  }
+});
+
+// ── ⑦ 权益包端到端(服务端 → runtime) + 额度提醒 ───────────────────────────
+//
+// 背景:服务端 `/api/me` 新增 `entitlements`(契约 §5),bridge 原样透传给 runtime。这里锁的是
+// **展示 == 判定**:status() 下发给面板的那份 caps,必须就是拦截派活时用的那一份 ——
+// 一旦两者分叉,面板就会承诺一个用户实际做不了的能力(契约 §8 红线 1)。
+
+/** 服务端说:免费版只有 assign.continue,没有 assign.new。 */
+const SERVER_FREE_ENT = Object.freeze({
+  plan: "free",
+  caps: ["notify", "approve", "status", "stop", "assign.continue"],
+  limits: { messages_per_month: 20 },
+  rev: "rev-e2e",
+  source: "configured"
+});
+
+test("★★ 权益包端到端:服务端说免费只有 assign.continue → 判定与面板展示一致(不多给 assign.new)", async () => {
+  const ilink = await fakeIlink();
+  try {
+    const sub = makeFakeSubscriber();
+    const { rt } = await boundRuntime(ilink, {
+      subscriber: sub, tier: "", tierProvider: async () => SERVER_FREE_ENT
+    });
+    await rt.refreshTierNow(); // bridge 启动时 / 每 10 分钟做的那次校准
+
+    const s = rt.status();
+    assert.equal(s.entitlements_source, "server", "★有服务端权益包时来源必须是 server(否则面板会展示内置表)");
+    assert.equal(s.plan, "free");
+    assert.deepEqual(s.caps, SERVER_FREE_ENT.caps, "★面板展示的 caps 必须与服务端逐字一致");
+    assert.deepEqual(s.limits, SERVER_FREE_ENT.limits, "限额同样来自服务端");
+
+    // #can 是私有方法:它只做 `grantsCap(#caps(), need)`,所以用同一份 caps 走同一个判定函数,
+    // 等价于直接问 #can —— 再加上下面的行为断言,展示与判定被同一条测试锁死。
+    assert.equal(rtmod.grantsCap(s.caps, "assign.new"), false, "★服务端没给 assign.new → 判定必须为假");
+    assert.equal(rtmod.grantsCap(s.caps, "assign.continue"), true, "★assign.continue 必须为真(免费能接着聊)");
+    assert.equal(rtmod.grantsCap(s.caps, "assign"), false, "只写 assign.continue 不等于授权整个 assign.*");
+
+    // 行为层:服务端没给 assign.new → /new 必须被拒
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "/new 做点事" } }] });
+    assert.equal(sub.calls.filter((c) => c.m === "createSession").length, 0,
+      "★服务端没给 assign.new,就绝不能开新会话(判定必须真的生效,不只是展示)");
+    assert.match(lastText(ilink.state), /会员/, "被拒时要如实说明这是会员能力");
+
+    // 行为层:有当前会话 → 续接必须放行(assign.continue 在 caps 里)
+    rt.currentSessionId = "session-x";
+    rt.currentSessionTitle = "已有任务";
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "接着做" } }] });
+    const prompted = sub.calls.filter((c) => c.m === "promptSession");
+    assert.equal(prompted.length, 1, "★assign.continue 必须真的放行(免费用户要能接着聊)");
+    assert.equal(prompted[0].text, "接着做");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★ 权益包:服务端缺字段时保留上次的值(不因缺字段清空能力)", async () => {
+  const ilink = await fakeIlink();
+  try {
+    const sub = makeFakeSubscriber();
+    let got = { plan: "free", caps: ["notify", "assign.continue"], limits: { messages_per_month: 20 }, rev: "r1" };
+    const { rt } = await boundRuntime(ilink, { subscriber: sub, tier: "", tierProvider: async () => got });
+    await rt.refreshTierNow();
+    assert.deepEqual(rt.status().caps, ["notify", "assign.continue"]);
+
+    // ② 这次只给了 caps(缺 limits)→ caps 跟着变,limits 保留上次的 20
+    got = { plan: "free", caps: ["notify", "approve", "assign.continue"], rev: "r2" };
+    await rt.refreshTierNow();
+    assert.deepEqual(rt.status().caps, ["notify", "approve", "assign.continue"], "caps 变了就要跟着变");
+    assert.equal(Number(rt.status().limits.messages_per_month), 20,
+      "★缺 limits 时必须保留上次的值(补一个 {} 会被读成「不限」= 放权)");
+
+    // ③ 服务端没带 entitlements(bridge 退回字符串档位)→ 整份老包保留,不因缺包清空能力
+    got = "pro";
+    await rt.refreshTierNow();
+    const s = rt.status();
+    assert.equal(s.plan, "pro", "档位字符串照旧生效");
+    assert.equal(s.entitlements_source, "server", "★旧契约下仍沿用上次的服务端包,不回退内置表(否则能力会被重置)");
+    assert.deepEqual(s.caps, ["notify", "approve", "assign.continue"], "★缺 caps 不得清空能力");
+    assert.equal(Number(s.limits.messages_per_month), 20, "limits 同样保留");
+    // fail-closed:档位显示 pro,但能力仍以服务端包为准 —— 不能因为"档位名像付费"就放权
+    assert.equal(rtmod.grantsCap(s.caps, "assign.new"), false, "★档位名不得覆盖权益包(显示 pro 也不能凭空多给能力)");
+  } finally {
+    await ilink.close();
+  }
+});
+
+/** 额度提醒的公共脚手架:免费档、每月 20 条、有 App 入口、可控时钟。 */
+async function quotaRuntime(ilink, { limits, caps = SERVER_FREE_ENT.caps, clock, appUrl = "https://app.example/x/" } = {}) {
+  const sub = makeFakeSubscriber();
+  const { rt, relayDir } = await boundRuntime(ilink, {
+    subscriber: sub,
+    tier: "",
+    tierProvider: async () => ({ plan: "free", caps, limits, rev: "rev-q" }),
+    appUrl,
+    clock
+  });
+  await rt.refreshTierNow();
+  rt.currentSessionId = "session-q";
+  rt.currentSessionTitle = "在跑的任务";
+  return { rt, relayDir, sub };
+}
+
+/** 走"真的派活"这条路(这是额度被消耗的唯一路径)。 */
+const sendTask = (rt, text = "继续做") =>
+  rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text } }] });
+
+/** 额度提醒的识别标记:「还剩 X 条」只在提醒里出现(拒绝文案说的是「已经用完」)。 */
+const quotaNotices = (state) => allTexts(state).filter((t) => /还剩 \d+ 条/.test(t));
+
+test("★★ 额度提醒:用掉 80% 触发一次、同月不重复、跨月可再提醒", async () => {
+  const ilink = await fakeIlink();
+  try {
+    let now = new Date("2026-03-05T10:00:00Z").getTime();
+    const { rt, relayDir } = await quotaRuntime(ilink, {
+      limits: { messages_per_month: 20 }, clock: () => now
+    });
+
+    // 用掉 15 条(75%)→ 还没到线,不打扰用户
+    for (let i = 0; i < 15; i += 1) await sendTask(rt, `派活${i}`);
+    await settle();
+    assert.equal(quotaNotices(ilink.state).length, 0, "才 75% 不该提醒(提醒太早 = 骚扰)");
+
+    // 第 16 条 = 80% → 必须提醒(而且是由"派活成功"自动触发的,不需要谁来点一下)
+    await sendTask(rt, "第 16 条");
+    const fired = await waitFor(() => quotaNotices(ilink.state).length === 1);
+    assert.ok(fired, "★额度用到 80% 必须自动提醒(notifyQuotaLow 以前是死代码,一次都不会发)");
+    const text = quotaNotices(ilink.state)[0];
+    assert.match(text, /还剩 4 条/, `要说清还剩几条,实际:${text}`);
+    assert.match(text, /下个月 1 号/, "要说清什么时候恢复(否则用户以为永久没了)");
+    assert.ok(text.includes("https://app.example/x/"), "要给 App 入口(免费用户越界时的转化链接)");
+
+    // 同一个自然月:再发消息 / 再手动检查都不重复
+    await rt.runQuotaRemindNow();
+    for (let i = 0; i < 4; i += 1) await sendTask(rt, `继续${i}`);
+    await settle();
+    assert.equal(quotaNotices(ilink.state).length, 1,
+      "★每个自然月最多提醒一次(每发一条念一遍额度是骚扰)");
+    assert.equal(Number(loadState(relayDir).last_quota_notice ? 1 : 0), 1, "去重状态要落盘(重启后不重复)");
+
+    // 跨月:用量按自然月归零 → 又能再提醒一次
+    now = new Date("2026-04-05T10:00:00Z").getTime();
+    await rt.runQuotaRemindNow();
+    assert.equal(quotaNotices(ilink.state).length, 1, "新月还没用额度,不该提醒");
+    for (let i = 0; i < 16; i += 1) await sendTask(rt, `四月派活${i}`);
+    const again = await waitFor(() => quotaNotices(ilink.state).length === 2);
+    assert.ok(again, "★跨月可以再提醒(用 #monthKey() 而不是「一辈子只提醒一次」)");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★ 额度提醒:messages_per_month = 0(不限)永不提醒", async () => {
+  // 付费档的限制就是 0 = 不限。若这里漏判 0,"不限"会被当成"额度 0 条"或"没有额度概念却催额度",
+  // 付费用户每个月都被念一遍 —— 这是最不该发生的一类骚扰。
+  const ilink = await fakeIlink();
+  try {
+    const PAID_CAPS = ["notify", "approve", "status", "stop", "assign", "sessions", "summary", "steer", "attach", "multi"];
+    const { rt, sub } = await quotaRuntime(ilink, {
+      limits: { messages_per_month: 0 }, caps: PAID_CAPS
+    });
+
+    for (let i = 0; i < 30; i += 1) await sendTask(rt, `派活${i}`);
+    await settle();
+    assert.equal(quotaNotices(ilink.state).length, 0, "★不限量就永远不该出现额度提醒");
+    assert.equal(sub.calls.filter((c) => c.m === "promptSession").length, 30, "不限量必须真的不限(30 条都放行)");
+
+    // 直接调检查入口也不该发(不是"恰好没触发",而是判据里就排除了 0)
+    await rt.runQuotaRemindNow();
+    assert.equal(quotaNotices(ilink.state).length, 0, "★0 = 不限,检查入口也必须直接返回");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★ 额度提醒不消耗消息额度(提醒自己不是「派活」)", async () => {
+  const ilink = await fakeIlink();
+  try {
+    const now = new Date("2026-05-05T10:00:00Z").getTime();
+    const { rt, sub } = await quotaRuntime(ilink, {
+      limits: { messages_per_month: 20 }, clock: () => now
+    });
+
+    for (let i = 0; i < 16; i += 1) await sendTask(rt, `派活${i}`);
+    assert.ok(await waitFor(() => quotaNotices(ilink.state).length === 1), "第 16 条应触发提醒");
+
+    // ★ 关键:提醒发出后用量必须还是 16。若提醒走了 #msgQuotaBump,这里会是 17。
+    assert.equal(rt.status().messages_used_this_month, 16,
+      "★提醒本身绝不能计入消息额度(否则越提醒越少,提醒成了惩罚)");
+    assert.equal(Number(rt.msgUsage.count), 16, "内部用量计数同样不能变");
+
+    // 剩余 4 条仍然可用(提醒没有偷偷多扣)
+    for (let i = 0; i < 4; i += 1) await sendTask(rt, `再发${i}`);
+    assert.equal(sub.calls.filter((c) => c.m === "promptSession").length, 20, "剩余额度必须照常可用");
+    assert.equal(rt.status().messages_used_this_month, 20);
+
+    // 第 21 条才是"用完"的拒绝(证明上面的 20 条是真的被放行了)
+    await sendTask(rt, "第 21 条");
+    assert.equal(sub.calls.filter((c) => c.m === "promptSession").length, 20, "额度用完必须拦");
+    assert.match(lastText(ilink.state), /额度已经用完/);
+  } finally {
+    await ilink.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 空 caps 是**权威**的"这一档什么都不能做"(2026-09-23 修)
+//
+// 真实缺陷:`#caps()` 与 `#refreshTier` 原先用 `caps.length` 判"服务端有没有给权益包",
+// 于是后台「明确清空某档」(契约 §4.1 下发 `caps: []`)被当成"没给" →
+// 沿用上次那份包、一份都没有时回退**内置表** → 本该"什么都不能做"的档位
+// 拿回内置的一整套能力(付费档尤其严重)。方向正好是 **fail-open**,与契约 §8 红线 2 相反。
+// ---------------------------------------------------------------------------
+
+test("★★ 权益包:服务端下发 caps: [] (后台明确清空) → 该档真的什么都不能做,绝不回退内置表", async () => {
+  const ilink = await fakeIlink();
+  try {
+    const sub = makeFakeSubscriber();
+    const { rt } = await boundRuntime(ilink, {
+      subscriber: sub, tier: "",
+      tierProvider: async () => ({ plan: "pro", caps: [], limits: { messages_per_month: 0 }, rev: "rev-empty" })
+    });
+    await rt.refreshTierNow();
+    const s = rt.status();
+    assert.equal(s.plan, "pro");
+    assert.deepEqual(s.caps, [], "★空数组是权威:这一档就是什么能力都没有");
+    assert.equal(s.entitlements_source, "server", "★空数组 ≠ 没给:来源仍必须是 server");
+    // 内置 pro 表里的能力现在一个都不能有(回退内置表就会全变真 = fail-open)
+    for (const cap of ["notify", "approve", "status", "stop", "sessions", "summary", "assign"]) {
+      assert.equal(rtmod.grantsCap(s.caps, cap), false,
+        `★清空后 ${cap} 必须为假(若回退内置表就会变真)`);
+    }
+    // 行为层:连续接都不行(该档什么都没授权)
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "/ls" } }] });
+    assert.equal(sub.calls.filter((c) => c.m === "listSessions").length, 0,
+      "★没授权 sessions 就不能列会话(判定必须真的生效,不只是展示)");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★权益包:先给一份含 assign 的包,再下发 caps: [] → 必须真的清空(沿用上次那份就是 fail-open)", async () => {
+  const ilink = await fakeIlink();
+  try {
+    const sub = makeFakeSubscriber();
+    let got = {
+      plan: "pro", caps: ["notify", "approve", "status", "stop", "assign"],
+      limits: { messages_per_month: 0 }, rev: "rev-1"
+    };
+    const { rt } = await boundRuntime(ilink, {
+      subscriber: sub, tier: "", tierProvider: async () => got
+    });
+    await rt.refreshTierNow();
+    assert.ok(rt.status().caps.includes("assign"), "前提:第一次下发的是含 assign 的包");
+
+    // 后台清空该档
+    got = { plan: "pro", caps: [], limits: { messages_per_month: 0 }, rev: "rev-2" };
+    await rt.refreshTierNow();
+    assert.deepEqual(rt.status().caps, [],
+      "★第二次下发空数组必须真的清空 —— 若沿用上次那份,后台的「清空」就静默失效了(fail-open)");
+    assert.equal(rtmod.grantsCap(rt.status().caps, "assign"), false, "assign 必须随之失效");
+  } finally {
+    await ilink.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 提醒(额度 / 会员到期)不得抢占审批的回执位
+//
+// 真机问题(2026-09-23 定位):提醒在文案层是**可回执**的(带「邀请好友 / 知道了」选项),
+// 于是被塞进审批队列;而数字回执按 FIFO 认领 —— 用户看着**底部最新那条审批**回「1」,
+// 回执却落到了更早的额度提醒上(还会被派给一个根本不存在的 question id)。
+// 结果:审批没人答,用户得再回一次才轮到,而他会以为"审批失灵了"。
+// 修法:队列分「决策」与「提醒」两类,数字优先给决策;提醒只在没有决策时才接数字。
+// ---------------------------------------------------------------------------
+
+test("★★ 提醒不得抢占审批的回执位:额度提醒在前、审批在后 → 回「1」必须答到审批上", async () => {
+  const ilink = await fakeIlink();
+  try {
+    const sub = makeFakeSubscriber();
+    const { rt } = await boundRuntime(ilink, { subscriber: sub });
+
+    // ① 先来一条额度提醒(它带「邀请好友 / 知道了」,所以是可回执的)
+    await rt.notifyQuotaLow({ message: "本月 20 条额度已用 16 条" });
+    assert.equal(rt.pendingReplies.length, 1, "前提:提醒确实进了队列");
+    assert.equal(rt.status().pending_replies, 0, "★但提醒不算「待拍板」——面板数字要与用户真要做的事一致");
+
+    // ② 再来一条真审批
+    await rt.notify({ kind: NODE_KINDS.APPROVAL_REQUEST, eventId: "ev-late", toolName: "Bash", answerShape: "approval", at: 2 });
+    assert.equal(rt.status().pending_replies, 1, "待拍板数 = 1(只有那条审批)");
+
+    // ③ 用户看到的是底部那条审批,回「1」→ 必须答到审批上
+    sub.calls.length = 0;
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "1" } }] });
+    const ap = sub.calls.filter((c) => c.m === "answerApproval");
+    assert.equal(ap.length, 1, "★回执必须落到审批上(旧实现会落到更早的额度提醒上 → 审批没人答)");
+    assert.equal(ap[0].id, "ev-late", "答的必须是那条审批");
+    assert.equal(sub.calls.filter((c) => c.m === "answerQuestion").length, 0,
+      "★绝不能把提醒的「邀请好友」当成 DSH 提问派出去(那个 eventId 根本不是提问)");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★ 提醒的 CTA 就地消化:回「1」给邀请入口、回「2」确认知道了,都不派给 DSH", async () => {
+  const ilink = await fakeIlink();
+  try {
+    const sub = makeFakeSubscriber();
+    const { rt } = await boundRuntime(ilink, { subscriber: sub, appUrl: "https://x.test/app/" });
+
+    // ① 只有提醒一条决策都没有 → 数字仍然可用(它的「邀请好友」这时才有意义)
+    await rt.notifyQuotaLow({ message: "本月 20 条额度已用 16 条" });
+    sub.calls.length = 0;
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "1" } }] });
+    assert.equal(sub.calls.filter((c) => c.m === "answerQuestion").length, 0,
+      "★提醒不是 DSH 提问,不能拿不存在的 id 去 answerQuestion(旧实现必然失败并回「没能替你完成」)");
+    assert.match(lastText(ilink.state), /邀请/, "应给出邀请入口");
+    assert.match(lastText(ilink.state), /x\.test/, "应带上 App 入口(用户点得到的才算数)");
+
+    // ② 「知道了」= 2
+    await rt.notifyQuotaLow({ message: "再提醒一次" });
+    sub.calls.length = 0;
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "2" } }] });
+    assert.equal(sub.calls.filter((c) => c.m === "answerQuestion").length, 0);
+    assert.equal(rt.pendingReplies.length, 0, "选完就该出队");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★ 多审批 + 提醒混排:回执仍按 FIFO 走审批(提醒不参与排队)", async () => {
+  const ilink = await fakeIlink();
+  try {
+    const sub = makeFakeSubscriber();
+    const { rt } = await boundRuntime(ilink, { subscriber: sub });
+
+    await rt.notify({ kind: NODE_KINDS.APPROVAL_REQUEST, eventId: "ev-1", toolName: "B1", answerShape: "approval", at: 1 });
+    await rt.notifyQuotaLow({ message: "提醒夹在两条审批中间" });
+    await rt.notify({ kind: NODE_KINDS.APPROVAL_REQUEST, eventId: "ev-2", toolName: "B2", answerShape: "approval", at: 3 });
+    assert.equal(rt.status().pending_replies, 2, "两条审批 = 2 条待拍板(提醒不计)");
+
+    sub.calls.length = 0;
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "1" } }] });
+    assert.equal(sub.calls.find((c) => c.m === "answerApproval").id, "ev-1", "先答最早那条审批");
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "1" } }] });
+    assert.equal(sub.calls.filter((c) => c.m === "answerApproval")[1].id, "ev-2", "再答第二条审批");
+    assert.equal(sub.calls.filter((c) => c.m === "answerQuestion").length, 0, "提醒全程不参与回执");
   } finally {
     await ilink.close();
   }

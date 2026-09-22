@@ -183,6 +183,22 @@ const SPECIAL_EVENT_KINDS = Object.freeze([
 ]);
 
 /**
+ * **提醒类**节点:它不是"等用户拍板",只是"告诉他一件事 + 顺带给个入口"。
+ *
+ * 为什么必须单独分一类(2026-09-23 定位到真机问题):
+ *   额度提醒与会员到期提醒在文案层是**可回执**的(带「邀请好友 / 知道了」选项,
+ *   见 wechat-channel.mjs 的 `optionsFor`),于是它们会被塞进审批队列 `pendingReplies`。
+ *   而数字回执按 **FIFO** 认领(微信里消息位置固定,用户从上往下读)——
+ *   真机后果:用户看到的是底部**最新那条审批**,回「1」,
+ *   回执却落到了**更早的那条额度提醒**上 → 审批没人答,得再回一次才轮到。
+ *
+ * 所以队列分两类:
+ *   · **决策**(审批 / 提问 / 计划)= 需要用户拍板,数字回执优先给它们;
+ *   · **提醒**(额度 / 会员到期)= 不占决策位;只有一条决策都没有时,数字才给它们。
+ */
+const NOTICE_FORMATTER_KINDS = Object.freeze(["quota", "membership"]);
+
+/**
  * 把事件节点翻译成文案节点。
  * @returns {{node: object|null, formatterKind: string}}
  */
@@ -446,7 +462,8 @@ export class WeChatRuntime {
       last_push_ok_at: state.last_push_ok_at || 0,
       last_error: state.last_error || "",
       cooldown_ms: cooldownMs,
-      pending_replies: this.pendingReplies.length,
+      // 只数**待拍板**的(不含额度/会员到期这类提醒):面板上的数字要与用户真实要做的决定一致
+      pending_replies: this.#decisionCount(),
       // ★ 面板要把「你现在能用什么」如实展示出来(业主:话术与权限必须一致,不多承诺)。
       //   这里下发的是**通道实际在用**的那一份(服务端权益包优先,否则内置表按档位),
       //   所以面板不需要自己猜档位 → 展示与判定不可能不一致。
@@ -687,13 +704,20 @@ export class WeChatRuntime {
    *    用户看着第 1 条回「1」,系统却答了最后一条,第 1 条于是永远没人回应。
    */
   #oldestPending() {
-    while (this.pendingReplies.length) {
-      const head = this.pendingReplies[0];
-      const entry = this.channel.registry.get(head.eventId);
-      if (entry) return head;
-      this.pendingReplies.shift(); // 已被消费/过期 → 丢掉继续看下一条
-    }
-    return null;
+    // 先清掉已被消费/过期的,再看队列
+    this.pendingReplies = this.pendingReplies.filter((p) => this.channel.registry.get(p.eventId));
+    // ★ **决策优先**:数字回执是给"要用户拍板的事"用的。
+    //   提醒类(额度/会员到期)只是告知 + 顺带入个口,不能抢走审批的回执位 ——
+    //   否则用户看着底部那条审批回「1」,回执却落到更早的提醒上(真机复现过)。
+    const decisions = this.pendingReplies.filter((p) => !p.notice);
+    if (decisions.length) return decisions[0];
+    // 一条决策都没有 → 才轮到提醒(它的「邀请好友 / 知道了」这时才有意义)
+    return this.pendingReplies[0] || null;
+  }
+
+  /** 待**拍板**的条数(不含提醒类)。 */
+  #decisionCount() {
+    return this.pendingReplies.filter((p) => !p.notice).length;
   }
 
   /**
@@ -712,7 +736,7 @@ export class WeChatRuntime {
     const opts = Array.isArray(entry && entry.options) ? entry.options : [];
     if (!opts.length) return; // 不可回执的(如破坏性审批)不再提示
     const task = String((pending.node && (pending.node.toolName || pending.node.title)) || "").trim();
-    const lines = [`还有 ${this.pendingReplies.length} 条待你拍板：`];
+    const lines = [`还有 ${this.#decisionCount()} 条待你拍板：`];
     if (task) lines.push(`· ${task}`);
     lines.push("");
     opts.forEach((o, i) => lines.push(`回复 ${i + 1} = ${o.label}`));
@@ -752,8 +776,9 @@ export class WeChatRuntime {
         // ⚠️ 陷阱:回执只认**纯数字**(见 classifyInbound)。免费档的核心价值恰恰是审批,
         //    用户很可能打字「允许」而不是回「1」—— 若只回一句付费提示,他会以为免费版什么都干不了。
         //    所以手上有待回执的消息时,先把"回数字就能拍板"说在前面。
-        const head = this.pendingReplies.length > 0
-          ? `你还有 ${this.pendingReplies.length} 条待你拍板的消息 —— 直接回一个数字(如 1)就能完成决定,不用打字。\n\n`
+        const waiting = this.#decisionCount();
+        const head = waiting > 0
+          ? `你还有 ${waiting} 条待你拍板的消息 —— 直接回一个数字(如 1)就能完成决定,不用打字。\n\n`
           : "";
         await this.reply(from, head + this.#upsellText());
         return;
@@ -779,7 +804,11 @@ export class WeChatRuntime {
    */
   #caps() {
     const server = this.entitlements && Array.isArray(this.entitlements.caps) ? this.entitlements.caps : null;
-    if (server && server.length) return server;
+    // ⚠️ 判据是「**是不是数组**」,不是「数组非空」(2026-09-23 修):
+    //   服务端下发 `caps: []` 是**权威的"这一档什么都不能做"**(后台明确清空,契约 §4.1)。
+    //   写成 `server.length` 会把空数组当成"没给",于是回退**内置表** ——
+    //   本该"什么都不能做"的档位拿回内置的一整套能力(付费档尤其严重),方向正好是 fail-open。
+    if (server) return server;
     return capabilitiesFor(this.#tier(), this.capabilityTable);
   }
 
@@ -848,7 +877,11 @@ export class WeChatRuntime {
     const isObj = Boolean(got) && typeof got === "object";
     const plan = String((isObj ? got.plan : got) || "").trim();
     if (!plan) return this.#tier(); // 空 = 这次没取到 → 沿用缓存(绝不降级)
-    const caps = isObj && Array.isArray(got.caps) && got.caps.length ? got.caps : null;
+    // ★ 判据是「caps 是**数组**」,**空数组也算权威**(2026-09-23 修):
+    //   空数组 = 服务端明确表达"这一档什么都不能做"(后台"清空",契约 §4.1)。
+    //   若把空数组当成"没给",会沿用上次那份包(或回退内置表)——
+    //   于是"清空 pro"变成"pro 拿回内置的一整付费套能力",比意图**更多**权限(fail-open)。
+    const caps = isObj && Array.isArray(got.caps) ? got.caps : null;
     const limits = isObj && got.limits && typeof got.limits === "object" ? got.limits : null;
     const rev = isObj ? String(got.rev || "") : "";
     const planChanged = plan !== this.cachedTier;
@@ -1067,6 +1100,10 @@ export class WeChatRuntime {
     }
     this.#msgQuotaBump();
     await this.reply(from, `已开新任务 ${short} 并下发。跑完我会推结论给你;中途想补充直接回话即可。`);
+    // ★ 额度消耗**之后**才可能提醒(必须排在 bump 之后:提醒要看到刚扣掉的这一条)。
+    //   放在回执之后:提醒落在"已下发"下面,读起来是补充说明而不是打断。
+    //   fire-and-forget:提醒是锦上添花,绝不能因为它失败/变慢而影响派活这条主流程。
+    this.#maybeRemindQuota().catch(() => {});
   }
 
   /** `/ls` —— 列出最近会话(带名称),供 /use 选择。 */
@@ -1125,7 +1162,7 @@ export class WeChatRuntime {
 
   /** `/status` —— 绑定状态 + 当前会话。 */
   async #cmdStatus(from) {
-    const base = renderStatusText(this.channel.account, loadState(this.relayDir), { pending: this.pendingReplies.length });
+    const base = renderStatusText(this.channel.account, loadState(this.relayDir), { pending: this.#decisionCount() });
     const name = this.currentSessionTitle || "";
     const short = this.currentSessionId ? String(this.currentSessionId).replace(/^session-/, "").slice(0, 8) : "";
     const line = this.currentSessionId
@@ -1184,6 +1221,9 @@ export class WeChatRuntime {
     if (r && r.ok) {
       this.#msgQuotaBump(); // 只在真的派出去之后扣额度(发失败不该扣)
       await this.reply(from, `已补充给「${this.currentSessionTitle || "当前任务"}」,跑完推结论给你。`);
+      // ★ 额度消耗**之后**才可能提醒(顺序不能反:提醒要看的是扣完之后还剩几条);
+      //   fire-and-forget,提醒失败不影响"已下发"这条主流程的结果。
+      this.#maybeRemindQuota().catch(() => {});
       return;
     }
     await this.reply(from, `发送失败:${(r && r.message) || "未知错误"}。回 /ls 确认当前任务还在不在。`);
@@ -1208,6 +1248,26 @@ export class WeChatRuntime {
     const option = entry.options[digits - 1];
     if (!option) {
       await this.reply(from, `编号 ${digits} 不在选项里。请回复 1-${entry.options.length} 之间的数字。`);
+      return;
+    }
+
+    // ── 提醒类(额度 / 会员到期):它**没有**对应的 DSH 提问或审批,回执必须就地消化 ──
+    //    ⚠️ 这里顺手修掉一个「从来没生效过」的入口:此前提醒的「邀请好友 / 知道了」
+    //       被当成提问派给 `subscriber.answerQuestion`,拿一个**不存在的 question id** 去答,
+    //       必然失败 → 用户看到的是「没能替你完成这个选择」。选项文案承诺了、行为却做不到,
+    //       正是业主红线里"话术与权限不一致"的那一类。
+    if (pending.notice) {
+      this.channel.registry.consume(pending.eventId);
+      this.pendingReplies = this.pendingReplies.filter((p) => p.eventId !== pending.eventId);
+      if (String(option.value) === "invite") {
+        const lines = ["邀请好友:在 App 里的「邀请」入口取你的专属链接,发给他即可。"];
+        if (this.appUrl) lines.push(this.appUrl);
+        // 只说事实,不报具体奖励数字(那是 App/后台的口径,这里报错了就成了假承诺)
+        lines.push("（只有邀请人得奖励,被邀请方没有奖励;奖励档位以 App 内展示为准。）");
+        await this.reply(from, lines.join("\n"));
+      } else {
+        await this.reply(from, "好的。");
+      }
       return;
     }
 
@@ -1411,7 +1471,9 @@ export class WeChatRuntime {
     // 已经还有别的待拍板 → 明确说"不止这一条"。不说的话用户会以为答完就结束了,
     // 后面几条就变成"没人回应"(业主报的那个 bug 的后半段现象)。
     // ⚠️ 数字必须取**发送前**的快照:push 之后它会包含这一条自己。
-    const othersWaiting = built.replyable && built.eventId ? this.pendingReplies.length : 0;
+    // ⚠️ 只数**决策**:提醒类(额度/会员到期)不占拍板位,更不该在提醒里说"你还有 N 条待拍板"。
+    const isNotice = NOTICE_FORMATTER_KINDS.includes(formatterKind);
+    const othersWaiting = built.replyable && built.eventId && !isNotice ? this.#decisionCount() : 0;
     const outgoing = othersWaiting > 0
       ? `${built.text}\n\n（你还有 ${othersWaiting + 1} 条待拍板，回完这条我会把下一条发到下面）`
       : built.text;
@@ -1423,6 +1485,8 @@ export class WeChatRuntime {
         kind: formatterKind,
         answerShape: eventNode.answerShape || (formatterKind === "approval" ? "approval" : "question"),
         node: eventNode,
+        // ★ 提醒类不参与 FIFO 认领(只有一条决策都没有时才会接数字),见 NOTICE_FORMATTER_KINDS
+        notice: isNotice,
         at: this.clock()
       });
       // 队列上限:只保留最近若干条待答,避免无限增长
@@ -1496,6 +1560,63 @@ export class WeChatRuntime {
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
   }
 
+  /**
+   * 每月消息额度「快用完了」的提醒(这是**唯一的**触发点)。
+   *
+   * ⚠️ 这条**以前根本不存在**:`notifyQuotaLow()` 只有定义、全仓零调用方 ——
+   *    于是用户永远是在额度**归零那一刻**才撞上冷冰冰的拒绝,事先毫无预告。
+   *    与 `#maybeRemindExpiry()` 同一套模式(落盘去重 + 只有真发出去了才记账),
+   *    调用点也照它那样 fire-and-forget(见 `#cmdNew` / `#sendToSession`)。
+   *
+   * 触发口径(两个条件取**较宽松**的那个,谁先到用谁 —— 别让用户到 0 才收到):
+   *   · 已用 ≥ 80% ;或 · 剩余 ≤ 2 条
+   * 频控:**每个自然月最多一次**(`#monthKey()` 落盘去重)。每发一条就念一遍额度是骚扰,
+   *     而且微信里挡住消息的正是额度本身 —— 提醒的价值在"提前预告",不是"复读"。
+   *
+   * ⚠️ `messages_per_month` 为 0/缺省 = **不限**(付费档就是 0):必须**直接返回**,
+   *    否则付费用户会被按月念叨"你额度快用完了"(他没有额度这回事)。
+   * ⚠️ 提醒本身**不消耗**消息额度:它不走 `#msgQuotaBump()`,也不经 `handleInbound`
+   *    (那是"派活"的入口)—— 发提醒绝不能让用户的余额更少。
+   */
+  async #maybeRemindQuota() {
+    if (this.stopping || !this.channel.account || !this.subscriber) return;
+    const limit = Number((this.#limits() || {}).messages_per_month || 0);
+    // 0 / 缺省 / 非法 = 不限 → 永不提醒(付费用户不该被念额度)
+    if (!Number.isFinite(limit) || limit <= 0) return;
+    const month = this.#monthKey();
+    const used = this.msgUsage && this.msgUsage.month === month ? Number(this.msgUsage.count || 0) : 0;
+    if (used <= 0) return; // 一条都还没发过:没有"快用完"这回事
+    const remain = Math.max(0, limit - used);
+    // 阈值 = min(80% 处, 剩余 2 条处)。`Math.max(1, …)` 保证不会在第 0 条就触发。
+    const threshold = Math.min(Math.ceil(limit * 0.8), Math.max(1, limit - 2));
+    if (used < threshold) return;
+    const state = loadState(this.relayDir);
+    if (state.last_quota_notice === month) return; // 这个自然月已经提醒过
+    const r = await this.notifyQuotaLow({ state: "low", message: this.#quotaLowText(limit, used, remain) });
+    // 只有真发出去了才记账(与简报/到期提醒同一个道理:没发出去的不能算已发)
+    if (r && r.ok) this.channel.writeState({ last_quota_notice: month });
+  }
+
+  /**
+   * 额度提醒正文。**只讲事实 + 与该用户实际能力一致的引导**(契约 §8 红线 1:不多承诺)。
+   *
+   * ⚠️ 升级引导必须**看 caps**,不能背一句固定的"开通会员即可用全部功能":
+   *    能力是后台按档位配的(契约 §2),写死的话术会承诺 `caps` 里根本没有的能力。
+   *    这里的做法是:只有在用户**确实还不具备**开新任务能力(`assign`)时才提示"这是会员能力",
+   *    其余情况只给 App 入口、不描述任何能力 —— 陈述少一句,总比多承诺一句强。
+   */
+  #quotaLowText(limit, used, remain) {
+    const lines = [
+      `本月 ${limit} 条消息额度已用 ${used} 条，还剩 ${remain} 条。`,
+      `额度按自然月计算，下个月 1 号自动归零（重新给满 ${limit} 条）。`
+    ];
+    if (!this.#can("assign")) {
+      lines.push("", "在微信里直接派活属于会员能力；开通后可继续使用（你能用的能力以 App 内展示为准）。");
+    }
+    if (this.appUrl) lines.push("", `👉 打开 App：${this.appUrl}`);
+    return lines.join("\n");
+  }
+
   #bumpToday(field = "notified") {
     const day = this.#today();
     if (this.todayStats.day !== day) {
@@ -1551,6 +1672,15 @@ export class WeChatRuntime {
   /** 供测试/运维手动触发一次"到期提醒"检查(绕过定时器)。与 runDigestNow 同一目的。 */
   async runExpiryRemindNow() {
     return this.#maybeRemindExpiry();
+  }
+
+  /**
+   * 供测试/运维手动触发一次"额度将尽"检查。生产路径是**派活成功之后**自动调用
+   * (见 `#cmdNew` / `#sendToSession`);单测要确定性地验它,所以单独开一个口子 ——
+   * 与 `runExpiryRemindNow` / `runDigestNow` 同一目的。
+   */
+  async runQuotaRemindNow() {
+    return this.#maybeRemindQuota();
   }
 
   /**

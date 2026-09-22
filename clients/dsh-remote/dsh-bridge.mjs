@@ -1230,6 +1230,15 @@ function tagWeChat(m) {
  * 取值 = 账号的**生效套餐**,服务端只有三种:free / pro / pro_max
  * (见企业端 auth.js 的 PLAN_PRIORITY;试用期服务端已折算成 pro,这里不必自己判断)。
  *
+ * ★ 返回**两种契约**(见 docs/entitlements-contract.md §5/§6.1):
+ *   · 服务端 `/api/me` 带了 `entitlements`(后台可配置的权益包)→ 返回**对象**
+ *     `{plan, caps, limits, rev}`,runtime 以它为准判定能力 —— 这样「后台改配置 = 用户侧实时生效」
+ *     才成立(无需发版)。caps/limits **原样透传**:权限判定以服务端为唯一真相源,
+ *     客户端任何"二次加工/本地过滤"都会让展示与判定分叉,也会让后台配置失效(红线 §8.1/§8.2)。
+ *   · 服务端**没带** `entitlements`(灰度期的旧服务端)→ 保持今天的行为、返回**字符串**档位:
+ *     runtime 有上次的包就继续用它,一份包都没有才按内置表解析。新旧服务端都要能跑,
+ *     所以这里不能只认新契约。
+ *
  * ⚠️ 取不到时返回**空串**,而不是 "free":空串让 runtime 沿用上次成功取到的档位。
  *    一次网络抖动就把付过钱的用户降级成免费、还提示他去升级,比多给几分钟权限糟糕得多。
  * ⚠️ 自建部署直接给最高档:用户跑的是自己的服务器,不存在"会员"这回事,
@@ -1290,6 +1299,29 @@ async function resolveWechatTier() {
         trial_expires_at: u.trial_expires_at ?? null
       };
     }
+    // ★ 服务端权益包(契约 §5):有它就返回对象,runtime 以服务端 caps/limits 为准。
+    //
+    // 🔴 判据是「`caps` 是**数组**」,**空数组也算给了**(2026-09-23 修):
+    //   后台「明确清空」某档(契约 §4.1 的 `EMPTY_CAPS_VALUE`,下发即 `caps: []`)表达的是
+    //   **这个档位什么能力都没有**。如果这里把空数组当成"没给",runtime 就会沿用上次那份包
+    //   (一份都没有时回退**内置表**)—— 于是"我清空了 pro"变成"pro 拿回内置的一整套付费能力",
+    //   比后台意图**更多**权限。那是 fail-open,方向正好反了(契约 §8 红线 2)。
+    //   所以:数组(含空) = 权威;不是数组/字段缺失 = 这次没拿到 → 退回字符串契约沿用上次。
+    const ent = j && j.entitlements;
+    if (ent && typeof ent === "object" && Array.isArray(ent.caps)) {
+      return {
+        // plan 也原样取服务端的值;只有权益包里缺 plan 时才退回 user.plan(同一份真相的旧字段)。
+        plan: String(ent.plan || (u && u.plan) || ""),
+        caps: ent.caps,
+        // ⚠️ limits 缺失时必须给 null,**不能补 `{}`**:runtime 里 `{}` 是"有效的一张限制表",
+        //    于是 messages_per_month 读成 0 = 不限 → 免费用户当场变成无限额度(等于放权)。
+        //    null 才会让 runtime 沿用上次的值 / 回退内置表 —— 缺字段绝不等于放开(契约 §8.2 fail-closed)。
+        limits: ent.limits && typeof ent.limits === "object" ? ent.limits : null,
+        rev: String(ent.rev || "")
+      };
+    }
+    // 没有权益包(旧服务端 / 灰度期)→ 保持旧契约:只给档位字符串。
+    // runtime 收到字符串后:有上次的包就继续用它,一份包都没有才按内置表解析(冷启动兜底)。
     return String((u && u.plan) || "");
   } catch {
     return "";

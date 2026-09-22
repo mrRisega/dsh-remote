@@ -912,3 +912,91 @@ test("★★ 面板能力镜像必须与运行时判定表一致（否则面板�
   assert.equal(mirrorMsgs, Number(rt.WECHAT_TIER_LIMITS.free.messages_per_month),
     "★面板展示的每月额度必须与运行时限制相同");
 });
+
+// ---------------------------------------------------------------------------
+// 权益包（服务端下发）驱动面板文案
+//
+// 上面那条镜像一致性用例保证的是「冷启动兜底等于运行时内置表」；
+// 下面这三条保证的是**服务端一旦下发了权益包，面板就以它为准** ——
+// 这是业主「后台改权限无需发版」与「话术与权限必须一致、不多承诺」的交汇点：
+// 后台把免费额度从 20 改成 5，面板必须当场说 5；说 20 就是让用户按 20 去发、
+// 第 6 条被拦，然后认为产品坏了。
+// ---------------------------------------------------------------------------
+
+/** 取导览里所有能力行的文本（不含小标题），便于逐行断言。 */
+function introRowTexts(tree) {
+  const intro = find(tree, (n) => n.props?.className === "dru-wx-intro");
+  assert.ok(intro, "微信 tab 顶部必须有导览块");
+  const rows = [];
+  walk(intro, (n) => { if (n.props?.className === "dru-wx-intro-row") rows.push(n); });
+  return { intro, texts: rows.map((r) => (r.children || []).join("")) };
+}
+
+/** 用一份新的 /wechat/status 应答刷新面板（复用卡上的「刷新状态」按钮）。 */
+async function withStatus(status) {
+  const plugin = loadPlugin();
+  const first = await plugin.settle();
+  plugin.setStatus(status);
+  const refresh = buttonWithText(first, "刷新状态");
+  assert.ok(refresh, "前提：未绑定卡上有「刷新状态」按钮");
+  refresh.props.onClick();
+  return plugin.settle();
+}
+
+test("★ 额度以服务端权益包为准:后台改成 5,面板必须说 5(不是写死的镜像 20)", async () => {
+  const tree = await withStatus({
+    ...NOT_BOUND, plan: "free",
+    caps: ["notify", "approve", "status", "stop", "assign.continue"],
+    limits: { messages_per_month: 5 },
+    messages_used_this_month: 2
+  });
+  const { intro, texts } = introRowTexts(tree);
+  assert.ok(textHas(intro, "5 条消息额度"), "面板必须显示服务端下发的 5 条");
+  assert.ok(!textHas(intro, "20 条"), "★不得再显示写死的镜像值 20（展示与判定不一致是最容易被投诉的）");
+  assert.ok(textHas(intro, "已用 2 条"), "已用条数来自同一份状态");
+  // 免费档缺的能力仍要如实标注为会员能力
+  assert.ok(texts.some((t) => t.indexOf("（会员）") > -1), "免费用户缺的能力必须标注（会员）");
+});
+
+test("旧版 bridge 不下发 limits:退回本地面板镜像,不能因为缺字段就不显示额度", async () => {
+  const tree = await withStatus({
+    ...NOT_BOUND, plan: "free",
+    caps: ["notify", "approve", "status", "stop", "assign.continue"]
+    // 刻意不给 limits / messages_used_this_month（旧版 bridge 就是这样）
+  });
+  const { intro } = introRowTexts(tree);
+  assert.ok(textHas(intro, "20 条消息额度"), "缺 limits 时应退回镜像的 20（而不是不显示额度）");
+  assert.ok(!textHas(intro, "已用"), "没有用量字段时不该编一个「已用 0 条」出来");
+});
+
+test("★ 付费用户被后台关掉某项能力:要如实说「当前套餐不含」,不能对着会员说「这是会员功能」", async () => {
+  const tree = await withStatus({
+    ...NOT_BOUND, plan: "pro",
+    caps: ["notify"],                       // 后台把 pro 的其他能力全关了
+    limits: { messages_per_month: 0 },      // 0 = 不限
+    messages_used_this_month: 0
+  });
+  const { texts } = introRowTexts(tree);
+  assert.ok(texts.some((t) => t.indexOf("当前套餐不含") > -1),
+    "付费用户的锁定项必须说明是「当前套餐不含」（后台关掉了）");
+  assert.ok(!texts.some((t) => t.indexOf("（会员）") > -1),
+    "★不得对着付费用户说「（会员）」—— 那是胡话，且与后台配置矛盾");
+  // 0 = 不限：不该提额度
+  assert.ok(!texts.some((t) => t.indexOf("条消息额度") > -1),
+    "额度 0 表示不限,不应显示成「0 条」也不该凭空提额度");
+  assert.ok(texts.some((t) => t.indexOf("✅") === 0), "仍然授权的能力要显示为可用");
+});
+
+test("★ 通道下发 caps: [] → 面板不得回退本地镜像(否则会展示用户实际没有的能力)", async () => {
+  // 空数组是**权威**的"这一档什么都不能做"(后台明确清空,契约 §4.1)。
+  // 判据若写成 `wx.caps.length`,这里就会回退到 WECHAT_PAID_CAPS 镜像 ——
+  // 面板给会员展示一整列 ✅,而他在微信里一条都发不出去(展示与判定分叉)。
+  const tree = await withStatus({
+    ...NOT_BOUND, plan: "pro", caps: [], limits: { messages_per_month: 0 }, messages_used_this_month: 0
+  });
+  const { texts } = introRowTexts(tree);
+  assert.ok(texts.length > 0, "前提：导览有能力行");
+  assert.ok(!texts.some((t) => t.indexOf("✅") === 0),
+    "★空 caps 时一个能力都不能显示为可用（回退镜像就会显示一排 ✅）");
+  assert.ok(texts.some((t) => t.indexOf("🔒") === 0), "应显示为不可用");
+});
