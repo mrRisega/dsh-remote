@@ -1242,6 +1242,18 @@ function tagWeChat(m) {
  */
 const WECHAT_TIER_TOKEN_TTL_MS = 5 * 60_000;
 let WECHAT_TIER_TOKEN = { value: "", at: 0 };
+/**
+ * 最近一次 `/api/me` 的账号快照(查档位时顺手记下来)。
+ *
+ * 为什么需要:微信通道要做"会员临近到期"提醒,而它**不该再单独打一次** `/api/me` ——
+ * 档位每 10 分钟本来就会查一次,顺手记住即可。查失败时**保持上次的值**(与档位同一策略:
+ * 一次网络抖动不该让提醒凭空消失或变成乱猜)。
+ */
+let WECHAT_ACCOUNT_SNAPSHOT = null;
+/** 供微信通道取账号快照(到期提醒用)。没查过就返回 null → 上层什么都不发。 */
+async function wechatAccountInfo() {
+  return WECHAT_ACCOUNT_SNAPSHOT;
+}
 
 async function resolveWechatTier() {
   if (process.env.DSH_BRIDGE_LOCAL_KEY) return "pro_max";
@@ -1269,7 +1281,16 @@ async function resolveWechatTier() {
     }
     if (!r.ok) return "";
     const j = await r.json().catch(() => null);
-    return String((j && j.user && j.user.plan) || "");
+    const u = (j && j.user) || null;
+    // 顺手记账号快照(到期提醒用)。⚠️ 只在**真拿到了 user** 时覆盖 —— 否则保持上次。
+    if (u) {
+      WECHAT_ACCOUNT_SNAPSHOT = {
+        plan: String(u.plan || ""),
+        plan_ends_at: u.plan_ends_at ?? null,
+        trial_expires_at: u.trial_expires_at ?? null
+      };
+    }
+    return String((u && u.plan) || "");
   } catch {
     return "";
   }
@@ -1300,6 +1321,8 @@ function startWeChat() {
       secret: process.env.DSH_BRIDGE_SECRET || (typeof cfg.bridge_secret === "string" ? cfg.bridge_secret : ""),
       // 免费/付费分层:档位来自账号的生效套餐,App 链接是免费用户越界时的转化入口。
       tierProvider: resolveWechatTier,
+      // 到期提醒的数据来源(复用上面那次 /api/me,不额外打网络)
+      accountInfo: wechatAccountInfo,
       appUrl: wechatAppUrl(),
       // 模块自己的消息已带 `[wechat]` / `[wechat/events]` 前缀,这里**不能再加一次**
       // (真机日志里出现过 `[wechat] [wechat] 控制面已就绪`)。没前缀的兜底补一个。

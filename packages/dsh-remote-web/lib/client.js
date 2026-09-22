@@ -40,6 +40,28 @@ window.__ModuleLoader__.load({
     var exports = module.exports;
     Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 
+    // ── 微信通道能力**镜像**（面板展示用；判定真身在 clients/dsh-remote/wechat-runtime.mjs）──
+    //
+    // ⚠️ 这两份必须一致，`wechat-bot-ui.test.mjs` 会逐项比对。
+    //    面板多承诺一项，用户绑完去微信一试就会拿到付费提示 —— 只会觉得产品骗人。
+    //    业主口径：「免费用户支持什么能力，就有什么能力，不要承诺过多的能力，保持前后一致」。
+    //    之所以放在顶层常量而不是内联在 JSX 里：测试要能把它们抠出来跟运行时表对账。
+    var WECHAT_FREE_CAPS = ["notify", "approve", "status", "stop", "assign.continue"];
+    // 付费侧也用**细粒度**列出:面板要能跟"文案挂在哪个能力上"一一对上,
+    // 而运行时那边写粗粒度 "assign" —— 前缀规则下 assign 天然覆盖 assign.new/assign.continue,
+    // 所以两边不冲突(有测试按前缀规则核对)。
+    var WECHAT_PAID_CAPS = ["notify", "approve", "status", "stop", "assign.new", "assign.continue", "sessions", "summary"];
+    var WECHAT_FREE_MSGS_PER_MONTH = 20;
+    /** 能力 → 给用户看的一句话（顺序即展示顺序）。 */
+    var WECHAT_CAP_LABELS = [
+      { cap: "notify", free: "任务完成 / 出错 / 停下 推送到微信", paid: "" },
+      { cap: "approve", free: "要你拍板时，回一个数字就完成决定", paid: "" },
+      { cap: "assign.continue", free: "继续已有任务（回复即续接）", paid: "" },
+      { cap: "assign.new", free: "", paid: "在微信里开新任务" },
+      { cap: "sessions", free: "", paid: "列出 / 切换会话" },
+      { cap: "summary", free: "", paid: "随时重发重要结论" }
+    ];
+
     var react = require("react");
     var h = react.createElement;
     var useState = react.useState;
@@ -4444,16 +4466,46 @@ window.__ModuleLoader__.load({
       // 位置：内嵌内容体的**最上面**，在「连接微信机器人」按钮之前（DOM 顺序也一样）——
       // 第一次进来的人先看懂用途，再决定要不要绑。紧凑小字，
       // 不会把连接按钮挤出首屏（见 .dru-wx-intro 的样式注释）。
-      // 只讲**产品真的会做的事**，且必须**按档位如实分层**：
-      // 免费档只能收通知 + 回数字拍板，「在微信里交代任务」是会员能力 ——
-      // 在面板里含糊其辞，用户绑完去微信发句话拿到付费提示，只会觉得产品骗人。
+      //
+      // ★ 能力对照是**数据驱动**的，不再是写死的四行：
+      //   · 判定来源 = `wx.caps`（微信通道**实际在用**的那一份，见 status()），
+      //     所以"面板上写的"与"微信里强制的"不可能不一致（业主：话术与权限必须一致）；
+      //   · 拿不到才退回本地面板镜像（旧版 bridge），两份由 wechat-bot-ui.test.mjs 锁死；
+      //   · 免费用户会看到**锁定的会员项**（🔒）—— 这就是业主要的"对比展示付费多什么"。
       // 已绑定态同样保留：它是常驻的用途说明（不是一次性引导气泡），不占用任何按钮。
+      var wxPlan = (wx && wx.plan) ? String(wx.plan) : "free";
+      var wxIsPaid = wxPlan !== "free";
+      var wxCaps = (wx && Array.isArray(wx.caps) && wx.caps.length) ? wx.caps : null;
+      var wxHas = function (cap) {
+        var list = wxCaps || (wxIsPaid ? WECHAT_PAID_CAPS : WECHAT_FREE_CAPS);
+        return list.some(function (c) { return c === cap || cap.indexOf(c + ".") === 0; });
+      };
+      var capRows = [];
+      // 状态还没读到时**不显示锁**：否则付费用户会先看到一排 🔒 再变成 ✅（闪一下很难看）
+      if (wx) {
+        WECHAT_CAP_LABELS.forEach(function (row, i) {
+          var text = row.free || row.paid;
+          if (!text) return;
+          var ok = wxHas(row.cap);
+          capRows.push(h("div", { className: "dru-wx-intro-row", key: "cap" + i },
+            (ok ? "✅ " : "🔒 ") + text + (ok ? "" : "（会员）")));
+        });
+      } else {
+        WECHAT_CAP_LABELS.forEach(function (row, i) {
+          var text = row.free || row.paid;
+          if (text) capRows.push(h("div", { className: "dru-wx-intro-row", key: "cap" + i }, "· " + text));
+        });
+      }
+      var quotaRow = (!wxIsPaid && WECHAT_FREE_MSGS_PER_MONTH > 0)
+        ? h("div", { className: "dru-wx-intro-row" },
+            "· 免费版每月 " + WECHAT_FREE_MSGS_PER_MONTH + " 条消息额度"
+            + (wx ? "（本月已用 " + Number(wx.messages_used_this_month || 0) + " 条）" : ""))
+        : null;
       var intro = h("div", { className: "dru-wx-intro", role: "note", "aria-label": "微信机器人通道能做什么" },
-        h("div", { className: "dru-wx-intro-title" }, "绑定后能做什么"),
-        h("div", { className: "dru-wx-intro-row" }, "· 任务完成 / 出错 / 停下时**推送**到微信 —— 不用守着电脑。"),
-        h("div", { className: "dru-wx-intro-row" }, "· 需要你拍板时，在微信里**回一个数字**就完成决定（放行 / 拒绝 / 选哪个）。"),
-        h("div", { className: "dru-wx-intro-row" }, "· 以上两项**免费用**。"),
-        h("div", { className: "dru-wx-intro-row" }, "· **会员**：还能直接在微信里交代任务、切换会话，并对同一个任务继续追问。")
+        h("div", { className: "dru-wx-intro-title" },
+          wx ? (wxIsPaid ? "你现在能用的（会员）" : "你现在能用的（免费）") : "绑定后能做什么"),
+        capRows,
+        quotaRow
       );
 
       if (loading && !wx && !fail) {

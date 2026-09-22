@@ -1738,6 +1738,26 @@ export function markUnbound(relayDir, reason = "", onWarn) {
 /** 回执有效期文案里的分钟数(§6 ①:审批有寿命,过期静默丢失,文案必须说出来)。 */
 export const DEFAULT_REPLY_TTL_MINUTES = 5;
 
+/**
+ * 完成通知里「结论」的展示上限(字)。业主口径(2026-09-22):
+ * 「任务完成通知里有些关键结论被大量截断了,加长一些,更完整地展示最终结论 ——
+ *   这可能是用户关注的内容,所以都给他们展示出来」。
+ * 原值 400 对真实结论太短(实测一条正常的修复总结就有 190+ 字,稍详细就超)。
+ */
+export const COMPLETION_SUMMARY_MAX = 1500;
+/**
+ * 单条微信消息的总长度上限(字)。超出仍会**显式标注**截断(不静默丢)。
+ * ⚠️ 这个值必须 ≥ COMPLETION_SUMMARY_MAX,否则结论会在拼接后被二次砍掉。
+ */
+export const COMPLETION_TEXT_MAX = 3000;
+/**
+ * 从会话历史里取「结论」时的上限(字)。
+ * ⚠️ 历史陷阱:`wechat-runtime.mjs` 的 #sessionSummary 曾写死 `slice(0, 700)`,
+ *    而展示侧是 400 —— 两边各砍一刀,且**取值侧更小**时会在更早的地方就被砍掉,
+ *    排查时只盯着 formatter 会找不到真正的截断点。两个值必须一起看(有测试锁这条关系)。
+ */
+export const SESSION_SUMMARY_MAX = 3000;
+
 const NODE_LABELS = Object.freeze({
   approval: "需要你拍板",
   question: "在等你回答",
@@ -1841,7 +1861,10 @@ export function formatNotification(node = {}, opts = {}) {
     case "daily": {
       lines.push(`【${title}】`);
       for (const l of Array.isArray(node.lines) ? node.lines : []) lines.push(String(l));
-      if (!Array.isArray(node.lines) || !node.lines.length) lines.push("今天暂时没有要做的事。");
+      // 措辞对齐"回顾今天做了什么" —— 日报不是待办清单
+      if (!Array.isArray(node.lines) || !node.lines.length) lines.push("今天这台电脑上没有跑任务。");
+      // 品牌轻露出(业主:让用户知道我们在给他提供服务)。**克制一行**、放在最底,不喧宾夺主。
+      lines.push("", "—— DSH 远程控制 · 微信机器人通道");
       // ⚠️ 这句是**功能**不是客套:微信 24h 推送窗口靠用户回消息续期,
       // 简报的产品作用正是每天制造一次互动(§7)。必须出现「回复」字样,否则用户不会回。
       lines.push("(回复任意一句话即可保持推送窗口有效)");
@@ -1904,6 +1927,85 @@ function shorten(s, n) {
   return t.length > n ? `${t.slice(0, n - 1)}…(已截断)` : t;
 }
 
+/** 按长度裁剪但**保留换行**(结论要按原样分多行展示 —— 压成一行正是"密密麻麻"的来源)。 */
+function clipText(s, n) {
+  const t = String(s ?? "").trim();
+  return t.length > n ? `${t.slice(0, n - 1)}…(已截断)` : t;
+}
+
+/**
+ * 把模型产出的 **Markdown 转成微信能看的纯文本**。
+ *
+ * 为什么必须转:微信**不渲染 Markdown**(最强证据是腾讯自己的插件在出站路径跑
+ * `StreamingMarkdownFilter` 主动剥离"不支持的 markdown 语法")。所以模型写的表格会以
+ * `| a | b |` 的**字面竖线**出现在气泡里、`**加粗**` 会显示成星号。
+ * 业主原话:「现在的表格形式看起来很奇怪,整个格式在微信上没有做过任何兼容,体验很差很差」
+ * —— 根因就在这里,不是"排版没调好"。
+ *
+ * 规则(只改"怎么显示",不改语义):
+ *   · 表格 → 逐行「· 列1:值1 ｜ 列2:值2」(气泡是**比例字体**,任何用空格对齐的尝试都不可靠)
+ *   · 标题 `## x` → `【x】` 独占一行
+ *   · `**粗**` / `__粗__` / `*斜*` → 去掉标记(留着就是星号噪声)
+ *   · `[文字](链接)` → `文字:链接` —— **必须留下裸 URL**,微信才会自动识别成可点链接
+ *   · 行内 `` `代码` `` → 去掉反引号;``` 围栏 → 去掉围栏行,内容原样保留
+ *   · 无序列表 `-` `*` `+` → 统一成 `·`;有序列表不动
+ *   · 引用 `>` → 去掉标记;分隔线 `---`/`***` → `———————`
+ *   · 3 个以上连续空行 → 压成 1 个
+ *
+ * ⚠️ 单字符 `*` / `_` 只在"看起来像强调"(前后不贴空格)时才剥 —— 否则 `2 * 3 * 4` 会被吃成 `2 3 4`。
+ */
+export function markdownToWechatText(md) {
+  const src = String(md ?? "").replace(/\r\n?/g, "\n");
+  if (!src.trim()) return "";
+  const lines = src.split("\n");
+  const out = [];
+  let inFence = false;
+
+  for (let i = 0; i < lines.length; i += 1) {
+    let line = lines[i];
+
+    // 围栏行整行丢掉(纯文本里代码本来就是纯文本,围栏反而碍眼)
+    if (/^\s*(```|~~~)/.test(line)) { inFence = !inFence; continue; }
+    if (inFence) { out.push(line); continue; }
+
+    // 表格:本行是 |…| 且下一行是分隔行 |---|---|
+    if (/^\s*\|.*\|\s*$/.test(line) && i + 1 < lines.length && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1])) {
+      const cells = (l) => l.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => c.trim());
+      const head = cells(line);
+      i += 2;
+      while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) {
+        const vals = cells(lines[i]);
+        const parts = vals
+          .map((v, k) => (v ? `${head[k] || `列${k + 1}`}：${v}` : ""))
+          .filter(Boolean);
+        if (parts.length) out.push(`· ${parts.join(" ｜ ")}`);
+        i += 1;
+      }
+      i -= 1; // 外层 for 还要 +1
+      continue;
+    }
+
+    const h = /^\s{0,3}(#{1,6})\s+(.*)$/.exec(line);
+    if (h) { out.push(`【${h[2].trim()}】`); continue; }
+
+    if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) { out.push("———————"); continue; }
+
+    line = line.replace(/^\s{0,3}>\s?/, "");                 // 引用
+    line = line.replace(/^(\s*)[-*+]\s+/, "$1· ");           // 无序列表统一
+
+    line = line
+      .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, "$1：$2")  // 链接 → 文字：裸URL
+      .replace(/\*\*([^*]+)\*\*/g, "$1")
+      .replace(/__([^_]+)__/g, "$1")
+      .replace(/\*(?!\s)([^*\n]+?)(?<!\s)\*/g, "$1")
+      .replace(/(?<![\w_])_(?!\s)([^_\n]+?)(?<!\s)_(?![\w_])/g, "$1")
+      .replace(/`([^`]+)`/g, "$1");
+
+    out.push(line);
+  }
+  return out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
 const STOP_REASONS = Object.freeze({
   completed: "正常完成",
   aborted: "被中止",
@@ -1958,50 +2060,58 @@ export function formatCompletion({ title, reason, summary, sessionId, hanging } 
   const reasonText = stopReasonText(reasonKey);
   const name = String(title ?? "").trim();
   const sid = String(sessionId ?? "").trim();
-  const body = String(summary ?? "").trim();
-  const summaryMax = Number.isFinite(opts.summaryMaxLength) ? opts.summaryMaxLength : 400;
+  // 结论是**模型产出**，通常是 Markdown —— 先转成微信能看的纯文本(表格/加粗/链接见转换器注释)
+  const bodyText = markdownToWechatText(summary);
+  const summaryMax = Number.isFinite(opts.summaryMaxLength) ? opts.summaryMaxLength : COMPLETION_SUMMARY_MAX;
   const ttlMinutes = Number.isFinite(opts.ttlMinutes) ? opts.ttlMinutes : DEFAULT_REPLY_TTL_MINUTES;
-  const lines = [];
 
-  // ① 结果头
-  lines.push(`【任务${reasonText}】`);
+  // ① 头部:结束方式 + 是哪个任务(用户第一眼要找的两件事)
+  const head = [`【任务${reasonText}】`];
   const note = COMPLETION_REASON_NOTES[reasonKey];
-  if (note) lines.push(note);
-
-  // ② 哪个任务(用户第一眼要找的就是它)
+  if (note) head.push(note);
   if (name) {
-    lines.push(`会话:${name}`);
+    head.push(`会话：${name}`);
   } else if (sid) {
     // 没名字但知道 id → 给短号,用户能在 /ls 里对上号(总比"未命名"强)
-    lines.push(`会话:未命名(${sid.replace(/^session-/, "").slice(0, 8)})`);
+    head.push(`会话：未命名(${sid.replace(/^session-/, "").slice(0, 8)})`);
   } else {
-    lines.push("会话:未命名(这次没取到会话名)");
+    head.push("会话：未命名(这次没取到会话名)");
   }
 
-  // ③ 结论
+  // ② 结论(**独立成段**,保留原有换行 —— 压成一行正是"密密麻麻"的来源)。
   //   只有「能回话」的档位才邀请用户回复 —— 否则那是对一个做不到的人下指令
   //   (免费用户回复纯文本只会拿到付费引导,见 wechat-runtime 的 #upsellText)。
   const canContinue = opts.continuationHint === undefined;
-  if (body) {
-    lines.push(`结论:${shorten(body, summaryMax)}`);
+  let conclusion;
+  if (bodyText) {
+    conclusion = clipText(bodyText, summaryMax);
   } else if (hanging) {
-    lines.push(canContinue
-      ? "结论:暂时没取到(任务可能还在收尾)。回复 /summary 可以再要一次。"
-      : "结论:暂时没取到(任务可能还在收尾)。");
+    conclusion = canContinue
+      ? "暂时没取到(任务可能还在收尾)。回复 /summary 可以再要一次。"
+      : "暂时没取到(任务可能还在收尾)。";
   } else {
-    lines.push(canContinue
-      ? "结论:这次没有产出结论。回复一句话就能追问。"
-      : "结论:这次没有产出结论。");
+    conclusion = canContinue
+      ? "这次没有产出结论。回复一句话就能追问。"
+      : "这次没有产出结论。";
   }
 
-  // ④ 收尾:回复即续接同一会话(付费档的产品核心,别删这句)。
-  //   免费档由调用方传 `continuationHint` 换成"会员可用 + App 链接"的说法。
-  lines.push(opts.continuationHint || "回复这条消息(直接说下一步)就能接着这个会话往下做,不用重新交代背景。");
+  // ③ 下一步:系统注入的内容**单独分区**(不再和正文拖在一起)。
+  //   付费档 = "回复即可续接"(产品核心);免费档由调用方换成"会员可用 + App 链接"。
+  const continuation = opts.continuationHint
+    || "· 直接回复一句话，就能接着这个会话往下做（不用重新交代背景）";
 
-  // 纯文本 + 长度上限:微信不是富客户端,超长整条截断并显式标注
-  let text = lines.join("\n");
-  const maxLen = Number.isFinite(opts.maxLength) ? opts.maxLength : 900;
-  if (text.length > maxLen) text = `${text.slice(0, maxLen - 20)}\n…(内容过长已截断)`;
+  const headSection = head.join("\n");
+  const tailSection = ["—— 下一步 ——", continuation].join("\n");
+  let text = `${headSection}\n\n—— 结论 ——\n${conclusion}\n\n${tailSection}`;
+
+  // ④ 长度安全网:**只压正文**,头部与「下一步」永不截断。
+  //   ⚠️ 旧实现把整条 join 后盲切尾部 —— 而"下一步/回复 N"恰好拼在最后,
+  //      于是一条超长消息会把**用户唯一能照做的那句话**切掉(真机投诉过的形态)。
+  const maxLen = Number.isFinite(opts.maxLength) ? opts.maxLength : COMPLETION_TEXT_MAX;
+  if (text.length > maxLen) {
+    const room = Math.max(80, maxLen - headSection.length - tailSection.length - 30);
+    text = `${headSection}\n\n—— 结论 ——\n${clipText(bodyText || conclusion, room)}\n\n${tailSection}`;
+  }
 
   return { kind: "completed", title: `任务${reasonText}`, text, replyable: false, ttlMinutes };
 }

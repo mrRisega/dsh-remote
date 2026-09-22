@@ -485,23 +485,26 @@ test("首屏导览：未绑定时就在最上面（DOM 顺序在「连接微信�
   // 语义：说明性文字（role=note + 可读名字），不是又一个按钮/工具栏
   assert.equal(intro.props.role, "note");
   assert.ok(intro.props["aria-label"], "导览块要有可读的名字");
-  // 排版：小标题 + 2~4 行短句，不许变成大横幅
+  // 排版：小标题 + 若干行短句，不许变成大横幅
   const rows = [];
   walk(intro, (n) => { if (n.props?.className === "dru-wx-intro-row") rows.push(n); });
-  assert.ok(rows.length >= 3 && rows.length <= 4, `导览应是 3~4 行短句，实际 ${rows.length} 行`);
+  assert.ok(rows.length >= 3 && rows.length <= 8, `导览应是 3~8 行短句，实际 ${rows.length} 行`);
 
-  // 三件能力，各说各的（缺一不可）
+  // 每项能力各说各的（缺一不可）—— 现在按能力清单渲染，允许带 ✅/🔒 前缀
   assert.ok(textHas(intro, "完成") && textHas(intro, "出错") && textHas(intro, "停下"),
     "① 要说清「任务完成 / 出错 / 停下」这些时刻");
   assert.ok(textHas(intro, "推送"), "① 要明说是**推送到微信**（不用守着电脑）");
   assert.ok(textHas(intro, "回一个数字"), "② 要明说「在微信里回一个数字」就完成决定");
   assert.ok(textHas(intro, "拍板"), "② 要交代这是需要你拍板的时刻");
-  assert.ok(textHas(intro, "交代任务"), "③ 要明说可以**直接在微信里交代任务**");
-  assert.ok(textHas(intro, "追问"), "③ 要明说可以对同一个任务继续追问");
-  // ★ 分层必须如实写在面板上：「交代任务/追问」是会员能力，免费档只有推送与回数字。
+  assert.ok(textHas(intro, "继续已有任务"), "③ 要明说免费也能继续已有任务（回复即续接）");
+  assert.ok(textHas(intro, "开新任务"), "③ 要明说「在微信里开新任务」是会员能力");
+  assert.ok(textHas(intro, "切换会话"), "③ 要明说「切换会话」是会员能力");
+  // ★ 分层必须如实写在面板上：免费用户要能看出**付费多什么**（业主："增加一个对比展示"）。
   //   面板里含糊其辞 → 用户绑完去微信发句话拿到付费提示 → 只会觉得产品骗人。
-  assert.ok(textHas(intro, "免费用"), "必须写明哪两项是免费的");
-  assert.ok(textHas(intro, "会员"), "必须写明「交代任务/切换会话」属于会员能力（不能含糊）");
+  assert.ok(textHas(intro, "会员"), "必须标出哪些是会员能力（不能含糊）");
+  assert.ok(textHas(intro, "额度"), "免费档要写明每月消息额度（业主：免费给每月 N 条）");
+  // 未绑定/未读到状态时不显示锁，免得闪一下
+  assert.ok(!textHas(intro, "🔒") || textHas(intro, "会员"), "锁必须配「会员」字样，不能只给一个符号");
 
   // DOM 顺序：导览在「连接微信机器人」按钮之前（用户先看懂用途，再看到按钮）
   const introAt = domIndex(tree, (n) => n.props?.className === "dru-wx-intro");
@@ -867,4 +870,45 @@ test("无障碍：真 <button>、状态区 aria-live 播报、按钮有文字标
   assert.ok(phaseRow, "应有绑定阶段行");
   assert.equal(phaseRow.props["aria-live"], "polite");
   assert.equal(phaseRow.props.role, "status");
+});
+
+test("★★ 面板能力镜像必须与运行时判定表一致（否则面板会承诺微信里做不到的事）", async () => {
+  // 这条守的是「话术与权限一致」：面板说免费能用什么，微信里就必须真的能用。
+  // 面板多写一项 → 用户绑完去微信一试就拿到付费提示 → 只会觉得产品骗人。
+  const rt = await import("../../../clients/dsh-remote/wechat-runtime.mjs");
+  const grab = (name) => {
+    const m = new RegExp(`var ${name} = (\\[[^\\]]*\\])`).exec(SOURCE);
+    assert.ok(m, `client.js 顶层应有 ${name}（测试靠它跟运行时对账）`);
+    return JSON.parse(m[1]);
+  };
+  const mirrorFree = grab("WECHAT_FREE_CAPS");
+  const mirrorPaid = grab("WECHAT_PAID_CAPS");
+  const q = /var WECHAT_FREE_MSGS_PER_MONTH = (\d+)/.exec(SOURCE);
+  assert.ok(q, "client.js 顶层应有 WECHAT_FREE_MSGS_PER_MONTH");
+  const mirrorMsgs = Number(q[1]);
+
+  // ① 免费档必须**逐项相等** —— 这是最容易出错、后果最重的一侧
+  assert.deepEqual([...mirrorFree].sort(), [...rt.WECHAT_CAPABILITY_TABLE.free].sort(),
+    "★面板的免费能力必须与运行时判定表逐项相同");
+
+  // ② 面板列的付费能力必须都被运行时真正授权（粗粒度也算，用前缀规则判）
+  for (const cap of mirrorPaid) {
+    assert.ok(rt.grantsCap(rt.WECHAT_CAPABILITY_TABLE.pro, cap),
+      `面板声称会员有 ${cap}，但运行时并没有授权它`);
+  }
+
+  // ③ 展示用的每一条文案都要挂在一个真实的能力上（不许出现"没有对应闸门"的承诺）
+  const known = new Set([...mirrorFree, ...mirrorPaid]);
+  const labelSrc = /var WECHAT_CAP_LABELS = (\[[\s\S]*?\]);/.exec(SOURCE);
+  assert.ok(labelSrc, "client.js 应有 WECHAT_CAP_LABELS");
+  const labels = JSON.parse(labelSrc[1].replace(/([{,]\s*)(\w+):/g, '$1"$2":').replace(/'/g, '"'));
+  assert.ok(labels.length >= 4, `能力文案太少（${labels.length} 条），导览会说不清能干什么`);
+  for (const row of labels) {
+    assert.ok(known.has(row.cap), `文案挂在未知能力上：${row.cap}`);
+    assert.ok(row.free || row.paid, `${row.cap} 既没有免费文案也没有付费文案`);
+  }
+
+  // ④ 额度数字必须与运行时一致（面板写 20、实际给 5 是最容易被投诉的那种不一致）
+  assert.equal(mirrorMsgs, Number(rt.WECHAT_TIER_LIMITS.free.messages_per_month),
+    "★面板展示的每月额度必须与运行时限制相同");
 });

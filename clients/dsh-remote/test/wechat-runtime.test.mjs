@@ -102,6 +102,8 @@ async function boundRuntime(ilink, opts = {}) {
     tier: opts.tier === undefined ? "pro" : opts.tier,
     tierProvider: opts.tierProvider,
     tierDenyThrottleMs: opts.tierDenyThrottleMs,
+    limitTable: opts.limitTable,
+    entitlements: opts.entitlements,
     appUrl: opts.appUrl,
     logger: quietLogger()
   });
@@ -117,7 +119,9 @@ function makeFakeSubscriber() {
   s.answer = async (id, outcome) => { s.calls.push({ m: "answer", id, outcome }); return { ok: true }; };
   s.answerApproval = async (id, value) => { s.calls.push({ m: "answerApproval", id, value }); return { ok: true }; };
   s.answerQuestion = async (id, answers) => { s.calls.push({ m: "answerQuestion", id, answers }); return { ok: true }; };
-  s.digestDue = (d = {}) => ({ kind: NODE_KINDS.DIGEST_DUE, notified: d.notified, answered: d.answered, at: 1 });
+  // ⚠️ 必须 `...d` 展开透传:真实实现是 `this.#emitLocal({ kind, specNode: 5, ...detail })`。
+  //    只挑 notified/answered 会把 `lines` 丢掉 → 日报退化成兜底文案,而测试还"通过"(假的失真)。
+  s.digestDue = (d = {}) => ({ kind: NODE_KINDS.DIGEST_DUE, ...d, at: 1 });
   s.quotaLow = (d = {}) => ({ kind: NODE_KINDS.QUOTA_LOW, message: d.message, at: 1 });
   s.membershipExpiring = (d = {}) => ({ kind: NODE_KINDS.MEMBERSHIP_EXPIRING, message: d.message, at: 1 });
   s.start = () => {};
@@ -307,7 +311,7 @@ test("★ handleCommand 的字段是 replyText:回 /help 必须真的发出帮�
 });
 
 test("★ 分层:免费档 = 通知+审批,付费档才给遥控;未知档位按最低档", () => {
-  const { capabilitiesFor, WECHAT_CAPABILITY_TABLE } = rtmod;
+  const { capabilitiesFor, WECHAT_CAPABILITY_TABLE, grantsCap, limitsFor } = rtmod;
   const free = capabilitiesFor("free");
   // 免费档(业主口径):收得到通知、点得了审批、看得到状态、停得下任务 —— 但**遥控不了**。
   for (const cap of ["notify", "approve", "status", "stop"]) {
@@ -318,8 +322,30 @@ test("★ 分层:免费档 = 通知+审批,付费档才给遥控;未知档位按
   }
   // 付费档 = 免费档超集 + 遥控
   const pro = capabilitiesFor("pro");
-  for (const cap of free) assert.ok(pro.includes(cap), `付费档必须是免费档超集,缺 ${cap}`);
-  for (const cap of ["assign", "sessions", "summary"]) assert.ok(pro.includes(cap), `付费档必须有 ${cap}`);
+  // ⚠️ 必须用 grantsCap(前缀规则)判超集:付费档写的是粗粒度 "assign",
+  //    它按前缀**覆盖** assign.continue —— 用裸 includes 会误判成"缺能力"。
+  for (const cap of free) assert.ok(grantsCap(pro, cap), `付费档必须授权免费档的每一项,缺 ${cap}`);
+  for (const cap of ["assign.new", "assign.continue", "sessions", "summary"]) {
+    assert.ok(grantsCap(pro, cap), `付费档必须有 ${cap}`);
+  }
+
+  // ★★ 业主 2026-09-22 拍板的核心不变量:免费**能续接已有会话、不能开新会话**
+  assert.ok(grantsCap(free, "assign.continue"), "免费档必须能「继续已有会话」(回复即续接)");
+  assert.ok(!grantsCap(free, "assign.new"), "★免费档**不得**能开新会话(那是会员能力的差异点)");
+  assert.ok(!grantsCap(free, "sessions"), "免费档不得能切换会话");
+
+  // 前缀规则本身:粗粒度授权覆盖细粒度,细粒度不越权,未知能力一律不授权(fail-closed)
+  assert.ok(grantsCap(["assign"], "assign.new") && grantsCap(["assign"], "assign.continue"),
+    "写 assign 应同时覆盖 new 与 continue");
+  assert.ok(!grantsCap(["assign.continue"], "assign.new"), "写 assign.continue 不得越权到 assign.new");
+  assert.ok(!grantsCap(["assign.continue"], "assign"), "细粒度不得反向覆盖粗粒度");
+  assert.ok(!grantsCap(["assign"], "constructor"), "前缀规则不能被开头相同的无关词命中");
+  assert.ok(!grantsCap(free, "steer") && !grantsCap(["whatever"], "assign.new"), "未知能力不授权");
+
+  // 额度(业主:「免费给每月 N 条消息额度,超出再引导升级」;付费档不限)
+  assert.ok(Number(limitsFor("free").messages_per_month) > 0, "免费档必须有每月消息额度");
+  assert.equal(Number(limitsFor("pro").messages_per_month || 0), 0, "付费档不应限量(0 = 不限)");
+  assert.equal(Number(limitsFor("pro_max").messages_per_month || 0), 0, "最高档同样不限量");
   assert.ok(pro.length > free.length, "付费档应比免费档多能力(否则钩子没意义)");
   // ⚠️ 服务端的最高档取值是 **pro_max** —— 漏了它 capabilitiesFor 会回退 free,
   //    把花了最多钱的用户当成免费用户挡在门外。
@@ -680,6 +706,260 @@ test("★ 分层:免费用户打字「允许」(而不是回数字)时,要先把
     await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "1" } }] });
     assert.equal(sub.calls.filter((c) => String(c.m).startsWith("answer")).length, 1,
       "回数字必须照常完成审批");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★★ 日报发送失败时**不能**把当天标记为已发(否则当天再也不会补发)", async () => {
+  // 旧实现先写 last_digest_day **再**发送 → 一旦这次没发出去(网络抖动),当天的简报就被烧掉。
+  const ilink = await fakeIlink();
+  try {
+    const sub = makeFakeSubscriber();
+    const { rt, relayDir } = await boundRuntime(ilink, { subscriber: sub, tier: "pro" });
+    // 让"现在"正好等于简报时刻,真实路径才会通过时刻闸门
+    rt.digestHour = new Date().getHours();
+    const stateOf = () => JSON.parse(fs.readFileSync(path.join(relayDir, ".wechat-state.json"), "utf8"));
+
+    const origSend = rt.channel.client.sendMessage.bind(rt.channel.client);
+    const sends = () => ilink.state.sends.length;
+
+    // ① 发送失败 → 不得记账
+    rt.channel.client.sendMessage = async () => { throw new Error("boom"); };
+    await rt.runMaybeDigestNow();
+    assert.ok(!stateOf().last_digest_day,
+      "★发送失败时绝不能标记今天已发 —— 否则当天再也不会补发(旧实现的坑)");
+
+    // ② 恢复发送 → 必须能补发成功并记账
+    rt.channel.client.sendMessage = origSend;
+    const n = sends();
+    await rt.runMaybeDigestNow();
+    assert.equal(sends(), n + 1, "恢复后应当补发一条");
+    assert.ok(stateOf().last_digest_day, "补发成功后要记账");
+
+    // ③ 已经发过 → 同一天不再重复
+    await rt.runMaybeDigestNow();
+    assert.equal(sends(), n + 1, "同一天只发一次(它兼作 24h 窗口心跳,不能刷屏)");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★ 日报:晚上发(不是早上)、内容是「今天干了啥」、带品牌露出", async () => {
+  // 业主:「每天早上发『今日干了啥事儿』,这肯定不太对劲。应该是晚上发,比如晚上 6 点,发『今天干了啥』」
+  // 且一天只发一次(它兼作 24h 推送窗口的心跳,早晚各一次就太频繁了)。
+  assert.equal(rtmod.DEFAULT_DIGEST_HOUR, 18, "日报时刻必须是晚上 18 点,不能是早上 9 点");
+  const ilink = await fakeIlink();
+  try {
+    const sub = makeFakeSubscriber();
+    const { rt } = await boundRuntime(ilink, { subscriber: sub, tier: "pro" });
+    // 造出今天的数据:一个正常完成的任务 + 一次真的拍板
+    await rt.notify({ kind: NODE_KINDS.TURN_END, sessionId: "s1", reason: "completed", at: 1 });
+    await rt.notify({
+      kind: NODE_KINDS.APPROVAL_REQUEST, eventId: "a1", toolName: "Read",
+      reason: "读配置", answerShape: "approval", at: 1
+    });
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "1" } }] });
+    await rt.runDigestNow();
+    const text = lastText(ilink.state);
+    assert.match(text, /完成任务 1 个/, `日报要回顾**今天做了什么**,实际:${text}`);
+    assert.match(text, /你在微信里拍板 1 次/, "拍板次数也要回顾(频道价值可见)");
+    assert.match(text, /DSH 远程控制/, "要有品牌轻露出");
+    assert.match(text, /回复/, "必须保留 24h 窗口心跳那句(靠用户回消息续期)");
+    assert.doesNotMatch(text, /没有要做的事/, "不许再用「待办清单」的措辞");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★★ 会员到期提醒:提前 2 天 / 1 天 / 到期当天各提醒一次,同一天不重复", async () => {
+  // 这条**以前根本不存在**:notifyMembershipExpiring() 只有定义、全仓零调用方 ——
+  // 业主以为"提前两天发、提前一天也发",实际一次都没发过。这里锁住补上的触发点。
+  const ilink = await fakeIlink();
+  try {
+    const DAY = 86_400_000;
+    let info = { plan: "pro", plan_ends_at: Date.now() + 2 * DAY, trial_expires_at: null };
+    const sub = makeFakeSubscriber();
+    const { rt } = await boundRuntime(ilink, { subscriber: sub, tier: "pro" });
+    rt.accountInfo = async () => info;
+
+    const before = ilink.state.sends.length;
+    await rt.runExpiryRemindNow();
+    assert.equal(ilink.state.sends.length, before + 1, "提前 2 天必须发一条提醒");
+
+    // 同一天、同一阈值:**不重复**
+    await rt.runExpiryRemindNow();
+    assert.equal(ilink.state.sends.length, before + 1, "同一个阈值一天只能提醒一次");
+
+    // 提前 5 天:保持安静(只在 2/1/到期当天三个节点说话)
+    info = { plan: "pro", plan_ends_at: Date.now() + 5 * DAY, trial_expires_at: null };
+    await rt.runExpiryRemindNow();
+    assert.equal(ilink.state.sends.length, before + 1, "提前 5 天不该打扰用户");
+
+    // 提前 1 天:是新阈值 → 再发一次
+    info = { plan: "pro", plan_ends_at: Date.now() + 1 * DAY, trial_expires_at: null };
+    await rt.runExpiryRemindNow();
+    assert.equal(ilink.state.sends.length, before + 2, "提前 1 天要再提醒一次");
+
+    // 没有到期信息 / 取不到账号 → 什么都不发(宁可不发,也不拿猜的到期日骚扰)
+    info = { plan: "pro", plan_ends_at: null, trial_expires_at: null };
+    const n = ilink.state.sends.length;
+    await rt.runExpiryRemindNow();
+    assert.equal(ilink.state.sends.length, n, "没有到期日就不该发");
+
+    rt.accountInfo = null;
+    await rt.runExpiryRemindNow();
+    assert.equal(ilink.state.sends.length, n, "没有 accountInfo 数据源就什么都不发");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★★ A:免费档「能续接已有会话、不能开新会话」(业主拍板的分级)", async () => {
+  const ilink = await fakeIlink();
+  try {
+    // ① 免费 + **没有**当前会话 → 纯文本等于开新任务 → 必须被拒
+    const subA = makeFakeSubscriber();
+    const a = await boundRuntime(ilink, { subscriber: subA, tier: "free", appUrl: "https://app.example/x/" });
+    await a.rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "帮我修个 bug" } }] });
+    assert.equal(subA.calls.filter((c) => c.m === "createSession").length, 0,
+      "免费 + 无当前会话:不得开新任务");
+    assert.match(lastText(ilink.state), /会员功能/, "要说明这是会员能力");
+
+    // ② 免费 + **有**当前会话 → 纯文本必须放行(这就是"能接着聊")
+    const subB = makeFakeSubscriber();
+    const b = await boundRuntime(ilink, { subscriber: subB, tier: "free" });
+    b.rt.currentSessionId = "session-x";
+    b.rt.currentSessionTitle = "已有任务";
+    await b.rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "继续修" } }] });
+    const prompted = subB.calls.filter((c) => c.m === "promptSession");
+    assert.equal(prompted.length, 1, "★免费 + 有当前会话:必须能继续聊(业主要的就是这个)");
+    assert.equal(prompted[0].text, "继续修", "内容要原样下发");
+
+    // ③ 免费仍不能开新会话、不能切换会话
+    const subC = makeFakeSubscriber();
+    const c = await boundRuntime(ilink, { subscriber: subC, tier: "free" });
+    c.rt.currentSessionId = "session-x";
+    await c.rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "/new 新任务" } }] });
+    assert.equal(subC.calls.filter((m) => m.m === "createSession").length, 0, "免费不得开新会话");
+    await c.rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "/ls" } }] });
+    assert.equal(subC.calls.filter((m) => m.m === "listSessions").length, 0, "免费不得列/切会话");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★★ B:免费档每月额度用完后引导升级;审批与指令不计数;付费档不限", async () => {
+  const LIMITS = { free: { messages_per_month: 2 }, pro: { messages_per_month: 0 }, pro_max: { messages_per_month: 0 } };
+  const ilink = await fakeIlink();
+  try {
+    const sub = makeFakeSubscriber();
+    const { rt } = await boundRuntime(ilink, {
+      subscriber: sub, tier: "free", appUrl: "https://app.example/x/", limitTable: LIMITS
+    });
+    rt.currentSessionId = "s";
+    rt.currentSessionTitle = "t";
+    const send = () => rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "派活" } }] });
+
+    // 审批与指令**不**吃额度:先做一次审批,额度不受影响
+    await rt.notify({
+      kind: NODE_KINDS.APPROVAL_REQUEST, eventId: "q1", toolName: "Read",
+      reason: "读配置", answerShape: "approval", at: 1
+    });
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "1" } }] });
+    assert.equal(sub.calls.filter((c) => c.m === "answerApproval").length, 1, "审批必须照常可用(安全阀不能吃额度)");
+
+    await send(); await send();
+    assert.equal(sub.calls.filter((c) => c.m === "promptSession").length, 2, "额度内 2 条应放行");
+
+    await send();
+    assert.equal(sub.calls.filter((c) => c.m === "promptSession").length, 2, "★超出额度后不得再派活");
+    const text = lastText(ilink.state);
+    assert.match(text, /额度已经用完/, `要说清是用完额度而不是报错,实际:${text}`);
+    assert.ok(text.includes("https://app.example/x/"), "仍要给升级入口(App 链接)");
+
+    // 付费档:同样连发 5 条都不受限
+    const paid = makeFakeSubscriber();
+    const p = await boundRuntime(ilink, { subscriber: paid, tier: "pro" });
+    p.rt.currentSessionId = "s";
+    for (let i = 0; i < 5; i += 1) {
+      await p.rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "派活" + i } }] });
+    }
+    assert.equal(paid.calls.filter((c) => c.m === "promptSession").length, 5, "付费档不限量");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★★ 权益包:服务端下发的 caps/limits 覆盖内置表(后台改权限无需发版)", async () => {
+  const ilink = await fakeIlink();
+  try {
+    // ① 服务端给免费档额外开了 assign.new → 免费用户当场就能开新会话
+    const subA = makeFakeSubscriber();
+    const a = await boundRuntime(ilink, {
+      subscriber: subA, tier: "free",
+      entitlements: { rev: "r1", plan: "free", caps: ["notify", "approve", "assign.new", "assign.continue"], limits: { messages_per_month: 0 } }
+    });
+    await a.rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "/new 做点事" } }] });
+    assert.equal(subA.calls.filter((c) => c.m === "createSession").length, 1,
+      "服务端放开后,免费档也能开新会话(证明权限真的由配置决定)");
+
+    // ② 反向:服务端把付费档的 assign 收掉 → 同一个付费用户立刻不能派活
+    const subB = makeFakeSubscriber();
+    const b = await boundRuntime(ilink, {
+      subscriber: subB, tier: "pro",
+      entitlements: { rev: "r2", plan: "pro", caps: ["notify", "approve", "status", "stop"], limits: {} }
+    });
+    b.rt.currentSessionId = "s";
+    await b.rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "派活" } }] });
+    assert.equal(subB.calls.filter((c) => c.m === "promptSession").length, 0,
+      "服务端收权后付费档也不该能派活(收权必须真的生效)");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★★ 多条待审批:回数字必须答**最早那条**(先进先出),答完把下一条顶到底部", async () => {
+  // 业主报的真 bug:「如果需要用户回应多条消息,而用户一开始只看到第一条审批消息,
+  //   回应一个数字之后,流程就结束了。后面的几条消息没有让用户继续回应,直接提示为『未回应』」
+  // 成因:旧实现按**栈顶(最新)**匹配数字,而微信是**从上往下读**的、消息位置一发出去就固定
+  //   → 用户看着第 1 条回「1」,系统答了最后一条,第 1 条永远没人回应,DSH 最终标它「未回应」。
+  const ilink = await fakeIlink();
+  try {
+    const sub = makeFakeSubscriber();
+    const { rt } = await boundRuntime(ilink, { subscriber: sub, tier: "pro" });
+
+    await rt.notify({
+      kind: NODE_KINDS.APPROVAL_REQUEST, eventId: "e1", toolName: "Read",
+      reason: "读配置", answerShape: "approval", at: 1
+    });
+    // 第二条到达时第一条还没被答 → 文案必须说明"不止这一条"
+    await rt.notify({
+      kind: NODE_KINDS.APPROVAL_REQUEST, eventId: "e2", toolName: "Write",
+      reason: "写文件", answerShape: "approval", at: 2
+    });
+    assert.equal(rt.pendingReplies.length, 2, "两条都该登记为待答");
+    assert.match(lastText(ilink.state), /还有 2 条待拍板/,
+      `★必须告诉用户"不止这一条",否则他以为答完就结束了,实际:${lastText(ilink.state)}`);
+
+    // 回「1」→ 必须答**最早**的 e1
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "1" } }] });
+    const answered = sub.calls.filter((c) => c.m === "answerApproval");
+    assert.equal(answered.length, 1, "必须真的回执一条");
+    assert.equal(answered[0].id, "e1", "★必须答**最早那条**(e1),而不是最新那条(e2)");
+
+    // 答完还剩 1 条 → 必须把**下一条重发到底部**,用户直接在最新消息上回数字
+    const after = lastText(ilink.state);
+    assert.match(after, /还有 1 条待你拍板/, `★答完要把下一条顶到底部,实际:${after}`);
+    assert.match(after, /回复 1/, "重发的提醒要带可回数字的选项");
+    assert.match(after, /Write/, "要指明下一条是什么(工具名),用户才知道在批什么");
+
+    // 再回一次 → 答掉 e2;队列空了就不该再发多余提醒
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "1" } }] });
+    const all = sub.calls.filter((c) => c.m === "answerApproval");
+    assert.equal(all.length, 2);
+    assert.equal(all[1].id, "e2", "第二条应是 e2");
+    assert.doesNotMatch(lastText(ilink.state), /待你拍板/, "队列空了就不该再发提醒");
   } finally {
     await ilink.close();
   }

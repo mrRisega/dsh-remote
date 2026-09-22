@@ -29,6 +29,10 @@ import test from "node:test";
 import {
   BindSession,
   COMMANDS,
+  COMPLETION_SUMMARY_MAX,
+  markdownToWechatText,
+  COMPLETION_TEXT_MAX,
+  SESSION_SUMMARY_MAX,
   DEFAULT_ILINK_BASE_URL,
   EventRegistry,
   HELP_TEXT,
@@ -1763,9 +1767,68 @@ test("完成模板:头一行按 reason 区分,completed 不许读成失败", () 
   assert.match(headers.get("error"), /出错/);
 });
 
+test("★ 微信不渲染 Markdown:模型产出的表格/加粗/链接必须先转成纯文本", () => {
+  // 业主原话:「现在的表格形式看起来很奇怪,整个格式在微信上没有做过任何兼容,体验很差很差」。
+  // 根因:微信**不渲染** Markdown(腾讯自己的插件在出站路径主动剥离),所以模型的表格会以
+  // 字面竖线、加粗会以字面星号出现在气泡里。这儿锁住"发送前必须已转换"。
+  const md = [
+    "## 修复结果",
+    "",
+    "| 项目 | 状态 |",
+    "|---|---|",
+    "| 黑窗 | 已修 |",
+    "| 指纹 | 已修 |",
+    "",
+    "**关键**:见 [提交](https://example.com/c/1)。",
+    "",
+    "- 测试通过",
+    "- `kill -9` 后自愈"
+  ].join("\n");
+  const out = markdownToWechatText(md);
+
+  assert.doesNotMatch(out, /\*\*/u, "加粗标记必须剥掉(留着就是星号噪声)");
+  assert.doesNotMatch(out, /\|/u, "★表格必须转成列表 —— 字面竖线在微信里就是一团乱码");
+  assert.match(out, /· 项目：黑窗 ｜ 状态：已修/u, "表格行要变成「列名:值 ｜ 列名:值」");
+  assert.match(out, /【修复结果】/u, "标题要变成【】独占一行");
+  assert.ok(out.includes("https://example.com/c/1"), "★链接必须留下**裸 URL**,否则微信不会变成可点链接");
+  assert.doesNotMatch(out, /\]\(/u, "不得残留 markdown 链接语法");
+  assert.match(out, /^· 测试通过$/mu, "无序列表统一成 ·");
+  assert.match(out, /kill -9 后自愈/u, "行内代码只去反引号,内容保留");
+  assert.doesNotMatch(out, /`/u, "反引号必须剥掉");
+
+  // 不能把乘号吃掉:`2 * 3 * 4` 里的单星号不是强调
+  assert.match(markdownToWechatText("结果 2 * 3 * 4 正确"), /2 \* 3 \* 4/,
+    "单个 * 只在看起来像强调时才剥,不能误伤乘号");
+
+  // 代码围栏:去掉围栏行,内容原样保留
+  const fenced = markdownToWechatText("```js\nconst a = 1;\n```");
+  assert.doesNotMatch(fenced, /```/u, "围栏行要去掉");
+  assert.match(fenced, /const a = 1;/u, "围栏内的内容要保留");
+
+  // 空输入/纯空白不炸
+  assert.equal(markdownToWechatText(""), "");
+  assert.equal(markdownToWechatText(null), "");
+  assert.equal(markdownToWechatText("   \n\n  "), "");
+});
+
+test("★★ 截断只压正文:头部与「下一步」必须活着(旧实现会把用户唯一能照做的那句话切掉)", () => {
+  // 旧实现:整条 join 后盲切尾部。而「回复 N … / 下一步」恰好拼在最后 →
+  // 一条超长消息会把**用户唯一能照做的指引**切掉(真机投诉过的形态)。
+  const huge = "长".repeat(COMPLETION_SUMMARY_MAX * 5);
+  const out = formatCompletion({ title: "超长任务", reason: "completed", summary: huge });
+  assert.match(out.text, /【任务正常完成】/u, "头部必须活着");
+  assert.match(out.text, /会话：超长任务/u, "会话名必须活着");
+  assert.match(out.text, /—— 下一步 ——/u, "★「下一步」分区必须活着");
+  assert.match(out.text, /直接回复一句话/u, "★那句可照做的指引必须活着");
+  assert.ok(out.text.length <= COMPLETION_TEXT_MAX, `整条要限长,实际 ${out.text.length}`);
+
+  // 正文自身超长仍要**显式**标注(不静默丢)
+  assert.match(out.text, /已截断/u, "正文被压时要显式标注");
+});
+
 test("完成模板:会话名在/不在都不能打印 undefined", () => {
   const named = formatCompletion({ title: "修登录跳转", reason: "completed", summary: "修好了。" });
-  assert.match(named.text, /会话:修登录跳转/, "会话名是用户最想看到的一行");
+  assert.match(named.text, /会话：修登录跳转/, "会话名是用户最想看到的一行");
   assert.equal(named.title, `任务${stopReasonText("completed")}`, "title 是展示标题(和 formatNotification 同义)");
 
   for (const t of ["", "   ", undefined, null]) {
@@ -1779,15 +1842,31 @@ test("完成模板:会话名在/不在都不能打印 undefined", () => {
   assert.doesNotMatch(byId.text, /session-abcdef1234567890/, "别把整个 id 印给用户看");
 });
 
-test("完成模板:结论在/不在/超长截断;hanging 说的是'取不到'", () => {
+test("完成模板:结论要**尽量完整**(未超上限不截断),超长才显式标注;hanging 说的是'取不到'", () => {
   const withSummary = formatCompletion({ title: "T", reason: "completed", summary: "结论正文" });
-  assert.match(withSummary.text, /结论:结论正文/);
+  // 结论**独立成段**(不再挤在 "结论:" 前缀后面) —— 压成一行正是"密密麻麻"的来源
+  assert.match(withSummary.text, /—— 结论 ——\n结论正文/, "结论要单独成段、原样展示");
 
-  const long = "长".repeat(1200);
-  const truncated = formatCompletion({ title: "T", reason: "completed", summary: long });
+  // ★ 业主口径(2026-09-22):「结论被大量截断了,加长一些,更完整地展示 —— 这可能是用户关注的内容」
+  //    旧上限 400 连一条正常的修复总结(实测 190+ 字)都快保不住。
+  const fits = "长".repeat(1200);
+  const kept = formatCompletion({ title: "T", reason: "completed", summary: fits });
+  assert.ok(kept.text.includes(fits),
+    `★未超上限的结论必须**整段**展示(旧上限 400 会砍掉它),实际整条长度 ${kept.text.length}`);
+  assert.doesNotMatch(kept.text, /已截断/, "没超上限就不该出现截断标注");
+
+  // 远超上限时仍必须**显式**标注截断(不静默丢)
+  const huge = "长".repeat(COMPLETION_SUMMARY_MAX * 3);
+  const truncated = formatCompletion({ title: "T", reason: "completed", summary: huge });
   assert.match(truncated.text, /已截断/, "超长必须有**显式**截断标注");
-  assert.ok(truncated.text.length <= 900, `整条要限在微信可读长度内,实际 ${truncated.text.length}`);
-  assert.equal(truncated.text.includes(long), false, "超长结论不得整段带出");
+  assert.ok(truncated.text.length <= COMPLETION_TEXT_MAX,
+    `整条要限在微信可读长度内,实际 ${truncated.text.length}`);
+  assert.equal(truncated.text.includes(huge), false, "超长结论不得整段带出");
+
+  // ★ 两道闸的关系:取值侧(会话历史)不能比展示侧(通知模板)更小,
+  //   否则结论会在拼接**之前**就被砍掉 —— 只盯 formatter 会找不到真正的截断点(历史踩过)
+  assert.ok(SESSION_SUMMARY_MAX >= COMPLETION_SUMMARY_MAX,
+    `取值上限(${SESSION_SUMMARY_MAX})必须 ≥ 展示上限(${COMPLETION_SUMMARY_MAX}),否则在更早处就被砍掉`);
 
   const noSummary = formatCompletion({ title: "T", reason: "completed" });
   assert.match(noSummary.text, /没有产出结论/);

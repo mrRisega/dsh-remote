@@ -49,6 +49,7 @@ import {
   isSessionExpired,
   writePrivateJson,
   SessionCooldown,
+  SESSION_SUMMARY_MAX,
   DEFAULT_UPDATES_TIMEOUT_MS
 } from "./wechat-channel.mjs";
 import { createEventSubscriber, NODE_KINDS } from "./dsh-events.mjs";
@@ -77,16 +78,59 @@ import { createEventSubscriber, NODE_KINDS } from "./dsh-events.mjs";
  *    最高的付费档用户当成免费用户挡在门外。
  * ⚠️ 改这张表 = 改产品权限,别顺手加能力;`free` 那行是"用户没付钱时他能做什么"的唯一定义。
  */
+const FREE_CAPABILITIES = Object.freeze([
+  "notify", "approve", "status", "stop",
+  // ★ 业主 2026-09-22 拍板:「免费只能继续已有会话(回复即续接),不能开新会话、不能选用别的会话」。
+  //   所以 assign 被**拆成两半**:continue 免费、new 付费 —— 既让免费用户"能接着聊",
+  //   又保住"开新任务 / 管会话"是会员能力(否则付费理由就没了)。
+  "assign.continue"
+]);
 const PAID_CAPABILITIES = Object.freeze([
   "notify", "approve", "status", "stop",
-  "assign", "sessions", "summary",
+  "assign", // 粗粒度授权:按前缀规则天然覆盖 assign.new 与 assign.continue
+  "sessions", "summary",
   "steer", "attach", "multi" // 预留:中途纠偏 / 附件 / 多会话并行
 ]);
 export const WECHAT_CAPABILITY_TABLE = Object.freeze({
-  free: Object.freeze(["notify", "approve", "status", "stop"]),
+  free: FREE_CAPABILITIES,
   pro: PAID_CAPABILITIES,
   pro_max: PAID_CAPABILITIES
 });
+
+/**
+ * 能力授权(点号**前缀规则**)。
+ *
+ * 配置里写粗粒度 `"assign"` 即授权 `assign` 与 `assign.*`;写细粒度 `"assign.continue"` 只授权它自己。
+ * 这样运营既能一键给整块能力,也能只给其中一半。
+ * ⚠️ **未知 need 一律不授权**(fail-closed):代码新加了个能力而配置没跟上时,宁可不给。
+ */
+export function grantsCap(caps, need) {
+  if (!Array.isArray(caps) || !need) return false;
+  return caps.some((c) => {
+    const s = String(c || "");
+    return s === need || need.startsWith(`${s}.`);
+  });
+}
+
+/**
+ * 各档位的**额外限制**(与能力表并列,同属"权益包")。
+ *
+ * `messages_per_month`:该档用户每月最多能给 agent 发多少条消息;**0 或缺省 = 不限**。
+ * 业主 2026-09-22:「免费给每月 N 条消息额度,超出再引导升级(可配置,挂在权益包里)」。
+ * ⚠️ 只有**派活**(发消息/开任务)计数;审批回执与指令**不计数** ——
+ *    否则免费用户会为了省额度而不敢拍板,那等于把安全阀关掉。
+ */
+export const WECHAT_TIER_LIMITS = Object.freeze({
+  free: Object.freeze({ messages_per_month: 20 }),
+  pro: Object.freeze({ messages_per_month: 0 }),
+  pro_max: Object.freeze({ messages_per_month: 0 })
+});
+
+/** 某档位的限制。未知档位按最低档(free)处理 —— 与能力表同一口径。 */
+export function limitsFor(tier, table = WECHAT_TIER_LIMITS) {
+  const key = Object.prototype.hasOwnProperty.call(table, String(tier || "")) ? String(tier) : "free";
+  return table[key] || {};
+}
 
 /** 某档位具备哪些能力。未知档位按最低档(free)处理 —— 宁可少给,不可误放。 */
 export function capabilitiesFor(tier, table = WECHAT_CAPABILITY_TABLE) {
@@ -103,7 +147,7 @@ export function capabilitiesFor(tier, table = WECHAT_CAPABILITY_TABLE) {
  * 一个只会发通知、却连"停下"都做不到的通道,用户会觉得被挟持。
  */
 const COMMAND_CAPABILITY = Object.freeze({
-  "/new": "assign",
+  "/new": "assign.new", // 开新会话 = 付费(「继续已有会话」走 assign.continue,见纯文本分支)
   "/ls": "sessions",
   "/use": "sessions",
   "/summary": "summary",
@@ -200,7 +244,15 @@ export const CONTROL_HEADER = "x-dsh-bridge-secret";
 /** 绑定会话的默认存活时长(面板上二维码可被扫的时间)。 */
 export const DEFAULT_BIND_TTL_MS = 5 * 60_000;
 /** 默认每日简报时刻(本地时区小时,0-23)。 */
-export const DEFAULT_DIGEST_HOUR = 9;
+/**
+ * 每日简报时刻(本地小时)。
+ *
+ * ⚠️ 必须是**晚上**而不是早上:简报的内容是"**今天**干了啥"(已完成/出错/你拍板了几次),
+ *    早上 9 点发的时候今天才刚开始,整篇都是空的 —— 业主原话「每天早上发『今日干了啥事儿』,
+ *    这肯定不太对劲。应该是晚上发,比如晚上 6 点,发『今天干了啥』」。
+ *    它同时兼作微信 24h 推送窗口的心跳,所以一天**只发一次**、不要早晚各一次。
+ */
+export const DEFAULT_DIGEST_HOUR = 18;
 /**
  * 档位校准间隔。10 分钟足够跟上升级/到期(派发被拒时还会立刻再确认一次),
  * 又不至于把账号 API 当心跳打。
@@ -337,11 +389,29 @@ export class WeChatRuntime {
      */
     this.tierOverride = typeof opts.tier === "string" ? opts.tier : "";
     this.capabilityTable = opts.capabilityTable || WECHAT_CAPABILITY_TABLE;
+    this.limitTable = opts.limitTable || WECHAT_TIER_LIMITS;
+    /**
+     * **服务端下发的权益包**(可空):`{rev, plan, caps[], limits{}}`。
+     * 空 = 冷启动/还没取到 → 用内置表按档位解析(与今天行为完全一致)。
+     * ⚠️ 取自磁盘缓存:进程重启后不会因为一次网络失败就把付费用户降级。
+     */
+    this.entitlements = (opts.entitlements && typeof opts.entitlements === "object")
+      ? opts.entitlements
+      : (persisted.entitlements && typeof persisted.entitlements === "object" ? persisted.entitlements : null);
+    this.entitlementsRev = String((this.entitlements && this.entitlements.rev) || "");
+    /** 免费档的每月消息用量(跨月自动归零)。 */
+    this.msgUsage = (persisted.msg_usage && typeof persisted.msg_usage === "object") ? persisted.msg_usage : null;
     /**
      * 真实档位来源(async→ "free"|"pro"|"pro_max";空串 = 这次没取到)。
      * bridge 用账号 API 的生效套餐实现它;不注入时档位恒为缓存/默认(测试与自建)。
      */
     this.tierProvider = typeof opts.tierProvider === "function" ? opts.tierProvider : null;
+    /**
+     * 账号快照来源(async→ `{plan, plan_ends_at, trial_expires_at}`)。
+     * 目前只服务于"会员临近到期提醒" —— bridge 注入时**复用它查档位那次 `/api/me`**,
+     * 不额外增加网络请求。不注入 = 不发这类提醒(宁可不发,也不拿猜的到期日骚扰用户)。
+     */
+    this.accountInfo = typeof opts.accountInfo === "function" ? opts.accountInfo : null;
     /** App 入口(免费用户越界时给的转化链接)。空则不附链接,不编一个假地址。 */
     this.appUrl = String(opts.appUrl || "").trim();
     /**
@@ -377,6 +447,16 @@ export class WeChatRuntime {
       last_error: state.last_error || "",
       cooldown_ms: cooldownMs,
       pending_replies: this.pendingReplies.length,
+      // ★ 面板要把「你现在能用什么」如实展示出来(业主:话术与权限必须一致,不多承诺)。
+      //   这里下发的是**通道实际在用**的那一份(服务端权益包优先,否则内置表按档位),
+      //   所以面板不需要自己猜档位 → 展示与判定不可能不一致。
+      plan: this.#tier(),
+      caps: this.#caps(),
+      limits: this.#limits(),
+      entitlements_source: this.entitlements && this.entitlements.caps ? "server" : "builtin",
+      messages_used_this_month: (this.msgUsage && this.msgUsage.month === this.#monthKey())
+        ? Number(this.msgUsage.count || 0)
+        : 0,
       // ⚠️ 失败/成功后 bind.done=true 但仍留着对象 —— 必须一起判,否则面板在绑定失败后
       // 会一直显示"正在绑定"(真机实测撞到:超时后 binding.active 还是 true)。
       binding: this.bind && !this.bind.done
@@ -597,16 +677,46 @@ export class WeChatRuntime {
   // ── 入站:回执与指令 ────────────────────────────────────────────────────
 
   /** 取"最近一条待答通知"(用户回数字时映射到它)。 */
-  #latestPending() {
-    const now = this.clock();
+  /**
+   * 取"**最早**一条待答通知"。
+   *
+   * ⚠️ 必须是**先进先出**,不能取最近一条。真机 bug(业主报的):
+   *    「如果需要用户回应多条消息,而用户一开始只看到第一条审批消息,回应一个数字之后,
+   *      流程就结束了,后面的几条消息没有让用户继续回应,直接提示为『未回应』」
+   *    成因:旧实现按栈顶(最新那条)匹配数字,而**微信是从上往下读的**、消息一发出去位置就固定 ——
+   *    用户看着第 1 条回「1」,系统却答了最后一条,第 1 条于是永远没人回应。
+   */
+  #oldestPending() {
     while (this.pendingReplies.length) {
-      const head = this.pendingReplies[this.pendingReplies.length - 1];
+      const head = this.pendingReplies[0];
       const entry = this.channel.registry.get(head.eventId);
       if (entry) return head;
-      this.pendingReplies.pop();
-      void now;
+      this.pendingReplies.shift(); // 已被消费/过期 → 丢掉继续看下一条
     }
     return null;
+  }
+
+  /**
+   * 答完一条后,把**下一条**待拍板的重新发到底部。
+   *
+   * 这是"多条审批"体验的关键一步:微信消息位置固定,用户永远在**底部的那条**上回数字。
+   * 把下一条重发到底部 ⇒ "用户正在看的那条"就恒等于"系统会作答的那条"(FIFO),两种直觉对齐。
+   * 不重发的话,用户得往上翻去找哪条还没答 —— 翻错就又是"答错对象"。
+   *
+   * 只发**紧凑提醒**(完整内容在聊天记录里已有),不复用完整模板:避免重复长文、也避免再占一个回执编号。
+   */
+  async #resurfaceNext(from) {
+    const pending = this.#oldestPending();
+    if (!pending) return;
+    const entry = this.channel.registry.get(pending.eventId);
+    const opts = Array.isArray(entry && entry.options) ? entry.options : [];
+    if (!opts.length) return; // 不可回执的(如破坏性审批)不再提示
+    const task = String((pending.node && (pending.node.toolName || pending.node.title)) || "").trim();
+    const lines = [`还有 ${this.pendingReplies.length} 条待你拍板：`];
+    if (task) lines.push(`· ${task}`);
+    lines.push("");
+    opts.forEach((o, i) => lines.push(`回复 ${i + 1} = ${o.label}`));
+    await this.reply(from, lines.join("\n"));
   }
 
   /** 处理一条入站消息(回执 / 指令 / 交代任务)。公开以便 bridge 与测试直接驱动。 */
@@ -633,8 +743,12 @@ export class WeChatRuntime {
       return;
     }
     if (cls.kind === "message") {
-      // 纯文本 = 「在微信里交代任务」→ 付费能力。免费用户拿到解释 + App 链接(转化入口)。
-      if (!(await this.#canNow("assign"))) {
+      // 纯文本 = 派活。★ 分两种(业主 2026-09-22 拍板):
+      //   · **有当前会话** → 「继续已有会话」= assign.continue —— **免费也有**(让免费用户能接着聊)
+      //   · **没有当前会话** → 等同开新任务 = assign.new —— 付费才有
+      //   这样既满足"能继续聊",又保住"开新任务/管会话"是会员能力。
+      const need = this.currentSessionId ? "assign.continue" : "assign.new";
+      if (!(await this.#canNow(need))) {
         // ⚠️ 陷阱:回执只认**纯数字**(见 classifyInbound)。免费档的核心价值恰恰是审批,
         //    用户很可能打字「允许」而不是回「1」—— 若只回一句付费提示,他会以为免费版什么都干不了。
         //    所以手上有待回执的消息时,先把"回数字就能拍板"说在前面。
@@ -658,9 +772,59 @@ export class WeChatRuntime {
     return this.cachedTier || "free";
   }
 
+  /**
+   * 当前生效的**能力集合**。
+   * 优先用服务端权益包下发的 caps;没有才按档位查内置表(冷启动兜底)。
+   * 这样"后台改权限无需发版"就成立了 —— 而内置表保证即使服务端没给也不会瞎放权。
+   */
+  #caps() {
+    const server = this.entitlements && Array.isArray(this.entitlements.caps) ? this.entitlements.caps : null;
+    if (server && server.length) return server;
+    return capabilitiesFor(this.#tier(), this.capabilityTable);
+  }
+
+  /** 当前生效的限制(服务端权益包优先,否则内置表按档位)。 */
+  #limits() {
+    const server = this.entitlements && this.entitlements.limits;
+    if (server && typeof server === "object") return server;
+    return limitsFor(this.#tier(), this.limitTable);
+  }
+
   /** 当前档位是否具备某能力(运营钩子的唯一判断入口)。 */
   #can(cap) {
-    return capabilitiesFor(this.#tier(), this.capabilityTable).includes(cap);
+    return grantsCap(this.#caps(), cap);
+  }
+
+  /** 月份键(用量按月归零)。 */
+  #monthKey(now = this.clock()) {
+    const d = new Date(now);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+  }
+
+  /**
+   * **每月消息额度闸**(业主 2026-09-22:免费给每月 N 条,超出引导升级)。
+   * `messages_per_month` 为 0/缺省 = 不限(付费档走这条)。
+   * ⚠️ 只在**派活**前拦;审批回执与指令不计数、也不拦 ——
+   *    否则免费用户会为了省额度不敢拍板,那等于把安全阀关掉。
+   */
+  #msgQuotaGate() {
+    const limit = Number((this.#limits() || {}).messages_per_month || 0);
+    if (!Number.isFinite(limit) || limit <= 0) return { ok: true };
+    const month = this.#monthKey();
+    const used = this.msgUsage && this.msgUsage.month === month ? Number(this.msgUsage.count || 0) : 0;
+    if (used < limit) return { ok: true };
+    return {
+      ok: false,
+      text: `本月的 ${limit} 条消息额度已经用完了(下个月 1 号自动恢复)。\n\n${this.#upsellText()}`
+    };
+  }
+
+  /** 记一条消息用量。**只在真的派出去之后调用**(发失败不该扣额度)。 */
+  #msgQuotaBump() {
+    const month = this.#monthKey();
+    const used = this.msgUsage && this.msgUsage.month === month ? Number(this.msgUsage.count || 0) : 0;
+    this.msgUsage = { month, count: used + 1 };
+    this.channel.writeState({ msg_usage: this.msgUsage });
   }
 
   /**
@@ -673,18 +837,36 @@ export class WeChatRuntime {
     const now = Date.now();
     if (now - this.tierCheckedAt < minIntervalMs) return this.#tier();
     this.tierCheckedAt = now;
-    let next = "";
+    let got = null;
     try {
-      next = String((await this.tierProvider()) || "").trim();
+      got = await this.tierProvider();
     } catch (e) {
       this.logger.warn(`[wechat] 读取账号档位失败(沿用上次):${redact(String(e && e.message ? e.message : e))}`);
       return this.#tier();
     }
-    if (!next) return this.#tier(); // 空串 = 这次没取到 → 沿用缓存
-    if (next !== this.cachedTier) {
-      this.cachedTier = next;
-      this.channel.writeState({ tier: next });
-      this.logger.info(`[wechat] 账号档位:${next}`);
+    // 兼容两种契约:字符串(旧:只给档位)与对象(权益包:档位 + 能力 + 限制 + 版本号)
+    const isObj = Boolean(got) && typeof got === "object";
+    const plan = String((isObj ? got.plan : got) || "").trim();
+    if (!plan) return this.#tier(); // 空 = 这次没取到 → 沿用缓存(绝不降级)
+    const caps = isObj && Array.isArray(got.caps) && got.caps.length ? got.caps : null;
+    const limits = isObj && got.limits && typeof got.limits === "object" ? got.limits : null;
+    const rev = isObj ? String(got.rev || "") : "";
+    const planChanged = plan !== this.cachedTier;
+    const bundleIncoming = Boolean(caps || limits);
+    this.cachedTier = plan;
+    if (bundleIncoming) {
+      // 服务端给了权益包 → 以它为准;没给的字段保留上次(不因为缺字段就把能力清空)
+      this.entitlements = {
+        rev,
+        plan,
+        caps: caps || (this.entitlements && this.entitlements.caps) || null,
+        limits: limits || (this.entitlements && this.entitlements.limits) || null
+      };
+      this.entitlementsRev = rev;
+    }
+    if (planChanged || bundleIncoming) {
+      this.channel.writeState(bundleIncoming ? { tier: plan, entitlements: this.entitlements } : { tier: plan });
+      if (planChanged) this.logger.info(`[wechat] 账号档位:${plan}${bundleIncoming ? "(含权益包)" : ""}`);
     }
     return this.#tier();
   }
@@ -851,6 +1033,12 @@ export class WeChatRuntime {
       await this.reply(from, "暂不可用:DSH 会话服务未就绪。");
       return;
     }
+    // ⚠️ 额度闸必须在**建会话之前** —— 否则超额时会在 DSH 里留下一个空会话(白占一个任务的坑)
+    const gate = this.#msgQuotaGate();
+    if (!gate.ok) {
+      await this.reply(from, gate.text);
+      return;
+    }
     const list = await this.#sessions();
     let cwd = "";
     if (list && list.length) {
@@ -875,8 +1063,9 @@ export class WeChatRuntime {
     const sent = await this.subscriber.promptSession({ sessionId: created.sessionId, text });
     if (!sent || !sent.ok) {
       await this.reply(from, `新任务 ${short} 已建立,但下发失败:${(sent && sent.message) || "未知错误"}`);
-      return;
+      return; // 没派出去 → 不扣额度
     }
+    this.#msgQuotaBump();
     await this.reply(from, `已开新任务 ${short} 并下发。跑完我会推结论给你;中途想补充直接回话即可。`);
   }
 
@@ -959,13 +1148,15 @@ export class WeChatRuntime {
     await this.reply(from, r);
   }
 
-  /** 取某个会话的"结论"= 最后一条助手消息(已截断到微信可读长度)。 */
+  /** 取某个会话的"结论"= 最后一条助手消息(截到微信可读长度上限)。 */
   async #sessionSummary(sessionId) {
     if (!this.subscriber || typeof this.subscriber.lastAssistantText !== "function") return "";
     try {
       const r = await this.subscriber.lastAssistantText({ sessionId });
       if (!r || !r.ok || !r.text) return "";
-      return String(r.text).trim().slice(0, 700);
+      // ⚠️ 这里与展示侧的 COMPLETION_SUMMARY_MAX 是**两道闸**:取值侧若更小,
+      //    结论会在拼接之前就被砍掉,排查时只盯 formatter 找不到真正截断点(历史踩过)。
+      return String(r.text).trim().slice(0, SESSION_SUMMARY_MAX);
     } catch {
       return "";
     }
@@ -983,8 +1174,15 @@ export class WeChatRuntime {
       await this.reply(from, "暂不可用:DSH 会话服务未就绪。");
       return;
     }
+    // 每月消息额度闸(放在真正派活之前;审批/指令不计数也不拦)
+    const gate = this.#msgQuotaGate();
+    if (!gate.ok) {
+      await this.reply(from, gate.text);
+      return;
+    }
     const r = await this.subscriber.promptSession({ sessionId: this.currentSessionId, text: body });
     if (r && r.ok) {
+      this.#msgQuotaBump(); // 只在真的派出去之后扣额度(发失败不该扣)
       await this.reply(from, `已补充给「${this.currentSessionTitle || "当前任务"}」,跑完推结论给你。`);
       return;
     }
@@ -995,7 +1193,7 @@ export class WeChatRuntime {
   async #answerChoice(from, digits) {
     if (digits === null || digits === undefined) return;
 
-    const pending = this.#latestPending();
+    const pending = this.#oldestPending();
     if (!pending) {
       // §6 ①:过期**绝不**当成同意,如实告诉用户。
       await this.reply(from, "这条对应的待办已经过期或已被处理过了,没有代你做出任何选择。");
@@ -1037,9 +1235,13 @@ export class WeChatRuntime {
     if (ans && ans.ok === false) {
       // 回晚了 / 已被别处处理 —— 如实告知,不假装成功(§6 ①)
       await this.reply(from, `没能替你完成这个选择(${ans.error || "可能已经过期或被处理"}）。任务那边已按"未批准"继续处理了,请到电脑上确认。`);
+      await this.#resurfaceNext(from); // 这条废了也要把下一条顶到底部,别让用户往上翻
       return;
     }
     await this.reply(from, `已按你的选择处理:${option.label || digits}。`);
+    // ★ 还有待拍板的 → 把下一条重发到底部,用户直接在最新那条上回数字即可。
+    //   (不重发的话用户得往上翻找哪条没答 —— 翻错就是"答错对象",正是业主报的那个 bug 的成因。)
+    await this.#resurfaceNext(from);
   }
 
   async reply(to, text) {
@@ -1140,6 +1342,12 @@ export class WeChatRuntime {
       return { ok: false, reason: `unmapped:${eventNode.kind}` };
     }
 
+    // 日报要能回答"今天干了啥" → 在既有的 notified/answered 之外,再记完成与失败。
+    // (owner 口径:日报不该是"今天要做啥"的清单,而是"今天做了什么"的回顾)
+    if (formatterKind === "stopped") {
+      this.#bumpToday(String(eventNode.reason || "") === "completed" ? "completed" : "failed");
+    }
+
     // ── v2 富化 ────────────────────────────────────────────────────────────
     // 两条 v2 规则在这里落地,顺序有讲究:先判"完成推送要富化",再判"审批要不要降级为
     // 只能回电脑确认"。两者都**不走**通用模板,所以放在 buildOutboundNotification 之前。
@@ -1187,8 +1395,8 @@ export class WeChatRuntime {
           detail ? `原因: ${detail}` : "",
           "",
           detail
-            ? "这一步的**内容**被判定为破坏性操作(删除 / 强推 / 覆盖等),不能从微信里一键放行。"
-            : "这个**工具本身**属于删除 / 覆盖类,不能从微信里一键放行。",
+            ? "这一步的内容被判定为破坏性操作(删除 / 强推 / 覆盖等),不能从微信里一键放行。"
+            : "这个工具本身属于删除 / 覆盖类,不能从微信里一键放行。",
           "请到电脑上确认;不处理的话 DSH 会按「未批准」继续。"
         ].filter(Boolean).join("\n"),
         replyable: false,
@@ -1200,7 +1408,15 @@ export class WeChatRuntime {
 
     if (!built || !built.text) return { ok: false, reason: "no_text" };
 
-    const sent = await this.reply(acct.userId, built.text);
+    // 已经还有别的待拍板 → 明确说"不止这一条"。不说的话用户会以为答完就结束了,
+    // 后面几条就变成"没人回应"(业主报的那个 bug 的后半段现象)。
+    // ⚠️ 数字必须取**发送前**的快照:push 之后它会包含这一条自己。
+    const othersWaiting = built.replyable && built.eventId ? this.pendingReplies.length : 0;
+    const outgoing = othersWaiting > 0
+      ? `${built.text}\n\n（你还有 ${othersWaiting + 1} 条待拍板，回完这条我会把下一条发到下面）`
+      : built.text;
+
+    const sent = await this.reply(acct.userId, outgoing);
     if (sent && built.replyable && built.eventId) {
       this.pendingReplies.push({
         eventId: built.eventId,
@@ -1232,11 +1448,47 @@ export class WeChatRuntime {
 
   #startDigestTimer() {
     if (this.digestTask) return;
-    // 每分钟检查一次"是否到了今天的简报时刻且今天还没发过"
+    // 每分钟检查一次:① 是否到了今天的简报时刻且今天还没发过 ② 会员是否临近到期
     this.digestTask = setInterval(() => {
       this.#maybeDigest().catch(() => {});
+      this.#maybeRemindExpiry().catch(() => {});
     }, 60_000);
     if (this.digestTask.unref) this.digestTask.unref();
+  }
+
+  /**
+   * 会员/试用临近到期的提醒(提前 2 天、提前 1 天、到期当天)。
+   *
+   * ⚠️ 这条**以前根本不存在**:`notifyMembershipExpiring()` 只有定义、全仓零调用方 ——
+   *    业主以为"提前两天发、提前一天也发",实际一次都没发过。这里补上唯一的触发点。
+   *
+   * 数据来源:`opts.accountInfo`(由 bridge 注入,复用它查档位时那次 `/api/me`,不额外打网络)。
+   * 拿不到就**什么都不发** —— 宁可漏发一次,也不要拿"猜的到期日"去骚扰用户。
+   * 每个阈值**一天只发一次**(落盘去重),避免一天里反复提醒。
+   */
+  async #maybeRemindExpiry() {
+    if (this.stopping || !this.channel.account || !this.subscriber) return;
+    if (typeof this.accountInfo !== "function") return;
+    const now = this.clock();
+    let info = null;
+    try { info = await this.accountInfo(); } catch { info = null; }
+    if (!info || typeof info !== "object") return;
+    const endsAt = Number(info.plan_ends_at || info.trial_expires_at || 0);
+    if (!Number.isFinite(endsAt) || endsAt <= 0) return;
+    const days = Math.ceil((endsAt - now) / 86_400_000);
+    // 只在这三个节点提醒:2 天 / 1 天 / 已到期(<=0)。其余日子保持安静。
+    const slot = days <= 0 ? "expired" : days === 1 ? "1" : days === 2 ? "2" : "";
+    if (!slot) return;
+    const key = `${this.#today(now)}:${slot}`;
+    const state = loadState(this.relayDir);
+    if (state.last_membership_notice === key) return; // 这个阈值今天已提醒过
+    const r = await this.notifyMembershipExpiring({
+      state: slot === "expired" ? "expired" : "expiring",
+      days: Math.max(0, days),
+      plan: String(info.plan || "")
+    });
+    // 只有真发出去了才记账(与简报同一个道理:不能把没发出去的当已发)
+    if (r && r.ok) this.channel.writeState({ last_membership_notice: key });
   }
 
   #today(now = this.clock()) {
@@ -1246,10 +1498,21 @@ export class WeChatRuntime {
 
   #bumpToday(field = "notified") {
     const day = this.#today();
-    if (this.todayStats.day !== day) this.todayStats = { day, notified: 0, answered: 0 };
+    if (this.todayStats.day !== day) {
+      this.todayStats = { day, notified: 0, answered: 0, completed: 0, failed: 0 };
+    }
     this.todayStats[field] = (this.todayStats[field] || 0) + 1;
   }
 
+  /**
+   * 每日简报(兼作 24h 推送窗口的心跳)。
+   *
+   * ⚠️ 旧实现有两个问题,一起修了:
+   *   ① 只把 `{notified, answered}` 交给下游,**没有 lines** → 用户每天收到的是兜底句
+   *      「今天暂时没有要做的事。」—— 那不是"今天干了啥",等于白发(业主:"日报发的内容有点问题")。
+   *   ② 先把 `last_digest_day` 落盘**再**发送 → 一旦这次没发出去(网络抖动/节点被权限关掉),
+   *      当天的简报就被**烧掉**、当天再也不会补发。
+   */
   async #maybeDigest() {
     if (this.stopping || !this.channel.account || !this.subscriber) return;
     const now = this.clock();
@@ -1257,12 +1520,37 @@ export class WeChatRuntime {
     if (hour !== this.digestHour) return;
     const state = loadState(this.relayDir);
     if (state.last_digest_day === this.#today(now)) return; // 今天已发
-    this.channel.writeState({ last_digest_day: this.#today(now) });
-    const node = this.subscriber.digestDue({
-      notified: this.todayStats.notified,
-      answered: this.todayStats.answered
-    });
-    await this.notify(node);
+    const s = this.todayStats;
+    const lines = this.#digestLines();
+    const node = this.subscriber.digestDue({ lines, notified: s.notified, answered: s.answered });
+    const r = await this.notify(node);
+    // ★ 只有**真的发出去了**才记"今天已发"(见上面 ②)
+    if (r && r.ok) this.channel.writeState({ last_digest_day: this.#today(now) });
+  }
+
+  /** 简报正文:回答"**今天**干了啥"(业主口径:日报是回顾,不是待办清单)。 */
+  #digestLines() {
+    const s = this.todayStats;
+    const lines = [];
+    if (s.completed) lines.push(`· 完成任务 ${s.completed} 个`);
+    if (s.failed) lines.push(`· 出错或中断 ${s.failed} 个`);
+    if (s.notified) lines.push(`· 推送通知 ${s.notified} 条`);
+    if (s.answered) lines.push(`· 你在微信里拍板 ${s.answered} 次`);
+    if (!lines.length) lines.push("· 今天这台电脑上没有跑任务。");
+    return lines;
+  }
+
+  /**
+   * 供测试驱动**真实**的简报路径(含"今天是否已发"与"只有发送成功才记账"两条判断)。
+   * 与 `runDigestNow` 的区别:后者是运维手动补发、故意绕过这两条判断;这里用于验证它们。
+   */
+  async runMaybeDigestNow() {
+    return this.#maybeDigest();
+  }
+
+  /** 供测试/运维手动触发一次"到期提醒"检查(绕过定时器)。与 runDigestNow 同一目的。 */
+  async runExpiryRemindNow() {
+    return this.#maybeRemindExpiry();
   }
 
   /**
@@ -1271,7 +1559,12 @@ export class WeChatRuntime {
    */
   async runDigestNow(extra = {}) {
     if (!this.subscriber) return { ok: false, reason: "not_running" };
-    const node = this.subscriber.digestDue({ notified: this.todayStats.notified, answered: this.todayStats.answered, ...extra });
+    const node = this.subscriber.digestDue({
+      lines: this.#digestLines(),
+      notified: this.todayStats.notified,
+      answered: this.todayStats.answered,
+      ...extra
+    });
     return this.notify(node);
   }
 
