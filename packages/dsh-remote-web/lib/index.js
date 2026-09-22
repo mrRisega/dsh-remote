@@ -1023,7 +1023,18 @@ function ensureRuntime(relayDir) {
   }
 }
 
-/** 生成 plist（与 dsh-setup.mjs writeAutostartFile 同构），返回路径。 */
+/**
+ * 生成 plist（与 dsh-setup.mjs 的 writeAutostartFile **必须同构**），返回路径。
+ *
+ * ⚠️ 两份模板历史上漂移过、并因此各造成一个真机事故（插件每次自愈/启动都会重写 plist，
+ *    所以**插件这份谁写谁说了算**，漂移等于把安装器那份正确的覆盖掉）：
+ *   · 漏 `/usr/sbin`、`/sbin`（SERVICE_PATH）→ bridge 找不到 `ioreg` → 机器指纹静默退化成
+ *     hostname 哈希（改一次主机名就被当成新设备）；
+ *   · 漏 `LimitLoadToSessionType` → `bootstrap user/<uid>` 失败（rc=5）→ 域阶梯回退到
+ *     gui/<uid>，而 macOS 26 上 gui 域是 on-demand-only、`RunAtLoad`/`KeepAlive` 失效 →
+ *     **服务被系统（BTM）回收后再也回不来**，只能手动点面板「启动」。
+ *   两者都由 launchd-domain.test.mjs 的跨文件不变量锁死。
+ */
 function writeAutostartFile(relayDir) {
   const plistPath = launchAgentPath();
   if (!plistPath) return null;
@@ -1037,6 +1048,7 @@ function writeAutostartFile(relayDir) {
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>10</integer>
+  <key>LimitLoadToSessionType</key><array><string>Aqua</string><string>Background</string></array>
   <key>StandardOutPath</key><string>${join(relayDir, ".dsh-bridge.log")}</string>
   <key>StandardErrorPath</key><string>${join(relayDir, ".dsh-bridge.log")}</string>
   <key>EnvironmentVariables</key><dict><key>PATH</key><string>${SERVICE_PATH}</string><key>DSH_BRIDGE_INSTALL_SOURCE</key><string>${installSourceOf(relayDir)}</string><key>DSH_BRIDGE_INSTALL_VERSION</key><string>${PLUGIN_VERSION}</string></dict>
@@ -2469,7 +2481,7 @@ const PLUGIN_ID = "dsh-remote-web";
 const PLUGIN_LEGACY_IDS = ["dsh-remote-ui"];
 const PLUGIN_ALL_IDS = [PLUGIN_ID, ...PLUGIN_LEGACY_IDS];
 /** 插件自身发布版本（与 dsh-remote 根包同步递增）。 */
-const PLUGIN_VERSION = "0.6.10-beta.5";
+const PLUGIN_VERSION = "0.6.10-beta.6";
 const UPDATE_LOG = ".dsh-update.log";
 const UPDATE_MARKER = ".dsh-update-running";
 

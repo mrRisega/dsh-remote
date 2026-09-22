@@ -36,6 +36,16 @@ test("launchd 修复：plist 必须带 LimitLoadToSessionType（user domain 的�
   // RunAtLoad / KeepAlive 仍需保留：user domain 下它们才真正生效
   assert.match(src, /<key>RunAtLoad<\/key><true\/>/, "RunAtLoad 不能删（user domain 下靠它开机自启）");
   assert.match(src, /<key>KeepAlive<\/key><true\/>/, "KeepAlive 不能删（user domain 下靠它崩溃自愈）");
+  // ★ 插件那份模板**也**必须有：它每次自愈/启动都会重写 plist（谁写谁说了算）。
+  //   真机实证 2026-09-22：插件模板漏了它 → bootstrap user/<uid> 失败 → 回退 gui/<uid> →
+  //   macOS 26 上该域 on-demand-only、KeepAlive 失效 → 服务被系统回收后再也回不来，
+  //   现场表现就是「自启动服务偶尔整个消失，连 kickstart 都报域里找不到该服务」。
+  assert.match(
+    INDEX_SRC,
+    /<key>LimitLoadToSessionType<\/key><array><string>Aqua<\/string><string>Background<\/string><\/array>/,
+    "★插件半边的 plist 模板也必须有 LimitLoadToSessionType（否则它会覆盖掉安装器那份正确的）"
+  );
+  assert.match(INDEX_SRC, /<key>KeepAlive<\/key><true\/>/, "插件模板也要保留 KeepAlive");
 });
 
 test("launchd 修复：启动走 user → gui 阶梯，且每次都 kickstart", () => {
