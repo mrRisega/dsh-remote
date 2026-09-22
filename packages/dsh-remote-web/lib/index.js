@@ -91,6 +91,20 @@ const DEFAULT_API = String(process.env.DSH_RELAY_DEFAULT_API || "").trim()
 const DEFAULT_APP_URL = "https://n.risegao.cn:13443/app/";
 
 /**
+ * 自启动服务（launchd plist / systemd unit）与子进程使用的 PATH。
+ *
+ * ⚠️ **必须含 `/usr/sbin` 与 `/sbin`**：它们是系统管理命令所在目录（`ioreg`、`sysctl`…），
+ *    而 bridge 会用这些命令探测本机信息。
+ *    真机实证（2026-09-22）：本文件此前**硬编码**了不含 `/usr/sbin` 的 PATH，而插件每次
+ *    自愈/启动都会重写 plist —— 于是它覆盖掉了 dsh-setup.mjs 里那份**正确**的 SERVICE_PATH，
+ *    结果 bridge 日志里刷 `/bin/sh: ioreg: command not found`，机器指纹静默退化成
+ *    hostname 哈希（用户改一次主机名就被当成新设备）。
+ * ⚠️ 与 `dsh-setup.mjs` 的 `SERVICE_PATH` **必须一致** —— 两处都会写同一个 plist，
+ *    谁写谁说了算；有测试锁死这条一致性（跨文件不变量）。
+ */
+const SERVICE_PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+
+/**
  * 把文件权限收紧到「只有本人可读写」。
  *
  * ⚠️ Windows 上 `{ mode: 0o600 }` 是**空操作**（Windows 用 ACL，不是 POSIX mode 位）：
@@ -226,7 +240,9 @@ function spawnEnv(extra) {
   // PATH 分隔符必须按平台取（Windows 是 ";"，POSIX 是 ":"）：写死 ":" 会把整条 PATH
   // 在 Windows 上拼成一个不存在的路径，node/npx 全部找不到。
   // 追加的 POSIX 目录只在类 Unix 上有意义，Windows 上不追加。
-  const posixDirs = isWindows() ? [] : ["/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin"];
+  // 含 /usr/sbin 与 /sbin：插件用 spawnEnv 拉起的是 watcher，它会再拉起 bridge，
+  // 而 bridge 要用 ioreg 之类系统命令（缺了它 → 机器指纹静默退化，见 SERVICE_PATH 注释）。
+  const posixDirs = isWindows() ? [] : ["/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"];
   const PATH = [nodeDir, base, ...posixDirs].filter(Boolean).join(delimiter);
   return { ...process.env, PATH, ...(extra || {}) };
 }
@@ -1023,7 +1039,7 @@ function writeAutostartFile(relayDir) {
   <key>ThrottleInterval</key><integer>10</integer>
   <key>StandardOutPath</key><string>${join(relayDir, ".dsh-bridge.log")}</string>
   <key>StandardErrorPath</key><string>${join(relayDir, ".dsh-bridge.log")}</string>
-  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string><key>DSH_BRIDGE_INSTALL_SOURCE</key><string>${installSourceOf(relayDir)}</string><key>DSH_BRIDGE_INSTALL_VERSION</key><string>${PLUGIN_VERSION}</string></dict>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>${SERVICE_PATH}</string><key>DSH_BRIDGE_INSTALL_SOURCE</key><string>${installSourceOf(relayDir)}</string><key>DSH_BRIDGE_INSTALL_VERSION</key><string>${PLUGIN_VERSION}</string></dict>
 </dict></plist>`;
   mkdirSync(dirname(plistPath), { recursive: true });
   writeFileSync(plistPath, plist, { mode: 0o644 });
@@ -2453,7 +2469,7 @@ const PLUGIN_ID = "dsh-remote-web";
 const PLUGIN_LEGACY_IDS = ["dsh-remote-ui"];
 const PLUGIN_ALL_IDS = [PLUGIN_ID, ...PLUGIN_LEGACY_IDS];
 /** 插件自身发布版本（与 dsh-remote 根包同步递增）。 */
-const PLUGIN_VERSION = "0.6.10-beta.4";
+const PLUGIN_VERSION = "0.6.10-beta.5";
 const UPDATE_LOG = ".dsh-update.log";
 const UPDATE_MARKER = ".dsh-update-running";
 

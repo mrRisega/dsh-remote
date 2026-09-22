@@ -407,6 +407,36 @@ function readPidFile(name) {
   } catch { return null; }
 }
 
+/**
+ * 这个 pid 看起来**真的**是 watcher 吗？
+ *
+ * 为什么必须查:pid 文件可能过期，而 pid 会被系统**回收给无关进程**。
+ * 去重逻辑信任 `pidAlive()` 只会导致"我多退一次"（安全方向）；但监管者接管时要
+ * **主动结束**那个 pid —— 盲杀一个被回收的无关进程是事故。所以动它之前先认一下命令行。
+ */
+function looksLikeWatcher(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  const r = sh(`ps -p ${pid} -o command=`);
+  return Boolean(r.ok && /dsh-setup\.mjs/.test(r.stdout));
+}
+
+/**
+ * 去重决策（纯函数 —— 这条判断的代价很高，必须能被直接测）。
+ *
+ *   · "run"      → 没有别的守护（或就是自己），正常跑
+ *   · "takeover" → 有别的守护，但**本进程是监管者(launchd)拉起的**：请它让位，我们接管
+ *   · "yield"    → 有别的守护，本进程是手动/插件脱离进程拉起的：直接退出，避免两个 bridge
+ *                  抢同一个设备登记
+ *
+ * 为什么"被监管者拉起"必须走 takeover 而不是 yield：
+ *   KeepAlive 每次重拉都秒退 → 监管者判为崩溃并节流 → 插件的自愈认定"服务坏了"→
+ *   bootout 摘掉作业（入口判定成立时连 plist 一起删）→ **自启动彻底消失**（真机实测）。
+ */
+function dedupDecision({ existingPid = null, selfPid = 0, supervisor = "" } = {}) {
+  if (!existingPid || existingPid === selfPid) return "run";
+  return supervisor ? "takeover" : "yield";
+}
+
 function pidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; }
@@ -958,12 +988,37 @@ function loginRateLimitUntil() {
 // ---------- run：前台跑 bridge（带配置 + 自启动 watcher） ----------
 async function runBridge() {
   // 去重（所有平台）：自启动服务、登录任务、插件半的脱离进程兜底都可能拉起 watcher，
-  // 两个 bridge 会抢同一个设备登记 → 以 pid 文件为准，已有守护在跑就直接退出。
+  // 两个 bridge 会抢同一个设备登记 → 以 pid 文件为准。
+  //
+  // ⚠️ 但**被监管者（launchd）拉起的那个实例绝不能再"直接退出"**。
+  //    真机实测的后果链：KeepAlive 每次重拉 → 本进程秒退 → 监管者判为崩溃并节流
+  //    （`launchctl print` 显示 `state = spawn scheduled`）→ 插件的自愈据此认定"服务坏了"
+  //    → `bootout` 摘掉作业（入口判定成立时连 plist 一起删）→
+  //    **自启动彻底消失，连 `launchctl kickstart` 都报"域里找不到该服务"**，
+  //    只剩插件面板的「启动」能救回来。
+  //    被监管者拉起 = 我们才是那个该活下来的实例 → 请游离实例让位，然后接管。
   {
     const other = readPidFile(WATCHER_PID_FILE);
     if (other && other !== process.pid && pidAlive(other)) {
-      console.log(`[dsh-remote] 已有一个 bridge 守护在运行（pid=${other}），本进程直接退出，避免重复实例。`);
-      return;
+      const supervisor = String(process.env.XPC_SERVICE_NAME || "");
+      const decision = dedupDecision({ existingPid: other, selfPid: process.pid, supervisor });
+      if (decision === "takeover") {
+        console.log(`[dsh-remote] 检测到游离守护（pid=${other}）——本进程由 ${supervisor} 监管，请它让位后接管。`);
+        // ⚠️ pid 可能已被系统回收给无关进程：必须确认它**真的**是 watcher 才敢动它，
+        //    否则宁可当作过期 pid 直接接管（下面 writePidFile 会覆盖掉）。
+        if (looksLikeWatcher(other)) {
+          try { process.kill(other, "SIGTERM"); } catch { /* 已退出 */ }
+          // 等它自己退（它的退出钩子会清理 pid 文件并停掉它的 bridge）。最多 5 秒 ——
+          // 不能等太久，否则监管者又看到一次"迟迟没起来"。
+          const deadline = Date.now() + 5000;
+          while (Date.now() < deadline && pidAlive(other)) sleepSync(100);
+          if (pidAlive(other)) { try { process.kill(other, "SIGKILL"); } catch { /* 已退出 */ } }
+        }
+        writePidFile(WATCHER_PID_FILE, process.pid);
+      } else {
+        console.log(`[dsh-remote] 已有一个 bridge 守护在运行（pid=${other}），本进程直接退出，避免重复实例。`);
+        return;
+      }
     }
   }
   let cfg = loadConfig();

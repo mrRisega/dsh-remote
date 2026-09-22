@@ -24,6 +24,8 @@ import { dirname, join } from "node:path";
 
 const SETUP = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "dsh-setup.mjs");
 const src = readFileSync(SETUP, "utf8");
+/** 插件半边也会写同一份 plist —— 两份模板必须一致（谁写谁说了算）。 */
+const INDEX_SRC = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "lib", "index.js"), "utf8");
 
 test("launchd 修复：plist 必须带 LimitLoadToSessionType（user domain 的必要条件）", () => {
   assert.match(
@@ -75,4 +77,51 @@ test("launchd 修复：服务 PATH 必须含 /usr/sbin 与 /sbin（否则 ioreg 
   // plist 与 systemd unit 都必须用这个常量，不能各写各的
   assert.ok(/\$\{SERVICE_PATH\}/.test(src), "plist/systemd 应使用 SERVICE_PATH 常量");
   assert.ok(!/Environment=PATH=\/usr\/local\/bin:\/usr\/bin:\/bin/.test(src), "systemd unit 不应再写死旧 PATH");
+});
+
+test("★ 两份 plist 模板的 PATH 必须一致（插件那份曾漏掉 /usr/sbin，覆盖掉正确的那份）", () => {
+  // 真机实证（2026-09-22）：插件半边在 plist 模板里**硬编码**了不含 /usr/sbin 的 PATH，
+  // 而它每次自愈/启动都会重写 plist → 覆盖掉 dsh-setup.mjs 里正确的那份 →
+  // bridge 日志刷 `/bin/sh: ioreg: command not found` → 机器指纹静默退化成 hostname 哈希。
+  const setupPath = /const SERVICE_PATH = "([^"]+)"/.exec(src);
+  const pluginPath = /const SERVICE_PATH = "([^"]+)"/.exec(INDEX_SRC);
+  assert.ok(setupPath, "dsh-setup.mjs 应定义 SERVICE_PATH");
+  assert.ok(pluginPath, "插件半边也必须定义 SERVICE_PATH（它也会写 plist）");
+  assert.equal(pluginPath[1], setupPath[1], "★两处 PATH 必须逐字一致：同一个 plist 谁写谁说了算");
+
+  // 插件写 plist 时必须用它，不能再硬编码
+  assert.ok(/\$\{SERVICE_PATH\}/.test(INDEX_SRC), "插件的 plist 模板必须使用 SERVICE_PATH");
+  assert.ok(!/<key>PATH<\/key><string>\/usr\/local\/bin:\/opt\/homebrew\/bin:\/usr\/bin:\/bin<\/string>/.test(INDEX_SRC),
+    "插件不得再硬编码不含 /usr/sbin 的 PATH");
+  // spawnEnv 拉起的是 watcher → 它会再拉起 bridge → 也必须能用到系统管理命令
+  for (const dir of ["/usr/sbin", "/sbin"]) {
+    assert.ok(INDEX_SRC.includes(`"${dir}"`), `spawnEnv 的 posixDirs 也应含 ${dir}`);
+  }
+});
+
+test("★ 被监管者(launchd)拉起的实例不得因『已有游离守护』而秒退", () => {
+  // 真机事故链：KeepAlive 重拉 → 本进程发现 pid 文件里已有游离守护 → 秒退
+  //   → 监管者判为崩溃并节流（`launchctl print` = `state = spawn scheduled`）
+  //   → 插件自愈认定"服务坏了" → bootout 摘作业（入口判定成立时连 plist 一起删）
+  //   → **自启动彻底消失，`launchctl kickstart` 报"域里找不到该服务"**。
+  const from = src.indexOf("function dedupDecision(");
+  assert.ok(from > -1, "应能找到 dedupDecision");
+  const body = src.slice(from, src.indexOf("function writeWindowsTask("));
+  assert.ok(body.length > 0, "切片边界应正确");
+  const decide = new Function(`${body}\nreturn dedupDecision;`)();
+
+  assert.equal(decide({ existingPid: 123, selfPid: 456, supervisor: "com.dshremote.bridge" }), "takeover",
+    "★被监管者拉起时必须接管，绝不能退出（否则自启动会被监管者与自愈联手摘掉）");
+  assert.equal(decide({ existingPid: 123, selfPid: 456, supervisor: "" }), "yield",
+    "手动/插件脱离进程拉起时仍必须让位（两个 bridge 会抢同一设备登记）");
+  assert.equal(decide({ existingPid: 0, selfPid: 456, supervisor: "" }), "run", "没有别的守护 → 正常跑");
+  assert.equal(decide({ existingPid: 456, selfPid: 456, supervisor: "" }), "run", "pid 就是自己 → 正常跑");
+  assert.equal(decide({ existingPid: null, selfPid: 456, supervisor: "" }), "run");
+
+  // 接管路径的接线：判据用监管者注入的 XPC_SERVICE_NAME；动那个 pid 之前必须先认命令行
+  const rb = src.slice(src.indexOf("async function runBridge()"), src.indexOf("// ---------- setup"));
+  assert.ok(rb.length > 0, "应能切出 runBridge");
+  assert.match(rb, /XPC_SERVICE_NAME/, "必须用监管者注入的 XPC_SERVICE_NAME 作判据");
+  assert.match(rb, /looksLikeWatcher\(other\)/, "★接管前必须确认那个 pid 真的是 watcher（pid 会被回收给无关进程）");
+  assert.match(rb, /dedupDecision\(/, "决策必须走 dedupDecision（保证被判为活代码且可测）");
 });
