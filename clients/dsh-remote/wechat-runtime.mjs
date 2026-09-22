@@ -1344,8 +1344,14 @@ export class WeChatRuntime {
 
   async reply(to, text) {
     if (!this.channel.account || !to) return false;
+    // ★ 文本**必须是字符串**。历史上 `#helpText()` 对付费档直接 `return HELP_TEXT` ——
+    //   那是个**数组**,而 `String(数组)` 会按逗号拼接、**一个换行都没有**:
+    //   用户实测到的正是「/help 回一坨,没有换行也没有编号」。数组一律按行拼接,
+    //   让"想给多行却给了数组"退化成**正确**的多行文本,而不是一坨。
+    const body = Array.isArray(text) ? text.join("\n") : String(text == null ? "" : text);
+    if (!body) return false;
     try {
-      await this.channel.client.sendMessage({ to, text });
+      await this.channel.client.sendMessage({ to, text: body });
       this.channel.markPush(true);
       return true;
     } catch (e) {

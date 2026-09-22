@@ -135,3 +135,46 @@ test("★ 被监管者(launchd)拉起的实例不得因『已有游离守护』�
   assert.match(rb, /looksLikeWatcher\(other\)/, "★接管前必须确认那个 pid 真的是 watcher（pid 会被回收给无关进程）");
   assert.match(rb, /dedupDecision\(/, "决策必须走 dedupDecision（保证被判为活代码且可测）");
 });
+
+// ---------------------------------------------------------------------------
+// 「一条微信指令回两条」的根治（2026-09-23 用户实测）
+//
+// 成因链：接管时把老 watcher SIGTERM，它只**请**子进程退出、最多等 3 秒就自己 exit；
+// 而 bridge 此刻常正卡在 35 秒的 getUpdates 长轮询里 —— 来不及退 → reparent 成孤儿继续跑。
+// 两个 bridge 各持自己的 updatesBuf、各轮询同一账号 ⇒ **同一条消息被消费两次、用户收到两条**。
+// 真机现场：`ps` 里两个 `dsh-bridge.mjs`，一个 PPID=1（孤儿）、一个挂在 watcher 下。
+// ---------------------------------------------------------------------------
+
+test("★ 遗留 bridge 的回收判定：只认「活着 + 确实是我们的 bridge 脚本 + 不是自己」", () => {
+  const from = src.indexOf("function shouldReapLeftoverBridge(");
+  assert.ok(from > -1, "应能找到 shouldReapLeftoverBridge");
+  const body = src.slice(from, src.indexOf("function writeWindowsTask("));
+  assert.ok(body.length > 0, "切片边界应正确");
+  const reap = new Function(`${body}\nreturn shouldReapLeftoverBridge;`)();
+
+  assert.equal(reap({ pid: 1538, selfPid: 1529, alive: true, isBridgeScript: true }), true,
+    "★活着且确认是我们的 bridge → 必须回收（否则它会和新实例抢同一账号的消息）");
+  assert.equal(reap({ pid: 1538, selfPid: 1529, alive: false, isBridgeScript: true }), false, "已经死了不用管");
+  assert.equal(reap({ pid: 1529, selfPid: 1529, alive: true, isBridgeScript: true }), false, "是自己不能杀");
+  assert.equal(reap({ pid: 999, selfPid: 1529, alive: true, isBridgeScript: false }), false,
+    "★pid 可能被系统回收给无关进程 —— 认不出是我们的 bridge 就绝不动它");
+  assert.equal(reap({ pid: 0, selfPid: 1529, alive: true, isBridgeScript: true }), false, "非法 pid");
+  assert.equal(reap({ pid: -1, selfPid: 1529, alive: true, isBridgeScript: true }), false, "非法 pid");
+  assert.equal(reap({}), false, "缺参一律不动");
+
+  const rb = src.slice(src.indexOf("async function runBridge()"), src.indexOf("// ---------- setup"));
+  assert.match(rb, /shouldReapLeftoverBridge\(/, "★接管后必须真的调用回收判定（保证它是活代码）");
+  assert.match(rb, /looksLikeBridge\(leftover\)/, "★动手前必须确认那个 pid 真的是 bridge 脚本");
+  assert.match(rb, /readPidFile\(BRIDGE_PID_FILE\)/, "回收目标取自 bridge 的 pid 文件");
+});
+
+test("★ watcher 退出前必须确保子进程真的死了（只『请』不够）", () => {
+  const rb = src.slice(src.indexOf("async function runBridge()"), src.indexOf("// ---------- setup"));
+  assert.match(rb, /bridgeProc\.send\(\{ type: "shutdown" \}\)/, "先请它优雅退出（跑完 notifystop）");
+  // 关键：退出前兜底 SIGTERM/SIGKILL —— 否则长轮询中的子进程会变成孤儿继续抢消息
+  const tail = rb.slice(rb.indexOf('for (const sig of ["SIGINT"'));
+  assert.match(tail, /bridgeProc\.kill\("SIGTERM"\)/, "★宽限期后必须补 SIGTERM（bridge 常卡在 35s 长轮询里）");
+  assert.match(tail, /bridgeProc\.kill\("SIGKILL"\)/, "★再宽限仍不退必须 SIGKILL（否则退出后留孤儿）");
+  assert.match(tail, /bridgeProc\.exitCode === null/, "判活要用 exitCode（已退出就别再杀）");
+  assert.match(src, /function looksLikeBridge\(pid\)/, "应有 looksLikeBridge 供回收前校验命令行");
+});

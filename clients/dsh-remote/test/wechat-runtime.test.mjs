@@ -1611,3 +1611,58 @@ test("★ 免费档(有 assign.continue 没 assign.new)的额度提醒:只说缺
     await ilink.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// 「/help 回一坨」的根治（2026-09-23 用户实测）
+//
+// 旧实现对付费档 `#helpText()` 直接 `return HELP_TEXT` —— 那是个**数组**，
+// 而发送前 `String(数组)` 会按逗号拼接、**一个换行都没有**：用户看到的正是
+// 「/help 回一坨，没有换行、也没有编号」。两处一起防：帮助改为逐行 join，
+// 且 reply() 收到数组时按行拼接（让"想给多行却给了数组"退化成正确的多行，而不是一坨）。
+// ---------------------------------------------------------------------------
+
+test("★ reply 收到数组时必须按行拼接,绝不能退化成逗号串", async () => {
+  const ilink = await fakeIlink();
+  try {
+    const { rt } = await boundRuntime(ilink, { subscriber: makeFakeSubscriber(), tier: "pro" });
+    await rt.reply("u", ["第一行", "· 第二行", "· 第三行"]);
+    const t = lastText(ilink.state);
+    assert.match(t, /第一行\n· 第二行\n· 第三行/, "★数组必须按 \\n 拼接");
+    assert.ok(!/第一行,/.test(t), "★绝不能出现逗号拼接（String(数组) 的老行为 = 用户看到的一坨）");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★ /help 必须逐行分隔:付费档也不许退化成一坨(无换行/无编号)", async () => {
+  const ilink = await fakeIlink();
+  try {
+    const { rt } = await boundRuntime(ilink, {
+      subscriber: makeFakeSubscriber(), tier: "pro",
+      entitlements: {
+        rev: "r-help", plan: "pro",
+        caps: ["notify", "approve", "status", "stop", "assign", "sessions", "summary"],
+        limits: { messages_per_month: 0 }
+      }
+    });
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "/help" } }] });
+    const t = lastText(ilink.state);
+    const lines = t.split("\n");
+    assert.ok(lines.length >= 6, `★帮助必须多行展示,实际只有 ${lines.length} 行:${t}`);
+    assert.match(t, /现在能用的/, "应有一行小节标题");
+    assert.ok(lines.some((l) => l.startsWith("· ")), "能力项应以「· 」开头（逐条，不是挤成一段）");
+    assert.ok(!/现在能用的:,/.test(t) && !/，·/.test(t), "★不得是逗号拼接的一坨");
+    // 免费档同样要多行（两条路都要能读）
+    const freeIlink = await fakeIlink();
+    try {
+      const f = await boundRuntime(freeIlink, { subscriber: makeFakeSubscriber(), tier: "free" });
+      await f.rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "/help" } }] });
+      const ft = lastText(freeIlink.state);
+      assert.ok(ft.split("\n").length >= 6, `★免费档帮助也要多行,实际:${ft}`);
+    } finally {
+      await freeIlink.close();
+    }
+  } finally {
+    await ilink.close();
+  }
+});

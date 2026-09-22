@@ -421,6 +421,34 @@ function looksLikeWatcher(pid) {
 }
 
 /**
+ * 这个 pid 是不是我们的 **bridge 子进程**（不是 watcher、也不是别的 node）。
+ *
+ * 为什么要单独判：接管时我们要回收"上一任遗留的 bridge"，而 pid 可能已被系统回收给无关进程 ——
+ * 对无关进程发 SIGKILL 是不可接受的。所以对 `ps` 出来的命令行做**双重**校验：
+ * 必须同时出现 bridge 脚本名与 clients/dsh-remote 路径片段。
+ */
+function looksLikeBridge(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  const r = sh(`ps -p ${pid} -o command=`);
+  if (!r.ok) return false;
+  const cmd = String(r.stdout || "");
+  return /dsh-bridge\.mjs/.test(cmd) && /clients[\\/]dsh-remote/.test(cmd);
+}
+
+/**
+ * 该不该回收这个"上一任留下的 bridge 子进程"（纯函数 —— 便于直接测）。
+ *
+ * 只有**确认它就是我们的 bridge 脚本**才敢动它；是自己、已死、非整数一律不动。
+ * 这条判断代价很高（误杀无关进程 / 漏杀导致两个实例抢同一微信账号的消息），所以抽出来单测。
+ */
+function shouldReapLeftoverBridge({ pid, selfPid = 0, alive = false, isBridgeScript = false } = {}) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (pid === selfPid) return false;
+  if (!alive) return false;
+  return Boolean(isBridgeScript);
+}
+
+/**
  * 去重决策（纯函数 —— 这条判断的代价很高，必须能被直接测）。
  *
  *   · "run"      → 没有别的守护（或就是自己），正常跑
@@ -1020,6 +1048,37 @@ async function runBridge() {
         return;
       }
     }
+    // ── 回收「上一任留下的 bridge 子进程」────────────────────────────────────
+    //
+    // 🔴 真机 bug（2026-09-23 用户实测）：一条微信指令**回两条**。
+    //    成因链：接管时把老 watcher SIGTERM（它只"请"子进程退出、最多等 3 秒就自己 exit），
+    //    而 bridge 此刻常正卡在 35 秒的 getUpdates 长轮询里 —— 来不及退 → 变成孤儿继续跑；
+    //    若老 watcher 是被 SIGKILL 干掉的（等超 5 秒那条路），连"请"都不会发生。
+    //    两个 bridge 各自持有自己的 updatesBuf、各自轮询同一个微信账号 ⇒ 同一条消息被消费两次、
+    //    回两条。所以**接管之后必须显式清掉上一任的子进程**，不能只靠"它应该会自己退"。
+    //
+    // 安全边界：pid 可能已被系统回收给无关进程 —— 必须确认它**真的**是我们的 bridge 脚本才动手
+    //（与 looksLikeWatcher 同一套纪律）。插件半的「脱离进程兜底」也会拉起 bridge，
+    // 但那种情况**没有** watcher 在跑（有 watcher 就不会走兜底），所以这里回收不会误伤正常形态。
+    {
+      const leftover = readPidFile(BRIDGE_PID_FILE);
+      const reap = shouldReapLeftoverBridge({
+        pid: leftover,
+        selfPid: process.pid,
+        alive: leftover ? pidAlive(leftover) : false,
+        isBridgeScript: leftover ? looksLikeBridge(leftover) : false
+      });
+      if (reap) {
+        console.log(`[dsh-remote] 回收上一任遗留的 bridge 子进程（pid=${leftover}）——避免两个实例抢同一账号的消息。`);
+        try { process.kill(leftover, "SIGTERM"); } catch { /* 已退出 */ }
+        const dl = Date.now() + 4000;
+        while (Date.now() < dl && pidAlive(leftover)) sleepSync(100);
+        if (pidAlive(leftover) && looksLikeBridge(leftover)) {
+          try { process.kill(leftover, "SIGKILL"); } catch { /* 已退出 */ }
+        }
+        removePidFile(BRIDGE_PID_FILE);
+      }
+    }
   }
   let cfg = loadConfig();
   let warnedNoLogin = false;
@@ -1142,7 +1201,21 @@ async function runBridge() {
             try { bridgeProc.send({ type: "shutdown" }); } catch { /* 通道已断，只能随父进程一起被回收 */ }
           }
           cleanup();
-          setTimeout(() => process.exit(0), 3000);
+          // 🔴 但**只"请"是不够的**（2026-09-23 真机 bug：一条微信指令回两条）：
+          //    bridge 此刻常正卡在 35s 的 getUpdates 长轮询里，3 秒根本退不完；
+          //    老 watcher 一 exit，子进程就被 reparent 成孤儿、继续轮询同一个微信账号 →
+          //    与新 bridge 抢消息（一条被消费两次、回两条）。所以退出前必须**确保它真的死了**。
+          setTimeout(() => {
+            if (bridgeProc && bridgeProc.exitCode === null) {
+              try { bridgeProc.kill("SIGTERM"); } catch { /* 已退出 */ }
+            }
+          }, 1500);
+          setTimeout(() => {
+            if (bridgeProc && bridgeProc.exitCode === null) {
+              try { bridgeProc.kill("SIGKILL"); } catch { /* 已退出 */ }
+            }
+            process.exit(0);
+          }, 3000);
         });
       } catch { /* 该信号在本平台不可注册 */ }
     }
