@@ -1343,6 +1343,10 @@ async function runTunnel() {
     console.error("[bridge] 隧道模式需要账号认证:请设 DSH_BRIDGE_TOKEN,或 DSH_BRIDGE_PHONE+DSH_BRIDGE_PASSWORD");
     process.exit(1);
   }
+  // 把刚拿到的 JWT 喂给档位查询的缓存:否则 startWeChat 里的档位校准会**再登录一次**
+  // (真机日志实测:同一个桥接启动里出现两条并发的 device-login)。
+  // 而 /api/device-login 是按出口 IP 限流的 —— 每次启动都多花一份登录额度没有道理。
+  WECHAT_TIER_TOKEN = { value: token, at: Date.now() };
   // 新进程开始:重置状态文件(上一轮的成功记录不能代表这一轮,面板据此判定 online)
   persistBridgeState({ device_id: DEVICE_ID, started_at: Date.now(), phase: "connecting", last_error: null }, { reset: true });
   await initE2ee(token);

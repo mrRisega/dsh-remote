@@ -3,6 +3,16 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.10-beta.4] - 2026-09-22
+
+> 预发版（只发 npm `beta` 通道，`latest` 仍是 0.6.9）。beta.3 的分层已可用，
+> 本条只修一个 beta.3 引入的可靠性问题（内容并入 beta.3 的分层说明）。
+
+- **修复：每次启动会多登录一次账号**。beta.3 的档位查询没有复用桥接刚拿到的凭据，
+  于是同一个启动里出现两条并发的登录请求；而登录接口是**按出口 IP 限流**的
+  （15 分钟内 5 次）—— 桥接崩溃重启几次就可能把自己打进限流，**远程访问随之失效**。
+  现在启动时直接复用已拿到的凭据，登录次数回到 1 次。
+
 ## [0.6.10-beta.3] - 2026-09-22
 
 > 预发版（只发 npm `beta` 通道，`latest` 仍是 0.6.9）。本轮把**微信机器人通道分成两档**，

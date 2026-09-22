@@ -102,6 +102,20 @@ test("★档位来源：token 失效(401/403)时丢掉缓存，下次重新登�
   assert.equal(bad.tokenCalls(), 2, "★401 之后必须重新登录一次（缓存已失效，不能一直拿坏 token 打）");
 });
 
+test("★档位来源：启动时必须复用桥接刚拿到的 JWT（否则每次启动多花一份登录额度）", () => {
+  // 真机日志实测：同一个桥接启动里出现两条并发的 device-login —— 一条是隧道登录，
+  // 另一条是档位校准。而 device-login 按出口 IP 限流，每次启动多花一份额度没有道理。
+  const i = BRIDGE_SRC.indexOf("async function runTunnel()");
+  assert.ok(i > -1, "应能找到 runTunnel");
+  const body = BRIDGE_SRC.slice(i, BRIDGE_SRC.indexOf("async function main()"));
+  assert.ok(body.length > 0, "切片边界应正确");
+  const seedAt = body.indexOf("WECHAT_TIER_TOKEN = { value: token");
+  const startAt = body.indexOf("startWeChat()");
+  assert.ok(seedAt > -1, "runTunnel 必须把刚拿到的 token 喂给档位缓存");
+  assert.ok(startAt > -1, "runTunnel 应调用 startWeChat()");
+  assert.ok(seedAt < startAt, "★必须在 startWeChat() **之前**喂，否则档位校准仍会再登录一次");
+});
+
 test("App 链接：由账号 API 地址推导，与插件半的 DEFAULT_APP_URL 同口径", () => {
   assert.equal(loadAppUrl(API_BASE)(), "https://api.example/app/");
   assert.equal(loadAppUrl("https://n.risegao.cn:13443/relay-api")(), "https://n.risegao.cn:13443/app/",
