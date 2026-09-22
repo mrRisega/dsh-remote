@@ -2480,8 +2480,27 @@ const PLUGIN_ID = "dsh-remote-web";
 /** 更名前 id（≤0.4.9）：彻底卸载/清理时一并移除，防旧拷贝残留。 */
 const PLUGIN_LEGACY_IDS = ["dsh-remote-ui"];
 const PLUGIN_ALL_IDS = [PLUGIN_ID, ...PLUGIN_LEGACY_IDS];
-/** 插件自身发布版本（与 dsh-remote 根包同步递增）。 */
-const PLUGIN_VERSION = "0.6.10-beta.7";
+/**
+ * 插件自身发布版本 —— **从 package.json 派生,不再手写**(与 dsh-remote 根包同步递增)。
+ *
+ * 为什么改成派生(2026-09-23):原先这里是硬编码字符串,每次发版要**手改两处**
+ * (package.json + 这里),beta.8 就漏改了 —— 装到用户机器上的插件在**装机上报**里
+ * 仍然自称 beta.7。而 `x-dsh-client` 头、更新通道判定(含 `-` 即 beta)、面板「插件版本」、
+ * 更新检测拿的都是这个值:一处漏改会同时污染装机来源统计与更新判断,
+ * 而且**发出去之后改不回来**(npm 同一版本不可覆盖)。
+ *
+ * 测试本来就会红(它拿 package.json 与上报值对账 —— 这次正是它抓住的),
+ * 但让两份数据**只有一个来源**才是根治。
+ * 读不到时退回 `0.0.0-unknown`:让异常**显式可见**,绝不悄悄冒充某个真实版本。
+ */
+const PLUGIN_VERSION = (() => {
+  try {
+    const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+    return String(pkg && pkg.version ? pkg.version : "") || "0.0.0-unknown";
+  } catch {
+    return "0.0.0-unknown";
+  }
+})();
 const UPDATE_LOG = ".dsh-update.log";
 const UPDATE_MARKER = ".dsh-update-running";
 
