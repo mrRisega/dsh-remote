@@ -40,6 +40,7 @@ import {
   extractInboundText,
   extractFromUserId,
   handleCommand,
+  HELP_TEXT,
   classifyInbound,
   formatCompletion,
   isDestructiveTool,
@@ -62,21 +63,29 @@ import { createEventSubscriber, NODE_KINDS } from "./dsh-events.mjs";
  */
 
 /**
- * v2 能力表(运营钩子)。
+ * v2 能力表(运营钩子) —— 业主 2026-09-22 确认的分层:
  *
- * 业主的运营规划:**当前全部免费开放**,后续留钩子让付费用户用更高阶的功能。
- * 所以这里把「谁能用什么」做成**一张表 + 一处判断**,而不是散在代码里的 if:
- * 将来加付费档 = 改这张表,不动任何业务逻辑(也不改架构)。
+ *   · **免费档 = 只读 + 审批**:收得到任务通知(含完成小结、报错、额度、会员到期),
+ *     点得了审批回执(选择下一步执行)。但**遥控不了**。
+ *   · **付费档 = 免费档 + 遥控**:在微信里直接交代任务、切换会话(以及预留的中途纠偏/附件/多会话)。
  *
- * ⚠️ 这张表现在是 **permissive** 的(免费档已含全部能力),所以它**不改变今天的可用性**;
- *    但它在代码路径上是活的(每次派发都会查),不是死代码。
- * ⚠️ `tier` 暂时恒为 "free" —— bridge 目前拿不到账号套餐。付费档上线时,
- *    由 host 半边/账号 API 提供真实 tier 再塞进 `#tier()`,**只需改这一个函数**。
+ * 免费用户尝试付费能力时,回复里带上 App 链接 —— 这既是解释,也是转化入口
+ * (见 `#upsellText()`:业主口径是"如果免费用户要去做其他的东西,就在消息后面跟一个访问 App 的链接")。
+ *
+ * ⚠️ `pro_max` **必须存在**:服务端的生效套餐取值就是 free / pro / pro_max(见企业端 auth.js 的
+ *    PLAN_PRIORITY),而 `capabilitiesFor` 对**未知档位回退 free** —— 漏了 pro_max 就会把
+ *    最高的付费档用户当成免费用户挡在门外。
+ * ⚠️ 改这张表 = 改产品权限,别顺手加能力;`free` 那行是"用户没付钱时他能做什么"的唯一定义。
  */
+const PAID_CAPABILITIES = Object.freeze([
+  "notify", "approve", "status", "stop",
+  "assign", "sessions", "summary",
+  "steer", "attach", "multi" // 预留:中途纠偏 / 附件 / 多会话并行
+]);
 export const WECHAT_CAPABILITY_TABLE = Object.freeze({
-  free: Object.freeze(["notify", "approve", "assign", "sessions", "summary"]),
-  // 预留给付费档:中途纠偏(steer)、附件、多会话并行。今天不启用。
-  pro: Object.freeze(["notify", "approve", "assign", "sessions", "summary", "steer", "attach", "multi"])
+  free: Object.freeze(["notify", "approve", "status", "stop"]),
+  pro: PAID_CAPABILITIES,
+  pro_max: PAID_CAPABILITIES
 });
 
 /** 某档位具备哪些能力。未知档位按最低档(free)处理 —— 宁可少给,不可误放。 */
@@ -84,6 +93,22 @@ export function capabilitiesFor(tier, table = WECHAT_CAPABILITY_TABLE) {
   const key = Object.prototype.hasOwnProperty.call(table, String(tier || "")) ? String(tier) : "free";
   return table[key];
 }
+
+/**
+ * 指令 → 所需能力。**没列出的指令不设门槛**（`/help`、`/status`、`/unbind`、`/quiet` 人人可用）。
+ *
+ * 为什么 `/unbind` 绝不设门槛:免费用户也必须能解绑 —— 否则他被绑上了却退不掉,
+ * 这既是骚扰也是合规问题。
+ * 为什么 `/stop` 放进免费档:免费用户已经能通过审批「选择下一步执行」,再给一个急停阀是同一件事;
+ * 一个只会发通知、却连"停下"都做不到的通道,用户会觉得被挟持。
+ */
+const COMMAND_CAPABILITY = Object.freeze({
+  "/new": "assign",
+  "/ls": "sessions",
+  "/use": "sessions",
+  "/summary": "summary",
+  "/stop": "stop"
+});
 
 /**
  * ★ 两个上游模块的**节点词表不一致**,这里是唯一的翻译点。
@@ -176,6 +201,11 @@ export const CONTROL_HEADER = "x-dsh-bridge-secret";
 export const DEFAULT_BIND_TTL_MS = 5 * 60_000;
 /** 默认每日简报时刻(本地时区小时,0-23)。 */
 export const DEFAULT_DIGEST_HOUR = 9;
+/**
+ * 档位校准间隔。10 分钟足够跟上升级/到期(派发被拒时还会立刻再确认一次),
+ * 又不至于把账号 API 当心跳打。
+ */
+export const WECHAT_TIER_REFRESH_MS = 10 * 60_000;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -302,11 +332,31 @@ export class WeChatRuntime {
     /** `/ls` 的结果缓存(1-based 序号供 /use 使用)。 */
     this.sessionIndex = [];
     /**
-     * 运营钩子的两个可注入点(都只为可测与将来接真实套餐;生产不传即用默认)。
-     * `tierOverride` 空 = 按 free;`capabilityTable` 空 = 用内置表。
+     * 运营钩子的可注入点(生产由 bridge 注入真实档位;测试可覆盖)。
+     * `tierOverride` 空 = 用缓存/默认;`capabilityTable` 空 = 用内置表。
      */
     this.tierOverride = typeof opts.tier === "string" ? opts.tier : "";
     this.capabilityTable = opts.capabilityTable || WECHAT_CAPABILITY_TABLE;
+    /**
+     * 真实档位来源(async→ "free"|"pro"|"pro_max";空串 = 这次没取到)。
+     * bridge 用账号 API 的生效套餐实现它;不注入时档位恒为缓存/默认(测试与自建)。
+     */
+    this.tierProvider = typeof opts.tierProvider === "function" ? opts.tierProvider : null;
+    /** App 入口(免费用户越界时给的转化链接)。空则不附链接,不编一个假地址。 */
+    this.appUrl = String(opts.appUrl || "").trim();
+    /**
+     * ★ 档位**持久化缓存**:进程重启后不会因为一次网络失败就把付费用户降级成免费。
+     * 首次运行且从未取到过 = 空 → 按 free(宁可少给,不可误放)。
+     */
+    this.cachedTier = String(persisted.tier || "").trim();
+    this.tierCheckedAt = 0;
+    this.tierTimer = null;
+    /**
+     * 被拒时重查档位的节流窗口。用户刚升级完重试要能进,但免费用户反复发消息
+     * 也不能变成"每条消息打一次账号 API",所以取 5 秒(最坏情况等 5 秒就能进)。
+     * 可注入,便于测试把这条路径跑成确定性的。
+     */
+    this.tierDenyThrottleMs = Number.isFinite(opts.tierDenyThrottleMs) ? opts.tierDenyThrottleMs : 5_000;
   }
 
   // ── 状态 ────────────────────────────────────────────────────────────────
@@ -456,6 +506,13 @@ export class WeChatRuntime {
     if (this.channelTask || !this.channel.account) return false;
     this.stopping = false;
     this.channel.writeState({ connected_at: this.clock(), last_error: "" });
+    // 档位:启动时取一次(不等它,别拖慢上线),之后每 10 分钟校准一次。
+    // 用户升级后不必重启 bridge —— 下一次派发时的 #canNow 还会立刻再确认一遍。
+    void this.#refreshTier(0);
+    if (!this.tierTimer) {
+      this.tierTimer = setInterval(() => { void this.#refreshTier(0); }, WECHAT_TIER_REFRESH_MS);
+      if (typeof this.tierTimer.unref === "function") this.tierTimer.unref();
+    }
     this.#startSubscriber();
     this.channelTask = this.#channelLoop().catch((e) => {
       this.logger.warn(`[wechat] 长轮询退出:${redact(String(e && e.message ? e.message : e))}`);
@@ -466,6 +523,10 @@ export class WeChatRuntime {
 
   async stopChannel() {
     this.stopping = true;
+    if (this.tierTimer) {
+      clearInterval(this.tierTimer);
+      this.tierTimer = null;
+    }
     if (this.subscriber) {
       try { this.subscriber.close(); } catch { /* 忽略 */ }
       this.subscriber = null;
@@ -572,22 +633,138 @@ export class WeChatRuntime {
       return;
     }
     if (cls.kind === "message") {
+      // 纯文本 = 「在微信里交代任务」→ 付费能力。免费用户拿到解释 + App 链接(转化入口)。
+      if (!(await this.#canNow("assign"))) {
+        // ⚠️ 陷阱:回执只认**纯数字**(见 classifyInbound)。免费档的核心价值恰恰是审批,
+        //    用户很可能打字「允许」而不是回「1」—— 若只回一句付费提示,他会以为免费版什么都干不了。
+        //    所以手上有待回执的消息时,先把"回数字就能拍板"说在前面。
+        const head = this.pendingReplies.length > 0
+          ? `你还有 ${this.pendingReplies.length} 条待你拍板的消息 —— 直接回一个数字(如 1)就能完成决定,不用打字。\n\n`
+          : "";
+        await this.reply(from, head + this.#upsellText());
+        return;
+      }
       await this.#sendToSession(from, cls.text);
       return;
     }
   }
 
   /**
-   * 当前账号档位。今天恒为 free(bridge 拿不到套餐);付费档上线时**只改这里**。
-   * 可用 `opts.tier` 覆盖,供测试注入。
+   * 当前账号档位。可用 `opts.tier` 覆盖(测试注入);否则用**上次成功取到的档位**。
+   * 从没取到过 = 空 → 按 free(宁可少给,不可误放)。
    */
   #tier() {
-    return this.tierOverride || "free";
+    if (this.tierOverride) return this.tierOverride;
+    return this.cachedTier || "free";
   }
 
   /** 当前档位是否具备某能力(运营钩子的唯一判断入口)。 */
   #can(cap) {
     return capabilitiesFor(this.#tier(), this.capabilityTable).includes(cap);
+  }
+
+  /**
+   * 刷新档位(带节流)。**取不到时保留上次已知档位** —— 网络抖一下就把付费用户降级成免费,
+   * 他会看到"升级后即可使用"而自己明明付过钱,这比多给几分钟权限糟糕得多。
+   * @returns {Promise<string>} 刷新后的档位
+   */
+  async #refreshTier(minIntervalMs = 30_000) {
+    if (!this.tierProvider) return this.#tier();
+    const now = Date.now();
+    if (now - this.tierCheckedAt < minIntervalMs) return this.#tier();
+    this.tierCheckedAt = now;
+    let next = "";
+    try {
+      next = String((await this.tierProvider()) || "").trim();
+    } catch (e) {
+      this.logger.warn(`[wechat] 读取账号档位失败(沿用上次):${redact(String(e && e.message ? e.message : e))}`);
+      return this.#tier();
+    }
+    if (!next) return this.#tier(); // 空串 = 这次没取到 → 沿用缓存
+    if (next !== this.cachedTier) {
+      this.cachedTier = next;
+      this.channel.writeState({ tier: next });
+      this.logger.info(`[wechat] 账号档位:${next}`);
+    }
+    return this.#tier();
+  }
+
+  /**
+   * 判能力时先**确保档位是新鲜的**:用户刚买完重试必须能进(最坏等 `tierDenyThrottleMs`,
+   * 默认 5 秒),而不是等到下次重启 bridge 才发现"我付了钱还是不能用"。
+   */
+  async #canNow(cap) {
+    if (this.#can(cap)) return true;
+    await this.#refreshTier(this.tierDenyThrottleMs);
+    return this.#can(cap);
+  }
+
+  /**
+   * 立刻校准一次档位(不走节流)。
+   *
+   * 存在的理由:这是唯一能**主动**触发校准的入口 —— 其余触发点都被"当前档位够用就不查"
+   * 拦在前面(`#canNow` 只在被拒时才查),于是一条关键不变量没法被测到:
+   * 「provider 返回空串时必须沿用上次档位,而不是降级」。付费用户的钱包就挂在这条上。
+   * 将来面板做"我刚买完,立刻校准"也走这里。
+   */
+  async refreshTierNow() {
+    return this.#refreshTier(0);
+  }
+
+  /**
+   * 帮助文案。**必须按档位如实分层**。
+   *
+   * 为什么不能直接用上游那个静态 HELP_TEXT:它把 `/new`、`/ls`、`/use` 与"直接发一句话"
+   * 都列成"你能用的",而 `#upsellText()` 正是让免费用户"回复 /help 看现在能做什么" ——
+   * 那等于把人骗到一个他做不到的清单上,然后每次尝试都吃一次拒绝。
+   */
+  #helpText() {
+    if (this.#can("assign")) return HELP_TEXT; // 付费档:完整清单
+    const lines = [
+      "【DSH 微信通道 · 通知版】",
+      "现在能用的:",
+      "· 回数字(如 1)回执最近一条需要你拍板的消息",
+      "· /stop 中断当前会话正在跑的回合",
+      "· /status 查看绑定与推送状态",
+      "· /quiet 暂停推送(回复任意消息恢复)",
+      "· /unbind 解除微信绑定",
+      "",
+      "会员功能(开通后可用):",
+      "· 直接发一句话 = 给当前任务派活",
+      "· /new 开新任务、/ls 列出会话、/use <编号> 切换会话、/summary 重发最近结论"
+    ];
+    if (this.appUrl) lines.push("", `👉 开通并查看设备列表:${this.appUrl}`);
+    return lines.join("\n");
+  }
+
+  /**
+   * 免费用户越界时的回复:说清「通知版能做什么」+ 给出可点击的 App 链接。
+   *
+   * 业主口径:免费用户要去做别的事情时,就在消息后面跟一个访问 App 的链接,
+   * 点一下就能到我们的 App 界面 —— 这既是解释,也是把用户引回远程控制主功能的入口。
+   * ⚠️ 微信不渲染 Markdown,所以这里用「」和纯文本,不要写 `**`。
+   */
+  #upsellText() {
+    const lines = [
+      "微信机器人当前是「通知版」:",
+      "· 能收到任务通知、完成小结,以及需要你审批的请求",
+      "· 在微信里直接交代任务、切换会话属于会员功能"
+    ];
+    if (this.appUrl) {
+      lines.push("", `👉 打开 App 查看设备列表、远程控制你的电脑:${this.appUrl}`);
+    }
+    lines.push("", "回复 /help 可以看到现在能做什么。");
+    return lines.join("\n");
+  }
+
+  /**
+   * 免费档的任务收尾话术。
+   * 默认那句「回复就能接着做」对免费用户是**空头承诺**(他回复只会拿到付费引导),
+   * 所以换成"会员可用 + App 链接",把用户引到主功能上去。
+   */
+  #continuationHint() {
+    const tail = this.appUrl ? `打开 App 继续:${this.appUrl}` : "打开 App 即可继续。";
+    return `在微信里接着交代下一步属于会员功能。${tail}`;
   }
 
   /** 指令分派。 */
@@ -596,9 +773,10 @@ export class WeChatRuntime {
     const args = cls.args || "";
 
     // ★ 运营钩子:能力表在**每次派发**时真的被查 —— 它是活代码,不是文档。
-    //   今天免费档已含 assign,所以行为不变;将来把 assign 从 free 拿掉即生效。
-    if (["/new", "/use", "/stop"].includes(cmd) && !this.#can("assign")) {
-      await this.reply(from, "当前档位还不能在微信里交代任务。升级后即可使用。");
+    //   先 `#canNow` 刷新档位再判:用户刚升级完立刻重试必须能进。
+    const need = COMMAND_CAPABILITY[cmd];
+    if (need && !(await this.#canNow(need))) {
+      await this.reply(from, this.#upsellText());
       return;
     }
 
@@ -636,7 +814,11 @@ export class WeChatRuntime {
       await this.#cmdStatus(from);
       return;
     }
-    // 其余(含 /help)交给上游的通用处理 —— ⚠️ 字段是 `replyText`,不是 text。
+    if (cmd === "/help") {
+      await this.reply(from, this.#helpText());
+      return;
+    }
+    // 其余交给上游的通用处理 —— ⚠️ 字段是 `replyText`,不是 text。
     const r = handleCommand(cmd, args);
     await this.reply(from, (r && r.replyText) || "可用指令:/new /ls /use /stop /status /summary /help /quiet /unbind");
   }
@@ -983,7 +1165,7 @@ export class WeChatRuntime {
         summary,
         sessionId: sid,
         hanging: !summary
-      });
+      }, this.#can("assign") ? {} : { continuationHint: this.#continuationHint() });
       built = { text: c.text, replyable: false, eventId: "" };
     } else if (
       formatterKind === "approval" &&

@@ -498,6 +498,10 @@ test("首屏导览：未绑定时就在最上面（DOM 顺序在「连接微信�
   assert.ok(textHas(intro, "拍板"), "② 要交代这是需要你拍板的时刻");
   assert.ok(textHas(intro, "交代任务"), "③ 要明说可以**直接在微信里交代任务**");
   assert.ok(textHas(intro, "追问"), "③ 要明说可以对同一个任务继续追问");
+  // ★ 分层必须如实写在面板上：「交代任务/追问」是会员能力，免费档只有推送与回数字。
+  //   面板里含糊其辞 → 用户绑完去微信发句话拿到付费提示 → 只会觉得产品骗人。
+  assert.ok(textHas(intro, "免费用"), "必须写明哪两项是免费的");
+  assert.ok(textHas(intro, "会员"), "必须写明「交代任务/切换会话」属于会员能力（不能含糊）");
 
   // DOM 顺序：导览在「连接微信机器人」按钮之前（用户先看懂用途，再看到按钮）
   const introAt = domIndex(tree, (n) => n.props?.className === "dru-wx-intro");

@@ -1947,7 +1947,9 @@ const COMPLETION_REASON_NOTES = Object.freeze({
  *
  * @param {object} args { title(会话名), reason(completed|aborted|blocked|error|max-tokens|interrupted),
  *                        summary(结论), sessionId, hanging(结论取不到时 true) }
- * @param {object} [opts] { summaryMaxLength=400, maxLength=900, ttlMinutes }
+ * @param {object} [opts] { summaryMaxLength=400, maxLength=900, ttlMinutes, continuationHint }
+ *   `continuationHint` 非空 = 用**调用方给的**收尾话术替换默认的「回复就能接着做」,
+ *   且不再在结论缺失时邀请用户回复(免费档做不到,不能对他下这种指令)。
  * @returns {{kind:'completed', title:string, text:string, replyable:false, ttlMinutes:number}}
  *   title 是**展示标题**(和 formatNotification 的 title 同义,【】里那一行);会话名在 text 里。
  */
@@ -1977,16 +1979,24 @@ export function formatCompletion({ title, reason, summary, sessionId, hanging } 
   }
 
   // ③ 结论
+  //   只有「能回话」的档位才邀请用户回复 —— 否则那是对一个做不到的人下指令
+  //   (免费用户回复纯文本只会拿到付费引导,见 wechat-runtime 的 #upsellText)。
+  const canContinue = opts.continuationHint === undefined;
   if (body) {
     lines.push(`结论:${shorten(body, summaryMax)}`);
   } else if (hanging) {
-    lines.push("结论:暂时没取到(任务可能还在收尾)。回复 /summary 可以再要一次。");
+    lines.push(canContinue
+      ? "结论:暂时没取到(任务可能还在收尾)。回复 /summary 可以再要一次。"
+      : "结论:暂时没取到(任务可能还在收尾)。");
   } else {
-    lines.push("结论:这次没有产出结论。回复一句话就能追问。");
+    lines.push(canContinue
+      ? "结论:这次没有产出结论。回复一句话就能追问。"
+      : "结论:这次没有产出结论。");
   }
 
-  // ④ 收尾:回复即续接同一会话(产品核心,别删这句)
-  lines.push("回复这条消息(直接说下一步)就能接着这个会话往下做,不用重新交代背景。");
+  // ④ 收尾:回复即续接同一会话(付费档的产品核心,别删这句)。
+  //   免费档由调用方传 `continuationHint` 换成"会员可用 + App 链接"的说法。
+  lines.push(opts.continuationHint || "回复这条消息(直接说下一步)就能接着这个会话往下做,不用重新交代背景。");
 
   // 纯文本 + 长度上限:微信不是富客户端,超长整条截断并显式标注
   let text = lines.join("\n");

@@ -1224,6 +1224,66 @@ function tagWeChat(m) {
   return s.startsWith("[") ? s : `[wechat] ${s}`;
 }
 
+/**
+ * 微信通道的档位来源(免费/付费分层)。
+ *
+ * 取值 = 账号的**生效套餐**,服务端只有三种:free / pro / pro_max
+ * (见企业端 auth.js 的 PLAN_PRIORITY;试用期服务端已折算成 pro,这里不必自己判断)。
+ *
+ * ⚠️ 取不到时返回**空串**,而不是 "free":空串让 runtime 沿用上次成功取到的档位。
+ *    一次网络抖动就把付过钱的用户降级成免费、还提示他去升级,比多给几分钟权限糟糕得多。
+ * ⚠️ 自建部署直接给最高档:用户跑的是自己的服务器,不存在"会员"这回事,
+ *    不能拿 SaaS 的分层去卡自建用户。
+ */
+/**
+ * 档位查询专用的 token 缓存(理由见 resolveWechatTier 里的注释)。
+ * TTL 取 5 分钟:远小于 JWT 有效期,又足以把「每 10 分钟一次定时校准 + 被拒即重查」
+ * 全部挡在网络之外 —— 不缓存的话,免费用户连着发几条消息就会触发一串 device-login。
+ */
+const WECHAT_TIER_TOKEN_TTL_MS = 5 * 60_000;
+let WECHAT_TIER_TOKEN = { value: "", at: 0 };
+
+async function resolveWechatTier() {
+  if (process.env.DSH_BRIDGE_LOCAL_KEY) return "pro_max";
+  try {
+    // ⚠️ `resolveToken()` **不带缓存**:账号模式下每调一次就重新 device-login 一次
+    //    (见它的第一行,只有 DSH_BRIDGE_TOKEN / 自建模式才短路)。
+    //    而档位会被反复查询:每 10 分钟一次定时校准 + 免费用户**每次被拒**都重查(最快 5 秒一次)。
+    //    拿它直接查 = 用户连着发几条消息就把自己打到登录限流里 —— 而 /api/device-login
+    //    是**按出口 IP 限流**的(15 分钟 5 次),连累的不只是他自己。
+    //    所以这里自己缓存 token。
+    const now = Date.now();
+    if (!WECHAT_TIER_TOKEN.value || now - WECHAT_TIER_TOKEN.at > WECHAT_TIER_TOKEN_TTL_MS) {
+      const t = await resolveToken();
+      if (!t) return "";
+      WECHAT_TIER_TOKEN = { value: t, at: now };
+    }
+    const r = await fetch(`${API_BASE}/api/me`, {
+      headers: { authorization: `Bearer ${WECHAT_TIER_TOKEN.value}` },
+      signal: AbortSignal.timeout(6000)
+    });
+    // token 过期/被吊销 → 丢掉缓存,下一次查询重新登录(而不是一直拿坏 token 打)
+    if (r.status === 401 || r.status === 403) {
+      WECHAT_TIER_TOKEN = { value: "", at: 0 };
+      return "";
+    }
+    if (!r.ok) return "";
+    const j = await r.json().catch(() => null);
+    return String((j && j.user && j.user.plan) || "");
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * App 入口(免费用户越界时给的转化链接)。
+ * 由账号 API 地址推导:去掉 `/relay-api` 再加 `/app/` —— 与插件半的 DEFAULT_APP_URL 同一口径
+ * (https://host:port/relay-api → https://host:port/app/)。
+ */
+function wechatAppUrl() {
+  return `${API_BASE.replace(/\/relay-api\/?$/, "")}/app/`;
+}
+
 let wechatRuntime = null;
 function startWeChat() {
   if (WECHAT_DISABLED) {
@@ -1238,6 +1298,9 @@ function startWeChat() {
       upstream: UPSTREAM,
       cookieOf: harnessCookieOf,
       secret: process.env.DSH_BRIDGE_SECRET || (typeof cfg.bridge_secret === "string" ? cfg.bridge_secret : ""),
+      // 免费/付费分层:档位来自账号的生效套餐,App 链接是免费用户越界时的转化入口。
+      tierProvider: resolveWechatTier,
+      appUrl: wechatAppUrl(),
       // 模块自己的消息已带 `[wechat]` / `[wechat/events]` 前缀,这里**不能再加一次**
       // (真机日志里出现过 `[wechat] [wechat] 控制面已就绪`)。没前缀的兜底补一个。
       logger: {

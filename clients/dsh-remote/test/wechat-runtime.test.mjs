@@ -97,6 +97,12 @@ async function boundRuntime(ilink, opts = {}) {
     upstream: "http://127.0.0.1:1",
     secret: SECRET,
     cooldownMs: opts.cooldownMs,
+    // 默认按**付费档**跑:本文件绝大多数用例测的是遥控能力(交代任务/选会话)。
+    // 免费档的门槛由「分层」那组用例专门守 —— 它们显式传 tier:"free"。
+    tier: opts.tier === undefined ? "pro" : opts.tier,
+    tierProvider: opts.tierProvider,
+    tierDenyThrottleMs: opts.tierDenyThrottleMs,
+    appUrl: opts.appUrl,
     logger: quietLogger()
   });
   // 替换订阅器:本文件测编排,不测 DSH 协议(那是 dsh-events.test.mjs 的职责)
@@ -300,17 +306,24 @@ test("★ handleCommand 的字段是 replyText:回 /help 必须真的发出帮�
   }
 });
 
-test("★ 运营钩子:能力表是活代码 —— 每档能力可查,未知档位按最低档", () => {
+test("★ 分层:免费档 = 通知+审批,付费档才给遥控;未知档位按最低档", () => {
   const { capabilitiesFor, WECHAT_CAPABILITY_TABLE } = rtmod;
-  // 免费档今天必须**包含全部**能力(业主:当前免费开放给所有人)
   const free = capabilitiesFor("free");
-  for (const cap of ["notify", "approve", "assign", "sessions", "summary"]) {
-    assert.ok(free.includes(cap), `免费档今天必须有 ${cap}(当前全免费)`);
+  // 免费档(业主口径):收得到通知、点得了审批、看得到状态、停得下任务 —— 但**遥控不了**。
+  for (const cap of ["notify", "approve", "status", "stop"]) {
+    assert.ok(free.includes(cap), `免费档必须有 ${cap}`);
   }
-  // 付费档是预留的:必须存在且是免费档的超集(加付费档 = 只改表,不动业务逻辑)
+  for (const cap of ["assign", "sessions", "summary"]) {
+    assert.ok(!free.includes(cap), `免费档**不得**有 ${cap}(业主:那是付费能力)`);
+  }
+  // 付费档 = 免费档超集 + 遥控
   const pro = capabilitiesFor("pro");
   for (const cap of free) assert.ok(pro.includes(cap), `付费档必须是免费档超集,缺 ${cap}`);
+  for (const cap of ["assign", "sessions", "summary"]) assert.ok(pro.includes(cap), `付费档必须有 ${cap}`);
   assert.ok(pro.length > free.length, "付费档应比免费档多能力(否则钩子没意义)");
+  // ⚠️ 服务端的最高档取值是 **pro_max** —— 漏了它 capabilitiesFor 会回退 free,
+  //    把花了最多钱的用户当成免费用户挡在门外。
+  assert.deepEqual(capabilitiesFor("pro_max"), pro, "pro_max 必须与 pro 同权(服务端 plan 取值就是 pro_max)");
   // 未知/空档位按最低档处理 —— 宁可少给,不可误放
   assert.deepEqual(capabilitiesFor("nonexistent"), free);
   assert.deepEqual(capabilitiesFor(""), free);
@@ -319,30 +332,126 @@ test("★ 运营钩子:能力表是活代码 —— 每档能力可查,未知档
   assert.ok(Object.isFrozen(WECHAT_CAPABILITY_TABLE));
 });
 
-test("★ 运营钩子:能力表在派发路径上真的生效 —— 拿掉 assign 后交代任务被拒", async () => {
-  // 这条守的是"钩子是活代码,不是文档":今天免费档含 assign 所以行为不变,
-  // 但把 assign 从表里拿掉后,**派发必须真的拒绝**。
+test("★ 分层:免费档被挡且回复里带 App 链接;付费档放行;未知档位按免费", async () => {
+  // 这条守的是两件事:(1) 门槛是**活代码**,不是文档;(2) 免费用户越界时拿到的是
+  // 「解释 + 可点击的 App 链接」,而不是一句干巴巴的拒绝 —— 那是把用户引回主功能的入口。
+  const APP_URL = "https://app.example/x/";
+  const ilink = await fakeIlink();
+  try {
+    const send = (rt) => rt.handleInbound({
+      from_user_id: "u", item_list: [{ type: 1, text_item: { text: "/new 做点事" } }]
+    });
+
+    // ① 免费档:必须拒绝,且回复里要有 App 链接
+    const free = await boundRuntime(ilink, { subscriber: makeFakeSubscriber(), tier: "free", appUrl: APP_URL });
+    await send(free.rt);
+    assert.equal(free.rt.subscriber.calls.filter((c) => c.m === "createSession").length, 0,
+      "免费档不得真的建会话");
+    const freeText = lastText(ilink.state);
+    assert.match(freeText, /会员功能/, `要说清为什么被拒,实际:${freeText}`);
+    assert.ok(freeText.includes(APP_URL),
+      `★回复必须带上可点击的 App 链接(业主:免费用户要去做别的,就给他访问 App 的链接),实际:${freeText}`);
+    assert.match(freeText, /\/help/, "还要告诉他现在能做什么,而不是死路一条");
+
+    // ② 付费档:同一句话必须放行
+    const pro = await boundRuntime(ilink, { subscriber: makeFakeSubscriber(), tier: "pro", appUrl: APP_URL });
+    await send(pro.rt);
+    assert.equal(pro.rt.subscriber.calls.filter((c) => c.m === "createSession").length, 1,
+      "付费档必须能交代任务");
+
+    // ③ 未知档位按最低档 —— 宁可少给,不可误放
+    const weird = await boundRuntime(ilink, { subscriber: makeFakeSubscriber(), tier: "谁", appUrl: APP_URL });
+    await send(weird.rt);
+    assert.equal(weird.rt.subscriber.calls.filter((c) => c.m === "createSession").length, 0,
+      "未知档位必须按免费档处理");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★ 分层:免费档仍能收通知、点审批、看状态、急停(不能把免费版做成废的)", async () => {
   const ilink = await fakeIlink();
   try {
     const sub = makeFakeSubscriber();
-    const relayDir = tmp();
-    saveAccount(relayDir, { token: "tok", accountId: "b", baseUrl: ilink.baseUrl, userId: "u", boundAt: 1 });
-    const rt = createWeChatRuntime({
-      relayDir, upstream: "http://127.0.0.1:1", secret: SECRET, logger: quietLogger(),
-      // 注入一张"免费档不含 assign"的表,模拟将来把该能力收进付费档
-      capabilityTable: { free: ["notify"], pro: ["notify", "approve", "assign", "sessions", "summary"] }
+    const { rt } = await boundRuntime(ilink, { subscriber: sub, tier: "free" });
+
+    // ① 通知 + 审批一步回执 —— 免费档的核心价值,绝不能因为分层被误伤
+    await rt.notify({
+      kind: NODE_KINDS.APPROVAL_REQUEST, eventId: "evt-free", toolName: "Read",
+      reason: "读取文件", answerShape: "approval", at: 1
     });
-    rt.subscriber = sub;
+    assert.ok(rt.pendingReplies.length > 0, "免费档必须收到可回执的审批通知");
+    assert.match(lastText(ilink.state), /回复 1/, "非破坏性审批必须给编号选项");
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "1" } }] });
+    assert.equal(sub.calls.filter((c) => String(c.m).startsWith("answer")).length, 1,
+      "免费档必须能一步回执审批");
+
+    // ② /status 是信息类:人人可用(也是免费用户的转化入口)
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "/status" } }] });
+    assert.ok(lastText(ilink.state).length > 0, "/status 必须对免费档可用");
+
+    // ③ /stop 是急停阀:免费档也必须能停。
+    //    免费用户不能主动 /use 切会话,但指针会在他收到事件时自动落上(见 #rememberSession),
+    //    这里直接把它置上,模拟"本来就在跑某个任务"。
+    rt.currentSessionId = "session-running";
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "/stop" } }] });
+    assert.equal(sub.calls.filter((c) => c.m === "cancelSession").length, 1,
+      "免费档必须能急停(一个只会通知、连停都停不了的通道会让人觉得被挟持)");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★ 分层:档位取不到时沿用上次已知档位(绝不因一次网络抖动把付费用户降级)", async () => {
+  const ilink = await fakeIlink();
+  try {
+    let answer = "pro";
+    const sub1 = makeFakeSubscriber();
+    const { rt } = await boundRuntime(ilink, {
+      subscriber: sub1, tier: "", tierProvider: async () => answer, tierDenyThrottleMs: 0
+    });
+
+    // 首次判档位时缓存为空(按免费)→ 被拒路径触发刷新 → 取到 pro → **同一条指令立即放行**
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "/ls" } }] });
+    assert.equal(sub1.calls.filter((c) => c.m === "listSessions").length, 1,
+      "首次取到 pro 后就该放行(不能因为'一开始不知道'就把付费用户挡掉)");
+
+    // 此后账号 API 一直取不到(返回空串)→ 必须**沿用 pro**。
+    // ⚠️ 必须**主动**触发一次校准:光靠派发测不到 —— 缓存已是 pro 时 `#can` 直接放行,
+    //    根本不会再走刷新那条路径(变异测试实测:不加这一步,"取不到就降级"的变异抓不到)。
+    answer = "";
+    assert.equal(await rt.refreshTierNow(), "pro",
+      "★取不到档位时必须沿用上次的 pro —— 付过钱的用户不该因一次网络失败被判成免费");
+
+    // 而且能力也真的还在(不只是内部字段好看)
+    const sub2 = makeFakeSubscriber();
+    rt.subscriber = sub2;
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "/ls" } }] });
+    assert.equal(sub2.calls.filter((c) => c.m === "listSessions").length, 1,
+      "沿用 pro 期间,遥控能力必须仍然可用");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★ 分层:刚升级完立刻重试必须能进(不必重启 bridge)", async () => {
+  const ilink = await fakeIlink();
+  try {
+    // 一开始服务端说 free → 交代任务被拒;用户买完后服务端改口 pro → 同一条指令必须能进。
+    // tierDenyThrottleMs:0 把节流关掉,让这条路径确定性地可测(生产默认 5 秒,注释已写明)。
+    let plan = "free";
+    const sub = makeFakeSubscriber();
+    const { rt } = await boundRuntime(ilink, {
+      subscriber: sub, tier: "", tierProvider: async () => plan, tierDenyThrottleMs: 0
+    });
 
     await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "/new 做点事" } }] });
-    assert.equal(sub.calls.filter((c) => c.m === "createSession").length, 0, "不含 assign 时不得真的建会话");
-    assert.match(lastText(ilink.state), /当前档位/, `必须给出可照做的拒绝理由,实际:${lastText(ilink.state)}`);
+    assert.equal(sub.calls.filter((c) => c.m === "createSession").length, 0, "免费时先拒");
 
-    // 默认档位(不注入)必须仍然可用 —— 业主:当前免费开放给所有人
-    const rt2 = createWeChatRuntime({ relayDir, upstream: "http://127.0.0.1:1", secret: SECRET, logger: quietLogger() });
-    rt2.subscriber = makeFakeSubscriber();
-    await rt2.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "/new 做点事" } }] });
-    assert.equal(rt2.subscriber.calls.filter((c) => c.m === "createSession").length, 1, "默认(免费档)今天必须能交代任务");
+    plan = "pro"; // 用户升级
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "/new 做点事" } }] });
+    assert.equal(sub.calls.filter((c) => c.m === "createSession").length, 1,
+      "★升级后必须能进:否则用户付了钱还要重启 bridge 才能用");
   } finally {
     await ilink.close();
   }
@@ -454,6 +563,7 @@ test("★ v2:当前会话指针在重启后恢复(否则用户下一条消息会
     const sub2 = makeFakeSubscriber();
     const rt2 = createWeChatRuntime({
       relayDir, upstream: "http://127.0.0.1:1", secret: SECRET,
+      tier: "pro", // 本用例测的是"指针持久化",不是分层;按付费档跑才有"发消息"这条能力
       logger: quietLogger()
     });
     rt2.subscriber = sub2;
@@ -479,6 +589,97 @@ test("★ v2:完成推送带会话名称 + 结论,而不只是「任务已停止
     assert.match(text, /修复 Windows 兼容性/, `必须带会话名称,实际:${text}`);
     assert.match(text, /PATH 分隔符/, `必须带结论,实际:${text}`);
     assert.match(text, /完成/, "正常完成不能读起来像失败");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★ 分层:免费档的完成推送不能承诺「回复就能接着做」,要改成会员说明 + App 链接", async () => {
+  // 默认那句「回复这条消息就能接着这个会话往下做」对免费用户是**空头承诺**:
+  // 他回复纯文本只会拿到付费引导。文案必须跟着档位走,否则用户会以为产品坏了。
+  const APP_URL = "https://app.example/x/";
+  const ilink = await fakeIlink();
+  try {
+    const sub = makeFakeSubscriber();
+    sub.sessionsFixture = [{ sessionId: "session-s1", title: "跑个长任务", running: false, cwd: "/p" }];
+    sub.summaryFixture = "已完成。";
+    const { rt } = await boundRuntime(ilink, { subscriber: sub, tier: "free", appUrl: APP_URL });
+    rt.currentSessionId = "session-s1";
+    await rt.notify({ kind: NODE_KINDS.TURN_END, sessionId: "session-s1", reason: "completed", at: 1 });
+    const text = lastText(ilink.state);
+
+    // 免费档照样要看得到"完成了 + 结论"(这是他的核心价值)
+    assert.match(text, /完成/, "免费档必须照样收到完成通知");
+    assert.match(text, /已完成/, "结论也要给");
+    assert.ok(!/就能接着这个会话/.test(text),
+      `★不得对免费用户承诺"回复就能接着做"(他做不到),实际:${text}`);
+    assert.ok(text.includes(APP_URL), `★收尾要给出 App 链接,实际:${text}`);
+
+    // 付费档:保留原话术(产品核心,别被这条改动误伤)
+    const ilink2 = await fakeIlink();
+    try {
+      const sub2 = makeFakeSubscriber();
+      sub2.sessionsFixture = [{ sessionId: "session-s1", title: "跑个长任务", running: false, cwd: "/p" }];
+      sub2.summaryFixture = "已完成。";
+      const { rt: rt2 } = await boundRuntime(ilink2, { subscriber: sub2, tier: "pro", appUrl: APP_URL });
+      rt2.currentSessionId = "session-s1";
+      await rt2.notify({ kind: NODE_KINDS.TURN_END, sessionId: "session-s1", reason: "completed", at: 1 });
+      assert.match(lastText(ilink2.state), /就能接着这个会话/, "付费档必须保留「回复即续接」这句");
+    } finally {
+      await ilink2.close();
+    }
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★ 分层:/help 必须按档位如实分层(免费用户看到的清单里不能有他做不到的指令)", async () => {
+  const APP_URL = "https://app.example/x/";
+  const ilink = await fakeIlink();
+  try {
+    const free = await boundRuntime(ilink, { subscriber: makeFakeSubscriber(), tier: "free", appUrl: APP_URL });
+    await free.rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "/help" } }] });
+    const t = lastText(ilink.state);
+    assert.match(t, /通知版/, "免费档的帮助要说明自己是通知版");
+    assert.ok(t.includes(APP_URL), "免费档的帮助里必须带开通入口(App 链接)");
+    assert.match(t, /会员功能/, "会员能力必须单独分组，不能混进「现在能用的」");
+    // /new 只能出现在「会员功能」那一段之后 —— 混在前面就是骗人
+    const memberAt = t.indexOf("会员功能");
+    assert.ok(memberAt > -1 && t.indexOf("/new") > memberAt, "/new 不得出现在免费能力段里");
+
+    const pro = await boundRuntime(ilink, { subscriber: makeFakeSubscriber(), tier: "pro", appUrl: APP_URL });
+    await pro.rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "/help" } }] });
+    const pt = lastText(ilink.state);
+    assert.match(pt, /DSH 微信通道/, "付费档仍用完整帮助");
+    assert.ok(!/通知版/.test(pt), "付费档不该被标成通知版");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★ 分层:免费用户打字「允许」(而不是回数字)时,要先把「回数字就能拍板」说在前面", async () => {
+  // 回执只认纯数字(classifyInbound),而免费档的核心价值就是审批 ——
+  // 用户很可能打字「允许」。这时只回一句付费提示,他会以为免费版什么都干不了。
+  const ilink = await fakeIlink();
+  try {
+    const sub = makeFakeSubscriber();
+    const { rt } = await boundRuntime(ilink, { subscriber: sub, tier: "free", appUrl: "https://app.example/x/" });
+    await rt.notify({
+      kind: NODE_KINDS.APPROVAL_REQUEST, eventId: "evt-1", toolName: "Read",
+      reason: "读取文件", answerShape: "approval", at: 1
+    });
+    assert.ok(rt.pendingReplies.length > 0, "先得有一条待回执的消息");
+
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "允许" } }] });
+    const text = lastText(ilink.state);
+    assert.match(text, /回一个数字/, `必须先告诉他怎么拍板,实际:${text}`);
+    assert.match(text, /待你拍板/, "要说明确实有东西在等他决定");
+    assert.ok(text.includes("https://app.example/x/"), "仍然要带上 App 链接");
+
+    // 而回数字本身必须真的能拍板(免费档的核心价值不能被这条改动带坏)
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "1" } }] });
+    assert.equal(sub.calls.filter((c) => String(c.m).startsWith("answer")).length, 1,
+      "回数字必须照常完成审批");
   } finally {
     await ilink.close();
   }
