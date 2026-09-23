@@ -30,6 +30,13 @@ jobs:
         with:
           node-version: '20'
 
+      # 安装工作区依赖：**必须**，否则打包时的 prepack（scripts/bundle-runtime.mjs）找不到 ws
+      # 而直接失败。2026-09-23 实测：v0.6.9~v0.6.12 的 tag 触发全部因此红掉，Release 一直停在
+      # v0.6.8 —— 市场 latest/download 拿到的是旧包（且不含 runtime/）。
+      # 用 install 而不是 ci：package-lock 长期未随版本更新，ci 会因不同步直接报错。
+      - name: Install workspace dependencies
+        run: npm install --no-audit --no-fund --ignore-scripts
+
       - name: Resolve version
         env:
           INPUT_VERSION: ${{ inputs.version }}
