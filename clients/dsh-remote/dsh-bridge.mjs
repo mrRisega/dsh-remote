@@ -76,6 +76,7 @@ import { promisify } from "node:util";
 import { gzip as gzipCb } from "node:zlib";
 // 移动端适配层(经隧道访问的官方 dsh web 窄屏注入;DSH_MOBILE_ADAPTER=0 可关闭,默认开启)
 import { maybeInjectMobileAdapter } from "./mobile-adapter.mjs";
+import { discoverUpstream, resolveUpstreamHint, FALLBACK_UPSTREAM } from "./upstream-discovery.mjs";
 // 镜像页 E2EE 加密 shim(Phase-4):text/html 注入;DSH_E2EE_SHIM=0 可关闭,叠加 e2ee.enabled 灰度门
 import { maybeInjectE2eeShim } from "./e2ee-shim.mjs";
 // E2EE(端到端加密)客户端基建(Phase-2):MK 派生/会话密钥/信封/握手/开关
@@ -114,7 +115,23 @@ const CONFIG_PATH = process.env.DSH_BRIDGE_CONFIG || DEFAULT_CONFIG;
 // 隧道模式(唯一):bridge 主动 WS 连 relay-router 的 /_bridge
 const TUNNEL_URL = (process.env.DSH_BRIDGE_TUNNEL_URL || "").replace(/\/+$/, "");
 const TUNNEL_HEARTBEAT_MS = Math.max(100, Number(process.env.DSH_BRIDGE_HEARTBEAT_MS) || 15_000);
-const UPSTREAM = process.env.DSH_BRIDGE_UPSTREAM || "http://127.0.0.1:3080";
+/**
+ * 上游 dsh web 的地址。
+ *
+ * ⚠️ 这里**不能**只信环境变量 + 写死 3080（2026-09-23 两起用户实测）：
+ *   ① `dsh web --port 8090` / `--port 0`（系统分配）→ 3080 没人听；
+ *   ② **DSH Desktop**（Electron 壳 `dsh-plugin-desktop`）默认 43120，被占用还会 +1。
+ * bridge 与 watcher 共用同一份发现实现（`upstream-discovery.mjs`）：
+ *   显式环境变量 > `<relayDir>/.dsh-upstream`（插件半用 ctx.webServer.port 落盘）> DSH_WEB_URL
+ *   > **动态发现**（本机 dsh 进程实际监听端口 + Desktop 端口区间，且每个候选都做身份校验）。
+ *
+ * 用 `let` 是因为：① 发现发生在启动之后（异步）；② 上游端口变了要能在**不重启 bridge** 的前提下跟上。
+ */
+const RELAY_DIR = path.dirname(CONFIG_PATH);
+let UPSTREAM = (() => {
+  const hint = resolveUpstreamHint({ relayDir: RELAY_DIR });
+  return hint.url || FALLBACK_UPSTREAM;
+})();
 // 微信机器人通道总开关:DSH_WECHAT=0 关闭(默认开启)。控制面只 bind 回环,且必须带 bridge_secret。
 const WECHAT_DISABLED = String(process.env.DSH_WECHAT || "") === "0";
 // 默认云端服务地址（dsh-remote setup 会显式传入；自建模式无需账号 API）
@@ -384,6 +401,37 @@ const STRIP_RES_HEADERS = new Set([
   "content-encoding", "content-length", "transfer-encoding",
   "connection", "keep-alive", "upgrade"
 ]);
+
+
+/** 上游重新发现的冷却:失败请求可能连成片,不能每个都去 lsof/pgrep + 探端口。 */
+const UPSTREAM_REFRESH_COOLDOWN_MS = 15_000;
+let upstreamRefreshedAt = 0;
+let upstreamRefreshInflight = null;
+/**
+ * 重新解析上游地址(带身份校验;显式 DSH_BRIDGE_UPSTREAM 时是恒等操作)。
+ * 上游端口变了(Desktop 换端口 / dsh web 重启到别的端口)时,靠它自愈而不必重启 bridge。
+ */
+async function refreshUpstream(reason = "") {
+  if (upstreamRefreshInflight) return upstreamRefreshInflight;
+  const now = Date.now();
+  if (now - upstreamRefreshedAt < UPSTREAM_REFRESH_COOLDOWN_MS) return UPSTREAM;
+  upstreamRefreshedAt = now;
+  upstreamRefreshInflight = (async () => {
+    try {
+      const found = await discoverUpstream({ relayDir: RELAY_DIR });
+      if (found.url && found.url !== UPSTREAM) {
+        console.log(`[bridge] 上游地址切换: ${UPSTREAM} → ${found.url}（来源 ${found.source}${reason ? `,${reason}` : ""}）`);
+        UPSTREAM = found.url;
+      }
+      return UPSTREAM;
+    } catch {
+      return UPSTREAM;
+    } finally {
+      upstreamRefreshInflight = null;
+    }
+  })();
+  return upstreamRefreshInflight;
+}
 
 console.log(`[bridge] 设备 ${DEVICE_ID} → 隧道 ${TUNNEL_URL}/_bridge`);
 console.log(`[bridge] 上游 ${UPSTREAM}`);
@@ -816,6 +864,9 @@ export async function handleHttpFrame(dchOrSend, frame) {
     send(reply);
     console.log(`[bridge] ${method} ${path} → ${reply.status} (${Date.now() - t0}ms, ${(reply.body.length * 3 / 4 / 1024).toFixed(0)}KB)`);
   } catch (e) {
+    // 上游不可达是「端口可能变了」的最强信号（Desktop 换端口 / dsh web 重启到别的端口）：
+    // 触发一次带冷却的重新发现，后续请求自动跟上，不必重启 bridge。
+    void refreshUpstream("上游请求失败");
     console.log(`[bridge] ${method} ${path} 上游错误: ${e.message}`);
     send({ id, type: "http", status: 502, headers: { "content-type": "application/json" }, body: Buffer.from(JSON.stringify({ error: String(e.message || e) })).toString("base64"), bodyBase64: true });
   }
@@ -877,6 +928,7 @@ export async function handleLegacyFrame(dchOrSend, frame) {
     send({ id, status: reply.status, headers: reply.headers, body: text });
     console.log(`[bridge] legacy ${method} ${path} → ${reply.status} (${Date.now() - t0}ms)`);
   } catch (e) {
+    void refreshUpstream("上游请求失败(legacy)");
     console.log(`[bridge] legacy ${method} ${path} 上游错误: ${e.message}`);
     send({ id, status: 502, headers: {}, body: JSON.stringify({ error: String(e.message || e) }) });
   }
@@ -1469,6 +1521,9 @@ function startWeChat() {
     const cfg = loadLocalConfig();
     wechatRuntime = createWeChatRuntime({
       relayDir,
+      // 上游地址在 runTunnel() 开头已完成动态发现（见 refreshUpstream），所以这里拿到的是真实端口。
+      // ⚠️ 这是**取值**而非引用：运行中若上游端口又变了（自愈重发现），微信通道要等 bridge 重启才跟上；
+      //    隧道转发那一侧不受影响（它每次都读最新的 UPSTREAM）。
       upstream: UPSTREAM,
       cookieOf: harnessCookieOf,
       secret: process.env.DSH_BRIDGE_SECRET || (typeof cfg.bridge_secret === "string" ? cfg.bridge_secret : ""),
@@ -1514,6 +1569,10 @@ function redactText(e) {
 }
 
 async function runTunnel() {
+  // 先动态确定上游再连隧道：上游端口不是 3080 时（DSH Desktop 默认 43120）这一步是关键 ——
+  // 否则 bridge 会连上中继、手机也能打开页面，但每个请求都打到一个没人听的端口。
+  await refreshUpstream("启动");
+  console.log(`[bridge] 上游地址已确定: ${UPSTREAM}`);
   const token = await resolveToken();
   if (!token) {
     console.error("[bridge] 隧道模式需要账号认证:请设 DSH_BRIDGE_TOKEN,或 DSH_BRIDGE_PHONE+DSH_BRIDGE_PASSWORD");

@@ -95,7 +95,34 @@ const RUNTIME_HOST_RE =
   /(data-sidebar-collapsed|data-details-collapsed|data-rightbar-collapsed|data-shell-overlay)|(pI_x6G_frame|hHd-Xa_root|hHd-Xa_toggle)/;
 
 const STYLE = `
-/* ===== dsh-remote mobile adapter (bridge 注入;仅 ≤820px 生效,桌面宽屏无任何规则) ===== */
+/* ===== 首屏加载提示（0.6.14）=====
+   为什么要有它：镜像页首屏要拉 dsh web 的全部客户端插件（实测 ~14 MB，一个不可拆分的
+   /plugins/?? 聚合请求），免费档限速下几十秒起步。此前页面上**只有官方那个转圈**，
+   用户无法区分"在加载"和"卡死了"，只能反复刷新 —— 反而更慢。
+   这里给一句人话提示 + 分阶段的补充说明，加载完成（或超时兜底）即自动移除。
+   ⚠️ 刻意**不**放进 @media (max-width:820px)：Windows/桌面浏览器打开镜像页同样要等。
+   ⚠️ pointer-events:none + 半透明：万一移除逻辑失效，也绝不挡住任何点击。 */
+.dsh-ma-boot {
+  position: fixed; inset: 0; z-index: 2147483000;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px;
+  background: color-mix(in srgb, var(--dsw-alias-bg-base, #0f1115) 88%, transparent);
+  backdrop-filter: blur(2px);
+  pointer-events: none;
+  font-family: inherit; text-align: center; padding: 24px;
+  transition: opacity .3s ease;
+}
+.dsh-ma-boot[data-fading="1"] { opacity: 0; }
+.dsh-ma-boot-spin {
+  width: 34px; height: 34px; border-radius: 50%;
+  border: 3px solid color-mix(in srgb, currentColor 22%, transparent);
+  border-top-color: currentColor;
+  animation: dsh-ma-boot-spin 1s linear infinite;
+}
+@keyframes dsh-ma-boot-spin { to { transform: rotate(360deg); } }
+.dsh-ma-boot-title { font-size: 15px; font-weight: 600; }
+.dsh-ma-boot-sub { font-size: 13px; line-height: 1.6; opacity: .75; max-width: 22em; }
+.dsh-ma-boot-elapsed { font-size: 12px; opacity: .55; font-variant-numeric: tabular-nums; }
+
 @media (max-width: 820px) {
   html, body { max-width: 100%; overflow-x: hidden; }
   html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
@@ -425,6 +452,89 @@ html[data-dsh-ma-merged-e2ee] #dsh-e2ee-badge { display: none !important; }
 
 const SCRIPT = `(() => {
   "use strict";
+
+  /* ===== 首屏加载提示（0.6.14）=====
+     用户反馈：「普通用户加载进入镜像页面时等待时间较长，目前等待过程中一直在转圈」
+     —— 官方那个转圈不告诉用户任何事。这里在**页面解析的第一时间**就挂上一条人话提示，
+     并在官方 UI 就绪（或兜底超时）后自动移除。
+
+     ⚠️ 必须放在所有主机判定（HOSTISH / NARROW）之前：首屏慢的正是这些判定等不到的时候。
+     ⚠️ 只做提示，不做任何拦截：pointer-events:none，也没有遮罩语义。 */
+  var maBootTip = null, maBootTimers = [], maBootStart = Date.now(), maBootElapsedTimer = 0, maBootWatchTimer = 0;
+  function maBootSet(cls, text) {
+    try { var n = maBootTip && maBootTip.querySelector(cls); if (n) n.textContent = text; } catch (e) { /* 忽略 */ }
+  }
+  function maBootShow() {
+    try {
+      if (maBootTip) return;
+      if (!document.body) return; // 解析太早（body 还没出来）→ 交给 DOMContentLoaded 再挂
+      maBootTip = document.createElement("div");
+      maBootTip.className = "dsh-ma-boot";
+      maBootTip.setAttribute("role", "status");
+      maBootTip.setAttribute("aria-live", "polite");
+      maBootTip.innerHTML =
+        '<div class="dsh-ma-boot-spin" aria-hidden="true"></div>' +
+        '<div class="dsh-ma-boot-title">正在加载远程桌面…</div>' +
+        '<div class="dsh-ma-boot-sub">首次打开需要下载较完整的前端资源，请稍候</div>' +
+        '<div class="dsh-ma-boot-elapsed">已等待 0 秒</div>';
+      document.body.appendChild(maBootTip);
+      // 秒表：让"到底等了多久"可见（用户据此判断是慢还是死了）
+      maBootElapsedTimer = setInterval(function () {
+        try {
+          var s = Math.floor((Date.now() - maBootStart) / 1000);
+          var n = maBootTip && maBootTip.querySelector(".dsh-ma-boot-elapsed");
+          if (n) n.textContent = "已等待 " + s + " 秒";
+        } catch (e) { /* 忽略 */ }
+      }, 1000);
+      maBootTimers.push(setTimeout(function () {
+        maBootSet(".dsh-ma-boot-sub", "网络较慢时可能需要一两分钟；加载完成后会自动进入，不用重复刷新");
+      }, 8000));
+      maBootTimers.push(setTimeout(function () {
+        maBootSet(".dsh-ma-boot-sub", "还在加载…如果长时间停在这里，可以下拉刷新重试（重复刷新不会更快）");
+      }, 30 * 1000));
+    } catch (e) { /* 提示失败绝不影响主功能 */ }
+  }
+  function maBootHide() {
+    try {
+      for (var i = 0; i < maBootTimers.length; i++) clearTimeout(maBootTimers[i]);
+      maBootTimers = [];
+      if (maBootElapsedTimer) { clearInterval(maBootElapsedTimer); maBootElapsedTimer = 0; }
+      if (maBootWatchTimer) { try { clearInterval(maBootWatchTimer); } catch (e) { /* 忽略 */ } maBootWatchTimer = 0; }
+      var tip = maBootTip;
+      maBootTip = null;
+      if (tip && tip.parentNode) {
+        try { tip.setAttribute("data-fading", "1"); } catch (e) { /* 忽略 */ }
+        setTimeout(function () { try { if (tip.parentNode) tip.parentNode.removeChild(tip); } catch (e) { /* 忽略 */ } }, 300);
+      }
+    } catch (e) { /* 忽略 */ }
+  }
+  /** 官方 UI 是否已经可用了（= 提示可以撤了）。 */
+  function maBootLooksReady() {
+    try {
+      // ① 适配层认出来的官方 frame（与下方 boot() 同一组选择器）
+      if (document.querySelector(".pI_x6G_frame, [data-sidebar-collapsed], [data-details-collapsed], [data-rightbar-collapsed]")) return true;
+      // ② 出现输入框/会话区也算"进来了"（官方改版首选信号失灵时的兜底）
+      return Boolean(document.querySelector('textarea, [contenteditable="true"], [role="textbox"]'));
+    } catch (e) { return false; }
+  }
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", maBootShow);
+  } else {
+    maBootShow();
+  }
+  // 轮询撤下：1s 一次，成本可忽略（只是两次 querySelector）；一旦撤下就自我停止。
+  // 上限与"4 分钟兜底"对齐，避免页面异常时留下常驻定时器。
+  maBootWatchTimer = setInterval(function () {
+    if (maBootLooksReady()) { maBootHide(); return; }
+    if (!maBootTip) { try { clearInterval(maBootWatchTimer); } catch (e) { /* 忽略 */ } maBootWatchTimer = 0; }
+  }, 1000);
+  maBootTimers.push(setTimeout(function () { maBootHide(); }, 240 * 1000));
+  // 页面卸载/进 bfcache 时收干净（测试与真机都靠这条不留悬挂定时器）
+  try {
+    var maBootBye = function () { maBootHide(); };
+    window.addEventListener("pagehide", maBootBye);
+    window.addEventListener("unload", maBootBye);
+  } catch (e) { /* 忽略 */ }
 
   /* —— 主机门解除(2026-09):镜像页(如 n.risegao.cn)经设备流认证回连同一台 127.0.0.1:3080,
      桥已把 Host 回环化并剥 Origin(不扩大信任面)。官方客户端以 transport.ownsHost 判定

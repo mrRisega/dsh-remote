@@ -370,8 +370,23 @@ test("运行时 dsh-setup.mjs：上游端口只有一处真相源，watcher/子�
   const code = SETUP_SRC.split("\n").filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join("\n");
   assert.ok(!/fetch\("http:\/\/127\.0\.0\.1:3080/.test(code), "探测不得写死 3080（dsh web 可能在别的端口）");
   assert.ok(!/findstr ":3080"|iTCP:3080/.test(code), "按端口找 dsh web 进程也不得写死 3080");
-  assert.ok(/fetch\(upstreamUrl\(\) \+ "\/"\)/.test(code), "watcher 的在线判据必须用 upstreamUrl()");
+  assert.ok(/async function upstreamReachable\(url = upstreamUrl\(\)/.test(code), "在线判据必须用解析出来的上游地址");
+  assert.ok(/await upstreamReachable\(upstreamUrl\(\)/.test(code), "isDshWebUp 必须基于 upstreamUrl() 探测");
   assert.ok(/DSH_BRIDGE_UPSTREAM: upstreamUrl\(\)/.test(code), "必须把上游显式透传给 bridge 子进程");
+  // ── 上游端口动态发现（2026-09-23 第二起实测：DSH Desktop 默认 43120，占用还会 +1）──
+  // 只靠"端口文件"不够：文件可能还没写、或写着上一轮的旧端口；那时必须自己去找。
+  assert.ok(
+    /from "\.\/clients\/dsh-remote\/upstream-discovery\.mjs"/.test(SETUP_SRC),
+    "必须复用共享的上游发现实现（watcher/bridge 同一份，避免两边漂移）"
+  );
+  assert.ok(
+    /const after = await refreshUpstreamDiscovery\(true\)/.test(code),
+    "探测失败必须主动做一次动态发现再试（否则端口一变就永远卡在 starting）"
+  );
+  assert.ok(
+    /await refreshUpstreamDiscovery\(true\);/.test(code),
+    "启动时先发现再打印：日志不得再谎称固定端口"
+  );
   // 半装运行时的根因之一：本安装器自己 import 的 src/lifecycle.mjs 必须在同步表里
   assert.ok(/"src\/lifecycle\.mjs"/.test(SETUP_SRC), "RUNTIME_CLIENT_FILES 必须包含 src/lifecycle.mjs（否则会漏同步出半装运行时）");
 });

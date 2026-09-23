@@ -3997,6 +3997,7 @@ function buildConnectDiagnostics(relayDir, conn, log) {
     `bridge 进程: ${conn.bridgeRunning ? "在运行" : "未运行"}（pid=${conn.bridgePids && conn.bridgePids.length ? conn.bridgePids.join(",") : "-"}，launchd state=${conn.launchdState || "-"}，崩溃循环=${conn.launchdCrashLoop ? "是" : "否"}）`,
     `后台守护: ${conn.watcherRunning ? `在运行（pid=${conn.watcherPids.join(",")}${conn.watcherAgeMs ? `，已 ${Math.round(conn.watcherAgeMs / 1000)} 秒` : ""}${conn.watcherWedged ? "，⚠️ 迟迟未拉起 bridge" : ""}${conn.watcherRestarts ? `，已自动重启 ${conn.watcherRestarts} 次` : ""}）` : "未运行"}`,
     `上游 dsh web: ${conn.upstreamUrl}（${conn.upstreamSource}${conn.upstreamReachable === null ? "" : conn.upstreamReachable ? "，可达" : `，⚠️ 不可达：${conn.upstreamError}`}）`,
+    `目录选择器: ${pickerPinState.kind === "native" ? "⚠️ 系统原生（远程时对话框弹在电脑那台机器上 → 手机上点「添加工作区」会像没反应）" : (pickerPinState.kind || "未知")}${pickerPinState.detail ? `（${pickerPinState.detail}）` : ""}`,
     `中继注册: ${conn.registered ? "已注册（" + conn.registerSource + "）" : "未注册"}`,
     `bridge 账号: ${conn.accountCurrent === false ? "⚠️ 仍是上一个账号的身份（需重启 bridge 重新登记）" : "当前账号"}`,
     conn.rateLimitedUntil ? `登录限流: 约 ${Math.ceil((conn.rateLimitedUntil - Date.now()) / 1000)} 秒后自动重试（凭据无误，无需改密码）` : "",
@@ -5894,6 +5895,100 @@ function registerRoutes(ctx, relayDir) {
  * @param ctx - host cordis context（注入 webServer）。
  * @param config - entry config（可选 relayDir）。
  */
+
+// ---------- 目录选择器：远程控制下必须用「浏览器内实现」（0.6.14） ----------
+//
+// 用户实测（Windows）：镜像页里点「添加工作区」**没反应**；同一功能在 Mac 上正常。
+//
+// 根因：官方 `directory-picker-auto` 在**绑定仅回环**且平台是 darwin/win32 时会挂
+// **原生**选择器（macOS 走 osascript，Windows 走一个 koffi + worker.cjs 子进程去弹 Win32
+// 文件夹对话框，还要合成 Alt 抢前台）。对远程控制来说这是双输：
+//   · 对话框弹在**电脑**那块屏上 —— 拿手机的人什么也看不到，表现就是"按钮无效"；
+//   · Windows 那条原生链路依赖 koffi 原生模块 + 子进程，失败点比 macOS 多得多。
+// 而 auto 只在 `webServer.host !== "127.0.0.1"` 时才改选 browse —— DSH Desktop（Electron 壳）
+// 自己持有 webserver 配置（实测监听 43120 / 回环），我们的 LAN 绑定补丁并不生效，于是它一直
+// 用的是原生那条路。**不能把"手机能不能选工作区"押在宿主的绑定地址上。**
+//
+// 做法（官方文档给的"直接合成那一对"的钉法）：在 loader 里先建起 browse 宿主+界面，
+// **成功之后**再摘掉 auto 条目（auto 的 effect 析构会连带卸掉 native 那一对）。
+//
+// 三条护栏，顺序不能改：
+//   ① 只在当前 kind === "native" 时动手；已经是 browse 就完全不碰（多数自建部署就是这样）；
+//   ② 先建 browse、后摘 auto —— browse 建不起来就什么都不做，宁可用原生也不能让选择器消失；
+//   ③ 任何失败只记日志、绝不抛给宿主（插件不能把 dsh web 拖挂）。
+// `DSH_REMOTE_NATIVE_PICKER=1` 可整体退出（想保留系统原生对话框的人）。
+const PICKER_AUTO_ENTRY_ID = "directory-picker";
+const PICKER_BROWSE_PACKAGES = [
+  "@deepseek-ai/dsh-host-directory-picker-browse",
+  "@deepseek-ai/dsh-client-ui-directory-picker-browse"
+];
+/** 最近一次固定的结果（诊断面板会显示：这类"点了没反应"的问题一眼定位）。 */
+let pickerPinState = { kind: "", action: "pending", detail: "" };
+
+/** 当前挂的是哪一路选择器（服务未就绪时返回空串）。 */
+function directoryPickerKind(ctx) {
+  try {
+    const svc = typeof ctx.get === "function" ? ctx.get("directoryPicker") : null;
+    const cap = svc && typeof svc.capability === "function" ? svc.capability() : null;
+    return cap && typeof cap.kind === "string" ? cap.kind : "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * 把目录选择器固定成 browse（幂等）。服务要等 auto 挂完才存在，所以内部带重试窗口。
+ * @returns {Promise<{kind:string, action:string, detail:string}>}
+ */
+async function pinBrowseDirectoryPicker(ctx, { attempts = 6, gapMs = 700 } = {}) {
+  if (String(process.env.DSH_REMOTE_NATIVE_PICKER || "") === "1") {
+    pickerPinState = { kind: directoryPickerKind(ctx), action: "skipped", detail: "DSH_REMOTE_NATIVE_PICKER=1，保留系统原生对话框" };
+    return pickerPinState;
+  }
+  let loader = null;
+  try { loader = typeof ctx.get === "function" ? ctx.get("loader") : null; } catch { loader = null; }
+  if (!loader || typeof loader.create !== "function") {
+    pickerPinState = { kind: directoryPickerKind(ctx), action: "skipped", detail: "没有 loader 服务，无法干预选择器" };
+    return pickerPinState;
+  }
+  for (let i = 0; i < attempts; i += 1) {
+    const kind = directoryPickerKind(ctx);
+    if (kind === "browse") {
+      pickerPinState = { kind, action: "none", detail: "已经是浏览器内选择器" };
+      return pickerPinState;
+    }
+    if (kind === "native") {
+      const created = [];
+      try {
+        for (const name of PICKER_BROWSE_PACKAGES) created.push(await loader.create({ name }));
+      } catch (e) {
+        for (const id of [...created].reverse()) { try { await loader.remove(id); } catch { /* 尽力回滚 */ } }
+        pickerPinState = { kind, action: "kept_native", detail: `浏览器内选择器装不起来，保留原生：${e && e.message ? e.message : e}` };
+        ctx.logger?.warn?.(`dsh-remote-web: 目录选择器固定为 browse 失败，保留原生：${e && e.message ? e.message : e}`);
+        return pickerPinState;
+      }
+      try {
+        const entry = loader.store ? loader.store[PICKER_AUTO_ENTRY_ID] : null;
+        if (entry) await loader.remove(PICKER_AUTO_ENTRY_ID);
+      } catch (e) {
+        // browse 已经起来了，选择器可用；只是 auto 没摘掉（两者并存时 browse 生效即可）
+        pickerPinState = { kind: "browse", action: "pinned", detail: `已切到浏览器内选择器（auto 条目未摘除：${e && e.message ? e.message : e}）` };
+        return pickerPinState;
+      }
+      pickerPinState = {
+        kind: "browse",
+        action: "pinned",
+        detail: "原生对话框在远程时弹在电脑那台屏上（手机上看不到），已改为浏览器内选择器"
+      };
+      ctx.logger?.info?.("dsh-remote-web: 目录选择器已固定为浏览器内实现（原生对话框远程不可见）");
+      return pickerPinState;
+    }
+    await sleep(gapMs); // 服务还没挂上（auto 正在建）→ 下一轮再看
+  }
+  pickerPinState = { kind: directoryPickerKind(ctx), action: "skipped", detail: "启动窗口内未确认到选择器服务" };
+  return pickerPinState;
+}
+
 export function apply(ctx, config = {}) {
   const relayDir = config.relayDir || process.env.DSH_RELAY_DIR || DEFAULT_RELAY_DIR;
   // 记住宿主 ctx：上游地址要问 dsh web 自己的监听端口（见 upstreamUrl）。
@@ -5929,6 +6024,12 @@ export function apply(ctx, config = {}) {
   ctx.effect(() => registerRoutes(ctx, relayDir), "dsh-remote-web: /dsh-remote routes");
   // 0.1.2-rc.1+ 浏览器会话代持：换取 Harness 会话 Cookie 供 bridge 上游携带（手机点设备不再 401 白页）
   ctx.effect(() => scheduleHarnessMint(ctx, relayDir), "dsh-remote-web: harness browser-session mint");
+  // 目录选择器:远程控制下必须用浏览器内实现(否则手机点「添加工作区」像没反应) —— 见上方长注释
+  ctx.effect(() => {
+    let alive = true;
+    void pinBrowseDirectoryPicker(ctx).catch(() => { /* 绝不影响宿主 */ });
+    return () => { alive = false; void alive; };
+  }, "dsh-remote-web: pin browser directory picker");
   // 插件市场一键全功能:缺桌面运行环境则自动安装,登录后自动拉起 bridge(不依赖用户跑 npx)
   ctx.effect(() => scheduleRuntime(relayDir), "dsh-remote-web: runtime self-provision");
   // 匿名遥测：插件停摆（卸载/重载）时停掉发送心跳；磁盘队列留给下次装载补发。
@@ -5946,3 +6047,8 @@ export function apply(ctx, config = {}) {
   maybeReportInstall(relayDir);
   ctx.logger?.info?.(`dsh-remote-web: /dsh-remote routes ready (relayDir=${relayDir})`);
 }
+
+// test hooks：cordis 只读 name/inject/apply，这些导出只给用例（见 test/picker-pin.test.mjs）。
+// 为什么不放进 apply 内部直接测：apply 是"装载即副作用"的同步函数，选择器固定是异步且带重试窗口的，
+// 单独导出才能把「先建 browse、后摘 auto」这个顺序契约钉死。
+export { pinBrowseDirectoryPicker as __pinBrowseDirectoryPicker, pickerPinState as __pickerPinState, directoryPickerKind as __directoryPickerKind, PICKER_AUTO_ENTRY_ID as __PICKER_AUTO_ENTRY_ID, PICKER_BROWSE_PACKAGES as __PICKER_BROWSE_PACKAGES };

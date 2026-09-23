@@ -29,6 +29,7 @@ import path from "node:path";
 import { spawn, spawnSync, execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { childStopped, stopChildGracefully } from "./clients/dsh-remote/src/lifecycle.mjs";
+import { discoverUpstream, resolveUpstreamHint, FALLBACK_UPSTREAM } from "./clients/dsh-remote/upstream-discovery.mjs";
 
 const THIS_DIR = path.dirname(fileURLToPath(import.meta.url)); // 本包目录（仓库或 node_modules）
 const IS_NPM_INSTALL = THIS_DIR.includes(`${path.sep}node_modules${path.sep}`);
@@ -779,14 +780,21 @@ function restartBridgeService() {
  * 【2026-09-23 用户实测事故】这里原本处处写死 `http://127.0.0.1:3080`：只要用户的 dsh web
  * 不在默认端口（`dsh web --port 8090`、profile 里配了 port、或 `--port 0` 让系统分配空闲端口），
  * watcher 的在线探测就**永远**失败 → bridge 永远不启动，而面板只会说「正在启动 Bridge…」。
- * 优先级：显式环境变量 > 插件半留下的端口文件 > DSH_WEB_URL > 默认 3080。
- * 为什么要有「端口文件」这一层：开机自启（登录任务 / launchd）拉起 watcher 时**没有**任何环境变量，
- * 只有插件半知道 dsh web 真实监听在哪个端口，所以它会把地址落盘（见插件 half 的 publishUpstream）。
+ * 优先级：显式环境变量 > **运行时动态发现** > 插件半留下的端口文件 > DSH_WEB_URL > 默认 3080。
+ *
+ * 为什么还要「动态发现」这一层（2026-09-23 第二起实测，DSH Desktop）：
+ *   DSH Desktop（Electron 壳 `dsh-plugin-desktop`）默认把 Web 服务放在 **43120**，被占用还会 +1；
+ *   而端口文件要等**插件半**加载后才有。于是「端口文件还没写」或「写的是上一轮的旧端口」时，
+ *   光靠文件仍会永久探错端口。发现逻辑（含 DSH 进程实际监听端口 + Desktop 端口区间 + 身份校验）
+ *   统一在 clients/dsh-remote/upstream-discovery.mjs，watcher 与 bridge 共用同一份实现。
  */
 const UPSTREAM_FILE = ".dsh-upstream";
+/** 运行时动态发现到的上游（优于可能过期的端口文件；进程内缓存）。 */
+let discoveredUpstream = "";
 function upstreamUrl() {
   const explicit = String(process.env.DSH_BRIDGE_UPSTREAM || "").trim();
   if (explicit) return explicit.replace(/\/+$/, "");
+  if (discoveredUpstream) return discoveredUpstream;
   try {
     const fromFile = String(fs.readFileSync(path.join(CONFIG_DIR, UPSTREAM_FILE), "utf8")).trim();
     if (/^https?:\/\/[^\s]+$/i.test(fromFile)) return fromFile.replace(/\/+$/, "");
@@ -798,26 +806,67 @@ function upstreamUrl() {
       if (u.port) return `http://127.0.0.1:${u.port}`; // bridge 的 loopback 围栏只认 127.0.0.1
     } catch { /* 非 URL：忽略 */ }
   }
-  return "http://127.0.0.1:3080";
+  return FALLBACK_UPSTREAM;
 }
 /** 上游端口（诊断/日志用；取不到就回退 3080）。 */
 function upstreamPort() {
   try { return Number(new URL(upstreamUrl()).port) || 3080; } catch { return 3080; }
 }
 
+/** 发现结果缓存与冷却：避免每轮轮询都去 lsof/pgrep + 逐个端口探测。 */
+let upstreamDiscoveryAt = 0;
+let upstreamDiscoveryInflight = null;
+const UPSTREAM_DISCOVERY_COOLDOWN_MS = 15_000;
+
 /**
- * dsh web 是否正在运行（默认 127.0.0.1:3080，端口以 upstreamUrl() 为准）。
- * bridge 本身依赖 dsh web 才工作：dsh web 没开时 bridge 起来也会立刻退出，
- * 所以「装完当下 bridge 没在跑」是**正常状态**，不能当失败吓用户（见 install 汇总）。
+ * 动态发现上游（带身份校验），成功后写入 `discoveredUpstream` 供全局复用。
+ * @param {boolean} force 忽略冷却（探测失败后的重试用）
  */
-async function isDshWebUp(timeoutMs = 1200) {
+async function refreshUpstreamDiscovery(force = false) {
+  if (upstreamDiscoveryInflight) return upstreamDiscoveryInflight;
+  const now = Date.now();
+  if (!force && now - upstreamDiscoveryAt < UPSTREAM_DISCOVERY_COOLDOWN_MS) return upstreamUrl();
+  upstreamDiscoveryAt = now;
+  upstreamDiscoveryInflight = (async () => {
+    try {
+      const found = await discoverUpstream({ relayDir: CONFIG_DIR, log: (m) => console.log(`[dsh-remote] ${m}`) });
+      // 「提示地址验证通过」与「候选命中」都值得记下来；fallback（什么都没找到）不污染现有判断
+      if (found.url && found.source !== "fallback") discoveredUpstream = found.url;
+      return upstreamUrl();
+    } catch {
+      return upstreamUrl();
+    } finally {
+      upstreamDiscoveryInflight = null;
+    }
+  })();
+  return upstreamDiscoveryInflight;
+}
+
+/** 上游是否**有响应**（判据刻意宽松：4xx/5xx 也算"端口在听"，那种情况问题在别处）。 */
+async function upstreamReachable(url = upstreamUrl(), timeoutMs = 1200) {
   try {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), timeoutMs);
-    await fetch(upstreamUrl() + "/", { signal: ac.signal });
+    await fetch(url + "/", { signal: ac.signal });
     clearTimeout(timer);
     return true;
   } catch { return false; }
+}
+
+/**
+ * dsh web 是否正在运行（端口以 upstreamUrl() 为准，**绝不写死 3080**）。
+ * bridge 本身依赖 dsh web 才工作：dsh web 没开时 bridge 起来也会立刻退出，
+ * 所以「装完当下 bridge 没在跑」是**正常状态**，不能当失败吓用户（见 install 汇总）。
+ *
+ * 探测失败时会**主动做一次动态发现**再试一次 —— 这一条正是 DSH Desktop 场景的关键：
+ * 上游在 43120（Desktop 默认，占用还会 +1），而端口文件可能还没写或写着上一轮的旧端口。
+ */
+async function isDshWebUp(timeoutMs = 1200) {
+  if (await upstreamReachable(upstreamUrl(), timeoutMs)) return true;
+  const before = upstreamUrl();
+  const after = await refreshUpstreamDiscovery(true);
+  if (after === before) return false;
+  return upstreamReachable(after, timeoutMs);
 }
 
 /**
@@ -1125,14 +1174,13 @@ async function runBridge() {
   /** 限流提示只打一次，避免刷屏。 */
   let warnedRateLimit = false;
 
-  // watcher：检测 dsh web 是否存活（端口以 upstreamUrl() 为准，绝不写死 3080），存活才启动 bridge
-  const checkUpstream = () => new Promise((resolve) => {
-    const t = setTimeout(() => resolve(false), 2000);
-    fetch(upstreamUrl() + "/")
-      .then(() => { clearTimeout(t); resolve(true); })
-      .catch(() => { clearTimeout(t); resolve(false); });
-  });
+  // watcher：检测 dsh web 是否存活（端口动态解析，绝不写死 3080），存活才启动 bridge。
+  // 走 isDshWebUp()：探测失败会自动做一次动态发现（DSH Desktop 的 43120 / 自定义端口都靠它）。
+  const checkUpstream = () => isDshWebUp(2000);
 
+  // 先做一次动态发现再打印/派生：否则日志会长期写着错误的端口（用户实测就卡在
+  // 「等待 dsh web（127.0.0.1:3080）启动...」而真实上游在 43120）。
+  await refreshUpstreamDiscovery(true);
   console.log(`[dsh-remote] 等待 dsh web（${upstreamUrl()}）启动...`);
   let bridgeProc = null;
   let starting = false;

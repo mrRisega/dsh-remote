@@ -3,6 +3,76 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.14] - 2026-09-23
+
+> 补丁版，主题是**「端口不是 3080 就用不了」**——一类环境兼容问题，不是某个用户的特殊情况。
+
+### 根因：上游端口被写死成 3080
+
+- 桥接链路两端都把上游钉在 `http://127.0.0.1:3080`（独立 `dsh web` 的默认端口）：
+  - **watcher**（`dsh-setup.mjs run`）用 3080 做「dsh web 在线吗」的判据，**在线才派生 bridge**；
+  - **bridge**（`dsh-bridge.mjs`）只认环境变量，缺省同样回退 3080。
+- 于是只要宿主端口不是 3080 —— `dsh web --port 8090`、`--port 0`（系统分配）、
+  或 **DSH Desktop**（Electron 壳 `dsh-plugin-desktop`，默认 **43120**、被占用还会 +1）——
+  watcher **永远探不到**，bridge **永远不会被派生**，而面板只会停在「正在启动 Bridge…」：
+  ```
+  连接阶段: starting（正在启动 Bridge…）   bridge 进程: 未运行   中继注册: 未注册
+  ```
+  用户侧看到的是"插件坏了"，实际是我们把端口写死了。
+
+### 修法：动态发现 + **身份校验**（watcher 与 bridge 共用同一份实现）
+
+新增 `clients/dsh-remote/upstream-discovery.mjs`（单一实现，两端共用），发现顺序：
+
+1. `DSH_BRIDGE_UPSTREAM`（显式覆盖，部署/排障用；直采信，保持既有语义）；
+2. `<relayDir>/.dsh-upstream`（**插件半**用 `ctx.webServer.port` 落盘，最权威）；
+3. `DSH_WEB_URL` 的端口；
+4. **实测端口**：本进程祖先进程 / 本机 dsh 进程正在 LISTEN 的端口（lsof / netstat）；
+5. 静态候选：3080 + DSH Desktop 的 43120 及其递增区间。
+
+- **候选必须通过 dsh web 身份校验**：43120 这类端口可能被别的本地程序占用，
+  只看"端口有响应"就把 bridge 接上去，既不可用也可能把用户流量交给陌生服务。
+  判据取 dsh web 自身特征（`__ModuleLoader__` / `DeepSeek Harness` / `dsh web authentication required` 等）。
+- watcher：探测失败会**主动做一次动态发现**再试，并把发现到的地址经 `DSH_BRIDGE_UPSTREAM`
+  传给 bridge；启动日志不再谎称"等待 3080"。
+- bridge：启动时先确定上游再连隧道；上游请求失败时**带冷却地重新发现**
+  （宿主换端口 / dsh web 重启到别的端口都能自愈，不必重启 bridge）。
+
+### 同版一并修：Windows「添加工作区」按钮没反应
+
+- 现象：镜像页点「添加工作区」无效（Mac 正常）；根因是**目录选择器**选错了那一支——
+  官方 `directory-picker-auto` 只在「绑定非回环」时才用**浏览器内**选择器，否则 darwin/win32 一律挂
+  **系统原生**对话框。原生那个框弹在**电脑那台机器的屏幕上**，拿手机的人什么也看不到，表现就是"点了没反应"；
+  Windows 那条原生链路还额外依赖 `koffi` 原生模块 + 一个 worker 子进程（要合成 Alt 抢前台），失败点更多。
+  DSH Desktop（Electron 壳）自带 webserver 配置（实测监听 43120 / 回环），我们的 LAN 绑定补丁不生效，
+  于是一直走原生那条路。
+- 修法：插件主动把选择器**固定成浏览器内实现**（官方文档给的"直接合成那一对"的钉法）：
+  先在 loader 里建起 `dsh-host-directory-picker-browse` + `dsh-client-ui-directory-picker-browse`，
+  **成功之后**才摘掉 auto 条目（它的析构会连带卸掉原生那对）。
+- 三条护栏（顺序错一条就会把用户的选择器搞没）：① 已经是 browse 就完全不碰；
+  ② 先建 browse、后摘 auto —— 建不起来就原样保留原生；③ 任何失败只记日志，绝不把 dsh web 拖挂。
+  想保留系统原生对话框的人可设 `DSH_REMOTE_NATIVE_PICKER=1` 退出。
+- 诊断面板新增一行「目录选择器」：是原生时会直接说明"远程时对话框弹在电脑那台机器上"，
+  这类"按钮没反应"下次一眼可定位。
+
+### 同版一并做：镜像页首屏加载提示
+
+- 现象：镜像页首屏要拉 dsh web 的全部客户端插件（实测 ~14 MB 的**不可拆分**聚合请求），
+  慢的时候页面上**只有官方那个转圈**，用户无法区分"在加载"和"卡死了"，只能反复刷新——反而更慢。
+- 做法：适配层在**页面解析的第一时间**就挂一条人话提示（早于所有主机判定，因为首屏慢的正是判定等不到的时候）：
+  「正在加载远程桌面…」+ 秒表（已等待 N 秒）+ 分阶段补充说明（8 秒后"可能要一两分钟，会自动进入"、
+  30 秒后"可以下拉刷新重试"）。官方 UI 一就绪就自动撤下，另有 4 分钟兜底与 pagehide 清理。
+- 边界：提示层 `pointer-events:none` + 半透明，**绝不挡住任何点击**；不限定窄屏（Windows/桌面浏览器同样要等）。
+
+### 测试
+
+- `upstream-discovery` 11 条：提示优先级、规范化、身份校验（拒绝陌生服务/5xx/空响应）、
+  候选命中与来源标注、Desktop 端口区间、找不到时回退 3080、真实监听端口解析。
+- **watcher 级行为回归 2 条**（用假 launchctl/pgrep/ps 隔离宿主）：
+  ① 上游在非默认端口时 watcher 必须发现并派生 bridge，且**派生的 bridge 拿到的正是那个端口**；
+  ② 上游确实不可达时保持等待，不谎报在线、不派生。
+- `test:bridge` 388 通过 / 0 失败。
+
 ## [0.6.13] - 2026-09-23
 
 > 补丁版，主题是**「打开慢、转圈两分钟」的根治**，外加三个真实报错。起因是一条诊断：
