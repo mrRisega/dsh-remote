@@ -591,7 +591,17 @@ class EventSubscriber extends EventEmitter {
     if (ws !== null) {
       try {
         ws.removeAllListeners();
-        ws.close(1000, "subscriber closed");
+        // ⚠️ 先挂一个吞掉的 error 监听：**握手中的**连接被 close() 时，ws 会**异步** emit
+        //    'error'（"WebSocket was closed before the connection was established"）。
+        //    上面刚 removeAllListeners()，于是它成了**未捕获错误** —— 真机表现是「解绑」
+        //    这一步偶发把流程打挂（测试里是一条 e2e 偶发红，2026-09-23 定位）。
+        ws.on("error", () => { /* 关闭途中的错误不该冒泡到业务 */ });
+        if (ws.readyState === this.#WebSocketImpl.CONNECTING) {
+          // 还没握手完 → terminate()：立刻中止，且不产生上面那个错误
+          ws.terminate();
+        } else {
+          ws.close(1000, "subscriber closed");
+        }
       } catch {
         /* 关不掉就等 GC */
       }

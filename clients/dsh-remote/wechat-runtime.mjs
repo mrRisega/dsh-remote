@@ -1679,25 +1679,93 @@ export class WeChatRuntime {
   /**
    * 每日简报(兼作 24h 推送窗口的心跳)。
    *
-   * ⚠️ 旧实现有两个问题,一起修了:
+   * ⚠️ 旧实现有三个问题,一起修了:
    *   ① 只把 `{notified, answered}` 交给下游,**没有 lines** → 用户每天收到的是兜底句
    *      「今天暂时没有要做的事。」—— 那不是"今天干了啥",等于白发(业主:"日报发的内容有点问题")。
    *   ② 先把 `last_digest_day` 落盘**再**发送 → 一旦这次没发出去(网络抖动/节点被权限关掉),
    *      当天的简报就被**烧掉**、当天再也不会补发。
+   *   ③ 「读 state → 发送 → 写 state」是一段**跨 await 的读-改-写**:发送要等网络,
+   *      这段窗口里第二个执行者会读到"今天还没发"→ **两条都发出去**
+   *      (2026-09-23 真机:业主收到两条简报)。现在用**原子占位**把"今天这条归我发"锁死。
    */
   async #maybeDigest() {
     if (this.stopping || !this.channel.account || !this.subscriber) return;
     const now = this.clock();
     const hour = new Date(now).getHours();
     if (hour !== this.digestHour) return;
+    const day = this.#today(now);
     const state = loadState(this.relayDir);
-    if (state.last_digest_day === this.#today(now)) return; // 今天已发
+    if (state.last_digest_day === day) return; // 今天已发
+    // ★ 先原子占位再发送:两个实例/两次 tick 并存时,只有一个能拿到(见 #claimDigest)
+    const claim = this.#claimDigest(day);
+    if (!claim.ok) return;
     const s = this.todayStats;
     const lines = this.#digestLines();
     const node = this.subscriber.digestDue({ lines, notified: s.notified, answered: s.answered });
-    const r = await this.notify(node);
+    let r = null;
+    try {
+      r = await this.notify(node);
+    } finally {
+      // 没真发出去 → 释放占位,留给下一 tick 补发(见上面 ②:不能把当天烧掉)
+      if (!(r && r.ok)) this.#releaseDigest(claim);
+    }
     // ★ 只有**真的发出去了**才记"今天已发"(见上面 ②)
-    if (r && r.ok) this.channel.writeState({ last_digest_day: this.#today(now) });
+    if (r && r.ok) this.channel.writeState({ last_digest_day: day });
+  }
+
+  /**
+   * 原子占位「今天这条简报由我来发」。
+   *
+   * 🔴 为什么光看 state 里的 `last_digest_day` 不够:那是**读-改-写**,中间隔着一次网络发送。
+   *    典型撞车场景有两个,都真实发生过:
+   *      · 更新期间新旧 bridge **短暂共存**(旧的还没退、新的已起);
+   *      · 一次发送耗时超过 60s,下一次定时器 tick **叠**上来。
+   *    两者都会让第二个执行者在写盘之前读到"今天还没发" → 用户收到两条。
+   *    `openSync(..., "wx")`(不存在才创建)由内核保证原子,只有一个执行者能拿到 ✅
+   *
+   * 生命期:发成功 → 占位**留着**(它比 state 更强,重启/换实例也不会丢);
+   *        发失败 → 立刻由 `#releaseDigest` 释放,让下一 tick 补发;
+   *        占位超过 10 分钟 = **陈旧**(进程在发送途中被杀)→ 接管它。
+   *        宁可极小概率重发一次,也不要出现"那天彻底不发了"。
+   */
+  #claimDigest(day) {
+    const file = path.join(this.relayDir, `.digest-${day}.sent`);
+    const STALE_MS = 10 * 60_000;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        fs.closeSync(fs.openSync(file, "wx"));
+        this.#pruneDigestClaims(day);
+        return { ok: true, file };
+      } catch (e) {
+        if (!e || e.code !== "EEXIST") {
+          // 目录不可写等:退回"这次不发",绝不因此把 bridge 打挂(简报是锦上添花)
+          return { ok: false, file };
+        }
+        let age = 0;
+        try { age = Date.now() - fs.statSync(file).mtimeMs; } catch { age = 0; }
+        if (age < STALE_MS) return { ok: false, file }; // 别人正在发 / 今天已经发过
+        try { fs.rmSync(file, { force: true }); } catch { return { ok: false, file }; }
+        // 删掉陈旧占位后重抢一次
+      }
+    }
+    return { ok: false, file };
+  }
+
+  /** 发送失败时释放占位(交给下一 tick 补发)。 */
+  #releaseDigest(claim) {
+    if (!claim || !claim.file) return;
+    try { fs.rmSync(claim.file, { force: true }); } catch { /* ignore */ }
+  }
+
+  /** 清掉别的日期留下的占位文件(一天一个,不清理会一年攒 365 个)。 */
+  #pruneDigestClaims(today) {
+    try {
+      for (const name of fs.readdirSync(this.relayDir)) {
+        if (!name.startsWith(".digest-") || !name.endsWith(".sent")) continue;
+        if (name === `.digest-${today}.sent`) continue;
+        try { fs.rmSync(path.join(this.relayDir, name), { force: true }); } catch { /* ignore */ }
+      }
+    } catch { /* 目录读不了就算了:占位本身仍生效 */ }
   }
 
   /** 简报正文:回答"**今天**干了啥"(业主口径:日报是回顾,不是待办清单)。 */

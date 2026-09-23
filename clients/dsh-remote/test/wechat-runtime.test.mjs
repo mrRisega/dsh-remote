@@ -1666,3 +1666,82 @@ test("★ /help 必须逐行分隔:付费档也不许退化成一坨(无换行/�
     await ilink.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// 日报**重复推送**的根治（2026-09-23 业主实测「每日简报推送了两次」）
+//
+// 根因：`#maybeDigest` 是「读 state → 等网络发送 → 写 state」的**跨 await 读-改-写**。
+// 发送要等网络，这段窗口里第二个执行者会读到"今天还没发" → 两条都发出去。
+// 真实撞车场景有两个：① 更新期间新旧 bridge 短暂共存；② 一次发送超过 60s，下一次 tick 叠上来。
+// 修法：`openSync(..., "wx")`（不存在才创建，内核保证原子）占位 —— 只有一个执行者拿得到。
+// ---------------------------------------------------------------------------
+
+/** 两个 runtime **共用同一个 relayDir**（模拟更新期间新旧 bridge 短暂共存）。 */
+async function twoRuntimesSameDir(ilink) {
+  const relayDir = tmp();
+  saveAccount(relayDir, { token: "tok-abc", accountId: "bot-1", baseUrl: ilink.baseUrl, userId: "user-1", boundAt: 1 });
+  const mk = () => {
+    const rt = createWeChatRuntime({
+      relayDir,
+      upstream: "http://127.0.0.1:1",
+      secret: SECRET,
+      tier: "pro",
+      logger: quietLogger()
+    });
+    rt.subscriber = makeFakeSubscriber();
+    rt.digestHour = new Date().getHours(); // 让真实路径通过时刻闸门
+    return rt;
+  };
+  return { rtA: mk(), rtB: mk(), relayDir };
+}
+
+test("★★ 两个实例共存时日报只能发一条(原子占位 —— 真机曾发两条)", async () => {
+  const ilink = await fakeIlink();
+  try {
+    const { rtA, rtB } = await twoRuntimesSameDir(ilink);
+    const before = ilink.state.sends.length;
+    // 并发触发：模拟两个实例在同一分钟内各自 tick（旧实现会两条都发）
+    await Promise.all([rtA.runMaybeDigestNow(), rtB.runMaybeDigestNow()]);
+    const sent = ilink.state.sends.length - before;
+    assert.equal(sent, 1, `★同一天只能有一条简报，实际发出 ${sent} 条（旧实现：两个执行者都读到"今天还没发"）`);
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★ 日报占位是陈旧的(>10 分钟)时必须接管,不能把那天彻底吞掉", async () => {
+  const ilink = await fakeIlink();
+  try {
+    const { rt, relayDir } = await boundRuntime(ilink, { subscriber: makeFakeSubscriber(), tier: "pro" });
+    rt.digestHour = new Date().getHours();
+    const day = `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, "0")}-${String(new Date().getDate()).padStart(2, "0")}`;
+    const lock = path.join(relayDir, `.digest-${day}.sent`);
+    // 造一个 20 分钟前的占位(模拟"上个实例占位后、发送途中被杀")
+    fs.writeFileSync(lock, "");
+    const old = new Date(Date.now() - 20 * 60_000);
+    fs.utimesSync(lock, old, old);
+
+    const before = ilink.state.sends.length;
+    await rt.runMaybeDigestNow();
+    assert.equal(ilink.state.sends.length - before, 1,
+      "★陈旧占位必须被接管并补发 —— 否则进程一被杀,那天就再也不会发简报");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★ 日报占位一天一个,换天时会清掉旧占位(不攒文件)", async () => {
+  const ilink = await fakeIlink();
+  try {
+    const { rt, relayDir } = await boundRuntime(ilink, { subscriber: makeFakeSubscriber(), tier: "pro" });
+    rt.digestHour = new Date().getHours();
+    // 放两个"昨天/前天"的占位
+    fs.writeFileSync(path.join(relayDir, ".digest-2020-01-01.sent"), "");
+    fs.writeFileSync(path.join(relayDir, ".digest-2020-01-02.sent"), "");
+    await rt.runMaybeDigestNow();
+    const left = fs.readdirSync(relayDir).filter((n) => n.startsWith(".digest-") && n.endsWith(".sent"));
+    assert.equal(left.length, 1, `旧占位必须被清掉,只剩今天的,实际:${left.join(", ")}`);
+  } finally {
+    await ilink.close();
+  }
+});

@@ -3,6 +3,15 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.11] - 2026-09-23
+
+> 补丁版。修业主实测的「**每日简报推送了两次**」，外加一处偶发把解绑流程打挂的 WebSocket 关闭问题。
+
+### 修复
+- **日报重复推送**：`#maybeDigest` 是「读 state → 等网络发送 → 写 state」的**跨 await 读-改-写**。发送要等网络，这段窗口里第二个执行者会读到"今天还没发" → **两条都发出去**。两个真实撞车场景：① 更新期间新旧 bridge 短暂共存；② 一次发送超过 60s，下一次 tick 叠上来。
+  现在改为 `openSync(..., "wx")`（不存在才创建，内核保证原子）**占位**：同一时刻只有一个执行者拿得到。占位发成功就留着（比 state 更强，重启/换实例都不会丢）；发失败立刻释放，留给下一 tick 补发；超过 10 分钟视为陈旧（进程在发送途中被杀）会接管 —— 宁可极小概率重发一次，也不要出现"那天彻底不发了"。
+- **偶发「解绑」打挂**：`EventSubscriber.close()` 先 `removeAllListeners()` 再 `close()`，而**握手中**的连接被关闭时 ws 会**异步** emit `error` —— 没有监听者就成了未捕获错误。现在握手中的连接走 `terminate()`，并先挂一个吞掉的 error 监听。
+
 ## [0.6.10] - 2026-09-23
 
 > 正式版（`latest`）。本版把「免费/付费权益」做成**后台可配置的权限包**、补齐管理后台能力，
