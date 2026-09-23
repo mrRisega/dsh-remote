@@ -15,7 +15,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test, { after } from "node:test";
-import { gunzipSync } from "node:zlib";
+import { gunzipSync, gzipSync } from "node:zlib";
 
 // ---------- 本地假上游(doHttp 全链路用;端口先占再 import,UPSTREAM 在模块加载时固定) ----------
 
@@ -29,6 +29,25 @@ const upstream = http.createServer((req, res) => {
   if (req.url === "/big-json") {
     res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
     res.end(BIG_JSON);
+    return;
+  }
+  /* 模拟**真实 dsh web**:上游自己就把响应 gzip 掉并回 content-encoding: gzip
+     (线上 `/plugins/??` 那个 13.4MB 的聚合包正是这样发的)。
+     这条路由是 bridge「丢弃上游压缩」那个 bug 的回归哨兵 —— 见文件末尾的集成用例。 */
+  if (req.url === "/upstream-gzip") {
+    const body = Buffer.from(BIG_JSON, "utf8");
+    if (String(req.headers["accept-encoding"] || "").includes("gzip")) {
+      const z = gzipSync(body);
+      res.writeHead(200, {
+        "content-type": "application/json; charset=utf-8",
+        "content-encoding": "gzip",
+        "content-length": String(z.length)
+      });
+      res.end(z);
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+    res.end(body);
     return;
   }
   if (req.url === "/tiny") {
@@ -212,4 +231,52 @@ test("集成:204 响应不压缩", async () => {
   });
   assert.equal(reply.status, 204);
   assert.equal(reply.headers["content-encoding"], undefined);
+});
+
+test("★ 回归:上游自己 gzip 过(content-encoding: gzip),bridge 仍必须重压回传", async () => {
+  /* 事故原貌(2026-09-23):
+   *   undici 的 fetch 会**自动解压** body,但**保留** `content-encoding: gzip` 响应头。
+   *   旧代码把该头当作"buf 已编码"传给 maybeCompressResponse → 函数保守 return null →
+   *   **永不重压**。于是线上 dsh web 的 /plugins/?? 聚合包(上游 gzip 后 5.12MB)
+   *   被按 13.39MB 原样塞进隧道(实测 3 次,每次 bridge 日志都是 13707KB)。
+   *   免费档 1Mbps 下这一条就把首屏从 ~40 秒拖到 100+ 秒。
+   *
+   * 这条用例守的是:**上游压过 ≠ 我们手上是压缩数据**。bridge 手上永远是 undici 解压后的明文,
+   * 所以必须照常走压缩分支 —— 一旦有人把这个头又接回去,这里立刻红。
+   */
+  const reply = await request({
+    id: "g5",
+    method: "GET",
+    path: "/upstream-gzip",
+    headers: { "accept-encoding": GZIP_ACCEPT, "user-agent": "phone-browser" }
+  });
+  assert.equal(reply.status, 200);
+  assert.equal(
+    reply.headers["content-encoding"],
+    "gzip",
+    "上游压过也照样要重压 —— 少了这个头,隧道里就是 2.6 倍的白流量"
+  );
+  const raw = Buffer.from(reply.body, "base64");
+  const plainLen = Buffer.byteLength(BIG_JSON);
+  assert.ok(raw.length < plainLen, `重压后必须小于明文 (${raw.length} < ${plainLen})`);
+  assert.ok(
+    raw.length < plainLen * 0.6,
+    `应当真正压下去(实测明文 ${plainLen} → ${raw.length});若接近明文说明压缩没生效`
+  );
+  // 只解压一次就应得到原文 —— 这一条同时排除"双重 gzip"这种更坏的结果
+  assert.equal(gunzipSync(raw).toString("utf8"), BIG_JSON, "只能有一层 gzip;解压一次必须就是原文");
+});
+
+test("★ 回归:上游 gzip + 客户端没带 Accept-Encoding → 不压缩,但内容仍是明文原文", async () => {
+  // 上游按 accept-encoding 决定压不压;bridge 解压后原样回传(不带 content-encoding),
+  // 手机端按 identity 处理 → 内容正确,只是没省流量。绝不能出现"标了 gzip 其实是明文"。
+  const reply = await request({
+    id: "g6",
+    method: "GET",
+    path: "/upstream-gzip",
+    headers: { "user-agent": "phone-browser" }
+  });
+  assert.equal(reply.status, 200);
+  assert.equal(reply.headers["content-encoding"], undefined);
+  assert.equal(Buffer.from(reply.body, "base64").toString("utf8"), BIG_JSON);
 });

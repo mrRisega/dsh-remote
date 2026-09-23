@@ -505,6 +505,15 @@ export async function handleFrame(dchOrSend, frame) {
   if (id === undefined || id === null) return;
   const send = toSender(dchOrSend);
   if (type === "http") return handleHttpFrame(send, frame);
+  if (type === "http-abort") {
+    // 手机侧断开了这条流(切页/锁屏):掐掉上游,别在电脑上留一条永不结束的 SSE 连接。
+    const c = streamAborts.get(id);
+    if (c) {
+      streamAborts.delete(id);
+      try { c.abort(); } catch { /* ignore */ }
+    }
+    return;
+  }
   if (type === "ws-open") return handleWsOpen(send, frame);
   if (type === "ws-msg") return handleWsMessage(send, frame);
   if (type === "ws-close") return handleWsClose(send, frame);
@@ -541,7 +550,10 @@ function headerValue(headers, name) {
  * 保守策略:任一条件不满足都返回 null(原样回传):
  *   - 方法非 HEAD、状态非 204/304;
  *   - buf ≥ 1KB(太小不值得压);
- *   - 上游未编码(contentEncoding 为空;undici 已自动解压 body,这里只看原 header);
+ *   - `contentEncoding` 为空 —— ⚠️ 它指的是**手上这份 buf 的编码**,不是上游响应头的值:
+ *     上游头的 "gzip" 在 undici 解压后依然留着(见下),照抄过来只会让我们白丢压缩收益;
+ *     调用方必须传"buf 是否已编码",dsh-bridge 的 doHttp 因此**固定传空串**。
+ *     若哪天 buf 真是一段未解压的字节流,调用方才应把对应编码传进来(函数会保守放弃压缩)。
  *   - 请求 Accept-Encoding 含 gzip(手机浏览器必带;没有就不压,避免手机不会解压);
  *   - content-type 可压缩(排除 text/event-stream);
  *   - gzip 后确实更小(极小文件/不可压数据 gzip 反而更大,保守判断)。
@@ -563,6 +575,97 @@ export async function maybeCompressResponse({ buf, contentType, contentEncoding,
   }
   if (out.length >= buf.length) return null; // 压完没变小
   return { buf: out, headers: { "content-encoding": "gzip" } };
+}
+
+/**
+ * 进行中的 SSE 流:frameId → AbortController。
+ * 手机侧断开时,中继会发 `http-abort`,这里据此掐掉上游(否则电脑上会留一条永不结束的连接)。
+ */
+const streamAborts = new Map();
+
+/**
+ * 中继在 `tunnel-register-ok` 里声明支持的**追加帧能力**。
+ *
+ * 为什么必须协商:browser→中继→bridge 是两段**独立升级**的链路。
+ * 新 bridge 的流式帧(`http-chunk`/`http-end`)对**旧中继**是不认识的 —— 旧中继会把
+ * "仅头部"帧当成一个完整的空响应直接 `end()`,SSE 于是变成"秒断 + 浏览器狂重连",
+ * 比原来的 120 秒挂起**更糟**。所以能力由中继声明:拿不到 `http-stream` 就老实退回
+ * 旧的整包缓冲行为(慢,但正确)。默认空集合 = 保守(连不上/旧中继都不冒险用新帧)。
+ */
+const routerCaps = new Set();
+
+/**
+ * SSE(`text/event-stream`)流式转发。
+ *
+ * 为什么必须流式:`doHttp` 是「整包 `await res.arrayBuffer()`」的语义,而 SSE **永不结束** ——
+ * 实测 DSH 的 `/plugins/events`(client-hmr 的事件通道)每次页面加载都把这条请求挂满
+ * bridge 的 120s 上游超时,然后报错;浏览器 EventSource 立刻重连,于是手机端 Network 里
+ * **永远有一条转圈的请求**,页面也始终拿不到事件。
+ *
+ * 帧协议(对中继**追加**、与既有 `http` 帧并存;不认识 streaming 的旧中继只会忽略后续
+ * chunk,退化成"空 body 后结束",不会把页面打挂):
+ *   ← { id, type:"http",       status, headers, streaming:true }  仅头部,无 body
+ *   ← { id, type:"http-chunk", seq, body, bodyBase64:true }       0..n 次
+ *   ← { id, type:"http-end",   seq }                              流结束(含出错收尾)
+ *   → { id, type:"http-abort" }                                   手机断开 → 掐上游
+ *
+ * ⚠️ E2EE 路径**不**走这里:信封是"一问一答"的结构,SSE 要逐块封/解需要另立协议;
+ *    而现实里 SSE 由 `EventSource` 发出、shim 不接管它(不带头部信封标记),
+ *    所以密文流根本不存在 —— 真要做时再单独设计,不要在这里偷偷降级成明文。
+ *
+ * @returns {Promise<{status:number, chunks:number, bytes:number, aborted?:boolean}>}
+ */
+async function doHttpStream(send, id, method, path, reqHeaders) {
+  const safe = safePath(path);
+  if (safe === null) throw new Error("非法路径");
+  const reqHdrs = sanitizeRequestHeaders(reqHeaders);
+  const ck = harnessCookieOf(); // 新版 dsh web 的浏览器会话 Cookie(否则 401 白页)
+  if (ck) reqHdrs.Cookie = ck;
+  const controller = new AbortController();
+  streamAborts.set(id, controller);
+
+  let res;
+  try {
+    res = await fetch(`${UPSTREAM}${safe}`, { method, headers: reqHdrs, signal: controller.signal });
+  } catch (e) {
+    streamAborts.delete(id);
+    throw e; // 头部都还没发出去 → 交给调用方回一个普通错误帧
+  }
+
+  const status = res.status;
+  // 头部帧:告诉中继"这是一条流",随后才逐块推 body
+  send({
+    id,
+    type: "http",
+    status,
+    headers: sanitizeResponseHeaders(Object.fromEntries(res.headers.entries())),
+    streaming: true
+  });
+
+  let seq = 0;
+  let bytes = 0;
+  try {
+    const reader = res.body && typeof res.body.getReader === "function" ? res.body.getReader() : null;
+    if (reader) {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value || value.length === 0) continue;
+        bytes += value.length;
+        send({ id, type: "http-chunk", seq: ++seq, body: Buffer.from(value).toString("base64"), bodyBase64: true });
+      }
+    }
+  } catch (e) {
+    // 头部已经发出去了:这里**绝不能**抛(调用方会用普通帧回 502,而中继那边响应头已定,
+    // 再写一次 head 会炸)。统一以 http-end 收尾,让 EventSource 按自己的节奏重连。
+    const aborted = controller.signal.aborted === true;
+    streamAborts.delete(id);
+    send({ id, type: "http-end", seq, ...(aborted ? { aborted: true } : { error: String(e?.message || e) }) });
+    return { status, chunks: seq, bytes, aborted };
+  }
+  streamAborts.delete(id);
+  send({ id, type: "http-end", seq });
+  return { status, chunks: seq, bytes };
 }
 
 async function doHttp(method, path, reqHeaders, body, isB64) {
@@ -624,7 +727,14 @@ async function doHttp(method, path, reqHeaders, body, isB64) {
   const compressed = await maybeCompressResponse({
     buf,
     contentType,
-    contentEncoding: res.headers.get("content-encoding") || "",
+    // 🔴 必须传空:这里的 `buf` 是 **undici 已经解压过**的明文,不是上游线速字节。
+    //    以前传的是 `res.headers.get("content-encoding")` —— 而 undici 解压之后**仍会把该头留着**
+    //    (本文件 sanitizeResponseHeaders 的注释正是这么写的:"undici 已自动解压 body,
+    //     content-encoding/length 会误导浏览器")。于是 maybeCompressResponse 看到 "gzip"
+    //    就保守地 `return null`,**永不重压** —— 实测代价:线上 dsh web 的 `/plugins/??`
+    //    聚合包本来 gzip 后 5.12MB,被原样发出 13.39MB(2.6×),免费档 1Mbps 下从 40 秒变成 100+ 秒。
+    //    传空之后语义才是自洽的:"我手上这份 buf 是未编码的明文,可以压"。
+    contentEncoding: "",
     acceptEncoding: headerValue(reqHeaders, "accept-encoding"),
     status: res.status,
     method
@@ -693,6 +803,13 @@ export async function handleHttpFrame(dchOrSend, frame) {
     }
   }
   try {
+    // SSE 必须流式转发(否则会挂满 120s 超时,见 doHttpStream 注释)。
+    // 客户端是 EventSource 时必带 Accept: text/event-stream,以此为准(不看路径白名单,免得漏)。
+    if (routerCaps.has("http-stream") && String(headerValue(headers, "accept") || "").includes("text/event-stream")) {
+      const s = await doHttpStream(send, id, method, path, headers);
+      console.log(`[bridge] ${method} ${path} → SSE ${s.status} (${Date.now() - t0}ms, ${s.chunks} 块 / ${(s.bytes / 1024).toFixed(1)}KB${s.aborted ? ", 手机已断开" : ""})`);
+      return;
+    }
     const reply = await doHttp(method, path, headers, body, !!isB64);
     reply.id = id;
     reply.type = "http";
@@ -1157,6 +1274,9 @@ function connectTunnel(token) {
     try {
       receive(raw, (frame) => {
         if (frame?.type === "tunnel-register-ok") {
+          // 记下中继声明的追加帧能力(旧中继不带 caps → 空集合 → 退回整包缓冲,见 routerCaps 注释)
+          routerCaps.clear();
+          for (const c of Array.isArray(frame.caps) ? frame.caps : []) routerCaps.add(String(c));
           // 中继注册成功 = 手机端此刻真的能进这台电脑:面板据此把阶段推进到 online(已连接 ✅)
           persistBridgeState({ device_id: DEVICE_ID, tunnel_registered_at: Date.now(), phase: "online", last_error: null });
           console.log(`[bridge] ✅ router 注册成功: ${DEVICE_ID},等待手机访问 /remote/${DEVICE_ID}/`);
@@ -1172,6 +1292,7 @@ function connectTunnel(token) {
     } catch (e) { console.log(`[bridge] 隧道帧错误: ${e.message}`); }
   });
   ws.on("close", (code, reason) => {
+    routerCaps.clear(); // 换中继/断线:能力重新协商,期间一律退回保守行为
     clearInterval(heartbeat);
     console.log(`[bridge] 隧道断开(code=${code}${reason ? ", " + reason : ""})`);
     closeAllWsSessions();

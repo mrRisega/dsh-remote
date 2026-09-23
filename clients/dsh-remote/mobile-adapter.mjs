@@ -1096,6 +1096,36 @@ const SCRIPT = `(() => {
       } catch (e8) { /* 引导条失败绝不能影响主功能 */ }
     };
 
+    /* 适配层自己创建的「抽屉入口」引用(汉堡按钮 / 遮罩),提到 boot() 外层保存。
+       为什么必须提到外层:官方 SPA 重渲染时会整片替换 body 子树,把这两个节点一起冲掉;
+       留住引用才能在下面的「存在性看门狗」里把**同一个节点**补回去(节点不变 → 挂在它上面的
+       click 处理、CSS 类、aria 属性全都原样保留,不会出现"补回来点不动"的假按钮)。 */
+    let maHamburger = null, maScrim = null;
+
+    /* 节点是否已经脱离文档。判不出来时一律当作"还在"—— 宁可不补,也绝不重复插入。 */
+    const maDetached = (el) => {
+      if (!el) return false;
+      try { if (typeof el.isConnected === "boolean") return !el.isConnected; } catch (eConn) { /* 继续退化 */ }
+      try {
+        const b = document.body;
+        if (b && typeof b.contains === "function") return !b.contains(el);
+      } catch (eHas) { /* 继续退化 */ }
+      return false;
+    };
+
+    /* —— 存在性看门狗:「建好了」不等于「一直都在」----------------------------------
+       done=true 只保证**曾经**建出来过。官方在路由/会话切换时会重建 DOM 子树,我们的汉堡按钮
+       与遮罩会跟着消失 —— 用户看到的就是"抽屉按钮用着用着又没了"。
+       这里按**引用**补回(不是重建),只在窄屏做(宽屏本来就不需要抽屉入口)。
+       幂等:节点还在文档里 → 什么都不做;boot 还没成功(引用为 null) → 同样什么都不做。 */
+    const ensureDrawerChrome = () => {
+      try {
+        if (!NARROW() || !document.body) return;
+        if (maDetached(maScrim)) document.body.appendChild(maScrim);
+        if (maDetached(maHamburger)) document.body.appendChild(maHamburger);
+      } catch (eChrome) { /* 补不回去也不能影响抽屉开合本身 */ }
+    };
+
     let done = false;
     const boot = () => {
       if (!HOSTISH()) return;
@@ -1228,6 +1258,7 @@ const SCRIPT = `(() => {
       const scrim = document.createElement("div");
       scrim.className = "dsh-ma-scrim";
       document.body.appendChild(scrim);
+      maScrim = scrim;                          // 供「存在性看门狗」在被官方冲掉后补回
       scrim.addEventListener("click", (e) => {
         e.stopPropagation();
         userWantsOpen = false;                    // 用户明确要关(遮罩的作用就是关抽屉)
@@ -1245,6 +1276,7 @@ const SCRIPT = `(() => {
       hamburger.setAttribute("aria-label", "打开菜单");
       hamburger.innerHTML = '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg>';
       document.body.appendChild(hamburger);
+      maHamburger = hamburger;                  // 供「存在性看门狗」在被官方冲掉后补回
       hamburger.addEventListener("click", (e) => {
         e.stopPropagation(); e.preventDefault();
         const nowOpen = document.documentElement.classList.contains("dsh-ma-sidebar-open");
@@ -1516,10 +1548,82 @@ const SCRIPT = `(() => {
     };
 
     if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot); else boot();
-    /* 官方模块系统异步挂载 UI,晚一点再补几次(幂等,done 守卫);同时等鲸鱼/设置弹层就位 */
-    [700, 1600, 3200, 7000, 12000].forEach((ms) =>
-      setTimeout(() => { try { boot(); whaleHookInit(); watchSettings(); } catch (e) { /* 幂等重试 */ } }, ms)
-    );
+
+    /* ================= 执行时机:无限期等待官方 DOM 就绪 =================
+       用户实测原话(2026-09-2x):「在网络比较慢的情况下,左边的抽屉按钮有时候出不来。
+                                   甭管网络有多慢,都要让那个抽屉能加载出来。」
+       ⚠️ 旧实现是**一组写死的固定重试**([700, 1600, 3200, 7000, 12000]ms),而汉堡按钮的创建
+          排在 boot() 里 "if (!frame) return;" 那一行之后 —— 官方 SPA bundle 有 13.4MB(实测未压缩),
+          免费档被中继限速到 128KB/s 时冷启动要 1-2 分钟,官方 frame 在 12 秒内根本没出现:
+          5 次重试全部在那一行返回 → done 永远为 false → 汉堡按钮**永远**不创建
+          → 用户看到"左边抽屉按钮出不来"。任何固定窗口都只是把这个阈值往后挪,治不了根。
+       现在改成「事件驱动 + 低频兜底」的**无限期**等待,只要抽屉入口还没建好就一直试:
+         · MutationObserver(document/subtree):官方 frame 一挂上就立刻跟上(网络快时零延迟);
+         · setInterval(1000ms):兜底 + 存在性看门狗 —— observer 不可用/被绕过时照样收敛,
+           也负责在 done 之后发现官方重渲染冲掉了我们的节点并补回。
+       两条路都只是"再调一次 pump()",pump 内部**全部幂等**(done / fabDone / whaleGuardsOn /
+       settingsWatchOn / drawerAutoCloseOn 等守卫都在),重复调用不会产生任何副作用,
+       也不改变"执行什么"——开合、遮罩不变量、sync()、isDrawer() 判定一行未动。 */
+    let maTorn = false, maInterval = 0, maObserver = null, maRafPending = false;
+    /* 廉价的"boot() 还有事可做吗"闸门(只读两个现成的布尔标志,不做任何 DOM 操作):
+         · fab 还没建出来(fabDone=false) → 要跑;
+         · 抽屉那段还没建好(done=false)且当前是窄屏 → 要跑(旋转/缩放回窄屏也能补建)。
+       两者都不成立 → boot() 里已无事可做,**绝不能**再跑:boot() 第一行 HOSTISH() 会把
+       documentElement.outerHTML 整个序列化一遍(最长 200KB),而官方流式输出时每帧都有 DOM
+       变更 —— 没有这道闸门就会变成每秒几十次全量序列化(旧实现只跑 5 次,不会有这个问题)。 */
+    const bootUseful = () => !fabDone || (!done && NARROW());
+    const pump = () => {
+      if (maTorn) return;
+      if (bootUseful()) { try { boot(); } catch (eBoot) { /* 幂等重试 */ } }
+      try { ensureDrawerChrome(); } catch (eChrome2) { /* 忽略 */ }
+      if (!whaleGuardsOn || !settingsWatchOn) {
+        try { whaleHookInit(); watchSettings(); } catch (eHook) { /* 两者内部都自带一次性守卫 */ }
+      }
+    };
+    /* 节流:一次 DOM 变更往往产生几十条记录,逐条 boot() 就是忙轮询。
+       统一合并成"本帧最多跑一次"(有 rAF 用 rAF,没有就退化成 0ms 宏任务) —— 天然去重。 */
+    const schedulePump = () => {
+      if (maTorn || maRafPending) return;
+      maRafPending = true;
+      const run = () => { maRafPending = false; pump(); };
+      try { if (typeof requestAnimationFrame === "function") { requestAnimationFrame(run); return; } } catch (eRaf) { /* 退化 */ }
+      setTimeout(run, 0);
+    };
+    /* 挂上"叫醒"的两条路。做成可重入(先清旧的再建新的),这样 bfcache 恢复后能重新武装。 */
+    const maArm = () => {
+      maTorn = false;
+      maRafPending = false;            // 冻结时若有一帧没跑到,不清掉就会永远挡住后续调度
+      try { if (maObserver) maObserver.disconnect(); } catch (eA1) { /* 忽略 */ }
+      maObserver = null;
+      try { if (maInterval) clearInterval(maInterval); } catch (eA2) { /* 忽略 */ }
+      maInterval = 0;
+      try {
+        if (typeof MutationObserver === "function" && document.documentElement) {
+          maObserver = new MutationObserver(schedulePump);
+          /* 只观察 childList+subtree:节点被官方换掉/新增才叫醒我们。
+             ⚠️ 刻意**不**观察 attributes —— 我们自己的 sync() 就会不停改 class,那会变成自激循环。 */
+          maObserver.observe(document.documentElement, { childList: true, subtree: true });
+        }
+      } catch (eObs) { maObserver = null; /* 退化:只靠下面的兜底表 */ }
+      try { maInterval = setInterval(pump, 1000); } catch (eInt) { maInterval = 0; }
+    };
+    maArm();
+    /* 清理:页面卸载时断开观察者与兜底表(bfcache/长驻页面都不留悬挂回调)。
+       pagehide 覆盖 bfcache 场景,unload 兜底更老的浏览器。 */
+    const maTeardown = () => {
+      maTorn = true;
+      try { if (maObserver) maObserver.disconnect(); } catch (eD1) { /* 忽略 */ }
+      maObserver = null;
+      try { if (maInterval) clearInterval(maInterval); } catch (eD2) { /* 忽略 */ }
+      maInterval = 0;
+    };
+    try { window.addEventListener("pagehide", maTeardown); } catch (ePh) { /* 忽略 */ }
+    try { window.addEventListener("unload", maTeardown); } catch (eUl) { /* 忽略 */ }
+    /* 手机上"切到别的 App 再切回来"走的常是 bfcache:pagehide(persisted=true) → pageshow(persisted=true)。
+       DOM 原样保留但计时器/观察者已断 —— 这里重新武装,否则回到页面后看门狗就永久失灵了。 */
+    try {
+      window.addEventListener("pageshow", (ev) => { try { if (ev && ev.persisted) maArm(); } catch (ePs) { /* 忽略 */ } });
+    } catch (ePs2) { /* 忽略 */ }
   } catch (e) { if (window.console) console.warn("[dsh-mobile-adapter]", e && e.message); }
 })();`;
 

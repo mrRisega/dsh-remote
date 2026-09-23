@@ -206,6 +206,9 @@ function signLocalJwt(sub, plan) {
 
 // 设备 id 格式:dev-<12hex>(与 bridge 稳定 identity 一致);也兼容旧 bridge-xxx(宽松)
 const DEVICE_ID_RE = /^(dev-[0-9a-f]{12}|[a-z0-9][a-z0-9-]{1,63})$/i;
+/** 本中继支持的追加帧能力(注册 ack 下发给 bridge;决定它敢不敢用流式/中止帧)。 */
+const ROUTER_FRAME_CAPS = ["http-stream"];
+
 const MAX_BODY_BYTES = 64 * 1024 * 1024; // 请求体上限 64MB(nginx client_max_body_size 200m 之下)
 const HTTP_REPLY_TIMEOUT_MS = 150_000;   // 等 bridge 回包上限(bridge 上游自身 120s)
 const WS_OPEN_TIMEOUT_MS = 20_000;       // 等 bridge ws-open 应答上限
@@ -306,6 +309,56 @@ function makeFrameReceiver() {
 // ---------- 工具 ----------
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * 设备无关的静态资源兜底(2026-09-23)。
+ *
+ * 问题(用户实测的 manifest 404):`dsh web` 的 HTML 里有 `<base href="/">`,于是
+ * `./manifest.webmanifest` **永远**解析成根路径 `/manifest.webmanifest`;而根路径要按
+ * `dsh_device` cookie 才能路由到某一台设备。浏览器取 **PWA manifest** 时是不带凭据的
+ * (manifest 抓取按规范以 credentials:omit 进行),所以根路径解析不到设备 → 404。
+ *
+ * 为什么由 router 自己发:manifest 内容与"哪台设备"无关(start_url 指向手机外壳 `/app/`),
+ * 没必要为它挑一台设备 —— 何况这类请求本来就没凭据,替它选设备反而是越权风险。
+ * 只在**解析不到设备**时兜底:能正常路由的请求一律原样转发上游,行为不变。
+ */
+const REMOTE_ICON_SVG =
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">'
+  + '<rect width="64" height="64" rx="14" fill="#111827"/>'
+  + '<path d="M20 44V20h9c7 0 12 4.6 12 12s-5 12-12 12h-9zm7-6h2c3.6 0 6-2.3 6-6s-2.4-6-6-6h-2v12z" fill="#f9fafb"/>'
+  + "</svg>";
+const DEVICE_FREE_ASSETS = new Map([
+  ["/manifest.webmanifest", {
+    type: "application/manifest+json; charset=utf-8",
+    body: JSON.stringify({
+      id: "/app/",
+      name: "DSH 远程控制",
+      short_name: "DSH 远程",
+      description: "在手机上远程控制电脑上的 DeepSeek Harness",
+      start_url: "/app/",
+      scope: "/",
+      display: "standalone",
+      background_color: "#111827",
+      theme_color: "#111827",
+      icons: [{ src: "/favicon.svg", sizes: "any", type: "image/svg+xml", purpose: "any" }]
+    })
+  }],
+  ["/favicon.svg", { type: "image/svg+xml; charset=utf-8", body: REMOTE_ICON_SVG }]
+]);
+
+/** 若该路径属于"设备无关静态资源",直接本地应答;否则返回 false(调用方继续走 404 流程)。 */
+function serveDeviceFreeAsset(res, pathname) {
+  const asset = DEVICE_FREE_ASSETS.get(pathname);
+  if (!asset) return false;
+  const body = Buffer.from(asset.body, "utf8");
+  res.writeHead(200, {
+    "content-type": asset.type,
+    "content-length": String(body.length),
+    "cache-control": "public, max-age=3600"
+  });
+  res.end(body);
+  return true;
+}
 
 function jsonBody(status, obj) {
   return { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }, body: JSON.stringify(obj) };
@@ -651,6 +704,8 @@ const server = http.createServer(async (req, res) => {
 
   const parsed = resolveRoute(req, url);
   if (!parsed) {
+    // 设备无关的静态资源先兜底(manifest/favicon:浏览器取它们时不带凭据,永远解析不到设备)
+    if ((req.method === "GET" || req.method === "HEAD") && serveDeviceFreeAsset(res, url.pathname)) return;
     // 根路径没有可用的设备凭据（dsh_device cookie 过期/被清）、或 /remote/<未知设备>：
     // 过去是一句纯文本 404 —— 用户在手机上看就是白屏。现在页面导航一律引导回设备列表。
     if (isDocNavigation(req)) {
@@ -734,6 +789,9 @@ const server = http.createServer(async (req, res) => {
     if (p && p.res === res) {
       pendingHttp.delete(id);
       clearTimeout(p.timer);
+      // 流式:手机侧断开(切页/锁屏/EventSource 主动 close)→ 通知 bridge 掐掉上游 SSE,
+      // 否则电脑端会留下一条永远开着的连接(DSH 的 /plugins/events 不会自己结束)。
+      if (p.streaming === true) sendToBridge(devices.get(p.deviceId), { id, type: "http-abort" });
     }
   });
 });
@@ -800,7 +858,11 @@ bridgeWss.on("connection", (ws, req) => {
         devices.set(deviceId, dev);
         clearTimeout(regTimer);
         try {
-          ws.send(JSON.stringify({ type: "tunnel-register-ok", deviceId }));
+          // caps:告诉 bridge 本中继支持哪些**追加**帧协议。
+          // 为什么要有这一步:新 bridge 的 SSE 流式帧(http-chunk/http-end)对旧中继是不认识的,
+          // 旧中继会把"仅头部"帧当成完整响应直接 end → SSE 变成"秒断+狂重连",比原来的
+          // 120s 挂起更糟。所以能力由**中继**声明,bridge 没有这个 caps 就退回旧的整包缓冲行为。
+          ws.send(JSON.stringify({ type: "tunnel-register-ok", deviceId, caps: ROUTER_FRAME_CAPS }));
         } catch {
           /* ignore */
         }
@@ -834,8 +896,13 @@ function cleanupDevice(dev) {
       pendingHttp.delete(id);
       clearTimeout(p.timer);
       if (!p.res.writableEnded) {
-        p.res.writeHead(502, { "content-type": "application/json" });
-        p.res.end(JSON.stringify({ error: { code: "device_offline", message: "bridge 断开,请重试" } }));
+        // 流式响应:响应头早就发出去了,不能再写 502 JSON —— 直接收尾,让 EventSource 自己重连。
+        if (p.streaming === true) {
+          try { p.res.end(); } catch { /* ignore */ }
+        } else {
+          p.res.writeHead(502, { "content-type": "application/json" });
+          p.res.end(JSON.stringify({ error: { code: "device_offline", message: "bridge 断开,请重试" } }));
+        }
       }
     }
   }
@@ -867,6 +934,25 @@ function onBridgeFrame(dev, frame) {
   if (type === "http") {
     const p = pendingHttp.get(id);
     if (!p) return;
+
+    // ── SSE 流式响应(2026-09-23)────────────────────────────────────────────
+    // bridge 遇到 `text/event-stream` 时不再整包缓冲:先发**仅头部**帧(streaming:true),
+    // 之后用 `http-chunk` 逐块推、`http-end` 收尾。
+    // 为什么必须做:DSH 的 `/plugins/events`(HMR 事件通道)是**永不结束**的流,而旧协议
+    // 只有"一个完整响应"帧 —— bridge 只能一直 await 到自己的 120s 上游超时才报错,
+    // 手机端于是每次开页面都挂满两分钟,EventSource 再立刻重连,Network 里永远有一条转圈的请求。
+    if (frame.streaming === true) {
+      clearTimeout(p.timer);
+      const sStatus = Number(frame.status) || 502;
+      if (sStatus >= 200 && sStatus < 400) reportMilestone(p.userId, "remote");
+      const sHeaders = sanitizeResHeaders(frame.headers || {});
+      delete sHeaders["content-length"]; // 流式:长度未知,交给 chunked
+      p.streaming = true;
+      p.res.writeHead(sStatus, sHeaders);
+      try { p.res.flushHeaders?.(); } catch { /* 立即把响应头推给手机,EventSource 好尽快 open */ }
+      return; // ⚠️ 刻意**不删** pendingHttp:后续 chunk 还要靠它
+    }
+
     pendingHttp.delete(id);
     clearTimeout(p.timer);
     const buf = frame.bodyBase64
@@ -883,6 +969,29 @@ function onBridgeFrame(dev, frame) {
       return;
     }
     void writeBody(p.res, buf);
+    return;
+  }
+
+  // ── SSE 流式:数据块 ───────────────────────────────────────────────────────
+  if (type === "http-chunk") {
+    const p = pendingHttp.get(id);
+    if (!p || p.streaming !== true) return;
+    const cbuf = frame.bodyBase64
+      ? Buffer.from(String(frame.body || ""), "base64")
+      : Buffer.from(String(frame.body || ""), "utf8");
+    if (cbuf.length === 0) return;
+    try {
+      if (!p.res.destroyed && !p.res.writableEnded) p.res.write(cbuf);
+    } catch { /* 手机已断开:交给 res.close / cleanupDevice 收尾 */ }
+    return;
+  }
+
+  // ── SSE 流式:结束 ─────────────────────────────────────────────────────────
+  if (type === "http-end") {
+    const p = pendingHttp.get(id);
+    if (!p || p.streaming !== true) return;
+    pendingHttp.delete(id);
+    try { if (!p.res.writableEnded) p.res.end(); } catch { /* ignore */ }
     return;
   }
 

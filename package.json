@@ -1,6 +1,6 @@
 {
   "name": "@mrrisega/dsh-remote",
-  "version": "0.6.12",
+  "version": "0.6.13",
   "description": "手机远程控制 DeepSeek Harness · Remote control DeepSeek Harness (dsh web) from any phone browser — 100% 全功能 App 级体验：发消息、看工具执行、审批权限、改设置、管凭据，含特权操作，免内网穿透。一条命令安装 npx @mrrisega/dsh-remote。Mobile remote control for DSH, self-host or SaaS, no server needed on LAN.",
   "keywords": [
     "deepseek-harness",
@@ -51,7 +51,7 @@
   },
   "scripts": {
     "test": "npm run test:router && npm run test:plugin && npm run test:bridge",
-    "test:router": "NODE_OPTIONS=\"--require $PWD/scripts/test-net-guard.cjs ${NODE_OPTIONS:-}\" node --test packages/relay-router/test/native-device-selection.test.mjs packages/relay-router/test/native-app-entry.test.mjs packages/relay-router/test/presence-report.test.mjs packages/relay-router/test/logger.test.mjs",
+    "test:router": "NODE_OPTIONS=\"--require $PWD/scripts/test-net-guard.cjs ${NODE_OPTIONS:-}\" node --test packages/relay-router/test/native-device-selection.test.mjs packages/relay-router/test/native-app-entry.test.mjs packages/relay-router/test/presence-report.test.mjs packages/relay-router/test/logger.test.mjs packages/relay-router/test/device-free-assets.test.mjs packages/relay-router/test/sse-streaming-contract.test.mjs",
     "_comment:test:plugin": "DSH_RELAY_BUNDLED_RUNTIME=/nonexistent = 强制走 npx 兜底分支（否则本机跑过 npm pack 后 packages/dsh-remote-web/runtime 存在，用例会改成走本地拷贝）。DSH_RELAY_SKIP_SERVICE=1 = 测试隔离：插件加载时不做真实系统操作（npx 补装 / launchctl / 重启 harness）；需要真实分支的用例自行 unset（见 account-switch / runtime-provision / harness-restart 用例注释）。DSH_RELAY_DEFAULT_API= 死端口：用例拆掉临时目录后，仍在飞的后台请求（装机上报重试等）会读到空配置并回落「默认云端地址」—— 指到本地死端口才不会打生产。",
     "test:plugin": "DSH_REMOTE_TELEMETRY=0 DSH_RELAY_SKIP_SERVICE=1 DSH_RELAY_DEFAULT_API=http://127.0.0.1:1 DSH_RELAY_BUNDLED_RUNTIME=/nonexistent-dsh-bundled NODE_OPTIONS=\"--require $PWD/scripts/test-net-guard.cjs ${NODE_OPTIONS:-}\" node --test --test-concurrency=1 packages/dsh-remote-web/test/*.test.mjs",
     "_comment:test:bridge": "⚠️ 必须 --test-concurrency=1（与 test:plugin 对齐）：tunnel-auth 有一条「bridge 5 秒内必须重连」的硬期限，并行跑时新增用例抢 CPU 会把它撞破 → 偶发假红（实测单独跑 2/2 通过、并发跑偶发 0/2）。假红比慢更贵。",
