@@ -110,8 +110,12 @@ jobs:
           sleep 8
           tmp=$(mktemp)
           url="https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/dsh-remote-web.tgz?cb=$(date +%s)"
-          curl -sL --max-time 60 -o "$tmp" "$url"
-          got=$(tar -xzOf "$tmp" package/package.json | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).version")
+          # 这一步是**提示性**的：发布本身已经在上一步成功。CDN/SSL 抖动（实测 exit 35）不该让整条流水线变红。
+          if ! curl -sL --max-time 60 -o "$tmp" "$url"; then
+            echo "::warning::latest/download 校验未能完成（网络/SSL 抖动），不影响本次发布；可稍后手动复查"
+            exit 0
+          fi
+          got=$(tar -xzOf "$tmp" package/package.json 2>/dev/null | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).version" 2>/dev/null || echo "?")
           echo "latest/download 现在返回: $got"
           if [ "$got" != "$VERSION" ]; then
             # CDN 有缓存：刚发布时可能仍返回旧内容，或另有更新的 release。提示而非失败。
