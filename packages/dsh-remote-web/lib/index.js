@@ -20,12 +20,13 @@
 //   - 0.1.2+ ?token 浏览器鉴权会话代持（0.4.1 起）
 //
 // 不依赖任何第三方包：只使用 node 内置模块与 cordis 注入的 webServer 服务。
-import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync, accessSync, chmodSync, openSync, closeSync, readSync, fstatSync, rmSync, renameSync, statSync, constants as fsConstants } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync, accessSync, chmodSync, openSync, closeSync, readSync, fstatSync, rmSync, renameSync, statSync, copyFileSync, cpSync, constants as fsConstants } from "node:fs";
 import { join, dirname, sep, delimiter } from "node:path";
 import { execSync, spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { buildFixPrompt, REPORT_TITLE, REPORT_FORMAT, REPORT_KEYS } from "./fix-prompt.js";
 
 /** 本插件在 host 侧的服务依赖。 */
 export const inject = ["webServer"];
@@ -89,6 +90,88 @@ const DEFAULT_RELAY_DIR = process.env.DSH_RELAY_DIR || join(homedir(), ".dsh-rem
 const DEFAULT_API = String(process.env.DSH_RELAY_DEFAULT_API || "").trim()
   || "https://n.risegao.cn:13443/relay-api";
 const DEFAULT_APP_URL = "https://n.risegao.cn:13443/app/";
+
+// ---------- 上游 dsh web 地址（bridge/watcher 都要连它，绝不写死 3080） ----------
+//
+// 【2026-09-23 用户实测事故】这里（以及运行时的 checkUpstream）原本把上游**写死**
+// `http://127.0.0.1:3080`：只要用户的 dsh web 不在默认端口（`dsh web --port 8090`、
+// profile 里配了 port、或 `--port 0` 让系统分配空闲端口），watcher 的「dsh web 在线吗」
+// 探测就永远失败 → **bridge 永远不启动**，而面板只会说「正在启动 Bridge…」（错误为空）
+// —— 用户反复修复也没有任何变化。
+// 这个插件就跑在 dsh web 进程里：`ctx.webServer` 是它自己的 HTTP 服务（`port` 是实际监听端口，
+// `config.port=0` 时也已被系统分配并回填），因此上游地址必须是**问出来**的，不是猜出来的。
+let webServerCtx = null;
+const FALLBACK_UPSTREAM = "http://127.0.0.1:3080";
+/** 从 dsh web 服务实例取实际端口（apply 时可能还没 listen 完，故调用时再读）。 */
+function boundWebPort() {
+  let ws = null;
+  try { ws = webServerCtx?.webServer || null; } catch { ws = null; } // 宿主 ctx 已销毁时静默回落
+  for (const v of [ws?.port, ws?.config?.port]) {
+    const n = Number(v);
+    if (Number.isInteger(n) && n > 0) return n;
+  }
+  const raw = String(process.env.DSH_WEB_URL || "").trim();
+  if (raw) {
+    try {
+      const n = Number(new URL(raw).port);
+      if (Number.isInteger(n) && n > 0) return n;
+    } catch { /* 非 URL：忽略 */ }
+  }
+  return 0;
+}
+/**
+ * 本机 dsh web 的**回环**上游地址（bridge 的 loopback 围栏只认 127.0.0.1，
+ * 所以即使 dsh web 绑的是 0.0.0.0，上游也照样写回环地址）。
+ * 优先级：显式 DSH_BRIDGE_UPSTREAM（用户/部署覆盖）> 实际监听端口 > DSH_WEB_URL 的端口 > 3080。
+ */
+function upstreamUrl() {
+  const explicit = String(process.env.DSH_BRIDGE_UPSTREAM || "").trim();
+  if (explicit) return explicit.replace(/\/+$/, "");
+  const port = boundWebPort();
+  return port ? `http://127.0.0.1:${port}` : FALLBACK_UPSTREAM;
+}
+
+/**
+ * 把上游地址落盘（`<relayDir>/.dsh-upstream`），供**没有环境变量**的那些守护读取：
+ * 开机自启的 watcher（Windows 登录任务 / launchd）由系统拉起，拿不到本进程的 env，
+ * 只有插件半知道 dsh web 真实监听在哪个端口。运行时（0.6.12+）读这个文件当第二优先来源。
+ * 内容没变就不写（面板每轮都会走到这里，别把磁盘写热）。
+ */
+const UPSTREAM_FILE = ".dsh-upstream";
+function publishUpstream(relayDir) {
+  if (skipsSystemOps()) return; // 测试/诊断隔离：不得对磁盘产生任何副作用（含创建配置目录）
+  try {
+    const url = upstreamUrl();
+    const file = join(relayDir, UPSTREAM_FILE);
+    let cur = "";
+    try { cur = readFileSync(file, "utf8").trim(); } catch { /* 首次 */ }
+    if (cur === url) return;
+    mkdirSync(relayDir, { recursive: true });
+    writeFileSync(file, url + "\n", { mode: 0o600 });
+  } catch { /* 非关键：读不到就沿用运行时的回退链 */ }
+}
+
+/**
+ * 上游是否可达（面板诊断用，与 watcher 的判据同构：**只认网络失败**，
+ * 4xx/5xx 也算「端口在听」——那样 bridge 连得上，问题在别处）。
+ * 带 TTL 缓存：面板 2~3s 轮询一次，不能每次都发一个请求。
+ */
+const UPSTREAM_PROBE_TTL_MS = 5000;
+const upstreamProbes = new Map();
+async function probeUpstream(relayDir) {
+  const url = upstreamUrl();
+  const cached = upstreamProbes.get(relayDir);
+  if (cached && cached.url === url && Date.now() - cached.at < UPSTREAM_PROBE_TTL_MS) return cached.value;
+  let value;
+  try {
+    await fetch(url + "/", { signal: AbortSignal.timeout(1500) });
+    value = { ok: true, error: "" };
+  } catch (e) {
+    value = { ok: false, error: String(e?.message || e).slice(0, 200) };
+  }
+  upstreamProbes.set(relayDir, { at: Date.now(), url, value });
+  return value;
+}
 
 /**
  * 自启动服务（launchd plist / systemd unit）与子进程使用的 PATH。
@@ -395,9 +478,21 @@ function healStalledJobs(relayDir) {
 }
 
 /** 读取 JSON body。 */
-async function readJsonBody(req) {
+async function readJsonBody(req, maxBytes = 256 * 1024) {
   let raw = "";
-  for await (const chunk of req) raw += chunk;
+  let n = 0;
+  let tooLarge = false;
+  for await (const chunk of req) {
+    n += chunk.length;
+    if (n > maxBytes) {
+      // 超限：**继续把请求读完**（丢弃内容）再返回，否则客户端可能在等一个没被读完的请求
+      tooLarge = true;
+      raw = "";
+      continue;
+    }
+    if (!tooLarge) raw += chunk;
+  }
+  if (tooLarge) return { __tooLarge: true }; // 上限保护：面板只发诊断/报告，256KB 足够
   if (!raw) return {};
   try {
     return JSON.parse(raw);
@@ -588,12 +683,78 @@ function scheduleHarnessMint(ctx, relayDir) {
 // ---------- 桌面运行环境就绪判定 / 系统级操作开关 ----------
 
 /**
- * 桌面运行环境是否就绪：固化运行时 `<relayDir>/dsh-setup.mjs` 存在即视为就绪。
- * 这是「bridge 能不能跑」的唯一权威判据，也是 launchd 自启动指向的入口脚本
- * （见 writeAutostartFile）——插件市场只装「插件半」时该文件不存在，必须先补装。
+ * 入口脚本（`<relayDir>/dsh-setup.mjs`）**声明要用到的**运行时文件清单。
+ *
+ * 为什么要解析入口脚本、而不是写死一张文件表：
+ *   · 写死会与运行时版本漂移（0.6.x 期间 clients/ 下文件增删过多次），漏一个就把好机器误判成坏机器；
+ *   · 入口脚本自己「点名」的文件就是它启动/拉起 bridge 时**必然**要读到的文件，是唯一稳定的真相源。
+ * 解析规则：只认**带引号的相对路径字面量**（注释里用反引号提到的名字不算），避免被说明文字误伤。
+ * 再对每个点名的脚本做一次有界闭包展开（它的 `./x.mjs` 相对导入同样必须存在）。
+ *
+ * 结果按「入口文件的 mtime+size」缓存：面板 2~3s 轮询一次，不能每次都读 200KB 源码；
+ * 而入口一变（补装/更新）键就变，立刻重算——依赖文件后来补齐时靠 existsSync 当场看到。
+ */
+const RUNTIME_MANIFEST_CACHE = new Map();
+const RUNTIME_REF_RE = /["'](?:\.\/)?(clients[\\/]dsh-remote[\\/][^"'\n]+?\.mjs)["']/g;
+const RUNTIME_IMPORT_RE = /from\s+["']\.\/([^"'\n]+\.mjs)["']/g;
+/** 闭包展开深度上限：入口 → dsh-bridge.mjs → 其直接依赖（实测正好 2 层）。 */
+const RUNTIME_CLOSURE_DEPTH = 4;
+
+function runtimeManifest(relayDir) {
+  const entry = join(relayDir, "dsh-setup.mjs");
+  let key = "";
+  try {
+    const st = statSync(entry);
+    key = `${st.mtimeMs}:${st.size}`;
+  } catch {
+    return []; // 入口不存在 → 由 missingRuntimeFiles 单独报告
+  }
+  const cached = RUNTIME_MANIFEST_CACHE.get(relayDir);
+  if (cached && cached.key === key) return cached.files;
+  let src = "";
+  try { src = readFileSync(entry, "utf8"); } catch { return []; }
+  const files = new Set();
+  const queue = [...src.matchAll(RUNTIME_REF_RE)].map((m) => m[1].replace(/\\/g, "/"));
+  for (let i = 0; i < queue.length && i < 64; i += 1) {
+    const rel = queue[i];
+    if (files.has(rel)) continue;
+    files.add(rel);
+    if (queue.length > RUNTIME_CLOSURE_DEPTH * 16) break; // 上限兜底：异常源码不至于把这里拖死
+    let body = "";
+    try { body = readFileSync(join(relayDir, rel), "utf8"); } catch { continue; } // 缺文件由调用方报告
+    const dir = dirname(rel);
+    for (const m of body.matchAll(RUNTIME_IMPORT_RE)) {
+      const next = join(dir, m[1]).replace(/\\/g, "/");
+      if (!files.has(next) && !queue.includes(next)) queue.push(next);
+    }
+  }
+  const list = [...files];
+  RUNTIME_MANIFEST_CACHE.set(relayDir, { key, files: list });
+  return list;
+}
+
+/**
+ * 桌面运行环境缺失/不完整的文件清单（空 = 就绪）。
+ *
+ * 【2026-09-23 用户实测事故】判据原本是「`dsh-setup.mjs` 存在即就绪」——**存在 ≠ 能加载**。
+ * npx 补装是「先拷入口脚本、再递归拷 clients/」，中途被打断（用户关窗口 / 杀软锁文件 /
+ * 机器休眠 / 看门狗判超时结束进程）就会留下一个**只有入口脚本的半装运行时**。此后：
+ *   · runtimeReady() 恒为 true → 插件再也不补装（自愈彻底停摆）；
+ *   · 面板如实显示「运行环境: 已就绪」，而插起来的 watcher **秒退**（Cannot find module …）；
+ *   · 用户看到的是「连接阶段: starting」+「最近错误: 无」永远不动 —— 正是那份用户反馈。
+ * 现在改成「入口脚本点名的文件真的都在」，半装运行时会被判为缺失 → 走既有的自动补装链路自愈。
+ */
+function missingRuntimeFiles(relayDir) {
+  if (!existsSync(join(relayDir, "dsh-setup.mjs"))) return ["dsh-setup.mjs"];
+  return runtimeManifest(relayDir).filter((rel) => !existsSync(join(relayDir, rel)));
+}
+
+/**
+ * 桌面运行环境是否就绪：入口脚本存在 **且** 它声明要用到的文件都在
+ * （只装「插件半」时入口本身不存在，必须先补装；半装运行时同样判为缺失以便自愈）。
  */
 function runtimeReady(relayDir) {
-  return existsSync(join(relayDir, "dsh-setup.mjs"));
+  return missingRuntimeFiles(relayDir).length === 0;
 }
 
 /**
@@ -918,10 +1079,85 @@ function resetProvisionRetry(relayDir) {
   provisionRetry.delete(String(relayDir));
 }
 
+// ---------- 运行环境随插件分发（0.6.12）：本地拷贝优先，npx 只作兜底 ----------
+//
+// 【2026-09-23 生产取证】Windows 上「装插件 → 后台 npx 补装运行环境」这条链是最大的流失源：
+// 近 14 天 427 台 win32 里 138 台 install_failed（32%）；v0.6.6 的 95 台里 73 台装机失败，
+// 其中 48 台点过「一键更新」却一台都没救回来。npx 在 Windows 上可失败的环节太多：
+// spawn npx.cmd 的 EINVAL、控制台代码页（GBK）导致连归因都读不出来、npm 缓存目录不可写、
+// 拷贝到一半被打断 → 半装运行时（入口在、依赖不在，插件却报「已就绪」）。
+// 现在插件包自带 runtime/（scripts/bundle-runtime.mjs 打进 npm 包），补装退化为**本地文件拷贝**：
+// 零网络、零 npx、零代码页，而且运行环境版本永远等于插件版本（不再出现插件 0.6.10 配运行时 0.6.9）。
+// 拷贝完必须自检（missingRuntimeFiles）——「半装」绝不当作成功，那正是上一版用户卡死的直接原因。
+
+/**
+ * 本插件自带的运行环境目录（lib/ → ../runtime）；仓库开发形态/未打包时返回 null。
+ * DSH_RELAY_BUNDLED_RUNTIME 可显式指定（测试/诊断用；指向不存在的目录 = 强制走 npx 兜底分支）。
+ */
+function readBundledRuntime() {
+  const override = String(process.env.DSH_RELAY_BUNDLED_RUNTIME || "").trim();
+  if (override) return existsSync(join(override, "dsh-setup.mjs")) ? override : null;
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const cand = join(here, "..", "runtime");
+    return existsSync(join(cand, "dsh-setup.mjs")) ? cand : null;
+  } catch { return null; }
+}
+
+/** 自带运行环境拷贝失败的退避（避免每次面板轮询都重试同一件不可能的事）。 */
+const bundledCopyFails = new Map(); // relayDir → nextAt
+
+/**
+ * 用插件自带的运行环境就地补装（纯本地拷贝）。
+ * @returns {{ok:boolean, reason?:string, detail?:string, missing?:string[]}}
+ */
+function provisionFromBundledRuntime(relayDir) {
+  const src = readBundledRuntime();
+  if (!src) return { ok: false, reason: "no-bundled-runtime" };
+  if (skipsSystemOps()) return { ok: false, reason: "skipped" };
+  if (Date.now() < (bundledCopyFails.get(relayDir) || 0)) return { ok: false, reason: "backoff" };
+  try {
+    mkdirSync(relayDir, { recursive: true });
+    copyFileSync(join(src, "dsh-setup.mjs"), join(relayDir, "dsh-setup.mjs"));
+    for (const dir of ["clients", "node_modules"]) {
+      const from = join(src, dir);
+      if (!existsSync(from)) continue;
+      cpSync(from, join(relayDir, dir), { recursive: true, force: true });
+    }
+    // 版本标记：与插件同版（诊断据此显示「运行时 x.y.z」）
+    try { writeFileSync(join(relayDir, ".dsh-setup-version"), `${PLUGIN_VERSION}\n`); } catch { /* 非关键 */ }
+    const missing = missingRuntimeFiles(relayDir);
+    if (missing.length) {
+      bundledCopyFails.set(relayDir, Date.now() + 60_000);
+      return { ok: false, reason: "incomplete", missing };
+    }
+    bundledCopyFails.delete(relayDir);
+    return { ok: true };
+  } catch (e) {
+    bundledCopyFails.set(relayDir, Date.now() + 60_000);
+    return { ok: false, reason: "copy-failed", detail: e.message };
+  }
+}
+
 function ensureRuntime(relayDir) {
   if (UNINSTALLED_DIRS.has(relayDir)) return false; // 已彻底卸载：不再自动安装运行环境
   if (runtimeReady(relayDir)) return true;
   if (skipsSystemOps()) return false; // 测试隔离：绝不在用例里 spawn 真实 npx 安装
+  // ① 插件自带的运行环境优先：本地拷贝即可，**不经过 npx、不联网**。
+  //    这一条同时治好「半装运行环境」（runtimeReady 为假 → 整份重拷 → 自检通过才算成功）。
+  const local = provisionFromBundledRuntime(relayDir);
+  if (local.ok) {
+    appendLogLine(relayDir, AUTO_INSTALL_LOG,
+      `[dsh-remote-web] 已用插件自带的运行环境就地补齐（v${PLUGIN_VERSION}，本地拷贝，未使用 npx）`);
+    telemetryRuntimeReady(relayDir);
+    return true;
+  }
+  if (local.reason === "incomplete") {
+    appendLogLine(relayDir, AUTO_INSTALL_LOG,
+      `[dsh-remote-web] 自带运行环境拷贝后仍不完整（缺 ${local.missing.slice(0, 3).join(", ")}）→ 转 npx 补装`);
+    telemetryRecord(relayDir, "install_failed", { fail_code: "install_script_missing" });
+  }
+  // ② 兜底：npx 补装（老路径保持不变；仓库开发形态、或没打包 runtime/ 的安装形态走这里）
   const gate = provisionRetryGate(relayDir);
   if (!gate.ok) {
     // 退避中：不重复 spawn（避免失败风暴）。面板会据 provisionRetryInfo() 显示"上次失败、X 后可重试"。
@@ -1151,13 +1387,20 @@ function startBridgeDetached(relayDir, fallbackReason = "") {
   }
   const setup = join(relayDir, "dsh-setup.mjs");
   if (!existsSync(setup)) return { ok: false, status: "not-installed", detail: `运行环境入口脚本不存在（${setup}）` };
+  publishUpstream(relayDir); // 落盘上游地址：开机自启拉起的守护（没有 env）据此找到 dsh web
   const log = join(relayDir, ".dsh-bridge.log");
   let out = "ignore";
   try { out = openSync(log, "a"); } catch { /* 打不开日志：退化到丢弃输出，不阻断启动 */ }
   const { child, error } = safeSpawn(process.execPath, [setup, "run"], {
     detached: true,
     cwd: homedir(),
-    env: spawnEnv({ DSH_BRIDGE_INSTALL_SOURCE: installSourceOf(relayDir), DSH_BRIDGE_INSTALL_VERSION: PLUGIN_VERSION }),
+    env: spawnEnv({
+      DSH_BRIDGE_INSTALL_SOURCE: installSourceOf(relayDir),
+      DSH_BRIDGE_INSTALL_VERSION: PLUGIN_VERSION,
+      // 上游端口**必须**透传：watcher 用它判断「dsh web 在线吗」，bridge 用它做转发目标。
+      // 不传的话两边都回落到写死的 3080 —— dsh web 不在默认端口时 bridge 永远不启动（0.6.12 修）。
+      DSH_BRIDGE_UPSTREAM: upstreamUrl(),
+    }),
     stdio: ["ignore", out, out],
     windowsHide: true,
     onError: (e) => appendLogLine(relayDir, AUTO_INSTALL_LOG, `[dsh-remote-web] Windows 启动 bridge 失败: ${e.message}`),
@@ -2817,6 +3060,73 @@ async function runOnlineUpdate(relayDir) {
       noteUpdateFailure(relayDir, e.message, fc); // ← 面板可查询，不再只躺在日志里
       telemetryRecord(relayDir, "update_failed", { fail_code: fc });
     };
+    /**
+     * 第三跳：离线通道（0.6.12）。
+     * 为什么必须有：Windows 上 Node ≥20.12 起 `spawn("npx.cmd")` 不带 shell 会抛 EINVAL，
+     * 于是「更新」这条路对老版本机器**彻底失效**（生产遥测：79 台点过更新、79 台全失败）。
+     * 离线通道用 HTTPS 取 tarball + 纯 Node 解包 + 跑包内安装器，不经 npx/npm/shell。
+     */
+    const runOffline = () => {
+      if (updateCancelledDirs.has(relayDir)) { updateCancelledDirs.delete(relayDir); return null; }
+      const helper = join(dirname(fileURLToPath(import.meta.url)), "offline-update.mjs");
+      if (!existsSync(helper)) {
+        appendLogLine(relayDir, UPDATE_LOG, "[update] 离线更新助手缺失（插件包不完整），放弃离线通道");
+        return null;
+      }
+      appendLogLine(relayDir, UPDATE_LOG,
+        `[update] npx 两次都未成功 → 改用离线通道（tarball + 纯 Node 解包，不经 npx/npm）…`);
+      let out = "ignore";
+      try { out = openSync(join(relayDir, UPDATE_LOG), "a"); } catch { /* 打不开日志：退化丢弃输出 */ }
+      const holder = { child: null };
+      const { child, error } = safeSpawn(process.execPath, [helper, relayDir, target.tag], {
+        detached: true,
+        env: spawnEnv({
+          DSH_BRIDGE_INSTALL_SOURCE: installSourceOf(relayDir),
+          DSH_BRIDGE_INSTALL_VERSION: PLUGIN_VERSION,
+          npm_config_registry: "https://registry.npmjs.org",
+        }),
+        stdio: ["ignore", out, out],
+        windowsHide: true,
+        onError: (e) => failUpdaterSpawn(e),
+      });
+      if (typeof out === "number") { try { closeSync(out); } catch { /* 子进程已继承 */ } }
+      if (error || !child) return null;
+      holder.child = child;
+      writeMarker(marker, child.pid);
+      startProgressWatch(UPDATE_WATCH_KEY, {
+        relayDir, logName: UPDATE_LOG, kind: "update",
+        getChild: () => holder.child,
+        onStall: (idle) => {
+          stalled = true;
+          appendLogLine(relayDir, UPDATE_LOG,
+            `[update] 离线通道也已 ${Math.round(idle / 1000)}s 无输出 → 判定卡住，结束该进程`);
+        },
+      });
+      child.on("exit", (code) => {
+        stopProgressWatch(UPDATE_WATCH_KEY);
+        if (updateCancelledDirs.has(relayDir)) {
+          updateCancelledDirs.delete(relayDir);
+          appendLogLine(relayDir, UPDATE_LOG, "[update] 已取消：不再重试");
+          return;
+        }
+        appendLogLine(relayDir, UPDATE_LOG, `[update] 离线通道退出 code=${code ?? "?"}`);
+        clear();
+        if (code !== 0 || stalled) {
+          const tail = readTail(join(relayDir, UPDATE_LOG));
+          const fc = stalled ? "update_stalled" : telemetryFailCodeFromText(tail);
+          const lastLine = String(tail || "").split("\n").map((l) => l.trim()).filter(Boolean).slice(-1)[0] || "";
+          noteUpdateFailure(relayDir, stalled
+            ? "离线通道也长时间没有输出（已判定卡住并结束）：请检查本机能否访问 registry.npmjs.org"
+            : (lastLine || `离线通道退出码 ${code}`), fc);
+          telemetryRecord(relayDir, "update_failed", { fail_code: fc });
+        } else {
+          updateFailures.delete(String(relayDir));
+        }
+      });
+      child.unref();
+      return child;
+    };
+    let offlineTried = false;
     const run = () => {
       if (updateCancelledDirs.has(relayDir)) { updateCancelledDirs.delete(relayDir); return null; } // 已取消：不再重试
       // 第一次：官方 npm 源；失败(exit≠0 **或长时间无输出**)才回退用户默认源（通常为国内镜像）
@@ -2857,6 +3167,13 @@ async function runOnlineUpdate(relayDir) {
             `[update] ${stalled ? "官方源长时间无输出" : `官方源安装失败(exit=${code})`}，回退默认源(npmmirror 等)重试…`);
           run();
           return;
+        }
+        // 两次 npx 都没成功 → 第三跳：离线通道（不经 npx/npm）。这是给"npx 坏掉的机器"留的出路，
+        // 也是 2026-09 那批「点了一键更新却永远失败」的 Windows 用户唯一可能自救的路径。
+        if (!offlineTried && (code !== 0 || stalled)) {
+          offlineTried = true;
+          if (runOffline()) return;
+          appendLogLine(relayDir, UPDATE_LOG, "[update] 离线通道也未能启动，按失败收尾");
         }
         appendLogLine(relayDir, UPDATE_LOG, `[update] npx 退出 code=${code ?? "?"}（${retried ? "默认源" : "官方源"}）`);
         clear();
@@ -3225,7 +3542,7 @@ const connectBooks = new Map();
 function connectBook(relayDir) {
   let b = connectBooks.get(relayDir);
   if (!b) {
-    b = { attempts: 0, lastAttemptAt: 0, reportAt: 0 };
+    b = { attempts: 0, lastAttemptAt: 0, reportAt: 0, watcherSeenAt: 0 };
     connectBooks.set(relayDir, b);
   }
   return b;
@@ -3324,6 +3641,113 @@ function clearStaleInstallMarker(relayDir) {
   } catch { return false; }
 }
 
+// ---------- 「守护活着、bridge 却迟迟起不来」：判据 + 真重启（0.6.12） ----------
+//
+// 【2026-09-23 用户实测】反馈里那句关键的「**多次修复都没有解决**」，根因就在这里：
+// startBridgeDetached 只要读到 `.dsh-watcher.pid` 指向一个**活着的**进程就返回「已在运行」——
+// 于是一个**活着但拉不起 bridge 的守护**（上游端口不对 / 运行环境半装 / 它自己卡住）会让
+// 所有自救路径全部空转：面板「启动 / 立即重试 / 一键修复」、插件每轮的自愈，一律 no-op。
+// 用户看到的永远是「正在启动 Bridge…」，重试次数一直涨，而状态一点不变。
+// 现在：守护存活超过阈值却仍没有 bridge 进程 → **真的把它结束掉再重新拉起**（有次数上限，不成风暴）。
+const WEDGER_MS = 90_000;       // 正常一台机器：守护起来后 1~10s 内 bridge 就该出现
+const WEDGE_FORCE_MS = 20_000;  // 用户显式点了「重试/修复」：给他更短的等待，别让他干等 90 秒
+const MAX_WATCHER_RESTARTS = 3; // 连续重启上限：再不行就不是「重启能解决」的问题，改为如实报错
+const watcherRestarts = new Map(); // relayDir → { count, at }
+
+/**
+ * 判定窗口（毫秒）。DSH_RELAY_WEDGE_MS 仅供本仓库测试/诊断把节奏压到亚秒级
+ * （与 DSH_RELAY_SELFHEAL_MS / DSH_REMOTE_TELEMETRY_MS 同一约定）：生产不设置，值就是上面那串。
+ * 设置时「显式重试」也走同一个窗口（否则用例得干等 20 秒）。
+ */
+function wedgeLimitMs(force) {
+  const v = Number(process.env.DSH_RELAY_WEDGE_MS);
+  if (Number.isFinite(v) && v > 0) return Math.max(80, v);
+  return force ? WEDGE_FORCE_MS : WEDGER_MS;
+}
+
+/**
+ * 守护（watcher）已存活多久：优先用 pid 文件的 mtime 当「本次拉起时刻」（插件刚 spawn 完就写它）；
+ * 没有 pid 文件时（0.6.7 之前的运行时、或文件被删）回退到 `observedSince` —— 本进程第一次看到
+ * 「守护活着但没有 bridge」的时刻。没有这层兜底，那类守护会永远算不出年龄、也就永远不会被重启。
+ */
+function watcherStartedAt(relayDir, observedSince = 0) {
+  try {
+    const m = statSync(join(relayDir, WATCHER_PID_FILE)).mtimeMs || 0;
+    if (m) return m;
+  } catch { /* 无 pid 文件 → 用观测起点 */ }
+  return Number(observedSince) || 0;
+}
+
+/**
+ * 「服务端登录限流」的最早可重试时刻（bridge 收到 429 时落盘，watcher 据此退避）。
+ * 读它是为了**如实解释**「正在启动 Bridge…」为什么不动：限流窗口内 watcher 会跳过拉起 bridge，
+ * 这是正常等待（15 分钟内自愈），不该被当成故障去重启守护。
+ */
+function loginRateLimitedUntil(relayDir) {
+  try {
+    const until = Number(String(readFileSync(join(relayDir, ".dsh-login-ratelimited"), "utf8")).trim());
+    return Number.isFinite(until) && until > Date.now() ? until : 0;
+  } catch { return 0; }
+}
+
+/** 本轮是否该把守护当成「卡死」并重启。纯函数式判据，便于用例直接锁死边界。 */
+function watcherWedgeOf(relayDir, { watcherRunning, bridgeRunning, force = false, now = Date.now(), observedSince = 0 } = {}) {
+  const rec = watcherRestarts.get(relayDir) || { count: 0, at: 0 };
+  const base = { wedged: false, ageMs: 0, known: false, restarts: rec.count, rateLimitedUntil: 0, exhausted: false };
+  if (!watcherRunning || bridgeRunning) return base;
+  const rateLimitedUntil = loginRateLimitedUntil(relayDir);
+  if (rateLimitedUntil) return { ...base, rateLimitedUntil };
+  const startedAt = watcherStartedAt(relayDir, observedSince);
+  if (!startedAt) return base; // 完全不知道它活了多久 → 不做激进结论
+  const ageMs = Math.max(0, now - startedAt);
+  const limit = wedgeLimitMs(force);
+  return { ...base, ageMs, known: true, wedged: ageMs >= limit, exhausted: rec.count >= MAX_WATCHER_RESTARTS };
+}
+
+/** 记一次「重启卡死守护」；bridge 真的起来后由 resetWatcherRestart 清零。 */
+function noteWatcherRestart(relayDir) {
+  const rec = watcherRestarts.get(relayDir) || { count: 0, at: 0 };
+  rec.count += 1;
+  rec.at = Date.now();
+  watcherRestarts.set(relayDir, rec);
+  return rec;
+}
+function resetWatcherRestart(relayDir) {
+  watcherRestarts.delete(relayDir);
+}
+
+/** 运行环境版本（运行时自己写的 .dsh-setup-version；缺 = 旧版本，诊断里如实显示「未知」）。 */
+function runtimeVersionOf(relayDir) {
+  try { return String(readFileSync(join(relayDir, ".dsh-setup-version"), "utf8")).trim(); } catch { return ""; }
+}
+
+/** 上游地址的来源说明（诊断用：一旦端口不对，这一行就能定位）。 */
+function upstreamSourceLabel() {
+  if (String(process.env.DSH_BRIDGE_UPSTREAM || "").trim()) return "来自 DSH_BRIDGE_UPSTREAM";
+  if (boundWebPort()) return "dsh web 实际监听端口";
+  if (String(process.env.DSH_WEB_URL || "").trim()) return "来自 DSH_WEB_URL";
+  return "默认值 3080（未取到 dsh web 实际监听端口）";
+}
+
+/**
+ * 诊断信息里的日志尾部：**必须先脱敏**。
+ * 这份文本是给用户复制出去发客服/贴到群里的，而 bridge 日志里有手机号（"用账号 138… 登录"）
+ * 与可能的 token/密码片段。只取末尾若干行、逐行截断，并抹掉形如凭据的内容。
+ */
+function redactForDiagnostics(text) {
+  return String(text || "")
+    .replace(/(1[3-9]\d)\d{4}(\d{4})/g, "$1****$2")                                   // 手机号
+    .replace(/(Bearer\s+)[A-Za-z0-9._~+/-]{8,}=*/gi, "$1<已隐去>")                       // Bearer 令牌
+    .replace(/((?:password|passwd|token|secret|local_key|bridge_secret)"?\s*[:=]\s*"?)[^\s",}]{4,}/gi, "$1<已隐去>");
+}
+/** 取日志尾部若干行（含脱敏 + 行截断），供「复制诊断信息」使用。 */
+function logTailForDiagnostics(relayDir, name, maxLines = 15) {
+  const tail = readTail(join(relayDir, name), 8 * 1024);
+  if (!tail) return "";
+  const lines = tail.split("\n").map((l) => l.trim()).filter(Boolean).slice(-maxLines);
+  return lines.map((l) => "  " + redactForDiagnostics(l).slice(0, 240)).join("\n");
+}
+
 /** 账号设备表里是否已登记本机 device_id（手机端 /api/devices 能看到的那一份）+ 节流缓存。 */
 async function accountDeviceBound(relayDir, cfg) {
   const deviceId = String(cfg.device_id || "");
@@ -3366,9 +3790,14 @@ async function composeConnect(relayDir, opts = {}) {
   const now = Date.now();
   const hasAcct = hasAccountCreds(cfg);
   const runtime = runtimeReady(relayDir);
+  const runtimeMissing = runtime ? [] : missingRuntimeFiles(relayDir);
   const inst = installStateOf(relayDir);
   const bridgePids = Array.isArray(manual.allBridge) ? manual.allBridge : [];
   const bridgeRunning = Boolean(launchd.running || bridgePids.length > 0 || (manual.bridge || []).length > 0);
+  const watcherPids = Array.isArray(manual.watcher) ? manual.watcher : [];
+  const watcherRunning = Boolean(!bridgeRunning && watcherPids.length > 0);
+  const wedge = watcherWedgeOf(relayDir, { watcherRunning, bridgeRunning, now });
+  const rateLimitedUntil = loginRateLimitedUntil(relayDir);
   const bindError = readBindError(relayDir);
   const bindFresh = Boolean(bindError && (!bindError.at || now - Number(bindError.at) < BIND_ERROR_FRESH_MS));
   const log = bridgeLogState(relayDir);
@@ -3397,6 +3826,18 @@ async function composeConnect(relayDir, opts = {}) {
     }
   }
 
+  // ── 上游可达性（只在「还没连上」时才探，带 5s 缓存） ──
+  // 这是「bridge 为什么起不来」最常见、也最容易无人知晓的一种：dsh web 不在 bridge 以为的端口上。
+  // 只把结论写进 detail（不动 phase）：探测失败也可能是本机网络栈/代理的偶发抖动，
+  // 直接判死会让「其实马上就好」的用户看到一条红字错误；而 starting 分支同样带「立即重试/复制诊断」。
+  const needUpstream = hasAcct && runtime && !bridgeRunning;
+  const upstream = needUpstream ? await probeUpstream(relayDir) : null;
+  const upstreamBroken = Boolean(upstream && !upstream.ok);
+  const upstreamNote = upstreamBroken
+    ? `\n⚠️ bridge 要连的本机 dsh web 地址 ${upstreamUrl()}（${upstreamSourceLabel()}）探测不通：${upstream.error || "连接被拒绝"}。`
+      + "若 dsh web 不在默认端口，请点「一键更新」升级运行环境（新版本会自动跟随实际端口），或把 dsh web 重启在 3080。"
+    : "";
+
   let phase;
   let error = null;
   let detail = "";
@@ -3421,6 +3862,12 @@ async function composeConnect(relayDir, opts = {}) {
       detail = inst.installing
         ? "正在后台安装运行环境（bridge 本体），首次约 1~2 分钟，装完会自动启动。"
         : "检测到缺少运行环境，正在后台自动安装（首次约 1~2 分钟），无需任何操作。";
+      if (runtimeMissing.length) {
+        // 半装运行时（入口在、依赖不在）：如实说清是「不完整」而不是「没装」，
+        // 否则用户看到「正在准备运行环境」会以为要等它装完，而它其实**已经卡在这状态很久了**。
+        detail = `运行环境不完整（缺 ${runtimeMissing.slice(0, 3).join("、")}${runtimeMissing.length > 3 ? " 等" : ""}），`
+          + "正在后台自动补装（约 1~2 分钟），装完会自动启动 bridge。";
+      }
     }
   } else if (!bridgeRunning) {
     if (launchd.crashing) {
@@ -3434,11 +3881,32 @@ async function composeConnect(relayDir, opts = {}) {
       phase = "error";
       error = { code: bindError.code || "bind_failed", message: bindError.message || "设备登记失败" };
       detail = "bridge 因设备登记失败退出，已进入自动重试；请按提示处理后重试。";
+    } else if (wedge.wedged && wedge.exhausted) {
+      // 守护活着、却反复拉不起 bridge，且已自动重启到上限 → 这是**真的**卡死了，给明确结论 + 出路。
+      // 旧实现在这种状态下永远显示「正在启动 Bridge…」，用户只能反复点修复（实测反馈）。
+      phase = "error";
+      error = {
+        code: "bridge_wedged",
+        message: `后台守护已运行 ${Math.round(wedge.ageMs / 1000)} 秒仍拉不起 bridge（已自动重启 ${wedge.restarts} 次）`,
+      };
+      detail = `运行环境版本 ${runtimeVersionOf(relayDir) || "未知"}。`
+        + "请点「一键更新」重装运行环境后重试（更新会一并升级 bridge 守护脚本）；仍不行请点「复制诊断信息」发给客服。"
+        + upstreamNote;
+    } else if (wedge.wedged) {
+      phase = "starting";
+      detail = `后台守护已运行 ${Math.round(wedge.ageMs / 1000)} 秒仍未拉起 bridge，正在自动重启它（无需操作）…`;
+    } else if (rateLimitedUntil) {
+      // 服务端登录限流：watcher 会主动等到窗口结束再拉起（这是等待，不是故障）
+      phase = "starting";
+      detail = `账号登录被服务端临时限流，约 ${Math.ceil((rateLimitedUntil - now) / 1000)} 秒后自动重试`
+        + "（凭据没错、无需改密码，也不需要任何操作）。";
     } else {
       phase = "starting";
-      detail = launchd.running
-        ? "后台服务已启动，正在等待 bridge 进程就绪…"
-        : "正在启动后台服务（bridge），通常几秒内完成，无需任何操作。";
+      detail = (watcherRunning
+        ? `后台守护已启动${wedge.known ? `（${Math.round(wedge.ageMs / 1000)} 秒）` : ""}，正在等待 bridge 进程就绪…`
+        : (launchd.running
+          ? "后台服务已启动，正在等待 bridge 进程就绪…"
+          : "正在启动后台服务（bridge），通常几秒内完成，无需任何操作。")) + upstreamNote;
     }
   } else if (registered) {
     phase = "online";
@@ -3472,11 +3940,25 @@ async function composeConnect(relayDir, opts = {}) {
     retryable: retryable !== false,
     deviceId,
     runtimeReady: runtime,
+    runtimeMissing,
+    runtimeVersion: runtimeVersionOf(relayDir),
     installing: inst.installing,
     installStale: inst.stale,
     bridgeRunning,
     accountCurrent, // 运行中的 bridge 是否属于当前账号（false = 上一个账号的进程还在跑）
     bridgePids,
+    // 守护（watcher）与上游：这两项以前完全不下发，于是「守护活着但拉不起 bridge」
+    // 与「上游端口不对」在面板上都长得跟「正在启动」一模一样（用户反馈就是这么来的）。
+    watcherPids,
+    watcherRunning,
+    watcherAgeMs: wedge.known ? wedge.ageMs : 0,
+    watcherWedged: Boolean(wedge.wedged),
+    watcherRestarts: wedge.restarts,
+    upstreamUrl: upstreamUrl(),
+    upstreamSource: upstreamSourceLabel(),
+    upstreamReachable: upstream ? upstream.ok : null,
+    upstreamError: upstream && !upstream.ok ? upstream.error : "",
+    rateLimitedUntil,
     launchdState: launchd.state || "",
     launchdCrashLoop: Boolean(launchd.crashing),
     registered,
@@ -3492,24 +3974,153 @@ async function composeConnect(relayDir, opts = {}) {
   return conn;
 }
 
-/** 可复制的诊断信息（面板「复制诊断信息」按钮）：版本 / relayDir / 阶段 / 最近错误 / 进程状态 / 日志路径。 */
+/**
+ * 可复制的诊断信息（面板「复制诊断信息」按钮）：版本 / relayDir / 阶段 / 最近错误 / 进程状态 /
+ * 日志路径 + **两个日志的尾部**。
+ *
+ * 【2026-09-23 用户实测】旧版只给日志**路径**：用户反馈里「最近错误: 无」而实际已经卡死——
+ * 因为 lastError 只认 bridge 日志里几个特定文案，node 自己的崩溃栈（MODULE_NOT_FOUND 等）
+ * 一律不算「错误」，客服/作者手上因此没有任何可用信息，只能来回问。现在把尾部**原文**带上
+ * （已脱敏手机号/令牌，见 redactForDiagnostics），一次复制就能定位。
+ */
 function buildConnectDiagnostics(relayDir, conn, log) {
-  return [
+  const rows = [
     "dsh-remote 连接诊断",
     `插件版本: ${PLUGIN_VERSION}`,
     `配置目录: ${relayDir}`,
     `连接阶段: ${conn.phase}（${conn.text}）`,
     `设备 ID: ${conn.deviceId || "（未生成）"}`,
-    `运行环境: ${conn.runtimeReady ? "已就绪" : "缺失"}${conn.installing ? "（后台安装中）" : ""}${conn.installStale ? "（安装标记已超时）" : ""}`,
+    `运行环境: ${conn.runtimeReady ? "已就绪" : "缺失"}${conn.runtimeVersion ? `（运行时 ${conn.runtimeVersion}）` : ""}${conn.installing ? "（后台安装中）" : ""}${conn.installStale ? "（安装标记已超时）" : ""}`,
+    conn.runtimeReady || !conn.runtimeMissing || !conn.runtimeMissing.length
+      ? ""
+      : `运行环境缺文件: ${conn.runtimeMissing.slice(0, 8).join(", ")}${conn.runtimeMissing.length > 8 ? ` 等 ${conn.runtimeMissing.length} 个` : ""}`,
     `bridge 进程: ${conn.bridgeRunning ? "在运行" : "未运行"}（pid=${conn.bridgePids && conn.bridgePids.length ? conn.bridgePids.join(",") : "-"}，launchd state=${conn.launchdState || "-"}，崩溃循环=${conn.launchdCrashLoop ? "是" : "否"}）`,
+    `后台守护: ${conn.watcherRunning ? `在运行（pid=${conn.watcherPids.join(",")}${conn.watcherAgeMs ? `，已 ${Math.round(conn.watcherAgeMs / 1000)} 秒` : ""}${conn.watcherWedged ? "，⚠️ 迟迟未拉起 bridge" : ""}${conn.watcherRestarts ? `，已自动重启 ${conn.watcherRestarts} 次` : ""}）` : "未运行"}`,
+    `上游 dsh web: ${conn.upstreamUrl}（${conn.upstreamSource}${conn.upstreamReachable === null ? "" : conn.upstreamReachable ? "，可达" : `，⚠️ 不可达：${conn.upstreamError}`}）`,
     `中继注册: ${conn.registered ? "已注册（" + conn.registerSource + "）" : "未注册"}`,
     `bridge 账号: ${conn.accountCurrent === false ? "⚠️ 仍是上一个账号的身份（需重启 bridge 重新登记）" : "当前账号"}`,
+    conn.rateLimitedUntil ? `登录限流: 约 ${Math.ceil((conn.rateLimitedUntil - Date.now()) / 1000)} 秒后自动重试（凭据无误，无需改密码）` : "",
     `最近错误: ${conn.error ? conn.error.code + ": " + conn.error.message : (log && log.lastError ? log.lastError : "无")}`,
     `自动重试: 已尝试 ${conn.attempts} 次${conn.nextRetryInMs ? `，约 ${Math.ceil(conn.nextRetryInMs / 1000)} 秒后重试` : ""}`,
     `bridge 日志: ${conn.logPath}`,
     `安装日志: ${conn.installLogPath}`,
     `时间: ${new Date().toISOString()}`,
-  ].join("\n");
+  ].filter(Boolean);
+  const bridgeTail = logTailForDiagnostics(relayDir, BRIDGE_LOG_FILE);
+  const installTail = logTailForDiagnostics(relayDir, AUTO_INSTALL_LOG);
+  if (bridgeTail) rows.push("", "--- bridge 日志（末尾）---", bridgeTail);
+  if (installTail) rows.push("", "--- 安装日志（末尾）---", installTail);
+  return rows.join("\n");
+}
+
+// ---------- 故障上报（用户主动、可预览、可编辑）＋「让 DeepSeek 帮我修」提示词 ----------
+//
+// 2026-09-23 用户反馈的教训：故障现场我们**看不见** —— 面板只给日志"路径"，诊断里写「最近错误: 无」，
+// 而我们又绝不做后台自动上传日志（隐私红线，见 docs/telemetry.md）。结果客服与开发者只能来回问，
+// 用户在「装不上 → 不知道怎么报 → 放弃」里流失（近 14 天 Windows 427 台里成功率只有 35.6%）。
+// 现在把「知情同意」做成产品能力，而不是绕过它：
+//   · GET  /dsh-remote/diag/bundle      → 完整预览：将要发送的每一个字（用户可看、可改、可删）；
+//   · POST /dsh-remote/diag/report      → **用户点确认后**才提交；
+//   · GET  /dsh-remote/diag/fix-prompt  → 让用户本机的 DSH 自己修，并产出定格式结论报告，
+//     用户可把报告贴回同一个上报道（不需要我们发版就能自救）。
+// 走**既有反馈通道**（企业端 /api/feedback），因此不需要任何服务端部署：
+// 正文受服务端 2000 字硬限（fb CONTENT_MAX），超出的日志作为**同一条反馈的回复**分片，
+// 于是后台「用户反馈」里就是一条可回复、可追踪的线程。
+const DIAG_NOTE_MAX = 600;
+const DIAG_CONTENT_MAX = 1900;   // 服务端 content 上限 2000，留余量
+const DIAG_PART_MAX = 1900;
+const DIAG_MAX_PARTS = 4;        // 日志/报告分片上限（超出只留尾部，宁缺毋滥）
+
+/** 上报标题（服务端 title 上限 120 字）。 */
+function diagTitleOf(conn, pluginVer) {
+  const bits = ["[诊断]", conn.phase || "unknown", `v${pluginVer || PLUGIN_VERSION}`, osPlatform(), process.arch];
+  return bits.join(" ").slice(0, 110);
+}
+
+/**
+ * 组装「用户主动上报」的内容：summary（正文）+ parts（分片，作为回复追加）。
+ * @param {{note?:string, attachLogs?:boolean, report?:string}} opts
+ *        note = 用户自己写的描述（必填引导）；attachLogs = 是否附带两个日志的尾部（默认附）；
+ *        report = 用户从 DSH 拿回来的结论报告（可选）。
+ */
+async function buildDiagReport(relayDir, opts = {}) {
+  const note = String(opts.note || "").slice(0, DIAG_NOTE_MAX).trim();
+  const attachLogs = opts.attachLogs !== false;
+  const report = String(opts.report || "");
+  const manual = manualStatus(relayDir);
+  const conn = await composeConnect(relayDir, { manual });
+  const cfg = loadConfig(relayDir);
+  const head = redactForDiagnostics([
+    `【插件】v${PLUGIN_VERSION}　运行时 ${runtimeVersionOf(relayDir) || "未知"}　${osPlatform()}/${process.arch}　node ${String(process.versions.node).split(".")[0]}`,
+    `【阶段】${conn.phase}（${conn.text}）`,
+    `【设备】ID=${conn.deviceId || "（未生成）"}　运行环境=${conn.runtimeReady ? "就绪" : `缺失${conn.runtimeMissing && conn.runtimeMissing.length ? `（缺 ${conn.runtimeMissing.slice(0, 3).join("、")}）` : ""}`}`,
+    `【bridge】${conn.bridgeRunning ? `在运行 pid=${conn.bridgePids.join(",")}` : "未运行"}　守护=${conn.watcherRunning ? `在运行 pid=${conn.watcherPids.join(",")}${conn.watcherAgeMs ? `（${Math.round(conn.watcherAgeMs / 1000)}s）` : ""}` : "未运行"}${conn.watcherWedged ? " ⚠️活着但拉不起 bridge" : ""}${conn.watcherRestarts ? ` 已自动重启 ${conn.watcherRestarts} 次` : ""}`,
+    `【上游】${conn.upstreamUrl}（${conn.upstreamSource}${conn.upstreamReachable === null ? "" : conn.upstreamReachable ? "，可达" : `，⚠️不可达：${conn.upstreamError}`}）`,
+    `【中继】${conn.registered ? `已注册（${conn.registerSource}）` : "未注册"}　账号=${conn.accountCurrent === false ? "⚠️上一个账号（需重启 bridge）" : "当前账号"}　自动重试=${conn.attempts} 次`,
+    `【错误】${conn.error ? `${conn.error.code}: ${conn.error.message}` : (conn.detail ? "无（见上方阶段说明）" : "无")}`,
+    `【配置目录】${relayDir}`,
+    `【账号】${cfg.phone || cfg.email ? "已登录" : "未登录"}（手机号不随本上报外发；服务端据登录态已知是谁）`,
+  ].join("\n"));
+  const parts = [];
+  const pushPart = (title, text) => {
+    let rest = String(text || "").trim();
+    while (rest && parts.length < DIAG_MAX_PARTS) {
+      parts.push(`--- ${title} ---\n${rest.slice(0, DIAG_PART_MAX)}`);
+      rest = rest.slice(DIAG_PART_MAX);
+    }
+  };
+  if (report.trim()) pushPart("用户回传的结论报告", report);
+  if (attachLogs) {
+    pushPart("bridge 日志（末尾）", logTailForDiagnostics(relayDir, BRIDGE_LOG_FILE, 40));
+    pushPart("安装/更新日志（末尾）", logTailForDiagnostics(relayDir, AUTO_INSTALL_LOG, 40));
+  }
+  const userPart = note ? `【用户描述】\n${note}\n\n` : "";
+  const summary = (userPart + head).slice(0, DIAG_CONTENT_MAX);
+  return { conn, title: diagTitleOf(conn, PLUGIN_VERSION), summary, parts };
+}
+
+/** 提交一条反馈（与面板同一条通道：登录态自动附账号 JWT，失败抛错带服务端人话）。 */
+async function submitFeedback(relayDir, payload) {
+  const cfg = loadConfig(relayDir);
+  const api = feedbackApiOf(cfg);
+  const headers = {
+    "content-type": "application/json",
+    "x-dsh-device": cfg.device_id || "",
+    "x-dsh-client": `dsh-remote-web/${PLUGIN_VERSION}`,
+  };
+  if (cfg.phone) headers["x-dsh-phone"] = String(cfg.phone);
+  const t = await feedbackAuthToken(relayDir).catch(() => "");
+  if (t) headers.authorization = `Bearer ${t}`;
+  const r = await fetch(`${api}/api/feedback`, {
+    method: "POST", headers, body: JSON.stringify(payload), signal: AbortSignal.timeout(12000),
+  });
+  const body = await r.json().catch(() => null);
+  if (!r.ok) {
+    const e = new Error(body?.error?.message || `反馈服务返回 ${r.status}`);
+    e.status = r.status;
+    e.code = body?.error?.code || "";
+    throw e;
+  }
+  return body || {};
+}
+
+/** 在同一条反馈下追加一条回复（日志分片用；账号态用账号 JWT 即可，无需 thread_token）。 */
+async function replyFeedback(relayDir, id, content) {
+  const cfg = loadConfig(relayDir);
+  const api = feedbackApiOf(cfg);
+  const headers = {
+    "content-type": "application/json",
+    "x-dsh-device": cfg.device_id || "",
+    "x-dsh-client": `dsh-remote-web/${PLUGIN_VERSION}`,
+  };
+  if (cfg.phone) headers["x-dsh-phone"] = String(cfg.phone);
+  const t = await feedbackAuthToken(relayDir).catch(() => "");
+  if (t) headers.authorization = `Bearer ${t}`;
+  const r = await fetch(`${api}/api/feedback/${encodeURIComponent(id)}/replies`, {
+    method: "POST", headers, body: JSON.stringify({ content: content.slice(0, DIAG_PART_MAX) }), signal: AbortSignal.timeout(12000),
+  });
+  if (!r.ok) return { ok: false, status: r.status };
+  return { ok: true };
 }
 
 /**
@@ -3539,10 +4150,16 @@ function ensureConnection(relayDir, opts = {}) {
   }
   const launchd = launchdStatus();
   const manual = manualStatus(relayDir);
-  if (launchd.running || (manual.allBridge || []).length || (manual.bridge || []).length) {
+  const bridgeProcs = [...(manual.allBridge || []), ...(manual.bridge || [])];
+  const watcherProcs = Array.isArray(manual.watcher) ? manual.watcher : [];
+  // ⚠️ 「有进程」必须分成两类看：bridge 本体（能让设备登记）与**守护 watcher**（只是负责拉起它）。
+  // 旧实现把两者混成一个 if，于是「守护活着、bridge 一直没起来」直接走「已在跑」分支 →
+  // 每一次修复/重试都变成 no-op（用户反馈：「多次修复都没有解决」）。0.6.12 拆开处理。
+  const watcherRunning = Boolean(launchd.running || watcherProcs.length);
+  if (bridgeProcs.length || watcherRunning) {
     // 进程在跑 ≠ 跑对了账号：切换账号后旧 bridge 会一直用旧凭据，
     // 只看"有没有进程"会让自愈永久停摆（实测事故）。这里多判一次账号归属。
-    if (!bridgeMatchesCurrentAccount(relayDir, cfg)) {
+    if (bridgeProcs.length && !bridgeMatchesCurrentAccount(relayDir, cfg)) {
       book.lastAttemptAt = now;
       book.attempts += 1;
       resetBridgeForAccountChange(relayDir, "bridge 身份与当前账号不符");
@@ -3550,6 +4167,37 @@ function ensureConnection(relayDir, opts = {}) {
       appendLogLine(relayDir, AUTO_INSTALL_LOG,
         `[dsh-remote-web] 检测到旧账号的 bridge 仍在运行，已重启以用当前账号重新登记（${r.status || "?"}）`);
       return { action: "restart", result: r };
+    }
+    if (!bridgeProcs.length) {
+      // 第一次看到「守护活着但没有 bridge」的时刻：pid 文件缺失时用它当存活起点（见 watcherStartedAt）
+      if (!book.watcherSeenAt) book.watcherSeenAt = now;
+      // 守护活着但没有 bridge：只有在「真的卡住了」时才动手（正常启动窗口内不打扰）。
+      const wedge = watcherWedgeOf(relayDir, {
+        watcherRunning: true, bridgeRunning: false, force: Boolean(opts.force), now,
+        observedSince: book.watcherSeenAt,
+      });
+      if (wedge.wedged && !wedge.exhausted && (isWindows() || isDarwin())) {
+        const rec = noteWatcherRestart(relayDir);
+        // Windows 没有服务管理器：必须显式结束卡死的守护（否则 startBridge 幂等直接返回）；
+        // macOS 走 launchctl，startBridge 内部已先 bootout 再 bootstrap，等价于重启。
+        if (isWindows()) stopBridgeDetached(relayDir);
+        const r = startBridge(relayDir);
+        appendLogLine(relayDir, AUTO_INSTALL_LOG,
+          `[dsh-remote-web] 后台守护已存活 ${Math.round(wedge.ageMs / 1000)} 秒仍无 bridge 进程`
+          + `（上游 ${upstreamUrl()}）→ 已第 ${rec.count} 次重启它（${r && r.status ? r.status : "?"}）`);
+        book.attempts = 0;      // 刚重新拉起：给下一轮一个立即复核的机会
+        book.lastAttemptAt = 0;
+        return { action: "restart-wedged-watcher", result: r, wedge };
+      }
+      if (wedge.wedged && wedge.exhausted) {
+        // 连续重启都不行 → 不再风暴式重启（面板据 wedged/exhausted 给出「一键更新」结论）
+        book.lastAttemptAt = now;
+        book.attempts += 1;
+        return { action: "wedge-exhausted", wedge };
+      }
+    } else {
+      resetWatcherRestart(relayDir); // bridge 真的在跑：连续重启计数清零
+      book.watcherSeenAt = 0;
     }
     book.attempts = 0; // 进程已在跑：退避计数归零，后续只等注册
     book.lastAttemptAt = now;
@@ -4737,6 +5385,83 @@ function registerRoutes(ctx, relayDir) {
         sendJson(res, 200, { ok: true, retried: true, action: action && action.action ? action.action : "none", connect });
       },
     },
+    // ── 🧾 故障上报（用户主动）与「让 DeepSeek 帮我修」提示词（0.6.12） ──────────
+    // 隐私红线：**绝不**后台自动上传日志。这里只提供「预览 → 用户确认 → 提交」，
+    // 以及把提示词交给用户，让他自己那台机器的 DSH 去修 —— 两条都由用户主动触发。
+    {
+      method: "GET",
+      path: "/dsh-remote/diag/bundle",
+      handler: async (_req, res) => {
+        // 预览 = 用户点确认后**真正会发出去**的全文（正文 + 分片），一字不多一分不少
+        const built = await buildDiagReport(relayDir, { attachLogs: true, note: "" });
+        sendJson(res, 200, {
+          ok: true,
+          title: built.title,
+          summary: built.summary,
+          parts: built.parts,
+          noteMax: DIAG_NOTE_MAX,
+          partMax: DIAG_PART_MAX,
+        });
+      },
+    },
+    {
+      method: "POST",
+      path: "/dsh-remote/diag/report",
+      handler: async (req, res) => {
+        const body = await readJsonBody(req);
+        if (body.__parseError) return sendJson(res, 400, { ok: false, code: "bad_request", error: "上报数据不是合法 JSON，请刷新页面重试。" });
+        if (body.__tooLarge) return sendJson(res, 413, { ok: false, code: "too_large", error: "报告内容过大（超过 256KB），请只保留结论部分。" });
+        let built;
+        try {
+          built = await buildDiagReport(relayDir, {
+            note: body.note, attachLogs: body.attachLogs !== false, report: body.report,
+          });
+        } catch (e) {
+          return sendJson(res, 500, { ok: false, code: "bundle_failed", error: `组装诊断信息失败：${e.message}` });
+        }
+        let created;
+        try {
+          created = await submitFeedback(relayDir, {
+            kind: "feedback", category: "bug", title: built.title, content: built.summary, contact: "",
+          });
+        } catch (e) {
+          return sendJson(res, e.status && e.status < 500 ? e.status : 502, {
+            ok: false, code: e.code || "submit_failed", error: `上报失败：${e.message}`,
+          });
+        }
+        const id = created?.feedback?.id || created?.id || "";
+        const threadToken = created?.thread_token || "";
+        // 日志/报告分片：作为**同一条反馈的回复**追加（服务端正文 2000 字硬限；分片失败不影响正文）
+        const warnings = [];
+        let sent = 0;
+        for (const part of built.parts) {
+          if (!id) break;
+          const r = await replyFeedback(relayDir, id, part).catch(() => ({ ok: false }));
+          if (r.ok) sent += 1;
+          else if (!warnings.includes("部分日志分片未能上传（正文已到达，不影响定位）")) warnings.push("部分日志分片未能上传（正文已到达，不影响定位）");
+        }
+        appendLogLine(relayDir, AUTO_INSTALL_LOG,
+          `[dsh-remote-web] 用户主动上报故障诊断（${id || "?"}，正文 1 条 + 分片 ${sent}/${built.parts.length}）`);
+        sendJson(res, 200, { ok: true, id, threadToken, parts: sent, totalParts: built.parts.length, warnings });
+      },
+    },
+    {
+      method: "GET",
+      path: "/dsh-remote/diag/fix-prompt",
+      handler: async (_req, res) => {
+        const conn = await composeConnect(relayDir);
+        const prompt = buildFixPrompt({
+          relayDir,
+          bridgeLogPath: join(relayDir, BRIDGE_LOG_FILE),
+          installLogPath: join(relayDir, AUTO_INSTALL_LOG),
+          pluginVersion: PLUGIN_VERSION,
+          runtimeVersion: runtimeVersionOf(relayDir),
+          upstreamUrl: conn.upstreamUrl,
+          phaseText: `${conn.text}${conn.detail ? " " + conn.detail : ""}`,
+        });
+        sendJson(res, 200, { ok: true, prompt, reportTitle: REPORT_TITLE, reportFormat: REPORT_FORMAT, reportKeys: REPORT_KEYS });
+      },
+    },
     // ── 🤖 微信机器人通道（设置页「🤖 微信机器人」栏目） ──────────────────────
     // 这六条只做代理：真正的协议与扫码状态机在 bridge 里（docs/wechat-bot-channel.md §3/§10）。
     // 失败一律是 5xx + {ok:false, code, error:<人话>}：面板按 code/文案分流，绝不塌成「失败」两个字。
@@ -5171,6 +5896,11 @@ function registerRoutes(ctx, relayDir) {
  */
 export function apply(ctx, config = {}) {
   const relayDir = config.relayDir || process.env.DSH_RELAY_DIR || DEFAULT_RELAY_DIR;
+  // 记住宿主 ctx：上游地址要问 dsh web 自己的监听端口（见 upstreamUrl）。
+  // 存 ctx 而不是当场取端口：apply 可能早于 webServer.listen 完成，端口那时还是 0/undefined。
+  webServerCtx = ctx;
+  // 上游地址落盘（0.6.12）：系统自启拉起的守护没有本进程的 env，只认这个文件。
+  publishUpstream(relayDir);
   // 全新激活（dsh web 重启后插件重新加载，或卸载后再次安装）→ 解除上次的「已卸载」停摆标记
   UNINSTALLED_DIRS.delete(relayDir);
   // 匿名遥测：装载即初始化（读回上次进程遗留的磁盘队列，例如重启前那条 harness_restart，

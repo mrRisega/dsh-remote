@@ -2103,6 +2103,16 @@ window.__ModuleLoader__.load({
       var mktFoldArr = useState(mktMoreWasFolded() || inviteTipWasDismissed()); var mktFolded = mktFoldArr[0]; var setMktFolded = mktFoldArr[1];
       // 「更多」这一层当前是否展开：纯界面态，不持久化（下次进面板回到收起，主界面保持干净）。
       var moreOpenArr = useState(false); var moreOpen = moreOpenArr[0]; var setMoreOpen = moreOpenArr[1];
+      // 🧾 故障上报 / 修复提示词（0.6.12）：全部 hook 追加在末尾，不动既有 hook 序号。
+      //   diagView: null=不展开 | "report"=上报（预览+确认） | "fix"=让 DSH 自己修（提示词+回传）
+      var diagViewArr = useState(null); var diagView = diagViewArr[0]; var setDiagView = diagViewArr[1];
+      var diagBundleArr = useState(null); var diagBundle = diagBundleArr[0]; var setDiagBundle = diagBundleArr[1];
+      var diagNoteArr = useState(""); var diagNote = diagNoteArr[0]; var setDiagNote = diagNoteArr[1];
+      var diagAttachArr = useState(true); var diagAttachLogs = diagAttachArr[0]; var setDiagAttachLogs = diagAttachArr[1];
+      var diagBusyArr = useState(""); var diagBusy = diagBusyArr[0]; var setDiagBusy = diagBusyArr[1];
+      var diagMsgArr = useState(null); var diagMsg = diagMsgArr[0]; var setDiagMsg = diagMsgArr[1];
+      var fixPromptArr = useState(null); var fixPrompt = fixPromptArr[0]; var setFixPrompt = fixPromptArr[1];
+      var fixReportArr = useState(""); var fixReport = fixReportArr[0]; var setFixReport = fixReportArr[1];
 
       var refresh = useCallback(function () {
         setBusy("status");
@@ -2586,6 +2596,67 @@ window.__ModuleLoader__.load({
           }
           setCopiedDiag(true);
           later(function () { setCopiedDiag(false); }, 2000);
+        });
+      };
+
+      // ── 🧾 故障上报（用户主动、可预览、可编辑）与「让 DeepSeek 帮我修」（0.6.12） ──
+      // 产品原则（2026-09-23 定的）：**绝不**后台自动上传日志。开发者要看得见故障现场，
+      // 但必须由用户自己点、并且能看见"将要发出去的每一个字"。于是：
+      //   ① 上报道：预览全文（正文+日志分片）→ 用户可写描述、可取消附带日志 → 确认才发；
+      //   ② 修复道：给用户一段提示词，让他本机的 DSH 自己修并产出结论报告，再把报告回传。
+      // 这两条把"客服来回问"变成"一次到位"，而且不需要我们发版。
+
+      /** 打开「上报故障」：先拉预览（= 确认后真正会发出去的全文）。 */
+      var openDiagReport = function () {
+        setDiagView("report"); setDiagMsg(null); setDiagBundle(null);
+        setDiagBusy("bundle");
+        api("/dsh-remote/diag/bundle").then(function (b) {
+          if (b && b.ok) setDiagBundle(b);
+          else setDiagMsg({ kind: "err", text: "读取诊断信息失败，请稍后重试。" });
+        }).catch(function (e) {
+          setDiagMsg({ kind: "err", text: "读取诊断信息失败：" + e.message });
+        }).finally(function () { setDiagBusy(""); });
+      };
+
+      /** 提交上报：正文（含用户描述）+ 日志分片，全部走既有反馈通道。 */
+      var submitDiagReport = function (extra) {
+        var body = {
+          note: extra && extra.note !== undefined ? extra.note : diagNote,
+          attachLogs: diagAttachLogs,
+          report: (extra && extra.report) || "",
+        };
+        setDiagBusy("report"); setDiagMsg(null);
+        post("/dsh-remote/diag/report", body).then(function (b) {
+          if (b && b.ok) {
+            var warn = (b.warnings && b.warnings.length) ? "（" + b.warnings.join("；") + "）" : "";
+            setDiagMsg({ kind: "ok", text: "✅ 已上报给开发者（编号 " + (b.id || "?") + "）" + warn + "。可在「用户反馈 → 我的反馈」里看到后续回复。" });
+            setFixReport(""); setDiagNote("");
+          } else {
+            setDiagMsg({ kind: "err", text: (b && b.error) || "上报失败，请稍后重试。" });
+          }
+        }).catch(function (e) {
+          setDiagMsg({ kind: "err", text: "上报失败：" + e.message });
+        }).finally(function () { setDiagBusy(""); });
+      };
+
+      /** 打开「让 DeepSeek 帮我修」：拉提示词（含当前故障上下文）。 */
+      var openFixPrompt = function () {
+        setDiagView("fix"); setDiagMsg(null); setFixPrompt(null);
+        setDiagBusy("prompt");
+        api("/dsh-remote/diag/fix-prompt").then(function (b) {
+          if (b && b.ok && b.prompt) setFixPrompt(b);
+          else setDiagMsg({ kind: "err", text: "读取修复提示词失败，请稍后重试。" });
+        }).catch(function (e) {
+          setDiagMsg({ kind: "err", text: "读取修复提示词失败：" + e.message });
+        }).finally(function () { setDiagBusy(""); });
+      };
+
+      var copyFixPrompt = function () {
+        var text = (fixPrompt && fixPrompt.prompt) || "";
+        if (!text) return;
+        copyText(text).then(function (done) {
+          if (done) setDiagMsg({ kind: "ok", text: "✅ 提示词已复制。粘到 DeepSeek Harness 里发送，它会自己检查并修复；跑完把它的结论报告贴回下面。" });
+          else setDiagMsg({ kind: "warn", text: "复制失败（浏览器可能限制了剪贴板）：可手动选中下面的文本复制。" });
         });
       };
 
@@ -3652,6 +3723,68 @@ window.__ModuleLoader__.load({
          * 面向非技术用户——非 online 阶段一律说明「正在自动进行，无需操作」；
          * 只有失败（error）才给可操作项：重试 / 复制诊断信息 / 日志路径，绝不出现死胡同。
          */
+        /**
+         * 🧾 故障上报 / 让 DeepSeek 帮我修（0.6.12）
+         * 产品原则：绝不后台自动上传日志 —— 这里全部由用户主动触发，且**先把要发的内容摊开给他看**。
+         */
+        function renderDiagTools() {
+          var rows = [];
+          if (diagMsg) {
+            rows.push(h("div", { className: "dru-msg" + (diagMsg.kind ? " dru-msg-" + diagMsg.kind : ""), style: { marginTop: 6 } }, diagMsg.text));
+          }
+          if (diagView === null) {
+            rows.push(h("div", { className: "dru-actions", style: { marginTop: 8 } },
+              h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "" || diagBusy !== "", onClick: openDiagReport },
+                diagBusy === "bundle" ? "准备中…" : "🧾 上报故障给开发者"),
+              h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "" || diagBusy !== "", onClick: openFixPrompt },
+                diagBusy === "prompt" ? "准备中…" : "🛠 让 DeepSeek 帮我修")));
+            rows.push(h("div", { className: "dru-hint", style: { marginTop: 4 } },
+              "「上报」会先让你看到将要发送的全部内容（可写描述、可取消附带日志），你确认后才发给我们；"
+              + "「帮我修」会给你一段提示词，让电脑上的 DeepSeek Harness 自己排查并修复。"));
+            return h("div", null, rows);
+          }
+          if (diagView === "report") {
+            var preview = diagBundle ? (diagBundle.summary + (diagBundle.parts && diagBundle.parts.length ? "\n\n" + diagBundle.parts.join("\n\n") : "")) : "";
+            rows.push(h("div", { className: "dru-hint", style: { marginTop: 6 } },
+              "下面就是**将要发送**的全部内容（可先改成你愿意分享的样子；手机号与密钥已自动隐去）："));
+            rows.push(h("pre", {
+              style: { margin: "6px 0 0", padding: "8px 10px", maxHeight: 220, overflow: "auto", whiteSpace: "pre-wrap", wordBreak: "break-all", fontSize: 12, lineHeight: 1.5, background: "var(--dru-surface-2)", border: "1px solid var(--dru-border-ctl)", borderRadius: 8 },
+            }, diagBusy === "bundle" ? "正在准备…" : (preview || "（暂无内容）")));
+            rows.push(h("textarea", {
+              className: "dru-fb-textarea", style: { marginTop: 6 }, maxLength: 600, value: diagNote,
+              placeholder: "用一句话说说你遇到的问题（可选，但很有帮助）",
+              onChange: function (e) { setDiagNote(e.target.value); },
+            }));
+            rows.push(h("label", { className: "dru-hint", style: { display: "block", marginTop: 6, cursor: "pointer" } },
+              h("input", { type: "checkbox", checked: diagAttachLogs, onChange: function (e) { setDiagAttachLogs(e.target.checked); } }),
+              " 附带两个日志的末尾（不含手机号/密码/令牌）"));
+            rows.push(h("div", { className: "dru-actions", style: { marginTop: 8 } },
+              h("button", { type: "button", className: "dru-btn dru-btn-primary", disabled: diagBusy !== "" || !diagBundle, onClick: function () { submitDiagReport(); } },
+                diagBusy === "report" ? "上报中…" : "确认上报"),
+              h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: diagBusy !== "", onClick: function () { setDiagView(null); setDiagMsg(null); } }, "取消")));
+            return h("div", null, rows);
+          }
+          // fix：复制提示词 → 本机 DSH 自己修 → 把结论报告贴回来（可选回传给我们）
+          var promptText = (fixPrompt && fixPrompt.prompt) || "";
+          rows.push(h("div", { className: "dru-hint", style: { marginTop: 6 } },
+            "① 复制下面的提示词；② 粘到电脑上的 DeepSeek Harness 里发送，它会自己检查并修复；③ 把它给出的结论报告贴回下面，回传给我们（可选）。"));
+          rows.push(h("pre", {
+            style: { margin: "6px 0 0", padding: "8px 10px", maxHeight: 200, overflow: "auto", whiteSpace: "pre-wrap", wordBreak: "break-word", fontSize: 12, lineHeight: 1.5, background: "var(--dru-surface-2)", border: "1px solid var(--dru-border-ctl)", borderRadius: 8 },
+          }, diagBusy === "prompt" ? "正在准备…" : (promptText || "（暂无内容）")));
+          rows.push(h("div", { className: "dru-actions", style: { marginTop: 6 } },
+            h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: !promptText, onClick: copyFixPrompt }, "📋 复制提示词")));
+          rows.push(h("textarea", {
+            className: "dru-fb-textarea", style: { marginTop: 6 }, maxLength: 20000, value: fixReport,
+            placeholder: "把 DeepSeek Harness 给出的「结论报告」整段贴到这里，我们一起看",
+            onChange: function (e) { setFixReport(e.target.value); },
+          }));
+          rows.push(h("div", { className: "dru-actions", style: { marginTop: 8 } },
+            h("button", { type: "button", className: "dru-btn dru-btn-primary", disabled: diagBusy !== "" || !fixReport.trim(), onClick: function () { submitDiagReport({ report: fixReport, note: diagNote || "（来自「让 DeepSeek 帮我修」的回传报告）" }); } },
+              diagBusy === "report" ? "回传中…" : "回传结论报告"),
+            h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: diagBusy !== "", onClick: function () { setDiagView(null); setDiagMsg(null); } }, "取消")));
+          return h("div", null, rows);
+        }
+
         function renderConnectBlock() {
           if (!loggedInSaaS || !connInfo) return null;
           var phase = connInfo.phase || "";
@@ -3675,6 +3808,8 @@ window.__ModuleLoader__.load({
               h("button", { type: "button", className: "dru-btn dru-btn-ghost", onClick: copyDiagnostics }, copiedDiag ? "已复制" : "复制诊断信息")));
             rows.push(h("div", { className: "dru-hint", style: { marginTop: 6 } },
               "查看日志：后台服务 " + (connInfo.logPath || "") + " ，安装 " + (connInfo.installLogPath || "") + "（把「复制诊断信息」的内容发给客服可加速定位）"));
+            var diagToolsErr = renderDiagTools();
+            if (diagToolsErr) rows.push(h("div", { style: { marginTop: 8, borderTop: "1px dashed var(--dru-border-ctl)", paddingTop: 8 } }, diagToolsErr));
             return h("div", null, rows);
           }
           // 非错误阶段：只解释「正在自动做什么」，并说明不需要任何操作
@@ -3697,6 +3832,8 @@ window.__ModuleLoader__.load({
           rows.push(h("div", { className: "dru-actions", style: { marginTop: 8 } },
             h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "", onClick: retryConnect }, busy === "connect-retry" ? "立即重试中…" : "立即重试"),
             h("button", { type: "button", className: "dru-btn dru-btn-ghost", onClick: copyDiagnostics }, copiedDiag ? "已复制" : "复制诊断信息")));
+          var diagTools = renderDiagTools();
+          if (diagTools) rows.push(h("div", { style: { marginTop: 8, borderTop: "1px dashed var(--dru-border-ctl)", paddingTop: 8 } }, diagTools));
           return h("div", null, rows);
         }
         // Phase-5:端到端加密(E2EE)状态行 —— 未登录/旧 host 未下发 e2ee 一律不渲染

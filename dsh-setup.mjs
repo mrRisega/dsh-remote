@@ -88,8 +88,13 @@ function findDepWs(startDir) {
   return null;
 }
 
-/** 同步运行时文件时一并覆盖的客户端脚本（bridge 会把这些直接发给手机/桌面，必须与装置器一致）。 */
-const RUNTIME_CLIENT_FILES = ["mobile-adapter.mjs", "dsh-bridge.mjs", "e2ee-shim.mjs", "e2ee-client.mjs", "e2ee-shim-script.js", "mobile-adapter.test.mjs", "wechat-channel.mjs", "dsh-events.mjs", "wechat-runtime.mjs"];
+/**
+ * 同步运行时文件时一并覆盖的客户端脚本（bridge 会把这些直接发给手机/桌面，必须与装置器一致）。
+ * ⚠️ `src/lifecycle.mjs` 也在表里：本安装器**自己**import 它（进程优雅停机的共用实现），
+ * 漏同步就会出现「入口脚本在、依赖不在」的半装运行时（插件半据此判定「运行环境已就绪」，
+ * 却永远起不来 bridge —— 2026-09-23 用户反馈的现场）。
+ */
+const RUNTIME_CLIENT_FILES = ["mobile-adapter.mjs", "dsh-bridge.mjs", "e2ee-shim.mjs", "e2ee-client.mjs", "e2ee-shim-script.js", "mobile-adapter.test.mjs", "wechat-channel.mjs", "dsh-events.mjs", "wechat-runtime.mjs", "src/lifecycle.mjs"];
 
 /**
  * 把"客户端脚本"补齐到配置目录。
@@ -769,7 +774,39 @@ function restartBridgeService() {
 }
 
 /**
- * dsh web 是否正在运行（127.0.0.1:3080）。
+ * 上游 dsh web 地址（bridge 的转发目标 + watcher 的「dsh web 在线吗」判据**同一个来源**）。
+ *
+ * 【2026-09-23 用户实测事故】这里原本处处写死 `http://127.0.0.1:3080`：只要用户的 dsh web
+ * 不在默认端口（`dsh web --port 8090`、profile 里配了 port、或 `--port 0` 让系统分配空闲端口），
+ * watcher 的在线探测就**永远**失败 → bridge 永远不启动，而面板只会说「正在启动 Bridge…」。
+ * 优先级：显式环境变量 > 插件半留下的端口文件 > DSH_WEB_URL > 默认 3080。
+ * 为什么要有「端口文件」这一层：开机自启（登录任务 / launchd）拉起 watcher 时**没有**任何环境变量，
+ * 只有插件半知道 dsh web 真实监听在哪个端口，所以它会把地址落盘（见插件 half 的 publishUpstream）。
+ */
+const UPSTREAM_FILE = ".dsh-upstream";
+function upstreamUrl() {
+  const explicit = String(process.env.DSH_BRIDGE_UPSTREAM || "").trim();
+  if (explicit) return explicit.replace(/\/+$/, "");
+  try {
+    const fromFile = String(fs.readFileSync(path.join(CONFIG_DIR, UPSTREAM_FILE), "utf8")).trim();
+    if (/^https?:\/\/[^\s]+$/i.test(fromFile)) return fromFile.replace(/\/+$/, "");
+  } catch { /* 没写过（旧版/首次）→ 往下回退 */ }
+  const web = String(process.env.DSH_WEB_URL || "").trim();
+  if (web) {
+    try {
+      const u = new URL(web);
+      if (u.port) return `http://127.0.0.1:${u.port}`; // bridge 的 loopback 围栏只认 127.0.0.1
+    } catch { /* 非 URL：忽略 */ }
+  }
+  return "http://127.0.0.1:3080";
+}
+/** 上游端口（诊断/日志用；取不到就回退 3080）。 */
+function upstreamPort() {
+  try { return Number(new URL(upstreamUrl()).port) || 3080; } catch { return 3080; }
+}
+
+/**
+ * dsh web 是否正在运行（默认 127.0.0.1:3080，端口以 upstreamUrl() 为准）。
  * bridge 本身依赖 dsh web 才工作：dsh web 没开时 bridge 起来也会立刻退出，
  * 所以「装完当下 bridge 没在跑」是**正常状态**，不能当失败吓用户（见 install 汇总）。
  */
@@ -777,7 +814,7 @@ async function isDshWebUp(timeoutMs = 1200) {
   try {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), timeoutMs);
-    await fetch("http://127.0.0.1:3080/", { signal: ac.signal });
+    await fetch(upstreamUrl() + "/", { signal: ac.signal });
     clearTimeout(timer);
     return true;
   } catch { return false; }
@@ -794,13 +831,14 @@ function resolveProfileDir(argv = []) {
 }
 
 /**
- * 监听 127.0.0.1:3080 的进程 pid（= dsh web）。
+ * 监听本机 dsh web 端口的进程 pid（= dsh web）。端口取 upstreamPort()（不再写死 3080）。
  * macOS/Linux：lsof → pgrep；Windows：netstat -ano 取 LISTENING 行的最后一列
  * （netstat 是系统自带，比每次都起 PowerShell 快得多）。
  */
 function dshWebPid() {
+  const port = upstreamPort();
   if (IS_WIN) {
-    const r = sh('netstat -ano | findstr ":3080"');
+    const r = sh(`netstat -ano | findstr ":${port}"`);
     for (const line of String(r.stdout || "").split("\n")) {
       if (!/LISTENING/i.test(line)) continue;
       const m = line.trim().match(/(\d+)\s*$/);
@@ -808,7 +846,7 @@ function dshWebPid() {
     }
     return null;
   }
-  const l = sh("lsof -nP -iTCP:3080 -sTCP:LISTEN -t 2>/dev/null || true");
+  const l = sh(`lsof -nP -iTCP:${port} -sTCP:LISTEN -t 2>/dev/null || true`);
   const pid = String(l.stdout || "").trim().split(/\s+/).filter(Boolean)[0];
   if (pid && /^\d+$/.test(pid)) return Number(pid);
   const p = sh("pgrep -f 'dsh web' 2>/dev/null | head -1");
@@ -884,7 +922,7 @@ function restartDshWeb() {
  */
 function restartDshWebWindows() {
   const pid = dshWebPid();
-  if (!pid) return { ok: false, how: "", detail: "未找到监听 3080 的进程（dsh web 没在运行？）" };
+  if (!pid) return { ok: false, how: "", detail: `未找到监听 ${upstreamPort()} 的进程（dsh web 没在运行？）` };
   const cmdline = windowsProcessCommandLine(pid);
   if (!cmdline) return { ok: false, how: "", detail: "无法获取 dsh web 的启动命令行，请手动重启" };
   if (/_npx|node_modules\\\.bin|node_modules\/\.bin/.test(cmdline)) {
@@ -1087,15 +1125,15 @@ async function runBridge() {
   /** 限流提示只打一次，避免刷屏。 */
   let warnedRateLimit = false;
 
-  // watcher：检测 dsh web（127.0.0.1:3080）存活，存活才启动 bridge
+  // watcher：检测 dsh web 是否存活（端口以 upstreamUrl() 为准，绝不写死 3080），存活才启动 bridge
   const checkUpstream = () => new Promise((resolve) => {
     const t = setTimeout(() => resolve(false), 2000);
-    fetch("http://127.0.0.1:3080/")
+    fetch(upstreamUrl() + "/")
       .then(() => { clearTimeout(t); resolve(true); })
       .catch(() => { clearTimeout(t); resolve(false); });
   });
 
-  console.log("[dsh-remote] 等待 dsh web（127.0.0.1:3080）启动...");
+  console.log(`[dsh-remote] 等待 dsh web（${upstreamUrl()}）启动...`);
   let bridgeProc = null;
   let starting = false;
 
@@ -1158,6 +1196,8 @@ async function runBridge() {
         ...process.env,
         DSH_BRIDGE_CONFIG: CONFIG_PATH,
         DSH_BRIDGE_TUNNEL_URL: cfg.tunnel_url,
+        // 上游端口显式传给 bridge：它自己在旧版本里也回退到写死的 3080（见 dsh-bridge.mjs 的 UPSTREAM）。
+        DSH_BRIDGE_UPSTREAM: upstreamUrl(),
         // 安装口径透传给 bridge（bridge 把它随设备登记请求一起上报给账号 API）
         DSH_BRIDGE_INSTALL_SOURCE: INSTALL_SOURCE,
         DSH_BRIDGE_INSTALL_VERSION: INSTALL_VERSION,
@@ -1335,7 +1375,7 @@ async function setup(argv) {
         fs.writeFileSync(patchPath, cur);
       } catch { /* 忽略：轮询会给出结论 */ }
       for (let i = 0; i < 45; i += 1) {
-        const r = await fetch("http://127.0.0.1:3080/dsh-remote/self", { signal: AbortSignal.timeout(900) })
+        const r = await fetch(upstreamUrl() + "/dsh-remote/self", { signal: AbortSignal.timeout(900) })
           .catch(() => null);
         if (r && r.ok) {
           const j = await r.json().catch(() => null);
@@ -1448,7 +1488,7 @@ async function setup(argv) {
     L.push("          再打开 设置 → 「远程访问」→ 注册/登录手机号即可。");
   } else if (needRestart && restartResult && restartResult.ok) {
     L.push("");
-    L.push("   下一步: dsh web 已重启，直接打开 http://127.0.0.1:3080 → 设置 → 「远程访问」→ 注册/登录手机号。");
+    L.push("   下一步: dsh web 已重启，直接打开 " + upstreamUrl() + " → 设置 → 「远程访问」→ 注册/登录手机号。");
   } else if (needRestart && pluginResult && pluginResult.hotPatch && pluginResult.changed) {
     // patch 已写入但探测窗口内没等到面板接口:热加载很可能还在进行(插件节点半启动+注册路由)。
     // 这种情况**不能**直接让用户重启 —— 先让他等几秒刷新,再给兜底方案。
@@ -1466,8 +1506,8 @@ async function setup(argv) {
     L.push("⚠️ 还需要重启一次 dsh web，插件面板才会出现（插件只在进程启动时装载）。");
     L.push("   请手动执行（任选其一）：");
     L.push("     launchctl kickstart -k gui/$(id -u)/com.dshweb.dev     # 用 launchd 托管时");
-    L.push("     kill $(lsof -ti tcp:3080 -sTCP:LISTEN) && dsh web --no-open   # 手动启动时");
-    L.push("   重启后：打开 http://127.0.0.1:3080 → 设置 → 「远程访问」→ 注册/登录手机号。");
+    L.push(`     kill $(lsof -ti tcp:${upstreamPort()} -sTCP:LISTEN) && dsh web --no-open   # 手动启动时`);
+    L.push(`   重启后：打开 ${upstreamUrl()} → 设置 → 「远程访问」→ 注册/登录手机号。`);
   } else {
     L.push("");
     L.push("   下一步: 打开 dsh web → 设置 → 「远程访问」→ 注册/登录手机号即可（无需任何命令）。");

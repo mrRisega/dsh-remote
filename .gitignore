@@ -15,6 +15,10 @@ logs/
 # 本机运行时产物（bridge/插件在仓库目录里跑时产生；绝不入库）
 .dsh-*
 
+# 插件包内的运行环境副本：**构建产物**，由 npm pack / npm publish 的 prepack 自动生成
+# （scripts/bundle-runtime.mjs）。绝不入库 —— dsh-setup.mjs / clients 一旦有两份副本就会漂移。
+packages/dsh-remote-web/runtime/
+
 # 系统
 .DS_Store
 .dsh-config.json
