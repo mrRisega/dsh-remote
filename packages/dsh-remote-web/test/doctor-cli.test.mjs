@@ -14,7 +14,7 @@
  */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -114,4 +114,20 @@ test("用法里必须有 doctor（否则用户不知道有这个入口）", () =
   const out = String(r.stdout || "") + String(r.stderr || "");
   assert.match(out, /dsh-remote doctor/, "用法里要列出 doctor");
   assert.match(out, /为什么连不上/, "要一句话说清它是干什么的");
+});
+
+test("★ 面板「复制诊断信息」必须带上 doctor 输出（唯一实现，插件半不抄第二份）", () => {
+  const clientSrc = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
+  // 面板侧：复制前先取 doctor，取不到就退回原有文本（按钮永不因此失败）
+  assert.match(clientSrc, /api\("\/dsh-remote\/doctor"/, "面板必须去取 doctor 输出");
+  assert.match(clientSrc, /base \+ "\\n\\n" \+ t \+ "\\n"/, "doctor 文本要接在原有诊断之后");
+  assert.match(clientSrc, /setTimeout\(function \(\) \{ copyNow\(base\); \}, 12000\)/,
+    "doctor 慢/挂住时必须有兜底：12 秒后用原有文本复制（不能把按钮挂住）");
+
+  const indexSrc = readFileSync(new URL("../lib/index.js", import.meta.url), "utf8");
+  // 节点侧：必须**起子进程跑运行环境里的 doctor**（复用唯一实现），而不是在插件里重写一份
+  assert.match(indexSrc, /path: "\/dsh-remote\/doctor"/, "节点半必须有这条路由");
+  assert.match(indexSrc, /safeSpawn\(process\.execPath, \[setup, "doctor"\]/, "必须跑运行环境的 doctor（同一份实现）");
+  assert.match(indexSrc, /skipsSystemOps\(\)\) return Promise\.resolve\(\{ ok: false, text: "", error: "测试隔离/,
+    "必须遵守测试隔离（用例不得真的起子进程）");
 });

@@ -874,3 +874,26 @@ test("★ 护栏：解析期绝不许往页面塞东西（0.6.14 首屏提示层
     "不得出现 1000000 以上的 z-index（压过一切的全屏层 = 判断错一次就锁死用户）");
   assert.ok(!/dsh-ma-boot/.test(css), "首屏提示层的样式必须已彻底删除");
 });
+
+test("★ 加载疑似失败时的提示：只在**已有的悬浮菜单**里多一行（不新增层、解析期不碰 DOM）", () => {
+  // 替代被删除的首屏提示层：同样的需求（让用户知道"没加载完、该怎么办"），
+  // 但换成安全的失败方向 —— 判断错了最多是菜单里多一行字，不会挡住任何人。
+  const { js: script, css } = injected();
+  const gate = script.indexOf("/* —— 主机门解除");
+  const preGate = script.slice(script.indexOf('"use strict";'), gate);
+  assert.ok(!/appendChild/.test(preGate), "解析期仍不得 appendChild（看门狗只置状态）");
+
+  // 提示必须挂在菜单里（菜单是被动展开的 → 天然不会覆盖界面）
+  assert.match(script, /dsh-ma-menu[\s\S]{0,600}?data-role="load-warn"/, "提示行必须放在悬浮菜单的 HTML 里");
+  assert.match(css, /div\.dsh-ma-menu \.dsh-ma-load-warn/, "样式必须限定在菜单内（不得是 body 级固定层）");
+  assert.ok(!/\.dsh-ma-load-warn\s*\{[^}]*position:\s*(fixed|absolute)/.test(css),
+    "提示行不得用 fixed/absolute 定位（那就又变成覆盖层了）");
+  assert.ok(!/\.dsh-ma-load-warn\s*\{[^}]*z-index/.test(css), "提示行不得有 z-index（压层）");
+
+  // 阈值要宽松：宁可漏报，不可吓人
+  assert.match(script, /if \(maLoadReadyNow\(\)\) return;/, "认出官方界面就不该报警");
+  assert.match(script, /\}, 25 \* 1000\);/, "看门狗阈值应为 25 秒（宽松）");
+  // 一句话要能直接发给客服
+  assert.match(script, /dsh-remote 手机端加载疑似卡住/, "必须给一句可直接发给客服的话");
+  assert.match(script, /maLoadCopyLine/, "要能复制（否则用户只能截图）");
+});

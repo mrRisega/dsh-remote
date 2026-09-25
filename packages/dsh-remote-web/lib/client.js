@@ -2594,18 +2594,34 @@ window.__ModuleLoader__.load({
         }).finally(function () { setBusy(""); });
       };
 
-      /** 「复制诊断信息」：版本 / 配置目录 / 阶段 / 最近错误 / 进程状态 / 日志路径（node 半已拼好）。 */
+      /** 「复制诊断信息」：版本 / 配置目录 / 阶段 / 最近错误 / 进程状态 / 日志路径（node 半已拼好）。
+       *  ★ 2026-09-25：再追加运行环境 `dsh-remote doctor` 的输出 —— 它把「上游端口是怎么来的 /
+       *  身份校验过没过 / 守护与 bridge 进程 / 事件订阅与待补发通知 / 带时间戳的日志尾部」一次讲清。
+       *  为什么不塞进 bridge-status 的负载：那是 2~3 秒一次的长轮询，而 doctor 要起一次子进程。
+       *  取不到就退回原有文本（按钮永不因此失败）。 */
       var copyDiagnostics = function () {
-        var text = (connInfo && connInfo.diagnostics) || "";
-        if (!text) return;
-        copyText(text).then(function (done) {
-          if (!done) {
-            // 剪贴板不可用：文案里已给出日志路径，用户可自行查看
-            setMsg("warn", "复制失败：浏览器可能限制了剪贴板权限；可展开下方日志路径自行查看。");
-            return;
-          }
-          setCopiedDiag(true);
-          later(function () { setCopiedDiag(false); }, 2000);
+        var base = (connInfo && connInfo.diagnostics) || "";
+        if (!base) return;
+        var copyNow = function (text) {
+          copyText(text).then(function (done) {
+            if (!done) {
+              // 剪贴板不可用：文案里已给出日志路径，用户可自行查看
+              setMsg("warn", "复制失败：浏览器可能限制了剪贴板权限；可展开下方日志路径自行查看。");
+              return;
+            }
+            setCopiedDiag(true);
+            later(function () { setCopiedDiag(false); }, 2000);
+          });
+        };
+        // doctor 慢/挂住也不能让按钮失灵：12 秒后就用原有文本复制
+        var timer = setTimeout(function () { copyNow(base); }, 12000);
+        api("/dsh-remote/doctor", {}, 12000).then(function (r) {
+          clearTimeout(timer);
+          var t = r && r.ok && r.text ? String(r.text) : "";
+          copyNow(t ? base + "\n\n" + t + "\n" : base);
+        }).catch(function () {
+          clearTimeout(timer);
+          copyNow(base);
         });
       };
 

@@ -764,6 +764,7 @@ async function doHttp(method, path, reqHeaders, body, isB64) {
     if (m.injected) {
       console.log(`[bridge] mobile-adapter 注入 ${path}: ${(buf.length / 1024).toFixed(0)}KB → ${(m.buf.length / 1024).toFixed(0)}KB`);
       buf = m.buf;
+      armMirrorLoadWatch(path);
     }
     // E2EE 镜像页加密 shim(Phase-4):仅桥端 e2ee 启用时注入(e2ee.enabled=false → 零注入零行为)
     if (e2ee.enabled) {
@@ -830,10 +831,39 @@ export function e2eeHttpResponseFrame(id, sessId, respEnv) {
   };
 }
 
+/**
+ * 「镜像页交付了、但页面再也没回来」的看门狗（2026-09-25）。
+ *
+ * 【为什么需要】首屏提示层被整块删除后，页面上不再有任何东西能告诉用户"没加载完"
+ * （那正是业主的要求：不许再有会盖住界面的层）。但**服务端能看见一个更硬的信号**：
+ * 我们把镜像页 HTML 交付给手机后，官方前端一定会在几秒内发一串请求（模块、会话、mux…）。
+ * 若 60 秒内一个都没有，那这个页面几乎必然没起来 —— 这时在**日志**里留一条带时间戳的结论，
+ * 用户「复制诊断信息」或 `dsh-remote doctor` 时就能看到，不用再靠猜。
+ *
+ * 代价与边界：
+ *   · 只是**一次**待办标记 + 一个 unref 定时器，没有额外请求、没有额外文件；
+ *   · 60 秒很宽松（正常加载 1~3 秒就回来一串请求）；用户"打开就关掉"最多多一行日志；
+ *   · 只记日志，不做任何用户可见动作（不注入、不弹层、不改状态）。
+ */
+let mirrorLoadWatch = null;
+function armMirrorLoadWatch(path) {
+  mirrorLoadWatch = { at: Date.now(), path };
+  const timer = setTimeout(() => {
+    if (!mirrorLoadWatch) return;
+    const waited = Math.round((Date.now() - mirrorLoadWatch.at) / 1000);
+    console.error(`[bridge] ⚠️ 镜像页疑似没加载起来：交付 ${mirrorLoadWatch.path} 后 ${waited} 秒内没有任何后续请求`
+      + `（正常 1~3 秒就会有一串）。手机侧请刷新一次；仍不行把这条日志发给客服。`);
+    mirrorLoadWatch = null;
+  }, 60 * 1000);
+  timer.unref?.();
+}
+
 export async function handleHttpFrame(dchOrSend, frame) {
   const send = toSender(dchOrSend);
   const { id, method = "GET", path = "/", headers = {}, body, bodyBase64: isB64 } = frame;
   const t0 = Date.now();
+  // 页面还活着：任何后续请求都撤掉「镜像页加载」看门狗（见 armMirrorLoadWatch）
+  if (mirrorLoadWatch) { mirrorLoadWatch = null; }
   // 桌面授权引导(方案A):POST /_e2ee/intro(device/channel 形态归一)—— 本地应答,不连上游
   if (method === "POST" && path === "/_e2ee/intro") {
     return answerIntro(send, id);
@@ -1674,6 +1704,10 @@ async function main() {
   });
   return runTunnel();
 }
+
+// test hooks：镜像页加载看门狗的内部状态（给用例断言"后续请求会撤掉它"，见 test/bridge-html-inject.test.mjs）
+export function __mirrorLoadWatchState() { return mirrorLoadWatch ? { ...mirrorLoadWatch } : null; }
+export function __armMirrorLoadWatch(path) { armMirrorLoadWatch(path); }
 
 // 直接运行(node dsh-bridge.mjs)时启动服务;被测试 import 时只导出协议函数。
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;

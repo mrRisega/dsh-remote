@@ -7,7 +7,7 @@
  *   - 非 html(SSE/json/二进制)不动。
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -107,4 +107,36 @@ test("集成:非 html(SSE / js / json)不动", async () => {
   const js = await request({ id: "h5", method: "GET", path: "/app.js", headers: { "accept-encoding": "gzip", "user-agent": "phone" } });
   assert.equal(decode(js), "console.log(1)");
   assert.ok(!decode(js).includes("dsh-mobile-adapter"));
+});
+
+// ── 「镜像页交付了、页面再也没回来」的看门狗（2026-09-25）────────────────────────
+// 背景：首屏提示层被整块删除（它会永久盖住已加载完的界面）。删掉之后页面上不再有任何东西
+// 能告诉用户"没加载完" —— 但服务端有一个更硬的信号：交付 HTML 后官方前端一定会在几秒内
+// 发一串请求；一个都没有，那这个页面几乎必然没起来。这里把它记进日志，供 doctor / 诊断复制查看。
+
+test("★ 看门狗：交付镜像页后挂起；**任何后续请求都会撤掉它**（别把正常加载误报成失败）", async () => {
+  const mod = await import("../dsh-bridge.mjs");
+  assert.equal(typeof mod.__mirrorLoadWatchState, "function", "要有可断言的状态钩子");
+  assert.equal(mod.__mirrorLoadWatchState(), null, "初始应为空");
+
+  // ① 交付镜像页（/ 是官方特征 HTML）→ 挂起看门狗
+  const page = await request({ id: "w1", method: "GET", path: "/page", headers: {} });
+  assert.ok(page && page.status === 200);
+  const st = mod.__mirrorLoadWatchState();
+  assert.ok(st && st.path === "/page", "交付镜像页后必须挂起看门狗");
+
+  // ② 页面发来任何后续请求 → 立即撤掉（页面活着，不该误报）
+  await request({ id: "w2", method: "POST", path: "/api/session/list", headers: { "content-type": "application/json" }, body: "{}" });
+  assert.equal(mod.__mirrorLoadWatchState(), null, "★ 有后续请求 = 页面活着，看门狗必须撤销");
+});
+
+test("看门狗只记日志、不做任何用户可见动作（不注入、不弹层、不改状态）", () => {
+  const src = readFileSync(new URL("../dsh-bridge.mjs", import.meta.url), "utf8");
+  const i = src.indexOf("function armMirrorLoadWatch");
+  assert.ok(i > 0, "找不到 armMirrorLoadWatch");
+  const body = src.slice(i, src.indexOf("\n}\n", i));
+  assert.match(body, /60 \* 1000/, "阈值 60 秒（宽松：正常加载 1~3 秒就回来一串请求）");
+  assert.match(body, /timer\.unref\?\.\(\)/, "定时器必须 unref（否则测试/退出会被它吊住）");
+  assert.match(body, /console\.error\(/, "只写日志");
+  assert.ok(!/appendChild|inject|writeFileSync|send\(/.test(body), "不得有注入/弹层/落盘/发帧等任何副作用");
 });

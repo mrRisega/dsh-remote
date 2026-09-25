@@ -399,6 +399,18 @@ div.dsh-ma-menu .dsh-ma-menu-note {
   margin-top: 8px; font-size: 11.5px; line-height: 1.7;
   color: var(--dsw-alias-label-tertiary, #6b7280);
 }
+/* 加载疑似没完成时的一行提示 —— **只放进已有的「远程控制」菜单**，不新增任何层。
+   2026-09-25 教训：首屏提示层（全屏覆盖 + 启发式退出）会永久盖住已加载完的界面，已整块删除。
+   这里换成**安全的失败方向**：判断错了最坏只是菜单里多一行字，绝不遮挡、绝不拦截。 */
+div.dsh-ma-menu .dsh-ma-load-warn {
+  display: flex; gap: 8px; align-items: flex-start; margin-top: 8px; padding: 8px 10px;
+  border-radius: 8px; cursor: pointer; font-size: 12px; line-height: 1.6;
+  background: color-mix(in srgb, var(--dsw-alias-label-warning, #9a6700) 12%, transparent);
+  color: var(--dsw-alias-label-warning, #9a6700);
+}
+div.dsh-ma-menu .dsh-ma-load-warn[hidden] { display: none !important; }
+div.dsh-ma-menu .dsh-ma-load-warn .ico { flex: none; }
+div.dsh-ma-menu .dsh-ma-load-warn .txt { min-width: 0; overflow-wrap: anywhere; }
 
 /* 会话过期引导条:镜像页在会话过期后只会"连不上"，这里给一句能照做的话 + 一个出口。
    非阻塞(顶部细条)，点关闭即消失；不拦截任何请求。 */
@@ -484,6 +496,83 @@ const SCRIPT = `(() => {
       try { globalThis.__DSH_TRANSPORT__ = tr; } catch (e2) { /* 忽略 */ }
     }
   })();
+
+  /* ===== 「加载疑似没完成」看门狗（2026-09-25，替代被整块删除的首屏提示层）=====
+     那个提示层是全屏覆盖 + 启发式退出 —— 判断错一次就把**已经加载完**的界面永久盖住
+     （业主实测：秒表走到 187 秒，刷新也一样）。所以这里换一条**安全的失败方向**：
+
+       · 解析期**不创建任何 DOM**（只有几个变量 + 一个定时器）—— 页面还没过主机门，
+         更不该有任何覆盖层；
+       · 25 秒后仍认不出官方界面 → 只置一个 slow 标记，**不往页面塞任何东西**；
+       · 标记生效时，往**已有的**「远程控制」悬浮菜单里多一行字（点一下复制一句话给客服），
+         并建议点菜单里本来就有的「返回设备列表」重来；
+       · 判断错了的代价 = 菜单里多一行字（用户不点开菜单完全看不到）；不会再挡住任何人。
+
+     ⚠️ 刻意**不**做成页面顶部/底部的固定细条：那种细条同样会盖住官方 UI 的一部分，
+        而且同样有"永不消失"的失败方向。菜单是被动展开的，天然没有这个问题。 */
+  var maLoadWatch = { startedAt: Date.now(), slow: false, wired: false, bound: false, warnEl: null, warnTxt: null };
+  /** 官方界面是否已经可用（只看最强信号；只用于决定"要不要多显示一行字"）。 */
+  function maLoadReadyNow() {
+    try {
+      if (document.querySelector(".pI_x6G_frame, div.dsh-ma-frame, [data-sidebar-collapsed], [data-details-collapsed], [data-rightbar-collapsed]")) return true;
+      return Boolean(document.querySelector('[data-composer-input], [contenteditable="true"], [role="textbox"], textarea'));
+    } catch (e) { return false; }
+  }
+  function maLoadWaitedSec() {
+    return Math.max(0, Math.round((Date.now() - maLoadWatch.startedAt) / 1000));
+  }
+  /** 给客服看的一句话（含等待时长与 UA，便于直接定位）。 */
+  function maLoadCopyLine() {
+    let ua = "";
+    try { ua = String((navigator && navigator.userAgent) || "").slice(0, 120); } catch (e) { /* 忽略 */ }
+    return "dsh-remote 手机端加载疑似卡住：等待 " + maLoadWaitedSec() + " 秒后仍未出现对话界面。UA=" + ua;
+  }
+  function maLoadRenderWarn() {
+    try {
+      if (!maLoadWatch.warnEl) return;
+      if (!maLoadWatch.slow) { maLoadWatch.warnEl.hidden = true; return; }
+      if (maLoadWatch.warnTxt) {
+        maLoadWatch.warnTxt.textContent = "本次页面可能没加载完整（已等 " + maLoadWaitedSec()
+          + " 秒）。点这里复制一句话发给客服，或点下方「返回设备列表」重来。";
+      }
+      maLoadWatch.warnEl.hidden = false;
+    } catch (e) { /* 提示失败绝不影响主功能 */ }
+  }
+  /** 把这一行接进已有的悬浮菜单（由菜单构建处调用；菜单不存在时什么都不做）。 */
+  function maWireLoadWarn(menu) {
+    try {
+      maLoadWatch.warnEl = menu.querySelector('[data-role="load-warn"]');
+      maLoadWatch.warnTxt = menu.querySelector('[data-role="load-warn-txt"]');
+      maLoadWatch.wired = true;
+      maLoadRenderWarn();
+      if (maLoadWatch.warnEl && !maLoadWatch.bound) {
+        maLoadWatch.bound = true;
+        maLoadWatch.warnEl.addEventListener("click", function () {
+          const line = maLoadCopyLine();
+          const show = (t) => { try { if (maLoadWatch.warnTxt) maLoadWatch.warnTxt.textContent = t; } catch (e) { /* 忽略 */ } };
+          try {
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              navigator.clipboard.writeText(line).then(
+                () => show("已复制。直接粘给客服即可（里面已带等待时长与机型信息）。"),
+                () => show(line) // 剪贴板不可用 → 至少把这句话显示出来让用户截图
+              );
+              return;
+            }
+          } catch (e) { /* 落到下面 */ }
+          show(line);
+        });
+      }
+    } catch (e) { /* 忽略 */ }
+  }
+  // 25 秒后仍认不出官方界面 → 置慢标记（**只改状态，不碰 DOM**）。
+  // 阈值取得很宽松：宁可漏报（什么都不显示，与今天一致），也不要误报吓人。
+  setTimeout(function () {
+    try {
+      if (maLoadReadyNow()) return;
+      maLoadWatch.slow = true;
+      if (maLoadWatch.wired) maLoadRenderWarn();
+    } catch (e) { /* 忽略 */ }
+  }, 25 * 1000);
 
   try {
     const HOST_RE = new RegExp(${JSON.stringify(RUNTIME_HOST_RE.source)});
@@ -855,8 +944,13 @@ const SCRIPT = `(() => {
           '<div class="dsh-ma-menu-e2ee" data-role="e2ee"><span class="ico">🔒</span><span class="txt">正在读取…</span></div>' +
         '</div>' +
         '<button type="button" class="dsh-ma-menu-back">← 返回设备列表</button>' +
+        '<div class="dsh-ma-load-warn" data-role="load-warn" hidden>' +
+          '<span class="ico">⚠</span>' +
+          '<span class="txt" data-role="load-warn-txt"></span>' +
+        '</div>' +
         '<div class="dsh-ma-menu-note">返回后可重新选择设备；端到端加密需在设备列表页重新解锁（会话密钥只存在本机内存里，刷新即失效）。</div>';
       document.body.appendChild(menu);
+      maWireLoadWarn(menu); // 加载疑似失败时，在这一行里说明白（点一下可复制）
 
       /* ---- 悬浮按钮的位置：默认**右上角**（原来在右下角，正好压住输入框的发送按钮）；
               可拖动，位置按"最近的角 + 距边偏移"记忆 —— 旋转屏幕/换窗口宽度都不会跑到屏幕外。 ---- */

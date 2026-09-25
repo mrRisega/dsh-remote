@@ -4206,6 +4206,54 @@ async function composeConnect(relayDir, opts = {}) {
 }
 
 /**
+ * 跑一次运行环境的 `dsh-remote doctor`，把它的输出交给面板「复制诊断信息」。
+ *
+ * 为什么用子进程而不是在插件里重写一份：doctor 的每一条结论（上游来源、身份校验、进程、
+ * 待补发队列、订阅异常、日志尾部）都必须与用户自己敲 `dsh-remote doctor` 看到的**完全一致** ——
+ * 两份实现必然漂移，而这份文本正是我们用来定位用户问题的唯一凭据。
+ *
+ * 安全与边界：
+ *   · **只读**：doctor 自己承诺不改任何东西（连运行时脚本同步都跳过）；
+ *   · 10 秒上限 + 输出上限 64KB：子进程卡死不会把面板按钮挂住，也不会把巨型文本塞进剪贴板；
+ *   · 测试隔离（DSH_RELAY_SKIP_SERVICE=1）直接跳过，用例不碰真实系统；
+ *   · 任何失败都返回 ok:false + 原因，面板退回原有诊断文本（绝不因此变红/报错）。
+ *
+ * @returns {Promise<{ok:boolean, text:string, error?:string}>}
+ */
+function runDoctorText(relayDir) {
+  if (skipsSystemOps()) return Promise.resolve({ ok: false, text: "", error: "测试隔离（DSH_RELAY_SKIP_SERVICE=1）" });
+  const setup = join(relayDir, "dsh-setup.mjs");
+  if (!existsSync(setup)) return Promise.resolve({ ok: false, text: "", error: `运行环境入口不存在（${setup}）` });
+  return new Promise((resolve) => {
+    let out = "";
+    let done = false;
+    const finish = (v) => { if (!done) { done = true; resolve(v); } };
+    const { child, error } = safeSpawn(process.execPath, [setup, "doctor"], {
+      cwd: homedir(),
+      env: spawnEnv({}),
+      stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true,
+      onError: (e) => finish({ ok: false, text: "", error: `启动 doctor 失败：${e.message}` }),
+    });
+    if (error || !child) return finish({ ok: false, text: "", error: `启动 doctor 失败：${error ? error.message : "无子进程"}` });
+    const timer = setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch { /* 已经退出 */ }
+      finish({ ok: false, text: out.trim(), error: "doctor 超过 10 秒未返回" });
+    }, 10_000);
+    timer.unref?.();
+    child.stdout?.on("data", (chunk) => {
+      if (out.length < 64 * 1024) out += String(chunk);
+    });
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      const text = out.trim();
+      if (!text) return finish({ ok: false, text: "", error: `doctor 没有输出（退出码 ${code}）` });
+      finish({ ok: true, text });
+    });
+  });
+}
+
+/**
  * 可复制的诊断信息（面板「复制诊断信息」按钮）：版本 / relayDir / 阶段 / 最近错误 / 进程状态 /
  * 日志路径 + **两个日志的尾部**。
  *
@@ -5490,6 +5538,21 @@ function registerRoutes(ctx, relayDir) {
         const runtimeReady = existsSync(join(relayDir, "dsh-setup.mjs"));
         // channel：当前更新通道（面板要显示出来 —— 否则预发版用户会点出一个方向相反的操作）
         sendJson(res, 200, { ok: true, version: PLUGIN_VERSION, channel: UPDATE_TAG, runtimeReady, relayDir });
+      },
+    },
+    {
+      /**
+       * `GET /dsh-remote/doctor` —— 面板「复制诊断信息」用的**一条命令自检**输出（只读）。
+       *
+       * 为什么单开一条路由、而不是塞进 bridge-status 的负载：`doctor` 要**起一次子进程**跑
+       * 运行环境里的 `dsh-setup.mjs doctor`（复用唯一实现 —— 插件半不抄第二份）。而 bridge-status
+       * 是 2~3 秒一次的长轮询，往那里塞子进程等于每 3 秒 fork 一个 node。
+       * 这里只在用户**真的点**「复制诊断信息」时跑一次（10 秒上限；任何失败都退回原有文本）。
+       */
+      method: "GET",
+      path: "/dsh-remote/doctor",
+      handler: async (_req, res) => {
+        sendJson(res, 200, await runDoctorText(relayDir));
       },
     },
     {
