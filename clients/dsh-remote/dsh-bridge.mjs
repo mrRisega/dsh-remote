@@ -89,6 +89,8 @@ import {
   encodeHttpResponsePlain,
   hasEnvelopeMarker,
   parseWsE2eeParams,
+  stripPlainWantHeader,
+  wantsBinaryResponsePlain,
   writeE2eeStateFile
 } from "./e2ee-client.mjs";
 // 微信机器人通道(编排层):绑定控制面 + 出站通知路由 + 入站长轮询。
@@ -800,6 +802,34 @@ async function doHttp(method, path, reqHeaders, body, isB64) {
   };
 }
 
+/**
+ * 构造 e2ee http 响应帧（**导出给用例**：第三层 base64 的去留必须有测试钉住）。
+ *
+ * 【0.6.15】这里曾经是 `body: Buffer.from(JSON.stringify(respEnv)).toString("base64")`
+ * + `bodyBase64: true` —— 也就是把整个信封 JSON 再 base64 一次。中继拿到它做的第一件事
+ * 就是解回 UTF-8 再写给手机，所以这一层**纯属白花 33% 流量**，而且正好落在按流量计量的
+ * bridge→中继 那条 WS 上（业主实测那条聚合包：12.69 MiB vs 直接发 UTF-8 的 9.5 MiB）。
+ * 中继对两种形态都支持（`frame.bodyBase64` 真假之分），所以直接发 UTF-8 明文即可。
+ *
+ * @param {string|number} id 帧 id
+ * @param {string} sessId E2EE 会话 id（只进标记头）
+ * @param {object} respEnv 已封好的响应信封
+ * @returns {{id:any,type:string,status:number,headers:object,body:string,bodyBase64:boolean}}
+ */
+export function e2eeHttpResponseFrame(id, sessId, respEnv) {
+  return {
+    id,
+    type: "http",
+    status: 200, // 外层一律 200,真实状态在信封明文 st 里(§4.3)
+    headers: {
+      "content-type": ENVELOPE_CONTENT_TYPE,
+      "x-dsh-e2ee": `v=2;s=${sessId};k=http-resp`
+    },
+    body: JSON.stringify(respEnv),
+    bodyBase64: false // ★ 第三层 base64 在这里被去掉（见上）
+  };
+}
+
 export async function handleHttpFrame(dchOrSend, frame) {
   const send = toSender(dchOrSend);
   const { id, method = "GET", path = "/", headers = {}, body, bodyBase64: isB64 } = frame;
@@ -827,22 +857,17 @@ export async function handleHttpFrame(dchOrSend, frame) {
       const session = e2ee.guardHttpRequest(String(env?.s || ""), env);
       const opened = session.open({ kind: "http", dir: "p2b", env, counter: env?.c ?? 0 });
       const req = decodeHttpRequestPlain(opened.data);
-      const reply = await doHttp(req.method, req.path, req.headers, req.bodyB64, true);
+      // 客户端是否声明"响应用二进制明文框架"（省掉正文那一层 base64，见 e2ee-client.mjs 长注释）。
+      // 老客户端（native.html 的 WC-CORE / 企业版内置那份）不声明 → 照旧走 JSON，零影响。
+      const wantBinPlain = wantsBinaryResponsePlain(req.headers);
+      const upstreamHeaders = wantBinPlain ? stripPlainWantHeader(req.headers) : req.headers;
+      const reply = await doHttp(req.method, req.path, upstreamHeaders, req.bodyB64, true);
       const bodyBuffer = Buffer.from(reply.body, "base64");
-      const plain = encodeHttpResponsePlain({ status: reply.status, headers: reply.headers, bodyBuffer });
+      const plain = encodeHttpResponsePlain({ status: reply.status, headers: reply.headers, bodyBuffer, binary: wantBinPlain });
       // 响应压缩已发生在 doHttp(明文侧,gzip 在加密前 §4.7);信封用 http-resp kind
       const respEnv = session.seal({ kind: "http-resp", dir: "b2p", counter: env?.c ?? 0, data: plain, reqNonceB64: String(env?.n || "") });
-      send({
-        id,
-        type: "http",
-        status: 200, // 外层一律 200,真实状态在信封明文 st 里(§4.3)
-        headers: {
-          "content-type": ENVELOPE_CONTENT_TYPE,
-          "x-dsh-e2ee": `v=2;s=${env.s};k=http-resp`
-        },
-        body: Buffer.from(JSON.stringify(respEnv)).toString("base64"),
-        bodyBase64: true
-      });
+      // ★ 0.6.15：**不再**把整个信封 JSON 再 base64 一次（第三层）。理由见 e2eeHttpResponseFrame。
+      send(e2eeHttpResponseFrame(id, env.s, respEnv));
       console.log(`[bridge] e2ee http ${req.method} ${req.path} → ${reply.status} (${Date.now() - t0}ms, 信封 ${(reply.body.length * 3 / 4 / 1024).toFixed(0)}KB)`);
       return;
     } catch (e) {

@@ -32,7 +32,9 @@ import {
   normalizeKdf,
   parseEnvelopeMarker,
   parseWsE2eeParams,
-  randomB64
+  randomB64,
+  stripPlainWantHeader,
+  wantsBinaryResponsePlain
 } from "../e2ee-client.mjs";
 
 // 固定口令/盐的 MK 期望值:由 enterprise e2ee.js deriveE2eeMasterKey 计算得到
@@ -212,6 +214,45 @@ function flipB64(b64) {
   buf[0] ^= 0xff;
   return buf.toString("base64url");
 }
+
+test("★ 0.6.15 二进制明文框架:正文不再 base64(省掉三层里的第一层),且旧 JSON 形态仍能解", () => {
+  // 业主实测"打开慢几分钟"的直接原因之一：同一条响应被 base64 编了三层(1.333³≈2.37×)。
+  // 第一层就是"gzip 正文塞进 JSON 明文"。二进制框架把它去掉，且必须**两种形态都能解**
+  // （老客户端只发旧形态，新客户端声明后收新形态）。
+  const body = Buffer.from("首屏聚合包".repeat(500), "utf8");
+  const headers = { "content-type": "application/javascript", "content-encoding": "gzip" };
+
+  const bin = encodeHttpResponsePlain({ status: 200, headers, bodyBuffer: body, binary: true });
+  const legacy = encodeHttpResponsePlain({ status: 200, headers, bodyBuffer: body });
+  assert.equal(bin[0], 0x02, "二进制框架必须以 0x02 开头（JSON 明文以 `{`=0x7B 开头，不可能冲突）");
+  // 旧形态：正文 base64 后是 1.333 倍（这就是被省掉的那一层）
+  assert.ok(legacy.length > bin.length * 1.3,
+    `旧 JSON 形态必须明显更大（实测 ${legacy.length} vs ${bin.length}）`);
+  assert.ok(bin.length < body.length + 256, `二进制框架只应多出一点头（实测 ${bin.length} vs 正文 ${body.length}）`);
+
+  const back = decodeHttpResponsePlain(bin);
+  assert.equal(back.status, 200);
+  assert.equal(back.enc, "gzip");
+  assert.equal(back.headers["content-type"], "application/javascript");
+  assert.deepEqual(Buffer.from(back.bodyBuffer), body, "正文必须逐字节还原");
+  const backLegacy = decodeHttpResponsePlain(legacy);
+  assert.deepEqual(Buffer.from(backLegacy.bodyBuffer), body, "旧形态必须照样能解（老客户端不受影响）");
+
+  // 空正文 / 只有头的响应
+  const empty = decodeHttpResponsePlain(encodeHttpResponsePlain({ status: 204, headers: {}, bodyBuffer: Buffer.alloc(0), binary: true }));
+  assert.equal(empty.status, 204);
+  assert.equal(empty.bodyBuffer.length, 0);
+});
+
+test("★ 0.6.15 协商头:只有客户端声明才用二进制框架,且声明头绝不转发给上游", () => {
+  assert.equal(wantsBinaryResponsePlain({ "x-dsh-e2ee-want": "bin" }), true);
+  assert.equal(wantsBinaryResponsePlain({ "X-DSH-E2EE-WANT": "BIN" }), true, "头名/值大小写不敏感");
+  assert.equal(wantsBinaryResponsePlain({ "x-dsh-e2ee-want": "json" }), false);
+  assert.equal(wantsBinaryResponsePlain({ "content-type": "application/json" }), false, "老客户端不发这个头 → 保持旧形态");
+
+  const stripped = stripPlainWantHeader({ "Content-Type": "application/json", "X-Dsh-E2ee-Want": "bin", "x-t": "v" });
+  assert.deepEqual(stripped, { "Content-Type": "application/json", "x-t": "v" }, "内部协商头绝不能出现在转发给上游的头里");
+});
 
 test("http 响应信封:封包→开包,enc=gzip 被提取、实体头剥离,正文还原", () => {
   const s = makeSession();

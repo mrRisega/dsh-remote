@@ -469,9 +469,12 @@ export function headerValueOf(headers, name) {
  * @returns {{method:string, path:string, headers:object, bodyB64:string, hasBody:boolean}}
  */
 export function decodeHttpRequestPlain(buf) {
+  // ⚠️ 不能写 `String(buf)`：手机端 shim 交出来的是 Uint8Array，String() 会得到 "123,34,..."，
+  //    结果永远是"不是 JSON"（0.6.15 对拍用例抓到的真问题）。
+  const raw = Buffer.isBuffer(buf) ? buf : (typeof buf === "string" ? Buffer.from(buf, "utf8") : Buffer.from(buf ?? []));
   let pt;
   try {
-    pt = JSON.parse(Buffer.isBuffer(buf) ? buf.toString("utf8") : String(buf));
+    pt = JSON.parse(raw.toString("utf8"));
   } catch {
     throw new E2eeError("bad_plain", "e2ee: http 请求明文不是 JSON");
   }
@@ -479,8 +482,8 @@ export function decodeHttpRequestPlain(buf) {
   const method = typeof pt.m === "string" && pt.m ? pt.m.toUpperCase() : "GET";
   const path = typeof pt.p === "string" && pt.p ? pt.p : "/";
   const headers = pt.h && typeof pt.h === "object" ? pt.h : {};
-  const b = typeof pt.b === "string" ? pt.b : "";
-  return { method, path, headers, bodyB64: b, hasBody: b !== "" };
+  const bodyB64 = typeof pt.b === "string" ? pt.b : "";
+  return { method, path, headers, bodyB64, hasBody: bodyB64 !== "" };
 }
 
 /** 编码请求信封明文(测试端/手机侧对称实现用;b 一律为 base64 正文)。 */
@@ -490,13 +493,60 @@ export function encodeHttpRequestPlain({ method = "GET", path = "/", headers = {
 }
 
 /**
- * 响应信封明文(§4.3):{ "st":status, "h":{头, 去 content-length/encoding}, "enc":"gzip|", "b":<b64> }
- * @returns {{status:number, headers:object, enc:string, bodyBuffer:Buffer}}
+ * 响应信封明文（§4.3）。
+ *
+ * 两种形态（**自动识别**，由首字节判别，解码方无需知道对方是哪个版本）：
+ *
+ *   ① 旧/兼容 JSON：`{ "st", "h", "enc", "b":<base64 正文> }` —— 首字节 `{`（0x7B）；
+ *   ② 新二进制框架（0.6.15）：`[0x02][4B 大端头长度][头 JSON][正文原始字节]` —— 首字节 0x02。
+ *
+ * ## 为什么要有 ②（这是"打开慢几分钟"的直接原因之一）
+ *
+ * 同一条响应在链路上被 base64 编码了**三层**（每层 +33%，叠起来 2.37 倍），其中第一层就是这里：
+ * gzip 后的正文塞进 JSON 只能 base64。以实测那条首屏聚合包（gzip 后 5.35 MiB）为例：
+ *
+ *   gzip 正文            5.35 MiB
+ *     ① base64 进 JSON     7.14 MiB   ← 本函数（旧形态）
+ *     ② AES-GCM 密文 base64url  9.52 MiB
+ *     ③ 信封 JSON base64   12.69 MiB  ← 隧道帧（bridge→中继，见 dsh-bridge.mjs）
+ *
+ * ②用"头 JSON + 正文原样跟在其后"的框架，**第一层 33% 直接消失**：明文 = 5.35 MiB + 几百字节头。
+ * 手机端下载量随之从 1.78× 降到 1.33×（9.52 → 7.14 MiB），中继那侧的计量也同步下降。
+ *
+ * ## 为什么是"客户端声明才用"
+ *
+ * 明文框架是**端到端**格式：老的手机客户端（`clients/dsh-web/native.html` 抽出的 WC-CORE、
+ * 企业版内置的那份）只认旧 JSON。所以改成**由客户端在请求里声明**（`x-dsh-e2ee-want: bin`），
+ * 桥端只对声明过的请求用新框架 —— 老客户端一个字都不用改，也不会收到看不懂的字节。
+ *
+ * @returns {{status:number, headers:object, enc:string, bodyBuffer:Buffer, bodyB64:string}}
+ *          `bodyBuffer` 是原始字节（新旧两种形态都填）；`bodyB64` 仅旧 JSON 形态填
+ *          （兼容既有调用方/对拍用例；二进制形态**不**额外做一次 base64，那正是要省掉的开销）。
  */
 export function decodeHttpResponsePlain(buf) {
+  const b = Buffer.isBuffer(buf) ? buf : Buffer.from(buf ?? []);
+  if (b.length >= 5 && b[0] === PLAIN_BIN_MAGIC) {
+    const len = b.readUInt32BE(1);
+    if (len > 0 && 5 + len <= b.length) {
+      let head;
+      try {
+        head = JSON.parse(b.subarray(5, 5 + len).toString("utf8"));
+      } catch {
+        throw new E2eeError("bad_plain", "e2ee: http 响应明文头不是 JSON");
+      }
+      if (!head || typeof head !== "object") throw new E2eeError("bad_plain", "e2ee: http 响应明文缺失");
+      return {
+        status: Number(head.st) || 502,
+        headers: head.h && typeof head.h === "object" ? head.h : {},
+        enc: typeof head.enc === "string" ? head.enc : "",
+        bodyBuffer: b.subarray(5 + len), // 视图，零拷贝
+        bodyB64: ""
+      };
+    }
+  }
   let pt;
   try {
-    pt = JSON.parse(Buffer.isBuffer(buf) ? buf.toString("utf8") : String(buf));
+    pt = JSON.parse(b.toString("utf8"));
   } catch {
     throw new E2eeError("bad_plain", "e2ee: http 响应明文不是 JSON");
   }
@@ -512,11 +562,36 @@ export function decodeHttpResponsePlain(buf) {
       throw new E2eeError("bad_plain", "e2ee: http 响应 body base64 非法");
     }
   }
-  return { status, headers, enc, bodyBuffer };
+  return { status, headers, enc, bodyBuffer, bodyB64: typeof pt.b === "string" ? pt.b : "" };
 }
 
-/** 编码响应信封明文(status/headers/原始正文;content-encoding 提取到 enc)。 */
-export function encodeHttpResponsePlain({ status = 200, headers = {}, bodyBuffer = Buffer.alloc(0) }) {
+/** 二进制明文框架的魔数（JSON 明文以 `{`=0x7B 开头，0x02 永不冲突）。 */
+export const PLAIN_BIN_MAGIC = 0x02;
+/** 客户端在**加密请求明文**里声明"我的响应明文请用二进制框架"的头（见上方长注释）。 */
+export const PLAIN_WANT_BIN_HEADER = "x-dsh-e2ee-want";
+export const PLAIN_WANT_BIN_VALUE = "bin";
+
+/** 请求头里是否声明了"响应用二进制明文框架"（大小写不敏感）。 */
+export function wantsBinaryResponsePlain(headers) {
+  const v = headerValueOf(headers, PLAIN_WANT_BIN_HEADER);
+  return String(v).toLowerCase().split(/[\s,]+/).includes(PLAIN_WANT_BIN_VALUE);
+}
+
+/** 从请求头里摘掉那个"内部协商"头（它绝不能转发给上游 dsh web）。返回新的头对象（不改原对象）。 */
+export function stripPlainWantHeader(headers) {
+  const out = {};
+  for (const [k, v] of Object.entries(headers || {})) {
+    if (String(k).toLowerCase() === PLAIN_WANT_BIN_HEADER) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+/**
+ * 编码响应信封明文（status/headers/原始正文；content-encoding 提取到 enc）。
+ * @param {boolean} [o.binary] true = 用二进制框架（省掉正文那一层 base64；仅客户端声明时使用）
+ */
+export function encodeHttpResponsePlain({ status = 200, headers = {}, bodyBuffer = Buffer.alloc(0), binary = false }) {
   const h = {};
   let enc = "";
   for (const [k, v] of Object.entries(headers || {})) {
@@ -527,11 +602,20 @@ export function encodeHttpResponsePlain({ status = 200, headers = {}, bodyBuffer
     }
     h[k] = Array.isArray(v) ? v.join(", ") : String(v);
   }
+  const head = { st: Number(status) || 200, h, enc };
+  const body = Buffer.isBuffer(bodyBuffer) ? bodyBuffer : Buffer.alloc(0);
+  if (binary) {
+    const headBuf = Buffer.from(JSON.stringify(head), "utf8");
+    const out = Buffer.allocUnsafe(5 + headBuf.length + body.length);
+    out[0] = PLAIN_BIN_MAGIC;
+    out.writeUInt32BE(headBuf.length, 1);
+    headBuf.copy(out, 5);
+    body.copy(out, 5 + headBuf.length);
+    return out;
+  }
   return Buffer.from(JSON.stringify({
-    st: Number(status) || 200,
-    h,
-    enc,
-    b: Buffer.isBuffer(bodyBuffer) && bodyBuffer.length ? bodyBuffer.toString("base64") : ""
+    ...head,
+    b: body.length ? body.toString("base64") : ""
   }), "utf8");
 }
 

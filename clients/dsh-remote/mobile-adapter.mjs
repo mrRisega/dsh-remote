@@ -36,6 +36,11 @@
  *          left+top 陈旧锚点,默认回到右下;再兜底一次“卡左上角”检测(合成鼠标事件走它自己
  *          的拖拽收尾,state/localStorage 由它自洽)。
  *        仅对 ≤820 且锚点命中 left+top 干预;透明区点击/滚动仍穿透,与桌面语义一致。
+ *     6)【0.6.15】**手机图片上传兼容**:官方只把 image/png|jpeg|webp|gif 当图片(本地编码随 prompt
+ *        发给模型),其余一律当普通文件后台上传 —— 模型于是"看不到图"。而手机最容易产出非白名单
+ *        类型(iPhone「高效」= image/heic;部分 Android 图库给空 type)。适配层在**捕获阶段**拦下
+ *        官方隐藏 input[type=file] 的 change,把这类文件**无损改 MIME**(扩展名可判时)或
+ *        canvas 转 JPEG 后重新派发;任何失败都原样重发,绝不丢文件。详见脚本内长注释。
  *
  * 宿主特征门(防误注入其它 html):
  *   - 注入前:content-type 必须 text/html 且含 </head> 且原文含官方标记
@@ -1699,6 +1704,172 @@ const SCRIPT = `(() => {
       try { if (typeof requestAnimationFrame === "function") { requestAnimationFrame(run); return; } } catch (eRaf) { /* 退化 */ }
       setTimeout(run, 0);
     };
+    /* ===== 手机图片上传兼容（0.6.15）=====
+       业主反馈：「手机端无法识别图片」——现象是选了照片发出去，模型看不到图 / 当成普通文件。
+
+       根因（官方 dsh web 客户端逻辑,dsh-client-ui-conversation 的 createDrafts）:
+         · 只有 file.type ∈ {image/png, image/jpeg, image/webp, image/gif} 才走**图片**通道
+           （本地编码后随 prompt 发出，模型真的"能看"）；
+         · 其余一律当**普通文件**：走 Web Worker 后台上传，模型只拿到一个文件引用。
+       而手机恰恰最容易产出"非白名单"的图片：
+         · iPhone 默认「高效」格式拍出来是 image/heic（不在白名单）；
+         · 部分 Android 图库 / 文件提供器给出的是**空 type**（""）；
+         · 从"文件"入口选的还可能是 heif / bmp / tiff / avif。
+
+       做法（全在浏览器里完成，不动官方代码、不动 host）：
+         1) 在**捕获阶段**监听 change（比 React 根容器的监听更早）:官方隐藏 input[type=file]
+            被选中后,若里面有"是图片但不在白名单"的文件,就先拦下这次事件,
+            用 canvas 把它转成 JPEG，再**替换 input.files 并重新派发一次 change** ——
+            这样官方按图片通道收下，模型就能"看见"了；
+         2) 任何一步失败（浏览器解不了 HEIC / canvas 不可用 / DataTransfer 不可用…）
+            一律**把原始文件原样重新派发**，绝不比现状更差（宁可当普通文件，也不能丢文件）；
+         3) 官方认得的类型一个字节都不碰（零行为）。 */
+    var MA_IMG_OK = { "image/png": 1, "image/jpeg": 1, "image/webp": 1, "image/gif": 1 };
+    var MA_IMG_EXT_RE = /\\.(png|jpe?g|webp|gif|heic|heif|bmp|tiff?|avif)$/i;
+    var MA_MAX_DIM = 4096;              // 与官方 imageLimits.maxImageDimension 对齐，避免超限被拒
+    var MA_CONVERT_TIMEOUT = 8000;      // 解码卡住就放弃（原样放行）
+    var MA_REENTRY = "__dshMaImageDone"; // 标记"这次 change 是我们自己派发的"
+
+    function maIsImageFile(f) {
+      var t = String((f && f.type) || "").toLowerCase();
+      if (t) return t.indexOf("image/") === 0;
+      return MA_IMG_EXT_RE.test(String((f && f.name) || ""));
+    }
+    /** 需要转码吗：是图片、但不在官方白名单里。 */
+    function maNeedsConvert(f) {
+      var t = String((f && f.type) || "").toLowerCase();
+      if (MA_IMG_OK[t]) return false;
+      return maIsImageFile(f);
+    }
+    /** 扩展名 → 白名单里的 MIME（拿不到返回空）。 */
+    function maMimeFromName(name) {
+      var m = /\.([A-Za-z0-9]+)$/.exec(String(name || ""));
+      if (!m) return "";
+      var e = m[1].toLowerCase();
+      if (e === "png") return "image/png";
+      if (e === "jpg" || e === "jpeg") return "image/jpeg";
+      if (e === "webp") return "image/webp";
+      if (e === "gif") return "image/gif";
+      return "";
+    }
+    /**
+     * 只改 type、不重编码（**无损**）。
+     * 为什么需要：Android 图库/文件提供器很常见地给出 type:""，而文件本身其实是标准 PNG/JPEG ——
+     * 这时把字节丢进 canvas 重编码纯属浪费（还可能丢透明通道），改个 MIME 就够了。
+     */
+    function maRelabel(file, mime) {
+      try {
+        return new File([file], String(file.name || "image"), { type: mime, lastModified: file.lastModified || Date.now() });
+      } catch (e) {
+        try { var b = file.slice(0, file.size, mime); b.name = file.name; return b; } catch (e2) { return null; }
+      }
+    }
+    /** 单个文件的归一化：优先无损改 MIME，实在不行才 canvas 转 JPEG。 */
+    async function maNormalizeImage(file) {
+      var mime = maMimeFromName(file && file.name);
+      if (mime && String(file.type || "") !== mime) {
+        var relabeled = maRelabel(file, mime);
+        if (relabeled) return relabeled;
+      }
+      return await maToJpeg(file);
+    }
+    function maToJpeg(file) {
+      return new Promise(function (resolve) {
+        var url = "";
+        try { url = URL.createObjectURL(file); } catch (e0) { resolve(null); return; }
+        var settled = false;
+        var finish = function (out) {
+          if (settled) return;
+          settled = true;
+          try { URL.revokeObjectURL(url); } catch (e1) { /* 忽略 */ }
+          resolve(out);
+        };
+        var timer = setTimeout(function () { finish(null); }, MA_CONVERT_TIMEOUT);
+        var img;
+        try { img = new Image(); } catch (e2) { clearTimeout(timer); finish(null); return; }
+        img.onload = function () {
+          clearTimeout(timer);
+          try {
+            var w = img.naturalWidth || img.width || 0;
+            var h = img.naturalHeight || img.height || 0;
+            if (!w || !h) return finish(null);
+            var scale = Math.min(1, MA_MAX_DIM / Math.max(w, h));
+            var cw = Math.max(1, Math.round(w * scale));
+            var ch = Math.max(1, Math.round(h * scale));
+            var cv = document.createElement("canvas");
+            cv.width = cw; cv.height = ch;
+            var ctx = cv.getContext("2d");
+            if (!ctx) return finish(null);
+            ctx.drawImage(img, 0, 0, cw, ch);
+            cv.toBlob(function (blob) {
+              if (!blob) return finish(null);
+              var base = String(file.name || "photo").replace(/\\.[^./\\\\]+$/, "") || "photo";
+              try {
+                finish(new File([blob], base + ".jpg", { type: "image/jpeg", lastModified: Date.now() }));
+              } catch (e3) {
+                // 极老的浏览器没有 File 构造器 → 用 type 改写过的 Blob 兜底（官方只看 type/name）
+                try { blob.name = base + ".jpg"; finish(blob); } catch (e4) { finish(null); }
+              }
+            }, "image/jpeg", 0.92);
+          } catch (e5) { finish(null); }
+        };
+        img.onerror = function () { clearTimeout(timer); finish(null); };
+        try { img.src = url; } catch (e6) { clearTimeout(timer); finish(null); }
+      });
+    }
+    /** 把 files 塞回 input（DataTransfer 缺失/只读 → 返回 false，调用方走"原样重发"）。 */
+    function maSetInputFiles(input, files) {
+      try {
+        var dt = new DataTransfer();
+        for (var i = 0; i < files.length; i++) dt.items.add(files[i]);
+        if (!dt.files || dt.files.length !== files.length) return false;
+        input.files = dt.files;
+        return true;
+      } catch (e) { return false; }
+    }
+    /** 重新派发一次 change（带重入标记，避免我们自己的监听再拦一次）。 */
+    function maRedispatch(input) {
+      try {
+        input[MA_REENTRY] = true;
+        input.dispatchEvent(new Event("change", { bubbles: true }));
+      } catch (e) { /* 忽略 */ } finally {
+        setTimeout(function () { try { input[MA_REENTRY] = false; } catch (e2) { /* 忽略 */ } }, 0);
+      }
+    }
+    async function maOnFilePicked(input) {
+      var list = input && input.files ? Array.prototype.slice.call(input.files) : [];
+      if (!list.length) return;
+      var need = list.filter(maNeedsConvert);
+      if (!need.length) return; // 官方认得的类型 → 零行为
+      var out = [];
+      for (var i = 0; i < list.length; i++) {
+        if (!maNeedsConvert(list[i])) { out.push(list[i]); continue; }
+        var conv = await maNormalizeImage(list[i]);
+        if (conv) out.push(conv);
+        else out.push(list[i]); // 转不了就按原文件走（与现状一致，绝不丢）
+      }
+      if (maSetInputFiles(input, out)) maRedispatch(input);
+      else maRedispatch(input); // 塞不回去 → 原样重发（文件不丢）
+    }
+    function maInstallImageCompat() {
+      try {
+        document.addEventListener("change", function (e) {
+          var t = e.target;
+          if (!t || String(t.tagName || "").toUpperCase() !== "INPUT") return;
+          if (String(t.type || "").toLowerCase() !== "file") return;
+          if (t[MA_REENTRY]) return; // 我们自己派发的那次 → 放行
+          var files = t.files ? Array.prototype.slice.call(t.files) : [];
+          if (!files.length) return;
+          var any = false;
+          for (var i = 0; i < files.length; i++) { if (maNeedsConvert(files[i])) { any = true; break; } }
+          if (!any) return; // 无需转码 → 完全不拦（官方照旧处理）
+          // 拦下这一次：官方若先看到原文件，会立刻按"普通文件"起后台上传（那就白改了）
+          try { e.stopPropagation(); } catch (eS) { /* 忽略 */ }
+          maOnFilePicked(t).catch(function () { maRedispatch(t); });
+        }, true); // ★ 捕获阶段：必须早于 React 根容器的 change 监听
+      } catch (e) { /* 适配层绝不把页面拖挂 */ }
+    }
+
     /* 挂上"叫醒"的两条路。做成可重入(先清旧的再建新的),这样 bfcache 恢复后能重新武装。 */
     const maArm = () => {
       maTorn = false;
@@ -1718,6 +1889,7 @@ const SCRIPT = `(() => {
       try { maInterval = setInterval(pump, 1000); } catch (eInt) { maInterval = 0; }
     };
     maArm();
+    maInstallImageCompat(); // 手机图片上传兼容（见上方长注释）：装了就一直有效，与 pump 无关
     /* 清理:页面卸载时断开观察者与兜底表(bfcache/长驻页面都不留悬挂回调)。
        pagehide 覆盖 bfcache 场景,unload 兜底更老的浏览器。 */
     const maTeardown = () => {

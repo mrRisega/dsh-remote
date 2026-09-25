@@ -3,6 +3,121 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.15] - 2026-09-25
+
+> 补丁版，主题是**「用户报的五件事」**——两条 0.6.14 自身引入/未覆盖的硬伤（Linux/NAS 起不来、
+> 目录选择器反而把插件装挂），加三项体验修复（慢、微信回话错会话、手机传不了图）。
+> 全部来自用户群反馈 + 诊断日志，逐条有测试钉住。
+
+### ① 飞牛 fnOS / Linux：bridge **从来没被拉起来过**（最严重）
+
+用户诊断（插件 0.6.14，平台 linux）：
+
+```
+连接阶段: starting（正在启动 Bridge…）   bridge 进程: 未运行   后台守护: 未运行
+上游 dsh web: http://127.0.0.1:3080（默认值 3080（未取到 dsh web 实际监听端口），⚠️ 不可达）
+安装日志: [dsh-remote-web] 自动启动 bridge 未成功(unsupported): 当前平台（linux）暂不支持自启动服务
+```
+
+- **根因 1**：`startBridge()` 只认 macOS 的 launchd，Linux 直接返回 `unsupported`。
+  而 Linux 既不是 darwin 也不是 win32 → 自愈每轮都被挡回，**bridge 永远起不来**。
+  用户看到「端口不对」于是反复改端口（改成 20xx、又改回 3080）—— 其实**根本没人在起进程**，
+  跟他改的那个端口毫无关系。
+- **根因 2**：自愈的就绪判据只对 Windows 放行，Linux 即使拉起来也会每轮重复"写 unit + 起进程"。
+- 修法：新增 `startBridgeLinux()` 阶梯 —— 有 user systemd 会话就用 `systemd --user`
+  （开机自启 + 崩溃自愈），**没有就退到脱离进程**（NAS/容器是常态，与 Windows 同一条路径）；
+  `serviceManager` 也如实上报 `systemd` / `detached`（以前一律写 systemd，面板文案跟着错）。
+  `dsh-setup.mjs` 的 Linux 重启路径同样补上脱离进程兜底。
+
+### ② 上游端口发现：NAS 上 dsh web 在 2298，五条路径全都没命中
+
+- 上面那个用户的 dsh web 实际在 **2298**，而 `ctx.webServer.port` 在该环境下取不到、
+  NAS 上 `lsof`/`pgrep` 常常没装、静态候选只有 3080 与 Desktop 的 43120 区间 → **2298 永远不在候选里**。
+- 修法一：`upstream-discovery.mjs` 新增「**本机所有回环 LISTEN 端口**」候选（源标注 `listen`），
+  多来源合并：Linux 直接读 `/proc/net/tcp{,6}`（零依赖，NAS 上最可靠）+ `ss` + `lsof` + `netstat`。
+  排在静态候选**之前**（排后面等于白加）；仍逐个做身份校验，陌生服务一律拒。
+- 修法二：身份校验新增**第二判据** —— 本插件自己的 `GET /dsh-remote/self`。
+  首页是登录页/自定义门户时（`__ModuleLoader__` 等特征一个都不出现），端口再对也会被判"陌生服务"；
+  而只有宿主这台 web server 会应答我们的路由，这是本机最硬的同一性证据。
+- 修法三：插件半新增 `discoverUpstreamSelf()` —— 问不到自己端口时主动发现一次并固化到
+  `.dsh-upstream`（watcher/bridge 是独立进程，只认这个文件），面板与 spawn 都随之用上正确地址。
+
+### ③ 目录选择器：0.6.14 的"修法"反而让插件**装载失败**（服务名冲突）
+
+用户诊断（DSH Desktop）：
+
+```
+error: service "directoryPicker" has been registered at .dLateDirectoryPicker3
+  at new DirectoryPicker (…/dsh-host-directory-picker/lib/index.js:1782)
+  at new BrowseDirectoryPicker (…/dsh-host-directory-picker-browse/lib/index.js:245)
+```
+
+- 根因：`native` 与 `browse` 两个后端注册的是**同一个服务名** `ctx.directoryPicker`
+  （seam 文档：one implementation per context, loading a second throws）。
+  所以 0.6.14 的「先建 browse、后摘 auto」**必然**抛 duplicate-service —— 顺序写反了。
+- 修法：**先摘 auto（释放服务名）→ 再建 browse → 建不起来就回滚**：卸掉半成品，
+  把 auto 条目**按原 id** 建回来（用户至少还有原生可用）。另加"摘不掉就一根手指都不动"的护栏。
+- 测试同步重写：假 loader 现在会**复现 duplicate-service**，把"顺序反过来必炸"这条钉成回归锁。
+
+### ④ 打开慢：同一条响应被 base64 编了**三层**（1.333³ ≈ 2.37×）
+
+用户实测（dev-1014f947f8ab，Ubuntu 上的 dsh + Windows 访问，首屏等几分钟）：
+gzip 后 5.35 MiB 的聚合包，经三层 base64 变成 bridge→中继 12.69 MiB、手机下载 9.52 MiB。
+
+| 层 | 位置 | 处理 |
+|---|---|---|
+| ① gzip 正文 → base64 进明文 JSON | `e2ee-client.mjs` | **去掉**（改成二进制框架，客户端声明后启用） |
+| ② AES-GCM 密文 → base64url 进信封 JSON | `e2ee-client.mjs` | 保留（JSON 装不下字节，且它承载手机侧解密） |
+| ③ 整个信封 JSON → 再 base64 进隧道帧 | `dsh-bridge.mjs` | **去掉**（中继拿到就解，纯属白花 33%） |
+
+- ③ 是纯浪费：中继收到帧后第一件事就是解回 UTF-8 再写给手机。现在直接发 UTF-8
+  （`bodyBase64:false`；中继两种形态都支持）。**这条腿正是按流量计量、用户被卡的那条**。
+- ① 用「头 JSON + 正文原始字节」的二进制框架（首字节 `0x02`，与 JSON 的 `{`=0x7B 永不冲突），
+  但只对**在请求里声明** `x-dsh-e2ee-want: bin` 的客户端启用 —— 镜像页 shim 声明，
+  老客户端（`native.html` 的 WC-CORE / 企业版内置那份）不声明就仍走旧 JSON，**零兼容风险**。
+  该头是端到端内部协商头，bridge 会**摘掉它再转发上游**（它不是业务头）。
+- 效果：电话侧下载 9.52 → 7.14 MiB（1.78× → 1.33×），bridge→中继 12.69 → 7.14 MiB。
+- 协议文档 `docs/e2ee-protocol.md` 同步更新（两种明文形态 + 协商规则 + 回包帧体不再套 base64）。
+
+### ⑤ 微信通道：回话发进了**上一次**的会话
+
+业主实测：B 任务跑完推了结论，他在微信里直接回「再改一下」，那条消息却发给了**上一次的当前会话 A**
+—— A 平白多了一条指令，B 永远收不到。
+修法：**完成推送把「当前会话」切到刚跑完的那个**（并落盘）。语义即"最近完成的任务 = 最近一次推送的
+对象 = 你现在回话的对象"，这是唯一不会让人踩空的解释。已是当前会话时不重复写状态。
+
+### ⑥ 手机端传不了图 / 传了模型看不见
+
+官方只把 `image/png|jpeg|webp|gif` 当**图片**（本地编码随 prompt 发给模型）；
+其余一律当**普通文件**后台上传，模型只拿到一个文件引用 —— 用户看到的就是"识别不了图片"。
+而手机恰恰最容易产出非白名单类型：iPhone「高效」格式 = `image/heic`；部分 Android 图库给**空 type**。
+
+- 修法：适配层在**捕获阶段**拦下官方隐藏 `input[type=file]` 的 `change`（必须早于 React 根容器），
+  把这类文件**无损改 MIME**（扩展名可判定时，如空 type + `.png`）或 canvas 转 JPEG 后
+  替换 `input.files` 并**重新派发**；官方认得的类型一个字节都不碰。
+- 任何失败（浏览器解不了 HEIC / 没有 DataTransfer / canvas 不可用）都**原样重新派发**，
+  绝不吞掉事件、绝不丢文件 —— 最差也只是回到今天的行为。
+
+### 测试
+
+- 新增 `packages/dsh-remote-web/test/linux-bridge.test.mjs` 7 条（无 systemd 时必须真的派生守护、
+  有 systemd 时写 unit 且带 `DSH_BRIDGE_UPSTREAM`、候选端口里必须有 2298 且排在静态候选之前、
+  `/dsh-remote/self` 第二判据、/proc 解析、静态接线护栏）。
+- 新增 `clients/dsh-remote/test/mobile-adapter-image.test.mjs` 7 条（HEIC 转码、空 type 无损改 MIME、
+  白名单零行为、解码失败/无 DataTransfer 时原样重发、混合选择保序）。
+- 重写 `packages/dsh-remote-web/test/picker-pin.test.mjs`（12 条，含"顺序反过来必炸"的回归锁）。
+- `e2ee-client` / `e2ee-shim` / `e2ee-bridge` / `wechat-runtime` 均补了钉住本次结论的用例
+  （二进制明文框架、协商头不转发上游、隧道帧不再套 base64、完成推送切会话）。
+- 顺手修掉一个测试设施真 bug：桥接对拍用的假上游按分片 `body += chunk`，
+  多字节 UTF-8 跨 64KB 分片会被拆坏（加大正文用例才暴露）。
+
+### 同版一并
+
+- 诊断文案：上游不通时不再建议"把 dsh web 重启在 3080"（对 NAS 用户是错的方向），
+  改为"会自动发现真实端口；仍不通可设 `DSH_BRIDGE_UPSTREAM=<你的端口>`"。
+- `decodeHttpRequestPlain()` 之前对 `Uint8Array` 用 `String(buf)` → 永远"不是 JSON"，
+  现在按字节解码（对拍用例抓到的真问题）。
+
 ## [0.6.14] - 2026-09-23
 
 > 补丁版，主题是**「端口不是 3080 就用不了」**——一类环境兼容问题，不是某个用户的特殊情况。

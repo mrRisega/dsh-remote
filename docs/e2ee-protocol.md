@@ -233,11 +233,30 @@ bridge 收到带该标记的 `http` 帧：解密 → 还原 method/path/headers 
 **响应（bridge → router → 手机）**：bridge 先做既有响应处理（解压、`mobile-adapter` 仅对**明文 HTML 壳**生效，见 §4.5），可压缩正文先 gzip（压缩在加密前，中继看不到明文也不得再压密文）→ 加密进信封 → 外 HTTP 一律 `200` + `content-type: application/vnd.dsh.e2ee-v2` + `x-dsh-e2ee`：
 
 ```
+# 形态 A（默认 / 兼容形态，所有老客户端都用它）
 plaintext(http 响应) = { "st":200, "h":{...原响应头, 去 content-length/content-encoding/transfer-encoding...},
                          "enc":"gzip|", "b":"<base64 正文>" }
+
+# 形态 B（0.6.15，**客户端声明后才用**）
+plaintext(http 响应) = [0x02][4B 大端头长度][头 JSON] [正文原始字节]
+                       头 JSON = { "st":200, "h":{...}, "enc":"gzip|" }
 ```
 
 手机 shim 解密后重建真实 status/headers/body 交给被 patch 的 fetch/XHR。
+
+**形态协商（0.6.15 起）**：客户端在**信封明文**的 `h` 里加一个内部头 `x-dsh-e2ee-want: bin`
+即表示“响应请用形态 B”。bridge 必须：
+
+1. 用 `wantsBinaryResponsePlain()` 判断后**把该头从转发给上游的头里摘掉**（`stripPlainWantHeader()`）——
+   它是端到端内部协商头，不是业务头，绝不能漏给 dsh web；
+2. 只对声明过的请求用形态 B，未声明（老 shim / `native.html` 的 WC-CORE / 企业版内置那份）一律形态 A。
+
+解码端**自动判别**：明文首字节 `0x02` = 形态 B，`{`(0x7B) = 形态 A（JSON 永不与 0x02 冲突）。
+node 侧 `decodeHttpResponsePlain()`、镜像页 `seDecodeHttpRespPlain()` 都同时接受两种形态。
+
+**为什么要这一层**：形态 A 要把已 gzip 的正文 base64 进 JSON（+33%），而这只是同一条响应的
+**三层 base64 里的第一层**（另两层见 §9.2 的帧体编码）。实测那条首屏聚合包（gzip 后 5.35 MiB）：
+形态 A 明文 7.14 MiB → 形态 B 明文 5.35 MiB，手机侧下载量从 1.78× 降到 1.33×。
 **router 层的真实错误不隐藏**：401/403/502/504 等由 router 直接产出（无信封标记），shim 透传并保留原有语义不变。
 
 **AAD 绑定**：AAD 含路径与查询串摘要，防止“同一密文被改贴到另一路径”的转发层花招（路径篡改本就会破坏路由，此为纵深）。
@@ -496,7 +515,14 @@ plaintext(http 响应) = { "st":200, "h":{...原响应头, 去 content-length/co
   "d":"<b64(AES-GCM(JSON{ m,p,h,b }) ‖ tag)>" }
 ```
 
-响应（bridge→router→手机）信封内明文：`{"st":200,"h":{…},"enc":"gzip","b":"<b64>"}`。
+响应（bridge→router→手机）信封内明文：形态 A `{"st":200,"h":{…},"enc":"gzip","b":"<b64>"}`
+（默认）或形态 B 二进制框架（客户端声明 `x-dsh-e2ee-want: bin` 时，见 §4.3）。
+
+**回包帧体不套 base64（0.6.15 起）**：`http` 回包帧用 `"body":"<信封 JSON(UTF-8)>", "bodyBase64":false`，
+**不再**写成 `body: base64(信封JSON), bodyBase64:true`。中继拿到帧后本来就只是把这段字节写给手机，
+base64 那一层（+33%）纯属白花，而且正好落在按流量计量的 bridge→中继 WS 上。
+中继对两种形态都支持（按 `bodyBase64` 真假判别），所以这是**协议兼容**的收紧，不是破坏性变更。
+`ws-msg` 的 `binary` 语义不变。
 
 WS 消息帧（现状帧结构不变，载荷=信封或原文）：`{ "id":"…","type":"ws-msg","data":"<信封JSON或原文>","binary":false }`。
 

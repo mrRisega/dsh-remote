@@ -211,12 +211,37 @@
   };
 
   /* ---- http 明文载荷编解码(与 node encode/decodeHttp*Plain 同构) ---- */
+  /* 0.6.15:响应明文支持二进制框架(首字节 0x02)，省掉"gzip 正文 → base64"那一层(+33%)。
+     由**本客户端主动声明**(请求明文里的 x-dsh-e2ee-want: bin)，桥端只对声明过的请求用它 ——
+     老客户端/企业版内置的那份不认识这个头，也就永远收不到看不懂的字节。 */
+  var SE_PLAIN_BIN_MAGIC = 2;
+  var SE_WANT_BIN_HEADER = "x-dsh-e2ee-want";
   function seEncodeHttpReqPlain(opt) {
     var b = opt.bodyBytes && opt.bodyBytes.length ? seBytesToB64(opt.bodyBytes) : "";
-    return seUtf8(JSON.stringify({ m: String(opt.method || "GET").toUpperCase(), p: opt.path, h: opt.headers || {}, b: b }));
+    var h = opt.headers || {};
+    h[SE_WANT_BIN_HEADER] = "bin";
+    return seUtf8(JSON.stringify({ m: String(opt.method || "GET").toUpperCase(), p: opt.path, h: h, b: b }));
   }
   function seDecodeHttpRespPlain(buf) {
-    var text = buf instanceof Uint8Array ? seUtf8Decode(buf) : String(buf);
+    var u8 = buf instanceof Uint8Array ? buf : new Uint8Array(0);
+    // ① 二进制框架：[0x02][4B 大端头长度][头 JSON][正文原始字节]
+    if (u8.length >= 5 && u8[0] === SE_PLAIN_BIN_MAGIC) {
+      var headLen = ((u8[1] << 24) | (u8[2] << 16) | (u8[3] << 8) | u8[4]) >>> 0;
+      if (headLen > 0 && 5 + headLen <= u8.length) {
+        var head = null;
+        try { head = JSON.parse(seUtf8Decode(u8.subarray(5, 5 + headLen))); } catch (e) { throw seErr("bad_plain", "e2ee: http 响应明文头不是 JSON"); }
+        if (!head || typeof head !== "object") throw seErr("bad_plain", "e2ee: http 响应明文缺失");
+        return {
+          status: Number(head.st) || 502,
+          headers: head.h && typeof head.h === "object" ? head.h : {},
+          enc: typeof head.enc === "string" ? head.enc : "",
+          bodyBytes: u8.subarray(5 + headLen),
+          bodyB64: ""
+        };
+      }
+    }
+    // ② 兼容 JSON：{st,h,enc,b:<base64>}
+    var text = buf instanceof Uint8Array ? seUtf8Decode(buf) : String(buf || "");
     var pt = null;
     try { pt = JSON.parse(text); } catch (e) { throw seErr("bad_plain", "e2ee: http 响应明文不是 JSON"); }
     if (!pt || typeof pt !== "object") throw seErr("bad_plain", "e2ee: http 响应明文缺失");
@@ -224,6 +249,7 @@
       status: Number(pt.st) || 502,
       headers: pt.h && typeof pt.h === "object" ? pt.h : {},
       enc: typeof pt.enc === "string" ? pt.enc : "",
+      bodyBytes: typeof pt.b === "string" && pt.b ? seB64ToBytes(pt.b) : new Uint8Array(0),
       bodyB64: typeof pt.b === "string" ? pt.b : ""
     };
   }
@@ -455,7 +481,7 @@
       seNotifyFail("响应明文非法");
       return seErrorResponse("bad_plain", "⚠ 无法解密:响应明文非法");
     }
-    var bodyU8 = rp.bodyB64 ? seB64ToBytes(rp.bodyB64) : new Uint8Array(0);
+    var bodyU8 = rp.bodyBytes instanceof Uint8Array ? rp.bodyBytes : (rp.bodyB64 ? seB64ToBytes(rp.bodyB64) : new Uint8Array(0));
     if (rp.enc === "gzip" && bodyU8.length) {
       var un = await seGunzip(bodyU8);
       if (!un) return seErrorResponse("gunzip", "⚠ 无法解压:响应 gzip 解压失败");

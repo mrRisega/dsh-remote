@@ -230,7 +230,16 @@ test("信封逐字段一致:http/http-resp/w(文本·二进制)/ctrl(shim ↔ no
 test("请求信封明文编解码与信封标记头同构(node 交叉)", () => {
   const plainShim = shim.seEncodeHttpReqPlain({ method: "POST", path: "/api/echo?b=2", headers: { "content-type": "application/json", "x-t": "v" }, bodyBytes: new Uint8Array(Buffer.from("载荷", "utf8")) });
   const plainNode = encodeHttpRequestPlain({ method: "POST", path: "/api/echo?b=2", headers: { "content-type": "application/json", "x-t": "v" }, bodyB64: Buffer.from("载荷", "utf8").toString("base64") });
-  assert.deepEqual(Buffer.from(plainShim), Buffer.from(plainNode));
+  const decShim = decodeHttpRequestPlain(plainShim);
+  const decNode = decodeHttpRequestPlain(plainNode);
+  // ★ 0.6.15:shim **额外**声明「响应明文请用二进制框架」（省掉正文那一层 base64）。
+  //   这是本版唯一一处**有意为之**的差异：老客户端（native.html / 企业版内置那份）不发这个头，
+  //   桥端也就永远不给他们发二进制明文 —— 兼容性靠"客户端声明"而不是靠版本号猜。
+  assert.equal(decShim.headers["x-dsh-e2ee-want"], "bin", "镜像页 shim 必须声明二进制明文框架");
+  assert.equal(decNode.headers["x-dsh-e2ee-want"], undefined, "桥端自己的编码器不得替客户端声明（否则老客户端会收到看不懂的字节）");
+  delete decShim.headers["x-dsh-e2ee-want"];
+  assert.deepEqual(decShim, decNode, "除该声明头外，请求明文逐字段同构");
+  assert.deepEqual(Buffer.from(decShim.bodyB64, "base64"), Buffer.from("载荷", "utf8"));
   const sessId = newSessId();
   assert.deepEqual(shim.seEnvelopeHeaders(sessId), envelopeRequestHeaders(sessId, "http"));
 });

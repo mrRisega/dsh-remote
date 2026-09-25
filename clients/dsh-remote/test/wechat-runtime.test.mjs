@@ -642,6 +642,53 @@ test("★ v2:完成推送带会话名称 + 结论,而不只是「任务已停止
   }
 });
 
+test("★ 0.6.15：完成推送必须把「当前会话」切到刚跑完的那个（否则回话会发进上一次的会话）", async () => {
+  // 业主实测：B 任务跑完推了结论，他在微信里直接回一句"再改一下"，那条消息却发给了
+  // **上一次的当前会话 A** —— A 平白多了一条指令，B 永远收不到。
+  const ilink = await fakeIlink();
+  try {
+    const sub = makeFakeSubscriber();
+    sub.sessionsFixture = [
+      { sessionId: "session-b", title: "刚跑完的活", running: false, cwd: "/p" },
+      { sessionId: "session-a", title: "早先的会话", running: false, cwd: "/p" }
+    ];
+    sub.summaryFixture = "已改完。";
+    const { rt, relayDir } = await boundRuntime(ilink, { subscriber: sub });
+    rt.currentSessionId = "session-a";
+    rt.currentSessionTitle = "早先的会话";
+
+    await rt.notify({ kind: NODE_KINDS.TURN_END, sessionId: "session-b", reason: "completed", at: 1 });
+    assert.equal(rt.currentSessionId, "session-b", "推送完必须切到刚完成的会话");
+    assert.equal(loadState(relayDir).current_session_id, "session-b", "切换必须落盘（重启后仍然对）");
+
+    // 现在回一句纯文本 → 必须发给 B，而不是 A
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "再改一下" } }] });
+    const prompt = sub.calls.filter((c) => c.m === "promptSession").pop();
+    assert.ok(prompt, "纯文本必须派给会话");
+    assert.equal(prompt.sessionId, "session-b", "回话必须发给**刚完成**的那个会话");
+    assert.equal(prompt.text, "再改一下");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★ 0.6.15：已经是当前会话的完成推送不重复写状态（幂等）", async () => {
+  const ilink = await fakeIlink();
+  try {
+    const sub = makeFakeSubscriber();
+    sub.sessionsFixture = [{ sessionId: "session-s1", title: "同一个任务", running: false, cwd: "/p" }];
+    sub.summaryFixture = "完成。";
+    const { rt } = await boundRuntime(ilink, { subscriber: sub });
+    rt.currentSessionId = "session-s1";
+    rt.currentSessionTitle = "同一个任务";
+    await rt.notify({ kind: NODE_KINDS.TURN_END, sessionId: "session-s1", reason: "completed", at: 1 });
+    assert.equal(rt.currentSessionId, "session-s1");
+    assert.match(lastText(ilink.state), /同一个任务/);
+  } finally {
+    await ilink.close();
+  }
+});
+
 test("★ 分层:免费档的完成推送不能承诺「回复就能接着做」,要改成会员说明 + App 链接", async () => {
   // 默认那句「回复这条消息就能接着这个会话往下做」对免费用户是**空头承诺**:
   // 他回复纯文本只会拿到付费引导。文案必须跟着档位走,否则用户会以为产品坏了。

@@ -56,6 +56,10 @@ function isWindows() {
 function isDarwin() {
   return osPlatform() === "darwin";
 }
+/** 是否 Linux：Desktop 之外的自建/主机部署 + **飞牛 fnOS / 群晖这类 NAS**（0.6.15 的实测环境）。 */
+function isLinux() {
+  return osPlatform() === "linux";
+}
 
 /**
  * 当前进程 uid。**Windows 没有 process.getuid**（typeof !== "function"），
@@ -122,13 +126,88 @@ function boundWebPort() {
 /**
  * 本机 dsh web 的**回环**上游地址（bridge 的 loopback 围栏只认 127.0.0.1，
  * 所以即使 dsh web 绑的是 0.0.0.0，上游也照样写回环地址）。
- * 优先级：显式 DSH_BRIDGE_UPSTREAM（用户/部署覆盖）> 实际监听端口 > DSH_WEB_URL 的端口 > 3080。
+ * 优先级：显式 DSH_BRIDGE_UPSTREAM（用户/部署覆盖）> 实际监听端口 > **主动发现** > DSH_WEB_URL > 3080。
+ *
+ * 【0.6.15 新增「主动发现」那一层】飞牛 fnOS 用户实测（2026-09-25）：
+ *   `boundWebPort()` 在该环境下**取不到**自己的监听端口（诊断原文：未取到 dsh web 实际监听端口），
+ *   于是上游回落 3080，而他的 dsh web 在 **2298** —— 面板永远「不可达」，用户反复改端口也没用。
+ *   发现结果（`discoveredUpstream`）由 `discoverUpstreamSelf()` 异步填充（本机回环端口扫描 + 身份校验），
+ *   填上之后这里就直接用它，watcher/bridge 拿到的 `DSH_BRIDGE_UPSTREAM` 也随之正确。
  */
 function upstreamUrl() {
   const explicit = String(process.env.DSH_BRIDGE_UPSTREAM || "").trim();
   if (explicit) return explicit.replace(/\/+$/, "");
   const port = boundWebPort();
-  return port ? `http://127.0.0.1:${port}` : FALLBACK_UPSTREAM;
+  if (port) return `http://127.0.0.1:${port}`;
+  if (discoveredUpstream.url && Date.now() - discoveredUpstream.at < UPSTREAM_DISCOVERY_TTL_MS) return discoveredUpstream.url;
+  return FALLBACK_UPSTREAM;
+}
+
+/** 主动发现的上游（插件半自己扫出来的；TTL 见 UPSTREAM_DISCOVERY_TTL_MS）。 */
+const discoveredUpstream = { at: 0, url: "" };
+const UPSTREAM_DISCOVERY_TTL_MS = 5 * 60 * 1000;
+let upstreamDiscoveryInFlight = null;
+
+/**
+ * 插件半主动发现上游地址（只在"问不出自己端口"时才真的去扫）。
+ *
+ * 复用 **运行环境里那一份**发现实现（`runtime/clients/dsh-remote/upstream-discovery.mjs`，与
+ * watcher/bridge 是同一份代码），避免第三份实现漂移；运行环境缺失时（首次安装、纯插件半）
+ * 静默回落，行为与旧版一致。
+ * @param {string} relayDir
+ * @param {{force?: boolean}} [opts]
+ * @returns {Promise<string>} 发现到的地址（没发现返回上游回退值）
+ */
+async function discoverUpstreamSelf(relayDir, { force = false } = {}) {
+  if (String(process.env.DSH_BRIDGE_UPSTREAM || "").trim()) return upstreamUrl();
+  if (boundWebPort()) return upstreamUrl(); // 已经问出来了，不必扫
+  if (skipsSystemOps()) {
+    // 测试/诊断隔离：零系统副作用，也不做端口扫描。顺手清掉上一条真实分支留下的发现结果，
+    // 否则同一个测试进程里后面的用例会读到"别人的"上游（真实踩到过：本机 3080 上跑着 dsh web）。
+    discoveredUpstream.at = 0;
+    discoveredUpstream.url = "";
+    return upstreamUrl();
+  }
+  // 平台被 DSH_RELAY_PLATFORM 覆盖 = 测试/诊断在模拟别的系统（生产永不设置）：
+  // 这时**不做真实端口扫描** —— 扫描读到的是宿主这台机器的真端口，会让"模拟 win32"的用例
+  // 在本机恰好跑着 dsh web 时得到与 CI 不一样的结果（实测踩到）。
+  if (osPlatform() !== process.platform) {
+    discoveredUpstream.at = 0;
+    discoveredUpstream.url = "";
+    return upstreamUrl();
+  }
+  if (!force && discoveredUpstream.url && Date.now() - discoveredUpstream.at < UPSTREAM_DISCOVERY_TTL_MS) return discoveredUpstream.url;
+  if (upstreamDiscoveryInFlight) return upstreamDiscoveryInFlight;
+  upstreamDiscoveryInFlight = (async () => {
+    try {
+      const mod = await import(new URL("../runtime/clients/dsh-remote/upstream-discovery.mjs", import.meta.url).href);
+      if (typeof mod?.discoverUpstream !== "function") return FALLBACK_UPSTREAM;
+      // ★ platform 必须跟着 osPlatform()：整个插件的平台判定都走它（DSH_RELAY_PLATFORM 可覆盖），
+      //   发现逻辑不一致的话，"win32 模拟"用例会去枚举宿主真实端口（本机 3080 上有 dsh web 就会被命中）。
+      const found = await mod.discoverUpstream({ relayDir, platform: osPlatform(), log: (m) => console.log(`[dsh-remote-web] ${m}`) });
+      const url = String(found?.url || "");
+      if (url) {
+        discoveredUpstream.at = Date.now();
+        discoveredUpstream.url = url;
+        // 固化到端口文件：watcher/bridge 是**别的进程**，只认这个文件
+        try {
+          const file = join(relayDir, UPSTREAM_FILE);
+          let cur = "";
+          try { cur = readFileSync(file, "utf8").trim(); } catch { /* 首次 */ }
+          if (cur !== url) {
+            mkdirSync(relayDir, { recursive: true });
+            writeFileSync(file, url + "\n", { mode: 0o600 });
+          }
+        } catch { /* 非关键 */ }
+      }
+      return url || FALLBACK_UPSTREAM;
+    } catch {
+      return FALLBACK_UPSTREAM; // 运行环境还没装好 / 模块不在 → 保持旧行为
+    } finally {
+      upstreamDiscoveryInFlight = null;
+    }
+  })();
+  return upstreamDiscoveryInFlight;
 }
 
 /**
@@ -770,6 +849,120 @@ function skipsSystemOps() {
 function launchAgentPath() {
   if (isDarwin()) return join(homedir(), "Library/LaunchAgents/com.dshremote.bridge.plist");
   return null;
+}
+
+/**
+ * Linux 的 systemd user unit 路径（与 dsh-setup.mjs 的 `autostartFilePath()` **同一路径**）。
+ * 为什么插件半也要写这个文件：插件自愈（scheduleRuntime）是"用户在面板里点什么就修什么"的那条路，
+ * 它以前在 Linux 上只会调 `systemctl --user restart`，而 unit 可能压根不存在。
+ */
+function linuxUnitPath() {
+  if (!isLinux()) return null;
+  return join(homedir(), ".config/systemd/user/dsh-bridge.service");
+}
+
+/**
+ * 本机到底有没有**可用的 user systemd 会话**。
+ *
+ * 为什么必须先问：飞牛 fnOS / 群晖这类 NAS 上，插件跑在**系统服务**里（不是登录会话），
+ * 没有 `XDG_RUNTIME_DIR`、也没有 `systemd --user` 的 user manager —— 这时 `systemctl --user`
+ * 会直接报 "Failed to connect to bus"，unit 写多少份都没用。以前插件在这条路上只会返回
+ * "不支持自启动"，bridge 于是**从来没被拉起来过**（用户诊断里 `bridge 进程: 未运行`）。
+ */
+function systemdUserAvailable() {
+  if (!isLinux()) return false;
+  if (!process.env.XDG_RUNTIME_DIR) return false; // 没有 runtime dir 就不可能有 user manager
+  return sh("systemctl --user show-environment").ok;
+}
+
+/**
+ * 上面那个判断的**带缓存**版本（面板 2~3 秒轮询一次 /status，不能每次都起一个 systemctl）。
+ * 60 秒 TTL：用户装了 systemd 会话/登出登录之后一分钟内就会跟上。
+ * 缓存键带上平台与 XDG_RUNTIME_DIR：测试/诊断会把它们换掉，换了就必须重新探（否则读到上一轮结论）。
+ */
+let systemdProbeCache = { at: 0, ok: false, key: "" };
+function systemdUserAvailableCached(ttlMs = 60_000) {
+  const key = `${osPlatform()}|${process.env.XDG_RUNTIME_DIR || ""}|${process.env.PATH || ""}`;
+  if (systemdProbeCache.key === key && Date.now() - systemdProbeCache.at < ttlMs) return systemdProbeCache.ok;
+  const ok = systemdUserAvailable();
+  systemdProbeCache = { at: Date.now(), ok, key };
+  return ok;
+}
+
+/** 写 Linux systemd user unit（与 dsh-setup.mjs 同内容）。写不了返回 null（不致命，还有脱离进程兜底）。 */
+function writeLinuxUnit(relayDir) {
+  const unitPath = linuxUnitPath();
+  if (!unitPath) return null;
+  const setup = join(relayDir, "dsh-setup.mjs");
+  const unit = `[Unit]
+Description=dsh-remote bridge (auto-starts with dsh web)
+
+[Service]
+ExecStart=${NODE_BIN} ${setup} run
+Restart=on-failure
+RestartSec=5
+Environment=PATH=${SERVICE_PATH}
+Environment=DSH_BRIDGE_UPSTREAM=${upstreamUrl()}
+Environment=DSH_BRIDGE_INSTALL_SOURCE=${installSourceOf(relayDir)}
+Environment=DSH_BRIDGE_INSTALL_VERSION=${PLUGIN_VERSION}
+
+[Install]
+WantedBy=default.target
+`;
+  try {
+    mkdirSync(dirname(unitPath), { recursive: true });
+    writeFileSync(unitPath, unit, { mode: 0o644 });
+    return unitPath;
+  } catch (e) {
+    appendLogLine(relayDir, AUTO_INSTALL_LOG, `[dsh-remote-web] 写入 systemd unit 失败: ${e.message}`);
+    return null;
+  }
+}
+
+/**
+ * Linux：拉起 bridge 的阶梯（**与 macOS 同构：可自愈优先，可用兜底**）。
+ *
+ * 【0.6.15 事故根因】0.6.14 及更早，`startBridge` 只认 macOS 的 launchd，Linux 直接返回
+ * `unsupported: 当前平台（linux）暂不支持自启动服务`。于是：
+ *   · 自愈轮次每轮都调用它、每轮都拿到 unsupported、**bridge 永远起不来**；
+ *   · 用户面板上的表现是永远停在「正在启动 Bridge…」+「bridge 进程: 未运行」；
+ *   · 用户以为是"端口不对"，于是反复改端口号（改到 3080 也没用）——
+ *     因为**根本没人在听那个端口**，跟端口一点关系都没有。
+ *   实测环境：飞牛 fnOS（Debian 系 NAS），插件跑在系统服务里，没有 user systemd 会话。
+ *
+ * 阶梯：
+ *   ①（有 user systemd 会话时）systemd --user enable --now dsh-bridge —— 开机自启 + 崩溃自愈；
+ *   ②（没有会话 / ① 失败）脱离进程拉起 `node <relayDir>/dsh-setup.mjs run` —— 与 Windows 同一条路径，
+ *      "现在一定能用"，代价是只有"重开 dsh web 时插件会自动拉起"这一层保障（如实告知用户）。
+ */
+function startBridgeLinux(relayDir) {
+  if (skipsSystemOps()) return { ok: false, status: "skipped", detail: "测试隔离（DSH_RELAY_SKIP_SERVICE=1）：跳过真实服务操作" };
+  if (!runtimeReady(relayDir)) {
+    ensureRuntime(relayDir);
+    return {
+      ok: false,
+      status: "provisioning",
+      runtimeMissing: true,
+      detail: "桌面运行环境（bridge）尚未安装，已在后台自动安装，完成后会自动启动 bridge——请稍候刷新面板（也可点下方「一键更新」查看进度）",
+    };
+  }
+  publishUpstream(relayDir); // 脱离进程拉起的 watcher 没有本进程 env，只认这个文件
+  const unit = writeLinuxUnit(relayDir);
+  if (unit && systemdUserAvailable()) {
+    sh("systemctl --user daemon-reload");
+    const en = sh("systemctl --user enable dsh-bridge");
+    const rs = sh("systemctl --user restart dsh-bridge");
+    const act = rs.ok ? sh("systemctl --user is-active dsh-bridge") : { ok: false, stdout: "", stderr: "" };
+    if (rs.ok && act.ok && act.stdout.trim() === "active") {
+      return { ok: true, status: "running", pid: null, detail: "已由 systemd --user 托管 bridge（开机自启 + 崩溃自愈）" };
+    }
+    appendLogLine(relayDir, AUTO_INSTALL_LOG,
+      `[dsh-remote-web] systemd --user 拉起 bridge 失败（enable=${en.ok ? "ok" : "fail"}, restart=${rs.ok ? "ok" : "fail"}），改用后台进程`);
+  }
+  const d = startBridgeDetached(relayDir, unit
+    ? "本机没有可用的 user systemd 会话（NAS / 容器 / 精简系统常见），已改为后台进程"
+    : "systemd unit 写入失败，已改为后台进程");
+  return d;
 }
 
 /**
@@ -1455,6 +1648,9 @@ function startBridge(relayDir) {
     return { ok: false, status: "uninstalled", detail: "插件已彻底卸载，重启 dsh web 后生效" };
   }
   if (isWindows()) return startBridgeDetached(relayDir);
+  // Linux（含飞牛/群晖这类 NAS）：阶梯见 startBridgeLinux —— 0.6.14 及更早这里只有
+  // `unsupported` 一条死路，bridge 在 Linux 上**从来没被拉起来过**。
+  if (isLinux()) return startBridgeLinux(relayDir);
   const plistPath = launchAgentPath();
   if (!plistPath) {
     return {
@@ -1548,9 +1744,11 @@ function scheduleRuntime(relayDir) {
       // 运行环境已在，看服务是否已在运行（runtime 可能位于 npx 缓存/固化目录，不必重复安装）
       const st = launchdStatus();
       if (st.running) { done = true; clearInterval(iv); return; }
-      // Windows 没有 launchd：以「watcher 进程在跑」为就绪判据。否则 launchdStatus 永远是 false，
-      // done 永远不置位，watcher 会一直空转（虽然 startBridge 幂等，但每轮都白跑一次进程发现）。
-      if (isWindows() && manualStatus(relayDir).watcher.length > 0) { done = true; clearInterval(iv); return; }
+      // 非 macOS（Windows **与 Linux**）没有 launchd：以「watcher 进程在跑」为就绪判据。
+      // 否则 launchdStatus 永远是 false，done 永远不置位，watcher 会一直空转。
+      // ★ Linux 也必须走这一支：`startBridge` 现在能在 Linux 上真正拉起 bridge（0.6.15），
+      //   但就绪判据漏了 Linux 的话，每轮自愈都会重复走一遍"写 unit + 起进程"。
+      if (!isDarwin() && manualStatus(relayDir).watcher.length > 0) { done = true; clearInterval(iv); return; }
       startBridge(relayDir); // 环境在但服务没起 → 拉起
     } catch { /* 下一轮再试 */ }
   }, selfhealIntervalMs());
@@ -2596,7 +2794,7 @@ async function composeStatus(relayDir) {
       // 平台与服务管理器：面板据此给出平台正确的文案（Windows 没有"自启动服务"这回事，
       // 也不该把 bridge 说成 launchd/systemd 服务）
       platform: osPlatform(),
-      serviceManager: isDarwin() ? "launchd" : isWindows() ? "detached" : osPlatform() === "linux" ? "systemd" : "none",
+      serviceManager: isDarwin() ? "launchd" : isWindows() ? "detached" : osPlatform() === "linux" ? (systemdUserAvailableCached() ? "systemd" : "detached") : "none",
       // Windows：登录任务（任务计划程序）是否已注册——面板据此给"能不能开机自启"的准确说法
       autostartTask: isWindows() ? windowsTaskRegistered() : null,
       launchd,
@@ -3725,8 +3923,11 @@ function runtimeVersionOf(relayDir) {
 function upstreamSourceLabel() {
   if (String(process.env.DSH_BRIDGE_UPSTREAM || "").trim()) return "来自 DSH_BRIDGE_UPSTREAM";
   if (boundWebPort()) return "dsh web 实际监听端口";
+  if (discoveredUpstream.url && Date.now() - discoveredUpstream.at < UPSTREAM_DISCOVERY_TTL_MS) {
+    return "**自动发现**（本机回环端口扫描 + 身份校验：问不到宿主自己的监听端口时用这条）";
+  }
   if (String(process.env.DSH_WEB_URL || "").trim()) return "来自 DSH_WEB_URL";
-  return "默认值 3080（未取到 dsh web 实际监听端口）";
+  return "默认值 3080（尚未取到/发现 dsh web 实际监听端口）";
 }
 
 /**
@@ -3784,6 +3985,10 @@ async function accountDeviceBound(relayDir, cfg) {
  */
 async function composeConnect(relayDir, opts = {}) {
   const cfg = opts.cfg || loadConfig(relayDir);
+  // 【0.6.15】上游端口问不出来时，先主动发现一次再算阶段：否则诊断里永远是"3080 不可达"，
+  // 而用户的 dsh web 其实好好地跑在 2298（飞牛/NAS 实测）—— 面板与用户都会往"改端口"这个
+  // 错误方向使劲。发现很快（本机回环，全失败也就几百毫秒），失败不影响任何既有行为。
+  await discoverUpstreamSelf(relayDir).catch(() => FALLBACK_UPSTREAM);
   const launchd = opts.launchd || launchdStatus();
   const manual = opts.manual || manualStatus(relayDir);
   const book = connectBook(relayDir);
@@ -3835,7 +4040,9 @@ async function composeConnect(relayDir, opts = {}) {
   const upstreamBroken = Boolean(upstream && !upstream.ok);
   const upstreamNote = upstreamBroken
     ? `\n⚠️ bridge 要连的本机 dsh web 地址 ${upstreamUrl()}（${upstreamSourceLabel()}）探测不通：${upstream.error || "连接被拒绝"}。`
-      + "若 dsh web 不在默认端口，请点「一键更新」升级运行环境（新版本会自动跟随实际端口），或把 dsh web 重启在 3080。"
+      + "本插件会自动发现 dsh web 的真实端口（0.6.15 起支持非默认端口），"
+      + "若仍不通：① 确认 dsh web 正在运行；② 点「一键更新」把运行环境升到最新版；"
+      + "③ 仍不行可在启动 dsh web 前设环境变量 `DSH_BRIDGE_UPSTREAM=http://127.0.0.1:<你的端口>`。"
     : "";
 
   let phase;
@@ -4177,11 +4384,13 @@ function ensureConnection(relayDir, opts = {}) {
         watcherRunning: true, bridgeRunning: false, force: Boolean(opts.force), now,
         observedSince: book.watcherSeenAt,
       });
-      if (wedge.wedged && !wedge.exhausted && (isWindows() || isDarwin())) {
+      if (wedge.wedged && !wedge.exhausted) {
         const rec = noteWatcherRestart(relayDir);
-        // Windows 没有服务管理器：必须显式结束卡死的守护（否则 startBridge 幂等直接返回）；
+        // Windows 没有服务管理器；Linux 上没有被 systemd 托管时也是脱离进程：
+        // 这两种都必须**显式结束卡死的守护**，否则 startBridge 幂等会直接返回、重启变成 no-op。
         // macOS 走 launchctl，startBridge 内部已先 bootout 再 bootstrap，等价于重启。
-        if (isWindows()) stopBridgeDetached(relayDir);
+        // ★ 0.6.15：以前这里把 Linux 排除在外（那时 Linux 的 startBridge 是死路，重启没意义）。
+        if (isWindows() || (isLinux() && !systemdUserAvailableCached())) stopBridgeDetached(relayDir);
         const r = startBridge(relayDir);
         appendLogLine(relayDir, AUTO_INSTALL_LOG,
           `[dsh-remote-web] 后台守护已存活 ${Math.round(wedge.ageMs / 1000)} 秒仍无 bridge 进程`
@@ -5909,15 +6118,34 @@ function registerRoutes(ctx, relayDir) {
 // 自己持有 webserver 配置（实测监听 43120 / 回环），我们的 LAN 绑定补丁并不生效，于是它一直
 // 用的是原生那条路。**不能把"手机能不能选工作区"押在宿主的绑定地址上。**
 //
-// 做法（官方文档给的"直接合成那一对"的钉法）：在 loader 里先建起 browse 宿主+界面，
-// **成功之后**再摘掉 auto 条目（auto 的 effect 析构会连带卸掉 native 那一对）。
+// 【0.6.15 事故修正 —— 0.6.14 的"先建 browse、后摘 auto"在 DSH Desktop 上必然失败】
 //
-// 三条护栏，顺序不能改：
+// 现场（用户诊断日志）：
+//   error: service "directoryPicker" has been registered at .dLateDirectoryPicker3
+//     at new DirectoryPicker (.../dsh-host-directory-picker/lib/index.js:1782)
+//     at new BrowseDirectoryPicker (.../dsh-host-directory-picker-browse/lib/index.js:245)
+//     at Fiber._execute
+// 用户看到的后果：插件装载失败（`entry did not activate`），而**原生那对还留着**
+// （auto 的析构没跑到 → 没被卸掉）。也就是说 0.6.14 这一版"修法"不但没修好，
+// 还额外制造了一条装载报错。
+//
+// 根因：`native` 与 `browse` 两个后端都是 `class DirectoryPicker extends Service`，
+// 注册的是**同一个服务名** `ctx.directoryPicker`。seam 的文档写得很直白：
+//   "one implementation per context; loading a second throws, cordis' standard
+//    duplicate-service behavior"（见 @deepseek-ai/dsh-host-directory-picker/lib/index.js）。
+// 所以"两者并存"从来就不成立 —— 只要 auto/native 还挂着，建 browse **一定**抛错。
+// 0.6.14 把顺序写反了：唯一能工作的顺序是**先摘 auto（释放服务名）、再建 browse**。
+//
+// 做法：先摘后建 + **失败回滚**（摘了却建不起来时把 auto 原样装回去，用户至少还有原生可用）。
+//
+// 四条护栏：
 //   ① 只在当前 kind === "native" 时动手；已经是 browse 就完全不碰（多数自建部署就是这样）；
-//   ② 先建 browse、后摘 auto —— browse 建不起来就什么都不做，宁可用原生也不能让选择器消失；
-//   ③ 任何失败只记日志、绝不抛给宿主（插件不能把 dsh web 拖挂）。
+//   ② **先摘 auto、后建 browse** —— 两个后端抢同一个服务名，并存是不可能的；
+//   ③ browse 建不起来（或建完仍不是 browse）→ 回滚：卸掉刚建的、把 auto 条目**按原 id** 建回来；
+//   ④ 任何失败只记日志、绝不抛给宿主（插件不能把 dsh web 拖挂）。
 // `DSH_REMOTE_NATIVE_PICKER=1` 可整体退出（想保留系统原生对话框的人）。
 const PICKER_AUTO_ENTRY_ID = "directory-picker";
+const PICKER_AUTO_PACKAGE = "@deepseek-ai/dsh-host-directory-picker-auto";
 const PICKER_BROWSE_PACKAGES = [
   "@deepseek-ai/dsh-host-directory-picker-browse",
   "@deepseek-ai/dsh-client-ui-directory-picker-browse"
@@ -5937,6 +6165,77 @@ function directoryPickerKind(ctx) {
 }
 
 /**
+ * 在 loader 里找条目（`store` 是扁平表；条目结构不同版本略有差异，故 options 也当来源之一）。
+ * @returns {{id: string, options: object|null}|null}
+ */
+function loaderEntryOf(loader, id) {
+  let entry = null;
+  try { entry = loader?.store ? loader.store[id] : null; } catch { entry = null; }
+  if (!entry) return null;
+  const options = entry.options && typeof entry.options === "object" ? { ...entry.options } : null;
+  return { id, options: options ? { ...options, id } : { id, name: PICKER_AUTO_PACKAGE } };
+}
+
+/**
+ * 把 auto 换成 browse 那一对（**先摘后建 + 失败回滚**）。前提：当前 kind === "native"。
+ * @returns {Promise<{kind:string, action:string, detail:string}>}
+ */
+async function swapAutoToBrowse(ctx, loader, kind) {
+  const auto = loaderEntryOf(loader, PICKER_AUTO_ENTRY_ID)
+    || { id: PICKER_AUTO_ENTRY_ID, options: { id: PICKER_AUTO_ENTRY_ID, name: PICKER_AUTO_PACKAGE } };
+  // ① 先摘 auto：它的 effect 析构会卸掉 native 那一对，同时**释放 directoryPicker 服务名**。
+  //    不先摘就建 browse，必然撞上 duplicate-service（0.6.14 就是这么坏掉的）。
+  try {
+    await loader.remove(PICKER_AUTO_ENTRY_ID);
+  } catch (e) {
+    pickerPinState = {
+      kind,
+      action: "kept_native",
+      detail: `摘不掉 auto 条目，保留原生：${e && e.message ? e.message : e}`
+    };
+    ctx.logger?.warn?.(`dsh-remote-web: 目录选择器切换失败（摘 auto），保留原生：${e && e.message ? e.message : e}`);
+    return pickerPinState;
+  }
+  // ② 再建 browse 那一对（宿主后端 + 界面半边）
+  const created = [];
+  const fail = async (e) => {
+    for (const id of [...created].reverse()) { try { await loader.remove(id); } catch { /* 尽力回滚 */ } }
+    // ③ 回滚 auto：**按原 id 建回来**，让用户至少还有原生选择器可用
+    let restored = false;
+    try { await loader.create(auto.options); restored = true; } catch { restored = false; }
+    const why = e && e.message ? e.message : e;
+    pickerPinState = {
+      kind: directoryPickerKind(ctx),
+      action: "kept_native",
+      detail: restored
+        ? `浏览器内选择器装不起来，已还原原生：${why}`
+        : `浏览器内选择器装不起来，且原生条目还原失败（请重启 DeepSeek harness）：${why}`
+    };
+    ctx.logger?.warn?.(`dsh-remote-web: 目录选择器固定为 browse 失败${restored ? "，已还原原生" : "，且还原失败"}：${why}`);
+    return pickerPinState;
+  };
+  for (const name of PICKER_BROWSE_PACKAGES) {
+    try {
+      created.push(await loader.create({ name }));
+    } catch (e) {
+      return await fail(e);
+    }
+  }
+  // ④ 复核：服务真的换成 browse 了吗（建成功了但服务没挂上也是白搭）
+  const now = directoryPickerKind(ctx);
+  if (now && now !== "browse") {
+    return await fail(new Error(`建完 browse 后服务仍是 ${now}`));
+  }
+  pickerPinState = {
+    kind: "browse",
+    action: "pinned",
+    detail: "原生对话框在远程时弹在电脑那台屏上（手机上看不到），已改为浏览器内选择器"
+  };
+  ctx.logger?.info?.("dsh-remote-web: 目录选择器已固定为浏览器内实现（原生对话框远程不可见）");
+  return pickerPinState;
+}
+
+/**
  * 把目录选择器固定成 browse（幂等）。服务要等 auto 挂完才存在，所以内部带重试窗口。
  * @returns {Promise<{kind:string, action:string, detail:string}>}
  */
@@ -5947,7 +6246,7 @@ async function pinBrowseDirectoryPicker(ctx, { attempts = 6, gapMs = 700 } = {})
   }
   let loader = null;
   try { loader = typeof ctx.get === "function" ? ctx.get("loader") : null; } catch { loader = null; }
-  if (!loader || typeof loader.create !== "function") {
+  if (!loader || typeof loader.create !== "function" || typeof loader.remove !== "function") {
     pickerPinState = { kind: directoryPickerKind(ctx), action: "skipped", detail: "没有 loader 服务，无法干预选择器" };
     return pickerPinState;
   }
@@ -5957,32 +6256,7 @@ async function pinBrowseDirectoryPicker(ctx, { attempts = 6, gapMs = 700 } = {})
       pickerPinState = { kind, action: "none", detail: "已经是浏览器内选择器" };
       return pickerPinState;
     }
-    if (kind === "native") {
-      const created = [];
-      try {
-        for (const name of PICKER_BROWSE_PACKAGES) created.push(await loader.create({ name }));
-      } catch (e) {
-        for (const id of [...created].reverse()) { try { await loader.remove(id); } catch { /* 尽力回滚 */ } }
-        pickerPinState = { kind, action: "kept_native", detail: `浏览器内选择器装不起来，保留原生：${e && e.message ? e.message : e}` };
-        ctx.logger?.warn?.(`dsh-remote-web: 目录选择器固定为 browse 失败，保留原生：${e && e.message ? e.message : e}`);
-        return pickerPinState;
-      }
-      try {
-        const entry = loader.store ? loader.store[PICKER_AUTO_ENTRY_ID] : null;
-        if (entry) await loader.remove(PICKER_AUTO_ENTRY_ID);
-      } catch (e) {
-        // browse 已经起来了，选择器可用；只是 auto 没摘掉（两者并存时 browse 生效即可）
-        pickerPinState = { kind: "browse", action: "pinned", detail: `已切到浏览器内选择器（auto 条目未摘除：${e && e.message ? e.message : e}）` };
-        return pickerPinState;
-      }
-      pickerPinState = {
-        kind: "browse",
-        action: "pinned",
-        detail: "原生对话框在远程时弹在电脑那台屏上（手机上看不到），已改为浏览器内选择器"
-      };
-      ctx.logger?.info?.("dsh-remote-web: 目录选择器已固定为浏览器内实现（原生对话框远程不可见）");
-      return pickerPinState;
-    }
+    if (kind === "native") return await swapAutoToBrowse(ctx, loader, kind);
     await sleep(gapMs); // 服务还没挂上（auto 正在建）→ 下一轮再看
   }
   pickerPinState = { kind: directoryPickerKind(ctx), action: "skipped", detail: "启动窗口内未确认到选择器服务" };
@@ -5996,6 +6270,10 @@ export function apply(ctx, config = {}) {
   webServerCtx = ctx;
   // 上游地址落盘（0.6.12）：系统自启拉起的守护没有本进程的 env，只认这个文件。
   publishUpstream(relayDir);
+  // 【0.6.15】问不到自己监听端口时（飞牛/NAS 实测就是这种情况）主动发现一次并固化：
+  // watcher/bridge 是独立进程，只有这里知道 dsh web 真实在哪个端口。fire-and-forget，
+  // 发现完 /dsh-remote/bridge-status 的下一轮轮询与自愈就会用上正确地址。
+  void discoverUpstreamSelf(relayDir).catch(() => FALLBACK_UPSTREAM);
   // 全新激活（dsh web 重启后插件重新加载，或卸载后再次安装）→ 解除上次的「已卸载」停摆标记
   UNINSTALLED_DIRS.delete(relayDir);
   // 匿名遥测：装载即初始化（读回上次进程遗留的磁盘队列，例如重启前那条 harness_restart，
@@ -6050,5 +6328,5 @@ export function apply(ctx, config = {}) {
 
 // test hooks：cordis 只读 name/inject/apply，这些导出只给用例（见 test/picker-pin.test.mjs）。
 // 为什么不放进 apply 内部直接测：apply 是"装载即副作用"的同步函数，选择器固定是异步且带重试窗口的，
-// 单独导出才能把「先建 browse、后摘 auto」这个顺序契约钉死。
-export { pinBrowseDirectoryPicker as __pinBrowseDirectoryPicker, pickerPinState as __pickerPinState, directoryPickerKind as __directoryPickerKind, PICKER_AUTO_ENTRY_ID as __PICKER_AUTO_ENTRY_ID, PICKER_BROWSE_PACKAGES as __PICKER_BROWSE_PACKAGES };
+// 单独导出才能把「**先摘 auto、后建 browse**」这个顺序契约钉死。
+export { pinBrowseDirectoryPicker as __pinBrowseDirectoryPicker, pickerPinState as __pickerPinState, directoryPickerKind as __directoryPickerKind, PICKER_AUTO_ENTRY_ID as __PICKER_AUTO_ENTRY_ID, PICKER_AUTO_PACKAGE as __PICKER_AUTO_PACKAGE, PICKER_BROWSE_PACKAGES as __PICKER_BROWSE_PACKAGES };

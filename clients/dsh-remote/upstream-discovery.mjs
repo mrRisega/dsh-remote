@@ -158,13 +158,140 @@ export function dshProcessPids(platform = process.platform) {
     .filter((n) => Number.isInteger(n) && n > 1 && n !== process.pid);
 }
 
+// ---------- 「本机所有回环监听端口」：NAS 上的救命稻草（0.6.15） ----------
+//
+// 【为什么必须加这一层】飞牛 fnOS 用户诊断（2026-09-25，插件 0.6.14）：
+//   上游 dsh web: http://127.0.0.1:3080（默认值 3080（**未取到 dsh web 实际监听端口**），⚠️ 不可达）
+//   他的 dsh web 实际在 **2298**（fnOS 应用里配的内部监听端口），而上面五条发现路径**全都没命中**：
+//     · 插件半的 ctx.webServer.port 没取到（该环境下拿不到）；
+//     · `lsof` 在 NAS 上**根本没装**；`pgrep -f dsh` 也可能没有；
+//     · 静态候选只有 3080 与 Desktop 的 43120 区间 —— 2298 永远不在里面。
+//   于是用户去改端口号（改成 20xx、又改回 3080）当然都没用：**没有任何一条路径会去试 2298**。
+//
+// 做法：直接把"这台机器上正在 LISTEN 的回环端口"全列出来当候选，再逐个做**身份校验**。
+// 为什么敢全列：身份校验（`looksLikeDshWeb` / `looksLikeDshRemoteSelf`）会拒掉所有陌生服务，
+// 多探几个端口只是几十毫秒；而漏掉一个端口就是"用户永远连不上"。
+
+/** 解析 /proc/net/tcp 一行里的本地地址与状态（Linux 无依赖：不需要 ss/netstat/lsof）。 */
+function parseProcNetLine(line) {
+  const cols = String(line || "").trim().split(/\s+/);
+  if (cols.length < 4) return null;
+  const local = cols[1];
+  const state = cols[3];
+  const m = /^([0-9A-Fa-f]{1,32}):([0-9A-Fa-f]{1,4})$/.exec(local || "");
+  if (!m) return null;
+  return { hex: m[1], port: parseInt(m[2], 16), state: String(state).toUpperCase() };
+}
+
+/** 32 位小端 hex（/proc/net/tcp）→ IPv4 点分串。 */
+function ipv4OfHex(hex) {
+  const h = String(hex).padStart(8, "0").slice(-8);
+  const bytes = [h.slice(6, 8), h.slice(4, 6), h.slice(2, 4), h.slice(0, 2)].map((x) => parseInt(x, 16));
+  return bytes.join(".");
+}
+
+/** 128 位 hex（/proc/net/tcp6）→ 是否回环（::1）。 */
+function isIpv6LoopbackHex(hex) {
+  const h = String(hex).toLowerCase().padStart(32, "0");
+  // ::1 在 /proc 里按 4 组小端 32 位存放 → 末组为 01000000，其余全 0
+  return /^0{24}01000000$/.test(h);
+}
+
+/** Linux：直接读 /proc/net/tcp{,6}（内核真值，NAS 上不需要任何外部命令）。 */
+export function procNetLoopbackPorts() {
+  const ports = new Set();
+  for (const file of ["/proc/net/tcp", "/proc/net/tcp6"]) {
+    let text = "";
+    try { text = fs.readFileSync(file, "utf8"); } catch { continue; }
+    for (const line of text.split("\n").slice(1)) {
+      const row = parseProcNetLine(line);
+      if (!row || row.state !== "0A") continue; // 0A = LISTEN
+      const loop = file.endsWith("tcp6")
+        ? isIpv6LoopbackHex(row.hex)
+        : ipv4OfHex(row.hex).startsWith("127.");
+      // 通配绑定（0.0.0.0 / ::）也收：dsh web 绑 0.0.0.0 时回环照样能连
+      const wildcard = file.endsWith("tcp6") ? /^0+$/.test(String(row.hex)) : ipv4OfHex(row.hex) === "0.0.0.0";
+      if (loop || wildcard) ports.add(row.port);
+    }
+  }
+  return [...ports];
+}
+
+/** `ss -ltnH` 输出里的本地端口（Linux；部分精简系统没有 /proc，或反之）。 */
+function ssLoopbackPorts() {
+  const ports = new Set();
+  const out = tryExec("ss", ["-ltnH"], 5000) || tryExec("ss", ["-ltn"], 5000);
+  for (const line of out.split("\n")) {
+    const cols = line.trim().split(/\s+/);
+    if (cols.length < 4) continue;
+    // ss 的本地地址是第 4 列（State Recv-Q Send-Q Local Address:Port Peer Address:Port）
+    const m = /[:.](\d+)$/.exec(cols[3] || "");
+    if (m) ports.add(Number(m[1]));
+  }
+  return [...ports];
+}
+
+/** `netstat -ltn` 输出里的本地端口（BSD/GNU 两种格式都认）。 */
+function netstatLoopbackPorts() {
+  const ports = new Set();
+  const out = (tryExec("netstat", ["-ltn"], 5000) || tryExec("netstat", ["-an"], 6000));
+  for (const line of out.split("\n")) {
+    if (!/listen/i.test(line) && !/^tcp/i.test(line)) continue;
+    const m = /(?:^|\s)(?:\d{1,3}\.){3}\d{1,3}[:.](\d+)|\[?::1?\]?[:.](\d+)/.exec(line);
+    const p = m ? Number(m[1] || m[2]) : 0;
+    if (p > 0 && p < 65536) ports.add(p);
+  }
+  return [...ports];
+}
+
+/** `lsof -nP -iTCP -sTCP:LISTEN` 输出里的本地端口（macOS/装了 lsof 的 Linux）。 */
+function lsofLoopbackPorts() {
+  const ports = new Set();
+  const out = tryExec("lsof", ["-nP", "-iTCP", "-sTCP:LISTEN"], 6000);
+  for (const line of out.split("\n")) {
+    const m = /(?:TCP\s+)?(?:\d{1,3}\.){3}\d{1,3}:(\d+)\s*\(LISTEN\)/.exec(line) || /TCP\s+\*:(\d+)/.exec(line);
+    if (m) ports.add(Number(m[1]));
+  }
+  return [...ports];
+}
+
+/**
+ * 本机所有回环（含通配绑定）LISTEN 端口，去重。
+ * 多来源合并而不是"取第一个成功的"：NAS 上 lsof/ss/netstat/pgrep 各有缺失，
+ * 只有合起来才够全；重复端口由 Set 消化，代价只是多读几个文件。
+ */
+export function allLoopbackListeningPorts(platform = process.platform) {
+  const ports = new Set();
+  const push = (list) => { for (const p of list) { const n = Number(p); if (Number.isInteger(n) && n > 0 && n < 65536) ports.add(n); } };
+  if (platform === "win32") {
+    for (const line of tryExec("netstat", ["-ano"], 6000).split(/\r?\n/)) {
+      if (!/LISTENING/i.test(line)) continue;
+      const cols = line.trim().split(/\s+/);
+      const m = /:(\d+)$/.exec(cols[1] || "");
+      if (m) push([Number(m[1])]);
+    }
+    return [...ports];
+  }
+  if (platform === "linux") {
+    push(procNetLoopbackPorts()); // 无依赖，优先
+    push(ssLoopbackPorts());
+  }
+  push(lsofLoopbackPorts());
+  push(netstatLoopbackPorts());
+  return [...ports];
+}
+
 /**
  * 候选列表（已去重，按"可能性"排序），每项带**来源标注**（用于日志与测试断言）。
  * 顺序 = 提示里的端口 → 显式额外端口 → DSH_WEB_URL 的端口 → 祖先/dsh 进程实测监听端口
- *        → 3080 → Desktop 默认端口区间。
+ *        → **本机所有回环监听端口** → 3080 → Desktop 默认端口区间。
+ *
+ * 「所有回环监听端口」排在静态候选之前：NAS 上 dsh web 的端口（实测 2298）**只可能**从这一层找到，
+ * 排在 3080 之后就等于白加（3080 探测失败之前不会去试它，而静态候选有 12 个 Desktop 端口）。
+ * 最后仍留静态候选兜底（宿主把端口藏得很深、/proc 也没有的极端情况）。
  * @returns {Array<{port:number, source:string}>}
  */
-export function candidatePorts({ relayDir = "", env = process.env, extraPorts = [], platform = process.platform } = {}) {
+export function candidatePorts({ relayDir = "", env = process.env, extraPorts = [], platform = process.platform, listenPorts = null } = {}) {
   const out = [];
   const seen = new Set();
   const push = (p, source) => {
@@ -179,6 +306,10 @@ export function candidatePorts({ relayDir = "", env = process.env, extraPorts = 
   push(portOf(upstreamFromDshWebUrl(env)), "dsh_web_url");
   const pids = [...new Set([process.pid, ...ancestorPids(process.pid, 6, platform), ...dshProcessPids(platform)])];
   for (const pid of pids) for (const p of listeningPortsOfPid(pid, platform)) push(p, "process");
+  // ★ 本机所有回环 LISTEN 端口（0.6.15）：NAS 上 dsh web 在 2298 这类非默认端口时唯一的发现路径。
+  //   调用方可以注入 listenPorts（测试用），避免用例依赖开发机真实监听表。
+  const listen = Array.isArray(listenPorts) ? listenPorts : allLoopbackListeningPorts(platform);
+  for (const p of listen) push(p, "listen");
   push(3080, "static");
   for (let i = 0; i < DESKTOP_PORT_SCAN; i++) push(DESKTOP_DEFAULT_PORT + i, "static");
   return out;
@@ -208,8 +339,28 @@ export function looksLikeDshWeb(status, text) {
   return DSH_WEB_MARKERS.some((m) => body.includes(m));
 }
 
+/** 本插件自己的路由（`GET /dsh-remote/self`）—— 只有"宿主这台 dsh web"才会应答。 */
+export const DSH_REMOTE_SELF_PATH = "/dsh-remote/self";
+
 /**
- * 探测一个候选：GET `/`，带身份校验。
+ * 身份校验的**第二判据**：本插件自己的 `/dsh-remote/self`。
+ *
+ * 为什么需要它：`looksLikeDshWeb` 依赖 dsh web 首页的 HTML 特征（`__ModuleLoader__` 等），
+ * 而首页在有些部署下是**跳转/登录页/自定义门户**，特征一个字都不出现 —— 于是明明端口就是对的，
+ * 却被判成"陌生服务"。`/dsh-remote/self` 由**本插件**注册在同一个 web server 上，
+ * 返回 `{"ok":true,"version":…,"channel":…,"relayDir":…}`，是本机最硬的同一性证据
+ * （它跑在同一条隧道上，能应答就说明这个端口就是宿主的 dsh web）。
+ */
+export function looksLikeDshRemoteSelf(status, text) {
+  if (Number(status) !== 200) return false;
+  const body = String(text || "");
+  if (!body.includes("relayDir")) return false;
+  return body.includes('"channel"') || body.includes('"runtimeReady"') || body.includes("dsh-remote");
+}
+
+/**
+ * 探测一个候选：先 GET `/`（dsh web 首页特征），不中再 GET `/dsh-remote/self`（本插件特征）。
+ * 两条判据任一命中即通过。
  * @returns {Promise<boolean>}
  */
 export async function probeDshWeb(url, { timeoutMs = PROBE_TIMEOUT_MS, fetchImpl } = {}) {
@@ -217,34 +368,38 @@ export async function probeDshWeb(url, { timeoutMs = PROBE_TIMEOUT_MS, fetchImpl
   if (!target) return false;
   const doFetch = fetchImpl || globalThis.fetch;
   if (typeof doFetch !== "function") return false;
-  try {
-    const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), timeoutMs);
-    let res;
+  const once = async (path, check) => {
     try {
-      // redirect: manual —— 不跟随跳转（跳走的多半不是我们要的宿主）
-      res = await doFetch(`${target}/`, { signal: ac.signal, redirect: "manual" });
-    } finally {
-      clearTimeout(timer);
-    }
-    const status = Number(res && res.status) || 0;
-    if (status >= 500) return false;
-    // 只读前 8KB 足够命中特征；读流失败按"不是"处理（宁可少一个候选，不可误接）
-    let text = "";
-    try {
-      if (res.body && typeof res.body.getReader === "function") {
-        const reader = res.body.getReader();
-        const { value } = await reader.read();
-        text = value ? Buffer.from(value).toString("utf8") : "";
-        try { await reader.cancel(); } catch { /* ignore */ }
-      } else if (typeof res.text === "function") {
-        text = await res.text();
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), timeoutMs);
+      let res;
+      try {
+        // redirect: manual —— 不跟随跳转（跳走的多半不是我们要的宿主）
+        res = await doFetch(`${target}${path}`, { signal: ac.signal, redirect: "manual" });
+      } finally {
+        clearTimeout(timer);
       }
-    } catch { /* 读失败 → text 为空 → 判否 */ }
-    return looksLikeDshWeb(status, text.slice(0, 8192));
-  } catch {
-    return false;
-  }
+      const status = Number(res && res.status) || 0;
+      if (status >= 500) return false;
+      // 只读前 8KB 足够命中特征；读流失败按"不是"处理（宁可少一个候选，不可误接）
+      let text = "";
+      try {
+        if (res.body && typeof res.body.getReader === "function") {
+          const reader = res.body.getReader();
+          const { value } = await reader.read();
+          text = value ? Buffer.from(value).toString("utf8") : "";
+          try { await reader.cancel(); } catch { /* ignore */ }
+        } else if (typeof res.text === "function") {
+          text = await res.text();
+        }
+      } catch { /* 读失败 → text 为空 → 判否 */ }
+      return check(status, text.slice(0, 8192));
+    } catch {
+      return false;
+    }
+  };
+  if (await once("/", looksLikeDshWeb)) return true;
+  return once(DSH_REMOTE_SELF_PATH, looksLikeDshRemoteSelf);
 }
 
 /**
@@ -261,6 +416,7 @@ export async function discoverUpstream({
   fetchImpl,
   platform = process.platform,
   extraPorts = [],
+  listenPorts = null,
   log
 } = {}) {
   const hint = resolveUpstreamHint({ relayDir, env });
@@ -273,7 +429,7 @@ export async function discoverUpstream({
 
   // ③ 候选并行探测(本地端口,拒绝是瞬时的;并行是为了不让 watcher 卡住)
   const hintPort = portOf(hint.url);
-  const entries = candidatePorts({ relayDir, env, platform, extraPorts }).filter((e) => e.port !== hintPort);
+  const entries = candidatePorts({ relayDir, env, platform, extraPorts, listenPorts }).filter((e) => e.port !== hintPort);
   const results = await Promise.all(entries.map(async (e) => ({ ...e, ok: await probeDshWeb(`http://127.0.0.1:${e.port}`, { timeoutMs, fetchImpl }) })));
   const hit = results.find((r) => r.ok);
   if (hit) {

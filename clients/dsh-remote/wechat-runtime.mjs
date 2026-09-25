@@ -1465,10 +1465,17 @@ export class WeChatRuntime {
         const list = await this.#sessions();
         const hit = list ? list.find((s) => s.sessionId === sid) : null;
         if (hit && hit.title) title = hit.title;
-        // 学到标题就记住,后面 /status 与 /ls 都能直接用
-        if (hit && sid === this.currentSessionId && title !== this.currentSessionTitle) {
-          this.#rememberSession(sid, title);
-        }
+      }
+      // ★ 0.6.15 修（业主实测）：**完成推送要把"当前会话"切到刚跑完的那个**。
+      //   旧行为只在 sid 已经是当前会话时才更新标题，于是：B 会话跑完推了结论，用户直接在微信里
+      //   回一句"再改一下"，那条消息却被 `#sendToSession` 发给了**上一次的当前会话 A** ——
+      //   A 莫名其妙多了一条指令，B 永远收不到。用户看到的正是"推送过来了，我准备回话，
+      //   它还停留在我之前的会话里"。
+      //   语义：**最近完成的任务 = 最近一次推送的对象 = 你现在回话的对象**。这是唯一不会让人踩空的解释。
+      if (sid && sid !== this.currentSessionId) {
+        this.#rememberSession(sid, title);
+      } else if (sid && title && title !== this.currentSessionTitle) {
+        this.#rememberSession(sid, title); // 学到标题就记住,后面 /status 与 /ls 都能直接用
       }
       const summary = sid ? await this.#sessionSummary(sid) : "";
       const c = formatCompletion({

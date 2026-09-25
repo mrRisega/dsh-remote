@@ -764,12 +764,32 @@ function restartBridgeService() {
     return startBridgeDarwin(plistPath);
   }
   if (process.platform === "linux") {
-    const r = sh(`systemctl --user restart dsh-bridge`);
-    if (!r.ok) return { ok: false, status: "failed", detail: (r.stderr || r.stdout).trim() || "systemctl restart 失败" };
-    const a = sh(`systemctl --user is-active dsh-bridge`);
-    return a.ok && a.stdout.trim() === "active"
-      ? { ok: true, status: "running", pid: null }
-      : { ok: false, status: "failed", detail: (a.stdout || a.stderr).trim() };
+    // 【0.6.15】飞牛 fnOS / 群晖这类 NAS 上**没有 user systemd 会话**（插件跑在系统服务里，
+    // 没有 XDG_RUNTIME_DIR）→ `systemctl --user` 只会报 "Failed to connect to bus"，
+    // 于是这一支原本必然失败、且没有任何兜底。现在：有会话就用 systemd（可自愈），
+    // 没有就退到脱离进程（spawnDetachedBridge，与 macOS 的兜底同一条路径）。
+    const hasUserSystemd = Boolean(process.env.XDG_RUNTIME_DIR) && sh("systemctl --user show-environment").ok;
+    if (hasUserSystemd) {
+      const r = sh(`systemctl --user restart dsh-bridge`);
+      if (r.ok) {
+        const a = sh(`systemctl --user is-active dsh-bridge`);
+        if (a.ok && a.stdout.trim() === "active") return { ok: true, status: "running", pid: null };
+        return { ok: false, status: "failed", detail: (a.stdout || a.stderr).trim() };
+      }
+      // 有会话却重启失败：继续往下走脱离进程兜底，绝不留一个"重启失败但没有任何进程"的空档
+    }
+    const d = spawnDetachedBridge();
+    if (d.ok) {
+      return {
+        ok: true,
+        status: "degraded-detached",
+        pid: d.pid,
+        detail: hasUserSystemd
+          ? "systemd --user 重启失败，已改为后台进程运行（现在可用；systemd 恢复后下一次重启会回到托管）"
+          : "本机没有 user systemd 会话（NAS/容器常见），已改为后台进程运行（现在可用，但不会开机自启）",
+      };
+    }
+    return { ok: false, status: "failed", detail: d.error || "systemd 与后台进程均启动失败" };
   }
   return { ok: false, status: "unsupported", detail: `平台 ${process.platform} 不支持自启动` };
 }

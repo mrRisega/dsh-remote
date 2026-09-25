@@ -105,9 +105,12 @@ const OFFICIAL_BODY = `<!doctype html>
 <body><div id="root"></div></body></html>`;
 
 const upstream = http.createServer((req, res) => {
-  let body = "";
-  req.on("data", (c) => { body += c; });
+  // ⚠️ 必须按 Buffer 攒再一次性 toString：`body += chunk` 会对**每个分片**单独 toString，
+  //    一个多字节 UTF-8 字符正好跨在 64KB 分片边界上就会被拆坏（0.6.15 加了大正文用例才暴露）。
+  const chunks = [];
+  req.on("data", (c) => chunks.push(c));
   req.on("end", () => {
+    const body = Buffer.concat(chunks).toString("utf8");
     // 官方 dsh web 特征 html(Phase-4:验证 e2ee 启用的桥端注入镜像 shim)
     if (req.url === "/official" || req.url.startsWith("/api/official")) {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
@@ -115,7 +118,7 @@ const upstream = http.createServer((req, res) => {
       return;
     }
     res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
-    res.end(JSON.stringify({ method: req.method, url: req.url, ct: req.headers["content-type"] || "", auth: req.headers["x-dsh-test-auth"] || "", body }));
+    res.end(JSON.stringify({ method: req.method, url: req.url, ct: req.headers["content-type"] || "", auth: req.headers["x-dsh-test-auth"] || "", want: req.headers["x-dsh-e2ee-want"] || "", body }));
   });
 });
 let upstreamWss = null;
@@ -373,6 +376,73 @@ test("E2EE HTTP:信封请求解封→上游→封回往返一致;篡改密文 �
   const badText = await bad.text();
   assert.match(badText, /⚠/);
   assert.match(badText, /auth_failed|无法解密/);
+});
+
+test("★ 0.6.15 三层 base64 降为两层:声明过的客户端收到二进制明文,协商头不转发上游", async () => {
+  // 业主实测（dev-1014f947f8ab，Ubuntu 上的 dsh + Windows 访问，首屏要等几分钟）：
+  // 同一条响应被 base64 编了三层（1.333³≈2.37×）。第一层是"gzip 正文进 JSON"，
+  // 现在由客户端声明 x-dsh-e2ee-want: bin 换成二进制框架；老客户端不声明 → 形态不变。
+  const u = globalThis.__unlocked;
+  assert.ok(u, "需要先解锁");
+  const { client } = u;
+  const payload = "首屏聚合包内容-".repeat(4000); // ~ 100KB：足够看出编码层差异
+
+  // ① 新客户端：声明二进制明文
+  const plainBin = Buffer.from(JSON.stringify({
+    m: "POST",
+    p: "/api/echo?bin=1",
+    h: { "content-type": "application/json; charset=utf-8", "x-dsh-e2ee-want": "bin" },
+    b: Buffer.from(payload, "utf8").toString("base64")
+  }), "utf8");
+  const envBin = client.seal({ kind: "http", dir: "p2b", counter: 21, data: plainBin });
+  const resBin = await fetch(`${routerBase}/remote/${DEV_ON}/api/echo?bin=1`, {
+    method: "POST",
+    headers: { ...envelopeRequestHeaders(client.sessId, "http"), cookie: COOKIE },
+    body: JSON.stringify(envBin)
+  });
+  assert.equal(resBin.status, 200);
+  const envRespBin = JSON.parse(await resBin.text());
+  const openedBin = client.open({ kind: "http-resp", dir: "b2p", env: envRespBin, counter: envRespBin.c, reqNonceB64: envBin.n });
+  assert.equal(openedBin.data[0], 0x02, "★ 声明过的客户端必须收到二进制明文框架（首字节 0x02）");
+  const respBin = decodeHttpResponsePlain(openedBin.data);
+  const upBin = JSON.parse(respBin.bodyBuffer.toString("utf8"));
+  assert.equal(upBin.want, "", "★ 内部协商头绝不能转发给上游 dsh web（它不是业务头）");
+  assert.equal(upBin.body, payload, "正文必须逐字节还原");
+
+  // ② 老客户端（不声明）→ 仍是旧 JSON 形态，解码照样成功（兼容性）
+  const plainOld = Buffer.from(JSON.stringify({
+    m: "POST",
+    p: "/api/echo?bin=0",
+    h: { "content-type": "application/json; charset=utf-8" },
+    b: Buffer.from(payload, "utf8").toString("base64")
+  }), "utf8");
+  const envOld = client.seal({ kind: "http", dir: "p2b", counter: 22, data: plainOld });
+  const resOld = await fetch(`${routerBase}/remote/${DEV_ON}/api/echo?bin=0`, {
+    method: "POST",
+    headers: { ...envelopeRequestHeaders(client.sessId, "http"), cookie: COOKIE },
+    body: JSON.stringify(envOld)
+  });
+  const envRespOld = JSON.parse(await resOld.text());
+  const openedOld = client.open({ kind: "http-resp", dir: "b2p", env: envRespOld, counter: envRespOld.c, reqNonceB64: envOld.n });
+  assert.equal(openedOld.data[0], 0x7b, "老客户端必须仍收到旧 JSON 明文（首字节 '{'）");
+  const respOld = decodeHttpResponsePlain(openedOld.data);
+  assert.equal(JSON.parse(respOld.bodyBuffer.toString("utf8")).body, payload);
+  // 同一份正文：新形态必须明显更小（省掉的就是那一层 33%）
+  assert.ok(openedOld.data.length > openedBin.data.length * 1.25,
+    `旧明文形态必须明显更大（实测 ${openedOld.data.length} vs ${openedBin.data.length}）`);
+});
+
+test("★ 0.6.15 隧道帧不再给信封 JSON 套第三层 base64（bridge→中继 是计量那条腿）", async () => {
+  const { e2eeHttpResponseFrame } = await import("../dsh-bridge.mjs");
+  const env = { v: 2, k: "http-resp", s: "s".repeat(32), c: 1, n: "n".repeat(16), t: 0, d: "A".repeat(3 * 1024 * 1024) };
+  const frame = e2eeHttpResponseFrame(7, env.s, env);
+  assert.equal(frame.bodyBase64, false, "★ 不得再标记 bodyBase64（那一层纯属白花 33% 流量）");
+  assert.equal(frame.status, 200);
+  assert.match(frame.headers["x-dsh-e2ee"], /k=http-resp$/);
+  assert.deepEqual(JSON.parse(frame.body), env, "中继解出来必须与原信封逐字段一致");
+  const oldBody = Buffer.from(JSON.stringify(env)).toString("base64");
+  assert.ok(oldBody.length > frame.body.length * 1.3,
+    `旧写法会把这条帧撑大 33%（实测 ${oldBody.length} vs ${frame.body.length}）`);
 });
 
 test("E2EE WS 数据流:&e2ee=&w= 标记 → 桥剥除标记连上游,逐消息加解密 echo 一致", async () => {
