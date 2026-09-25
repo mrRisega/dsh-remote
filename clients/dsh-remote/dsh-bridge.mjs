@@ -1621,7 +1621,31 @@ async function runTunnel() {
   }, 1000);
 }
 
+/**
+ * 给 stdout/stderr 的每一行加 ISO 时间戳。
+ *
+ * 【2026-09-25 事故】bridge 日志**没有任何时间戳**，于是排查
+ * 「任务跑完没收到微信推送」时完全无法把日志和事件对上时间：
+ * 不知道最后一条 `sendmessage 失败` 发生在用户的回话之前还是之后，
+ * 最后只能靠"数行数 ÷ 每分钟行数"去估时间（估出来的结论还差点搞反方向）。
+ * 加了时间戳之后，这类问题一眼可读。只影响本进程的输出（日志由 watcher 重定向到 .dsh-bridge.log）。
+ */
+function stampConsoleLines() {
+  for (const level of ["log", "info", "warn", "error"]) {
+    const original = console[level]?.bind(console);
+    if (typeof original !== "function") continue;
+    console[level] = (...args) => {
+      try {
+        original(`[${new Date().toISOString()}]`, ...args);
+      } catch {
+        original(...args);
+      }
+    };
+  }
+}
+
 async function main() {
+  stampConsoleLines();
   // 隧道模式是唯一模式(WebRTC/信令已废弃删除)
   if (!TUNNEL_URL) {
     console.error("[bridge] 缺少 DSH_BRIDGE_TUNNEL_URL:隧道模式是唯一模式(请设 relay-router 地址)");

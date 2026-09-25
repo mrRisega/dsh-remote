@@ -1949,12 +1949,22 @@ window.__ModuleLoader__.load({
                 "已 " + Math.round(idleShown / 1000) + " 秒没有新输出（总计 " + fmtDuration(elapsedShown) + "）：安装过程偶尔会安静一会儿，超过 " + Math.round(cancelAfterMs / 1000) + " 秒没变化会出现「取消并重试」。")
             : null,
         // ③ 操作区（主操作 / 检查 / 取消并重试 / 彻底卸载）
+        //
+        // ★ 2026-09-25（用户反馈 fb_4cc2c9df749c 原话：「我的端口不是 3080，**没找到一键更新的按钮**」）：
+        //   已是最新版时按钮写的是「重新检查 / 修复」—— 用户按字面找「一键更新」，找不到就以为
+        //   面板没有修复入口。现在：按钮直接自称「一键修复 / 重装运行环境」，并在下面补一句
+        //   「已是最新版本」+ 该做什么，让"修不好"的出路不再藏在按钮文案里。
+        !outdated
+          ? h("div", { className: "dru-hint", style: { marginTop: 6 } },
+              "已是最新版本 v" + (ver && ver.version ? ver.version : "（未知）")
+              + "。若手机连不上或后台服务没起来，点「一键修复 / 重装运行环境」会重新补装并拉起后台服务，不需要其他操作。")
+          : null,
         h("div", { className: "dru-actions", style: { marginTop: 10 } },
           outdated
             ? h("button", { type: "button", className: "dru-btn dru-btn-primary", disabled: upBusy || unBusy || chkBusy || updating, onClick: doUpdate },
                 upBusy ? "更新启动中…" : updating ? "正在更新…" : "一键更新到 v" + chk.latest)
             : h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: upBusy || unBusy || chkBusy || updating, onClick: doUpdate },
-                updating ? "正在更新…" : (ver && !ver.runtimeReady) ? "安装并启动（一键修复）" : "重新检查 / 修复"),
+                updating ? "正在更新…" : (ver && !ver.runtimeReady) ? "安装并启动（一键修复）" : "一键修复 / 重装运行环境"),
           h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: chkBusy || updating || upBusy, onClick: doCheck }, chkBusy ? "检查中…" : "检查更新"),
           canCancel
             ? h("button", {
@@ -4779,6 +4789,26 @@ window.__ModuleLoader__.load({
             : null,
           !wx.channel_running
             ? h("div", { className: "dru-msg dru-msg-warn" }, "提示：后台服务的微信通道当前没有在运行（绑定状态不受影响）。到「📱 远程访问」面板重启后台服务后会自动恢复。")
+            : null,
+          // ── 事件订阅 / 推送健康（2026-09-25 事故加的）────────────────────────────
+          // 那次「任务跑完一条推送都没收到、日志里也没有任何报错」的两个可用信号：
+          //   ① 待补发队列非空 = 平台侧刚才发不出去（现在会补发，但要如实告诉用户）；
+          //   ② 事件订阅没就绪 / 最近有订阅异常 = 任务通知根本不会来（"没收到推送"的另一种成因，
+          //      以前完全没有界面入口，只能翻日志）。
+          // 只在**真有问题**时才显示，正常时不占地方。
+          wx.events_running && wx.events_state && wx.events_state !== "ready"
+            ? h("div", { className: "dru-msg dru-msg-warn" },
+                "提示：任务事件订阅未就绪（状态 " + String(wx.events_state) + "），这段时间任务跑完可能不会推给你。稍候会自动重连；持续如此请到「📱 远程访问」重启后台服务。")
+            : null,
+          (Number(wx.pending_outbox) || 0) > 0
+            ? h("div", { className: "dru-msg dru-msg-warn" },
+                "有 " + Number(wx.pending_outbox) + " 条通知刚才没能发出去（微信侧发送失败），已排在待补发队列里 —— 你下次在微信里任意发一句话，就会自动补给你。")
+            : null,
+          wx.last_fault && wx.last_fault.code
+            ? h("div", { className: "dru-hint" },
+                "最近一次事件订阅异常：" + String(wx.last_fault.code)
+                + "（" + String(wx.last_fault.message || "").slice(0, 80) + "）"
+                + (wx.last_fault.at ? " · " + new Date(Number(wx.last_fault.at)).toLocaleString("zh-CN") : ""))
             : null,
           wx.disabled
             ? h("div", { className: "dru-msg dru-msg-warn" }, "提示：微信通道已按配置关闭（环境变量 DSH_WECHAT=0）。凭据仍在，重新开启后会继续推送。")

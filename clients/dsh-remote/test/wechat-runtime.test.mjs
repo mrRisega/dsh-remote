@@ -31,7 +31,8 @@ import {
   toFormatterNode,
   CONTROL_HEADER
 } from "../wechat-runtime.mjs";
-import { saveAccount, loadState, formatNotification, SessionCooldown } from "../wechat-channel.mjs";
+import * as channelMod from "../wechat-channel.mjs";
+  import { saveAccount, loadState, formatNotification, SessionCooldown } from "../wechat-channel.mjs";
 import { NODE_KINDS } from "../dsh-events.mjs";
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "wc-rt-"));
@@ -61,6 +62,9 @@ function fakeIlink(handler) {
       }
       if (url.pathname.endsWith("/sendmessage")) {
         try { state.sends.push(JSON.parse(body)); } catch { state.sends.push({ raw: body }); }
+        // 可选的发送结果覆盖：用例用它模拟真机上的 `ret=-2 errmsg=prepare failed`
+        // （平台侧发送**间歇性**失败，正是"任务跑完没收到推送"那次的现场）。
+        if (handler && handler.onSendMessage) return handler.onSendMessage(state, reply);
         return reply({ ret: 0, message_id: "m" + state.sends.length });
       }
       if (url.pathname.endsWith("/notifystart")) { state.notifyStart += 1; return reply({ ret: 0 }); }
@@ -1788,6 +1792,222 @@ test("★ 日报占位一天一个,换天时会清掉旧占位(不攒文件)", a
     await rt.runMaybeDigestNow();
     const left = fs.readdirSync(relayDir).filter((n) => n.startsWith(".digest-") && n.endsWith(".sent"));
     assert.equal(left.length, 1, `旧占位必须被清掉,只剩今天的,实际:${left.join(", ")}`);
+  } finally {
+    await ilink.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 出站必须回带 context_token（2026-09-23 业主实测「没收到微信通道」）
+//
+// 平台要求出站消息带回「这条会话的上下文令牌」，而它只出现在**入站消息**里
+// （官方实现：messaging/send.js 的 buildTextMessageReq → `msg.context_token`；
+//  腾讯自家插件同样是「入站取出 → 按 (账号,用户) 缓存 → 发送时回带」）。
+// 我们以前从不发它 → 真机日志 `sendMessage: ret=-2 errmsg=prepare failed`：消息发不出去。
+// ---------------------------------------------------------------------------
+
+test("★★ 出站必须回带 context_token(入站带来什么就回什么)", async () => {
+  const ilink = await fakeIlink();
+  try {
+    const { rt } = await boundRuntime(ilink, { subscriber: makeFakeSubscriber(), tier: "pro" });
+    // 真实形状：入站消息带顶层 context_token；发送目标是账号的 userId
+    await rt.handleInbound({
+      from_user_id: "user-1", context_token: "CT-abc-123",
+      item_list: [{ type: 1, text_item: { text: "/status" } }]
+    });
+    const last = ilink.state.sends.at(-1);
+    assert.equal(last.msg.context_token, "CT-abc-123",
+      "★出站 msg 必须回带 context_token —— 不带就是 ret=-2 prepare failed(消息根本发不出去)");
+    assert.equal(last.msg.to_user_id, "user-1");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★ 没有 context_token 时**完全不带这个键**(而不是空串)", async () => {
+  const ilink = await fakeIlink();
+  try {
+    const { rt } = await boundRuntime(ilink, { subscriber: makeFakeSubscriber(), tier: "pro" });
+    await rt.handleInbound({ from_user_id: "user-1", item_list: [{ type: 1, text_item: { text: "/status" } }] });
+    const last = ilink.state.sends.at(-1);
+    assert.ok(!("context_token" in last.msg),
+      "★拿不到令牌时不得塞空串(与官方 `contextToken ?? undefined` 同口径)");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★ context_token 落盘持久化:bridge 重启后不必等用户先说话也能发", async () => {
+  const ilink = await fakeIlink();
+  try {
+    const first = await boundRuntime(ilink, { subscriber: makeFakeSubscriber(), tier: "pro" });
+    await first.rt.handleInbound({
+      from_user_id: "user-1", context_token: "CT-persist-9",
+      item_list: [{ type: 1, text_item: { text: "/status" } }]
+    });
+    // 同一个 relayDir 上新建一个 runtime（= bridge 重启）
+    const rt2 = createWeChatRuntime({
+      relayDir: first.relayDir, upstream: "http://127.0.0.1:1", secret: SECRET, tier: "pro", logger: quietLogger()
+    });
+    rt2.subscriber = makeFakeSubscriber();
+    await rt2.reply("user-1", "重启后的第一条推送");
+    assert.equal(ilink.state.sends.at(-1).msg.context_token, "CT-persist-9",
+      "★重启后必须从状态文件恢复令牌 —— 否则重启后的第一条通知(最该送达的那条)发不出去");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★ 解绑必须清掉 context_token(换绑后不能拿上一个人的上下文去发)", async () => {
+  const ilink = await fakeIlink();
+  try {
+    const { rt } = await boundRuntime(ilink, { subscriber: makeFakeSubscriber(), tier: "pro" });
+    await rt.handleInbound({
+      from_user_id: "user-1", context_token: "CT-old-user",
+      item_list: [{ type: 1, text_item: { text: "/status" } }]
+    });
+    await rt.unbind();
+    assert.equal(rt.channel.client.contextToken, "", "内存里必须清掉");
+    const st = JSON.parse(fs.readFileSync(path.join(rt.relayDir, ".wechat-state.json"), "utf8"));
+    assert.ok(!st.context_token, `状态文件里也必须清掉,实际:${JSON.stringify(st.context_token)}`);
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★ extractContextToken 防御式:形状不认识一律当没有,绝不猜", () => {
+  const { extractContextToken } = channelMod;
+  assert.equal(extractContextToken(null), "");
+  assert.equal(extractContextToken("CT-x"), "", "字符串消息没有这个字段");
+  assert.equal(extractContextToken({}), "");
+  assert.equal(extractContextToken({ context_token: "" }), "", "空串=没有");
+  assert.equal(extractContextToken({ context_token: "   " }), "", "纯空白=没有");
+  assert.equal(extractContextToken({ context_token: 123 }), "", "非字符串=没有");
+  assert.equal(extractContextToken({ context_token: " CT-1 " }), "CT-1", "合法值去首尾空白");
+  assert.equal(extractContextToken({ contextToken: "CT-2" }), "CT-2", "兼容驼峰写法");
+});
+
+// ═════════════ 2026-09-25 事故：完成推送"消失" + 回话跑进另一个会话 ═════════════
+//
+// 现场（业主）：任务跑完一条微信都没收到；他在微信里回了一句，结果**发进了上一个会话**。
+// 日志证据：48 条 `sendmessage 失败:sendMessage: ret=-2 errmsg=prepare failed`
+//   —— 平台侧发送是**间歇性**失败的，而旧实现失败即丢弃：那条"任务跑完了"永远消失了。
+// 状态证据：`current_session_id` 停在几天前的旧会话上（因为切换只在推送成功后发生）。
+
+test("★ 事故锁：主动推送失败**不能消失** —— 入队，并在下一次入站时补发（带「补发」标记）", async () => {
+  let failSends = true;
+  const ilink = await fakeIlink({
+    onSendMessage: (_state, reply) => (failSends
+      ? reply({ ret: -2, errmsg: "prepare failed" })
+      : reply({ ret: 0, message_id: "ok" })),
+  });
+  try {
+    const sub = makeFakeSubscriber();
+    sub.sessionsFixture = [{ sessionId: "session-done", title: "跑完的活", running: false, cwd: "/p" }];
+    sub.summaryFixture = "做完了。";
+    const { rt, relayDir } = await boundRuntime(ilink, { subscriber: sub });
+    const stateOf = () => JSON.parse(fs.readFileSync(path.join(relayDir, ".wechat-state.json"), "utf8"));
+
+    // ① 平台侧发不出去 → 完成推送必须**入队**，而不是丢掉
+    await rt.notify({ kind: NODE_KINDS.TURN_END, sessionId: "session-done", reason: "completed", at: 1 });
+    const queued = stateOf().pending_outbox || [];
+    assert.equal(queued.length, 1, "★ 推送失败必须入队（旧实现直接丢，用户永远不知道这条存在过）");
+    assert.match(String(queued[0].text), /跑完的活|做完了/, "入队的应该是那条完整正文");
+
+    // ② 平台恢复 + 用户随便发一条 → 补发必须跟上
+    failSends = false;
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "/status" } }] });
+    await waitFor(() => (stateOf().pending_outbox || []).length === 0);
+    const resent = allTexts(ilink.state).filter((t) => t.startsWith("（补发）"));
+    assert.equal(resent.length, 1, "★ 恢复后必须把积压补上（且只补一次）");
+    assert.match(resent[0], /跑完的活/, "补发的就是那条完成通知");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★ 事故锁：静音（/quiet）也要记下「最近完成的任务」，回话不能跑进上一个会话", async () => {
+  const ilink = await fakeIlink();
+  try {
+    const sub = makeFakeSubscriber();
+    sub.sessionsFixture = [
+      { sessionId: "session-new", title: "刚跑完的活", running: false, cwd: "/p" },
+      { sessionId: "session-old", title: "早先的会话", running: false, cwd: "/p" },
+    ];
+    sub.summaryFixture = "完成。";
+    const { rt, relayDir } = await boundRuntime(ilink, { subscriber: sub });
+    rt.currentSessionId = "session-old";
+    rt.currentSessionTitle = "早先的会话";
+    // 静音：完成推送**不会**发出来（用户主动要求的"别打扰"）
+    rt.channel.writeState({ quiet: true });
+
+    await rt.notify({ kind: NODE_KINDS.TURN_END, sessionId: "session-new", reason: "completed", at: 2 });
+    assert.equal(lastText(ilink.state).includes("刚跑完的活"), false, "静音时不推送（前置条件）");
+
+    // 用户下一秒回话 → 必须发给他**刚跑完**的那个会话，而不是旧会话
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "再改一下" } }] });
+    const prompt = sub.calls.filter((c) => c.m === "promptSession").pop();
+    assert.ok(prompt, "纯文本必须派给会话");
+    assert.equal(prompt.sessionId, "session-new",
+      "★ 静音只表示不打扰，不表示「当它没发生过」—— 回话目标必须是最近完成的任务");
+    assert.match(lastText(ilink.state), /刚跑完的活/, "确认文案里要说清发给了哪个会话");
+    assert.match(lastText(ilink.state), /已自动切为回复对象/, "自动切换要如实告知（不能悄悄改目标）");
+    void relayDir;
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★ 事故锁：用户主动 /use 切走的会话不能被「最近完成」抢回去", async () => {
+  const ilink = await fakeIlink();
+  try {
+    const sub = makeFakeSubscriber();
+    sub.sessionsFixture = [
+      { sessionId: "session-done", title: "刚跑完的活", running: false, cwd: "/p" },
+      { sessionId: "session-mine", title: "我要聊的", running: false, cwd: "/p" },
+    ];
+    sub.summaryFixture = "完成。";
+    const { rt } = await boundRuntime(ilink, { subscriber: sub });
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "/use 2" } }] });
+    assert.equal(rt.currentSessionId, "session-mine", "前置条件：/use 切到了 2 号");
+    await rt.notify({ kind: NODE_KINDS.TURN_END, sessionId: "session-done", reason: "completed", at: 3 });
+
+    // 完成事件在处理时会把它自己设为回复目标（这是产品口径）；但用户**之后**再切回去要算数：
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "/use 2" } }] });
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "继续聊我的" } }] });
+    const prompt = sub.calls.filter((c) => c.m === "promptSession").pop();
+    assert.equal(prompt.sessionId, "session-mine",
+      "★ 对表只在「指针落后于最近完成」时切换；用户明确选过的会话不许被抢回去");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★ 事故锁：订阅 fault 必须落到日志 + 状态（旧实现只 emit、没人接 → 全静默）", async () => {
+  // 那次「一条推送都没有、日志里也没有任何报错」的根因就在这类静默里：
+  // `#emitFault` 只 emit('fault')，而运行时没接这个事件 —— follow 失败/发现失败/流上限
+  // 全都不留任何痕迹。现在必须：① 一条 warn 进 bridge 日志；② 非预期的记进状态文件。
+  const ilink = await fakeIlink();
+  try {
+    const warns = [];
+    const sub = makeFakeSubscriber();
+    const { rt, relayDir } = await boundRuntime(ilink, { subscriber: sub });
+    rt.logger = { info() {}, warn: (m) => warns.push(String(m)), error() {}, debug() {}, addSecret() {} };
+    await rt.startChannel(); // 真实接线：#startSubscriber() → 给注入的订阅器挂 handler
+    try {
+      sub.emit("fault", { code: "follow-limit", message: "follow 流已达上限 8", sessionId: "session-x", expected: false });
+      const st = JSON.parse(fs.readFileSync(path.join(relayDir, ".wechat-state.json"), "utf8"));
+      assert.ok(warns.some((m) => m.includes("订阅异常 follow-limit")),
+        `订阅异常必须进日志（否则事后无从查起），实际:${JSON.stringify(warns)}`);
+      assert.equal(st.last_fault && st.last_fault.code, "follow-limit", "非预期的订阅异常要记进状态供面板显示");
+
+      // 预期内的（子代理会话必然被拒 / 会话刚被删）只记日志，不该污染故障状态
+      sub.emit("fault", { code: "session/agent-busy", message: "busy", sessionId: "sub-1", expected: true });
+      const st2 = JSON.parse(fs.readFileSync(path.join(relayDir, ".wechat-state.json"), "utf8"));
+      assert.equal(st2.last_fault.code, "follow-limit", "expected 的异常不该覆盖真正的故障");
+    } finally {
+      await rt.stopChannel();
+    }
   } finally {
     await ilink.close();
   }

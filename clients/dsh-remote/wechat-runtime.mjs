@@ -39,6 +39,7 @@ import {
   extractDigits,
   extractInboundText,
   extractFromUserId,
+  extractContextToken,
   handleCommand,
   classifyInbound,
   formatCompletion,
@@ -196,6 +197,14 @@ const SPECIAL_EVENT_KINDS = Object.freeze([
  *   · **提醒**(额度 / 会员到期)= 不占决策位;只有一条决策都没有时,数字才给它们。
  */
 const NOTICE_FORMATTER_KINDS = Object.freeze(["quota", "membership"]);
+
+/**
+ * 主动推送失败后的**待补发队列**上限（见 `#pushProactive`）。
+ * 为什么是 20：够放下"一轮里所有该告诉用户的事"；再多下去，补发就变成刷屏了。
+ */
+const MAX_OUTBOX = 20;
+/** 补发时的正文前缀（迟到必须如实说，不能让用户以为刚刚才发生）。 */
+const OUTBOX_MARK = "（补发）";
 
 /**
  * 把事件节点翻译成文案节点。
@@ -479,7 +488,21 @@ export class WeChatRuntime {
         ? { active: true, need_verify_code: !!this.bind.needVerifyCode }
         : { active: false, failed: !!(this.bind && this.bind.done && !this.bind.result) },
       channel_running: !!this.channelTask,
-      events_running: !!this.subscriber
+      events_running: !!this.subscriber,
+      // ── 诊断字段（2026-09-25 事故加的）────────────────────────────────────
+      // 那次「任务跑完一条微信都没收到，日志里也没有任何报错」暴露了三件必须能看见的事：
+      //   ① 事件订阅到底 ready 了没、**正在 follow 哪些会话**（follow 集为空 = turn/end 收不到）；
+      //   ② 有没有排进待补发队列的通知（推送失败不再等于消失）；
+      //   ③ 最近一次订阅异常是什么（以前 fault 只 emit、没人接，全静默）。
+      events_state: this.subscriber && typeof this.subscriber.state === "string" ? this.subscriber.state : "",
+      followed_sessions: this.subscriber && typeof this.subscriber.sessions === "function"
+        ? this.subscriber.sessions()
+        : [],
+      pending_outbox: Array.isArray(state.pending_outbox) ? state.pending_outbox.length : 0,
+      last_fault: state.last_fault || null,
+      last_completed_session_id: state.last_completed_session_id || "",
+      last_completed_at: Number(state.last_completed_at || 0),
+      inbound_shape_null_token: state.inbound_shape || ""
     };
   }
 
@@ -746,10 +769,23 @@ export class WeChatRuntime {
   async handleInbound(msg) {
     const from = extractFromUserId(msg);
     const text = normalizeInput(extractInboundText(msg));
+    // ★ 每条入站消息都带上 `context_token`,而**出站必须回带它**才发得出去
+    //   (不进它 → 真机 `ret=-2 errmsg=prepare failed`,业主「没收到微信通道」)。
+    //   放在 `if (!text) return` **之前**:图片/语音这类没有文本的消息同样会刷新上下文。
+    //   记不住不影响主流程(最坏就是这一条发不出去,与以前一样)。
+    try { this.channel.rememberContextToken(extractContextToken(msg), from); } catch { /* 忽略 */ }
+    // ★ 0.6.15：收到入站消息 = 平台侧这条会话刚刚"活过来"，是补发积压通知的最好时机。
+    //   fire-and-forget：补发失败不能影响用户这条消息的处理。
+    void this.#flushOutbox(from).catch(() => 0);
     if (!text) return;
 
     // 内部统计:任何入站互动都算一次"窗口续期"事件
     this.#bumpToday();
+    // ★ 0.6.15：`context_token` 的形状一直没被验证过（§11）。真机日志里
+    //   `ret=-2 prepare failed` 出现过 48 次，而状态文件里**从来没有** context_token ——
+    //   也就是说入站消息里没带它（或字段名和我们猜的不一样）。这里把**字段名**记一次
+    //   （只有名字，没有值），下次再出这个问题就能一眼看出该取哪个键，不用再猜。
+    this.#noteInboundShapeIfNoToken(msg);
 
     // ── v2 分派:命令 → 数字 → 普通消息 ────────────────────────────────────
     // ⚠️ 顺序不能换:
@@ -1082,7 +1118,59 @@ export class WeChatRuntime {
   #rememberSession(sessionId, title) {
     this.currentSessionId = sessionId || "";
     this.currentSessionTitle = title || "";
-    this.channel.writeState({ current_session_id: this.currentSessionId, current_session_title: this.currentSessionTitle });
+    this.channel.writeState({
+      current_session_id: this.currentSessionId,
+      current_session_title: this.currentSessionTitle,
+      // 「回复目标是什么时候定下来的」——回话前对表要用（见 #retargetToLatestCompletion）。
+      current_session_set_at: this.clock(),
+    });
+  }
+
+  /**
+   * 记下"最近完成的任务"（**无论那条完成推送有没有发出去**）。
+   *
+   * 为什么必须有它：`#rememberSession` 只在推送真的发出去了才会被调用 —— 一旦推送失败
+   * （微信侧 ret=-2）或者订阅漏了 turn/end，当前会话指针就**停在旧会话上**，用户回话会发进
+   * 那个旧会话（业主 2026-09-25 实测：「刚才我回了个话，而且回到了另外一个对话里面去了」）。
+   * 有了这个记录，回话前就能对一次表（见 `#retargetToLatestCompletion`）。
+   */
+  #rememberCompletion(sessionId, title) {
+    if (!sessionId) return;
+    this.channel.writeState({
+      last_completed_session_id: String(sessionId),
+      last_completed_session_title: String(title || ""),
+      last_completed_at: this.clock(),
+    });
+  }
+
+  /**
+   * 回话前的"对表"：当前会话指针是不是**落后于**最近一次完成？
+   *
+   * 判据严格且保守：只有「完成时间**晚于**我们最后一次把回复目标定下来的时间」才切换。
+   * 绝不因为"还有个更活跃的会话"就改主意 —— 那会把用户正在聊的会话顶掉。
+   * @returns {boolean} 是否切换了
+   */
+  async #retargetToLatestCompletion() {
+    try {
+      const st = loadState(this.relayDir);
+      const sid = String(st.last_completed_session_id || "");
+      if (!sid || sid === this.currentSessionId) return false;
+      const doneAt = Number(st.last_completed_at || 0);
+      const setAt = Number(st.current_session_set_at || 0);
+      if (!doneAt || doneAt <= setAt) return false;
+      let title = String(st.last_completed_session_title || "");
+      if (!title) {
+        // 静音路径只记了 id（没解析标题）→ 这里补一次，让确认文案里能出现人话的会话名
+        try {
+          const list = await this.#sessions();
+          const hit = list ? list.find((s) => s.sessionId === sid) : null;
+          if (hit && hit.title) title = hit.title;
+        } catch { /* 取不到就用空标题 */ }
+      }
+      this.#rememberSession(sid, title);
+      this.logger.info(`[wechat] 回话前对表：当前会话落后于最近完成的任务 ${sid}，已自动切过去`);
+      return true;
+    } catch { return false; }
   }
 
   /** 拉一次会话列表(带标题),并记住 1-based 序号供 /use 使用。 */
@@ -1249,6 +1337,9 @@ export class WeChatRuntime {
       await this.reply(from, "暂不可用:DSH 会话服务未就绪。");
       return;
     }
+    // ★ 0.6.15：回话前先对一次表 —— 完成推送**没发出去**时（平台 ret=-2 / 订阅漏了 turn/end），
+    //   当前会话指针会停在旧会话上，这一句"再改一下"就会发给那个旧会话。
+    const switched = await this.#retargetToLatestCompletion();
     // 每月消息额度闸(放在真正派活之前;审批/指令不计数也不拦)
     const gate = this.#msgQuotaGate();
     if (!gate.ok) {
@@ -1258,7 +1349,10 @@ export class WeChatRuntime {
     const r = await this.subscriber.promptSession({ sessionId: this.currentSessionId, text: body });
     if (r && r.ok) {
       this.#msgQuotaBump(); // 只在真的派出去之后扣额度(发失败不该扣)
-      await this.reply(from, `已补充给「${this.currentSessionTitle || "当前任务"}」,跑完推结论给你。`);
+      // 「最后一次把回复目标定下来」的时间：下一次对表要看它，避免把用户正在聊的会话顶掉。
+      this.channel.writeState({ current_session_set_at: this.clock() });
+      const note = switched ? "（刚跑完的那个任务已自动切为回复对象）" : "";
+      await this.reply(from, `已补充给「${this.currentSessionTitle || "当前任务"}」,跑完推结论给你。${note}`);
       // ★ 额度消耗**之后**才可能提醒(顺序不能反:提醒要看的是扣完之后还剩几条);
       //   fire-and-forget,提醒失败不影响"已下发"这条主流程的结果。
       this.#maybeRemindQuota().catch(() => {});
@@ -1360,9 +1454,116 @@ export class WeChatRuntime {
     }
   }
 
+  /**
+   * 入站消息里到底有没有 `context_token`？没有的话，把**字段名**记一次（值一律不记）。
+   *
+   * 为什么需要：出站要回带 `context_token`，而没人验证过它的真实形状（§11）。
+   * 真机证据（2026-09-25）：bridge 日志里 `ret=-2 errmsg=prepare failed` 出现 48 次，
+   * 而状态文件里**从来没有** context_token —— 说明入站消息里没带它，或者它在别的键上。
+   * 猜字段名没有意义，让真机告诉我们：只记名字（不含任何内容/凭据），一次就够。
+   */
+  #noteInboundShapeIfNoToken(msg) {
+    try {
+      if (extractContextToken(msg)) return; // 有令牌就没什么可记的
+      const shape = [];
+      const walk = (obj, prefix, depth) => {
+        if (!obj || typeof obj !== "object" || depth > 2 || shape.length >= 40) return;
+        for (const k of Object.keys(obj)) {
+          if (shape.length >= 40) return;
+          const path = prefix ? `${prefix}.${k}` : k;
+          shape.push(path);
+          const v = obj[k];
+          if (v && typeof v === "object" && !Array.isArray(v)) walk(v, path, depth + 1);
+        }
+      };
+      walk(msg, "", 0);
+      const joined = shape.join(",");
+      const st = loadState(this.relayDir);
+      if (String(st.inbound_shape || "") === joined) return; // 同形状只记一次
+      this.channel.writeState({ inbound_shape: joined });
+      this.logger.info(`[wechat] 入站消息里没有 context_token；字段名（不含值）：${joined}`);
+    } catch { /* 诊断失败不影响主流程 */ }
+  }
+
   #noteFailure(text) {
     this.channel.writeState({ last_error: String(text).slice(0, 200) });
     this.logger.warn(`[wechat] ${text}`);
+  }
+
+  // ── 待补发队列（主动推送失败不再静默丢失） ──────────────────────────────
+  //
+  // 【2026-09-25 事故】业主的任务跑完后**一条微信都没收到**，而日志里躺着 48 条
+  // `sendmessage 失败:sendMessage: ret=-2 errmsg=prepare failed` —— 平台侧发送失败是
+  // **间歇性**的（实测同一台机器上有的消息发得出去、有的发不出去），而旧实现失败即丢弃：
+  // 用户永远不知道那条"任务跑完了"存在过。
+  //
+  // 做法：主动推送（通知类）失败就**入队**，在下一次成功发送/成功入站时按 FIFO 补发。
+  // 补发时正文前加「（补发）」——迟到就要如实说，不能让用户以为刚刚才发生。
+  // ⚠️ 队列落盘且**只存正文**（不含 token/eventId）：状态文件是面板可读的，
+  //    凭据一律不进（§8）。
+  #outbox() {
+    try {
+      const st = loadState(this.relayDir);
+      return Array.isArray(st.pending_outbox) ? st.pending_outbox : [];
+    } catch { return []; }
+  }
+
+  #writeOutbox(items) {
+    const list = Array.isArray(items) ? items : [];
+    this.channel.writeState({ pending_outbox: list, pending_outbox_count: list.length });
+    return list;
+  }
+
+  #enqueueOutbox(text, kind = "") {
+    const body = String(text || "");
+    if (!body) return 0;
+    const list = this.#outbox();
+    list.push({ text: body, kind: String(kind || ""), at: this.clock() });
+    // 上限：丢最旧的（用户最需要的是"最近发生了什么"，而无限攒下去只会让补发像刷屏）
+    while (list.length > MAX_OUTBOX) list.shift();
+    return this.#writeOutbox(list).length;
+  }
+
+  /**
+   * 把待补发队列按 FIFO 发出去（碰到第一条失败就停，保留剩下的下次再试）。
+   * @returns {Promise<number>} 这次补发成功的条数
+   */
+  async #flushOutbox(to) {
+    const list = this.#outbox();
+    if (!list.length || !to) return 0;
+    let sent = 0;
+    const rest = [...list];
+    while (rest.length) {
+      const item = rest[0];
+      const ok = await this.reply(to, `${OUTBOX_MARK}${String(item && item.text ? item.text : "")}`);
+      if (!ok) break; // 还是发不出去：原样留着，下次再试
+      rest.shift();
+      sent += 1;
+    }
+    if (sent > 0) {
+      this.#writeOutbox(rest);
+      this.logger.info(`[wechat] 待补发队列已送出 ${sent} 条（剩 ${rest.length} 条）`);
+    }
+    return sent;
+  }
+
+  /**
+   * 主动推送（通知类）：先补发积压，再发这一条；发不出去就入队，绝不丢。
+   * @returns {Promise<{sent:boolean, queued:boolean}>} queued=true 表示"已排进待补发"，
+   *   调用方据此仍可登记待拍板项（用户稍后看到时还能回执）。
+   */
+  async #pushProactive(to, text, kind = "", { queue = true } = {}) {
+    const body = String(text || "");
+    if (!body) return { sent: false, queued: false };
+    await this.#flushOutbox(to).catch(() => 0);
+    const ok = await this.reply(to, body);
+    if (ok) return { sent: true, queued: false };
+    // queue=false：**自己有重试/占位语义**的通知（日报）绝不能排队 ——
+    // 排队 + 它自己的下一次 tick 补发 = 用户收到两条，而且"当天已发"的占位账也会算错。
+    if (!queue) return { sent: false, queued: false };
+    const depth = this.#enqueueOutbox(body, kind);
+    this.logger.warn(`[wechat] 主动推送失败(${kind || "?"})：已排进待补发队列（${depth} 条），下一条能发出去时会补上`);
+    return { sent: false, queued: true };
   }
 
   // ── 出站:DSH 事件 → 微信通知 ───────────────────────────────────────────
@@ -1401,6 +1602,20 @@ export class WeChatRuntime {
     sub.on("auth-error", (info) => {
       this.logger.warn(`[wechat/events] 鉴权失败(${info && info.surface}):需要刷新 harness cookie`);
     });
+    sub.on("fault", (info) => {
+      // ★ 2026-09-25：订阅层的 fault **以前完全没人接**（`#emitFault` 只 emit、不 log），
+      //   于是「follow 失败 / 发现失败 / 流上限」全都**静默消失** —— 用户看到的是
+      //   「任务跑完没有任何推送，日志里也没有任何报错」，事后只能靠数日志行数考古。
+      //   现在：一条 warn 落进 bridge 日志（带时间戳），并把**非预期**的那条记进状态文件供面板显示。
+      //   `expected: true`（子代理会话必然被拒 / 会话刚被删）只记日志，不当故障刷状态。
+      const code = String((info && info.code) || "unknown");
+      const message = String((info && info.message) || "").slice(0, 160);
+      const sessionId = String((info && info.sessionId) || "");
+      this.logger.warn(`[wechat/events] 订阅异常 ${code}${sessionId ? ` session=${sessionId}` : ""}: ${message}`);
+      if (!(info && info.expected === true)) {
+        this.channel.writeState({ last_fault: { code, message, session_id: sessionId, at: this.clock() } });
+      }
+    });
   }
 
   async #tellGap() {
@@ -1414,7 +1629,7 @@ export class WeChatRuntime {
    * 把一条**事件**节点发到微信。可回执的登记进待答队列。
    * 公开方法:bridge 与测试都直接调用它(不叫 #notify 是因为它是本模块的主要出口之一)。
    */
-  async notify(eventNode) {
+  async notify(eventNode, opts = {}) {
     if (!eventNode || !this.channel.account) return { ok: false, reason: "not_bound" };
     const acct = this.channel.account;
 
@@ -1427,7 +1642,15 @@ export class WeChatRuntime {
         NODE_KINDS.PLAN_REVIEW,
         NODE_KINDS.SESSION_ERROR
       ].includes(eventNode.kind);
-      if (!important) return { ok: false, reason: "quiet" };
+      if (!important) {
+        // ★ 0.6.15：静音也要**记账**。完成推送被静音时，这条"最近完成的任务"仍然必须被记下来 ——
+        //   否则用户下一秒回话就会发进上一次的会话（业主实测的那个"回到另一个对话"）。
+        //   静音只表示"不打扰"，不表示"当它没发生过"。
+        if (eventNode.kind === NODE_KINDS.TURN_END && eventNode.sessionId) {
+          this.#rememberCompletion(eventNode.sessionId, "");
+        }
+        return { ok: false, reason: "quiet" };
+      }
     }
 
     // 没有文案模板的节点:按设计另行处理,不是漏接线
@@ -1472,6 +1695,11 @@ export class WeChatRuntime {
       //   A 莫名其妙多了一条指令，B 永远收不到。用户看到的正是"推送过来了，我准备回话，
       //   它还停留在我之前的会话里"。
       //   语义：**最近完成的任务 = 最近一次推送的对象 = 你现在回话的对象**。这是唯一不会让人踩空的解释。
+      //
+      // ★ 0.6.15 补：**先无条件记下"最近完成的任务"**（与推送成败无关）。
+      //   推送失败（微信 ret=-2）或订阅漏了 turn/end 时，这一步是回话前对表的唯一依据，
+      //   否则当前会话指针会停在旧会话上，用户回话直接发进旧会话（业主实测的第二个症状）。
+      this.#rememberCompletion(sid, title);
       if (sid && sid !== this.currentSessionId) {
         this.#rememberSession(sid, title);
       } else if (sid && title && title !== this.currentSessionTitle) {
@@ -1531,7 +1759,15 @@ export class WeChatRuntime {
       ? `${built.text}\n\n（你还有 ${othersWaiting + 1} 条待拍板，回完这条我会把下一条发到下面）`
       : built.text;
 
-    const sent = await this.reply(acct.userId, outgoing);
+    // ★ 0.6.15：走 `#pushProactive`（先补发积压 → 再发这条 → 发不出去就入队），
+    //   不再直接 `reply()`。旧实现失败即丢弃 —— 平台的发送失败是间歇性的，用户于是
+    //   "任务跑完了却一条都没收到"，而且谁也不知道那条通知存在过。
+    // 日报（`daily`）自带重试与"当天已发"占位：它一旦进了补发队列就会与下一次 tick 撞成两条，
+    // 也会把占位账算错 —— 这类通知**明确不排队**（其余通知都排队，失败不再等于消失）。
+    const queueFailedPush = opts.queueFailedPush !== false && formatterKind !== "daily";
+    const pushed = await this.#pushProactive(acct.userId, outgoing, formatterKind, { queue: queueFailedPush });
+    // 入队也算"已经安排了送达"：用户稍后看到补发时，回执必须仍然认得出这条待办。
+    const sent = pushed.sent || pushed.queued;
     if (sent && built.replyable && built.eventId) {
       this.pendingReplies.push({
         eventId: built.eventId,

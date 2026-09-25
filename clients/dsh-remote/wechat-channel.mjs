@@ -429,7 +429,30 @@ export class IlinkClient {
     this.clientVersion = resolveClientVersion(opts.clientVersion);
     this.logger = opts.logger || createLogger();
     this.fetchImpl = opts.fetch || ((...a) => globalThis.fetch(...a));
+    /**
+     * 出站要回带的会话上下文令牌（来自**最近一条入站消息**的 `context_token`）。
+     * 与 `contextTokenPeer` 成对使用：只回带给**同一个对端**，避免把 A 的上下文发给 B。
+     * 由 WeChatChannel 在收到入站消息时写入并在启动时从状态文件恢复。
+     */
+    this.contextToken = String(opts.contextToken || "");
+    this.contextTokenPeer = String(opts.contextTokenPeer || "");
     if (this.token) this.logger.addSecret(this.token);
+  }
+
+  /** 清掉会话上下文令牌（解绑/换绑时必须调用：旧令牌属于上一个人/上一个会话）。 */
+  clearContextToken() {
+    this.contextToken = "";
+    this.contextTokenPeer = "";
+  }
+
+  /** 记下/更新会话上下文令牌（入站消息带来；sendMessage 会回带）。 */
+  setContextToken(token, peerUserId) {
+    const t = String(token || "").trim();
+    if (!t) return false;
+    this.contextToken = t;
+    this.contextTokenPeer = String(peerUserId || "");
+    this.logger.addSecret(t); // 日志同样按密文处理(它等价于会话凭据)
+    return true;
   }
 
   /** 换基址(scaned_but_redirect 用)。 */
@@ -675,13 +698,25 @@ export class IlinkClient {
    */
   async sendMessage({ to, text, clientId, timeoutMs = DEFAULT_API_TIMEOUT_MS, signal } = {}) {
     if (!to) throw new WeChatError("bad_options", "sendMessage: 缺少 to(to_user_id)");
+    // ★ 回带 `context_token`：平台要求出站消息带上"这条会话的上下文令牌"，而它只出现在
+    //   **入站消息**里（官方实现见 messaging/send.js 的 buildTextMessageReq：`msg.context_token`；
+    //   腾讯自家插件同样是「从入站取出 → 按 (账号, 用户) 缓存 → 发送时回带」）。
+    //   🔴 我们以前**从不发它** → 真机症状就是日志里的 `ret=-2 errmsg=prepare failed`：
+    //   消息发不出去（业主 2026-09-23：「没收到微信通道」）。
+    //   ⚠️ 只在"有令牌且属于同一个对端"时带上，绝不拿 A 的上下文发给 B。
+    const peer = String(to);
+    // 本产品一个 bot 只绑定一个微信用户,所以只要有令牌就回带;`contextTokenPeer` 仅作诊断。
+    // ⚠️ 换绑会换人 → unbind 时必须**清掉**旧令牌(见 clearContextToken),否则会拿旧上下文发。
+    const ctxToken = this.contextToken || "";
     const msg = {
       from_user_id: "",
-      to_user_id: String(to),
+      to_user_id: peer,
       client_id: clientId || newClientId(),
       message_type: MessageType.BOT,
       message_state: MessageState.FINISH,
-      item_list: text ? [{ type: MessageItemType.TEXT, text_item: { text: String(text) } }] : []
+      item_list: text ? [{ type: MessageItemType.TEXT, text_item: { text: String(text) } }] : [],
+      // 没有就**不出现这个键**（不是空串）—— 与官方 `contextToken ?? undefined` 同口径
+      ...(ctxToken ? { context_token: ctxToken } : {})
     };
     const { json } = await this.request({
       method: "POST",
@@ -2397,6 +2432,23 @@ export function extractFromUserId(msg) {
 }
 
 /**
+ * 取出入站消息里的会话上下文令牌 `context_token`。
+ *
+ * 为什么必须取:平台要求**出站**消息回带它（官方实现 `msg.context_token`），
+ * 而它只出现在入站消息里 —— 不回带的后果真机实测是
+ * `sendMessage: ret=-2 errmsg=prepare failed`（消息根本发不出去）。
+ * 形状未验证（§11），所以防御式：非字符串/空串一律当"没有"，绝不猜。
+ */
+export function extractContextToken(msg) {
+  if (!msg || typeof msg !== "object") return "";
+  for (const k of ["context_token", "contextToken"]) {
+    const v = msg[k];
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return "";
+}
+
+/**
  * 别名 → 规范指令名。
  * ⚠️ 编排层是按**规范名**分派的(`cmd === "/ls"`),所以别名必须在 `classifyInbound()`
  * 里收敛一次;否则 `/list` 会掉进"未知指令",用户看到一句"不认识"。
@@ -2705,6 +2757,32 @@ export class WeChatChannel {
     this.cooldown = new SessionCooldown({ cooldownMs: opts.cooldownMs, clock: this.clock });
     this.registry = new EventRegistry({ clock: this.clock });
     this.updatesBuf = "";
+    // ★ 恢复上次记住的 context_token：不恢复的话，bridge 一重启就要等用户先发一条消息
+    //   才重新具备"能发出去"的能力 —— 而重启后的第一条通知恰恰是最需要送达的那条。
+    this.#restoreContextToken();
+  }
+
+  /** 从状态文件恢复 context_token（启动时 / 换绑后各调一次）。 */
+  #restoreContextToken() {
+    try {
+      const st = loadState(this.relayDir);
+      if (st.context_token) this.client.setContextToken(st.context_token, st.context_token_peer || "");
+    } catch { /* 状态文件读不了就当没有:不影响主流程 */ }
+  }
+
+  /**
+   * 记下入站消息带来的 `context_token`（发送时回带它才发得出去，见 sendMessage 注释）。
+   * 落盘持久化：重启/换实例后仍然能发；同时**按对端成对保存**，绝不跨对端复用。
+   * @returns {boolean} 是否有变化（无变化不重复写盘）
+   */
+  rememberContextToken(token, peerUserId) {
+    const t = String(token || "").trim();
+    if (!t) return false;
+    const peer = String(peerUserId || "");
+    if (this.client.contextToken === t && this.client.contextTokenPeer === peer) return false;
+    this.client.setContextToken(t, peer);
+    this.writeState({ context_token: t, context_token_peer: peer });
+    return true;
   }
 
   /** 面板接口用:永不回显 token(§8)。 */
@@ -2743,6 +2821,8 @@ export class WeChatChannel {
       logger: this.logger,
       fetch: this.client.fetchImpl
     });
+    // 换绑会**新建 client** → 必须把会话上下文令牌重新挂上（否则换绑后第一条推送就发不出去）
+    this.#restoreContextToken();
     this.writeState({
       bound: true,
       bot_id: account.accountId,
@@ -2777,7 +2857,10 @@ export class WeChatChannel {
     const cleared = clearAccount(this.relayDir);
     this.account = null;
     this.client.setToken("");
-    this.writeState({ bound: false, bot_id: "", bound_at: 0, connected_at: 0, last_error: notifyError });
+    // ★ 会话上下文令牌属于**上一个人/上一个会话**：解绑必须一并清掉，
+    //   否则换绑后第一条推送会拿旧上下文去发 —— 表现还是"发不出去"。
+    this.client.clearContextToken();
+    this.writeState({ bound: false, bot_id: "", bound_at: 0, connected_at: 0, last_error: notifyError, context_token: "", context_token_peer: "" });
     // ★ 解绑同样清冷却:凭据都删了,再"退避"没有任何意义 ——
     //   留着只会让用户重新绑定时继续被挡(见 adoptConfirmed 的注释)。
     this.cooldown.clear();

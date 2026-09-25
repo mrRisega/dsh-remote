@@ -1996,3 +1996,92 @@ test("一元：本地校验（空 text / 缺 sessionId / 坏 mode…）直接类
     await dispose();
   }
 });
+
+// ═══════════════════ 2026-09-25 事故：完成推送静默消失（业主实测）═══════════════════
+//
+// 现场：任务跑完了，微信**一条推送都没有**，bridge 日志里也**没有任何报错**。
+// 活体探针（以微信通道同款方式订阅本机 dsh web）显示：
+//   · 新起的订阅器 163ms 就发现并 follow 了正在跑的会话 —— 机制本身是好的；
+//   · 而当时在跑的 bridge 进程到 3080 只有 2 条 WS（mux + control）、**没有 follow 流**，
+//     可它明明有一个正在跑长任务的会话。
+// 根因就在下面这条：周期性发现被"当前一条 follow 都没有"这个条件**关掉了自己**——
+// 丢一次 status:true 边沿就永久失去发现能力，而 turn/end 只在 follow 流上才有。
+
+test("★ 事故锁：一条 follow 都没有时，周期性发现**仍然要跑**（丢一次边沿不能永久失聪）", async () => {
+  const api = await startFakeDsh({ listItems: [] }); // 连上时没有任何会话在跑
+  const sub = createEventSubscriber({
+    upstream: api.base,
+    cookie: () => api.cookie,
+    discoverIntervalMs: 40,
+    reconnect: { minMs: 15, maxMs: 40, factor: 1, jitter: 0 },
+  });
+  try {
+    await start(sub);
+    await api.waitForListCalls(1);
+    assert.deepEqual(sub.sessions(), [], "前置条件：此刻不 follow 任何会话");
+
+    // 之后某个会话开始跑，但**故意不发任何 status 边沿事件**（模拟边沿丢失/早于我们订阅）
+    const opened = [];
+    sub.on("follow-opened", (info) => opened.push(info));
+    api.setListItems([{ sessionId: "session-late", running: true }]);
+
+    // ⚠️ 用**有界**等待（`once` 会永久挂住）——回归时必须是"红"，不能是"卡死"。
+    try {
+      await waitFor(() => opened.length > 0, { label: "周期性发现把在跑的会话 follow 起来" });
+    } catch (e) {
+      assert.fail(`★ 一条 follow 都没有时，周期性发现也必须继续跑（否则丢一次边沿就永久失聪）：${e.message}`);
+    }
+    assert.equal(opened[0].sessionId, "session-late");
+    assert.deepEqual(sub.sessions(), ["session-late"]);
+  } finally {
+    sub.close();
+    await api.close();
+  }
+});
+
+test("★ 一次 follow 失败不该把这条会话**永久**钉死：下一轮 running 边沿必须重试", async () => {
+  const faults = [];
+  let failNext = true;
+  const api = await startFakeDsh({
+    onOpen(server, conn, stream) {
+      if (stream.endpoint !== "session/follow") return;
+      // 第一轮一律 agent-busy（真机上子代理/繁忙会话就是这个码）；之后放行
+      if (failNext) {
+        server.fail(conn, stream.streamId, {
+          code: "session/agent-busy",
+          message: "session is busy",
+          details: {},
+        });
+      }
+    },
+  });
+  const sub = createEventSubscriber({
+    upstream: api.base,
+    cookie: () => api.cookie,
+    followSettleMs: 20,
+    reconnect: { minMs: 15, maxMs: 40, factor: 1, jitter: 0 },
+  });
+  try {
+    sub.on("fault", (f) => faults.push(f));
+    await start(sub);
+
+    api.pushEmit("api-session/status", ["session-busy-then-ok", true]);
+    await waitFor(() => faults.some((f) => f.code === "session/agent-busy"), { label: "第一次 follow 被拒" });
+    assert.deepEqual(sub.sessions(), [], "第一次失败：没有 follow 流");
+
+    // 新一轮 running（用户又跑了一轮）→ 必须重新订阅，而不是被 #followBlocked 永久挡住
+    const opened = [];
+    sub.on("follow-opened", (info) => opened.push(info));
+    failNext = false;
+    api.pushEmit("api-session/status", ["session-busy-then-ok", true]);
+    try {
+      await waitFor(() => opened.length > 0, { label: "新一轮 running 触发重新订阅" });
+    } catch (e) {
+      assert.fail(`★ 一次 follow 失败不得把会话永久钉死（这一整轮的 turn/end 都会丢）：${e.message}`);
+    }
+    assert.equal(opened[0].sessionId, "session-busy-then-ok");
+  } finally {
+    sub.close();
+    await api.close();
+  }
+});

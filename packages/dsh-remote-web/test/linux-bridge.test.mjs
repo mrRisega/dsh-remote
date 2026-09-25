@@ -35,6 +35,10 @@ import test from "node:test";
 
 import { apply } from "../lib/index.js";
 import {
+  __noteAutostartFailure,
+  __clearAutostartFailure,
+} from "../lib/index.js";
+import {
   allLoopbackListeningPorts,
   candidatePorts,
   looksLikeDshRemoteSelf,
@@ -303,4 +307,40 @@ test("静态护栏：本文件里的关键接线必须还在（lest 回归时静
   assert.ok(!/当前平台（\$\{osPlatform\(\)\}）暂不支持自启动服务/.test(src) || /isLinux\(\)/.test(src),
     "Linux 不再走 unsupported 分支");
   void nodeFs;
+});
+
+// ─────────────────── ③ 日志噪音：同一条失败不许每轮刷一遍 ───────────────────
+
+test("★ 用户反馈锁：同一条自动启动失败**不许每轮刷日志**（实测被刷了 13~19 遍）", async () => {
+  // 现场：两条用户反馈的安装日志里，同一行
+  //   `自动启动 bridge 未成功(unsupported): 当前平台（linux）暂不支持自启动服务`
+  // 分别重复 19 次 / 13 次（自愈每轮都重试，每次都写一行）。用户复制过来的诊断里全是重复行，
+  // 第一现场被淹没 —— 那次我们只能靠"数行数 ÷ 每分钟行数"才推出时间线。
+  const env = await makeEnv({ haveSystemd: false });
+  const logPath = path.join(env.relayDir, ".dsh-setup-install.log");
+  const lines = () => {
+    try { return readFileSync(logPath, "utf8").split("\n").filter((l) => l.includes("自动启动 bridge 未成功")); }
+    catch { return []; }
+  };
+  try {
+    assert.equal(__noteAutostartFailure(env.relayDir, "unsupported", "当前平台（linux）暂不支持自启动服务"), 1);
+    assert.equal(lines().length, 1, "第一次失败必须记一行（否则用户什么都看不到）");
+    for (let i = 0; i < 3; i += 1) __noteAutostartFailure(env.relayDir, "unsupported", "当前平台（linux）暂不支持自启动服务");
+    assert.equal(lines().length, 1, `同一条结论不得重复刷屏，实际 ${lines().length} 行`);
+    assert.ok(lines()[0].includes("自动启动 bridge 未成功"), "第一行要是人话原话");
+    // 到 5 次时补一行"还在失败、已 5 次"，让用户知道不是一次性的
+    __noteAutostartFailure(env.relayDir, "unsupported", "当前平台（linux）暂不支持自启动服务");
+    assert.equal(lines().length, 2, "第 5 次补一行累计说明");
+    assert.match(lines()[1], /已连续 5 次/, "要说明是「还在失败」，而不是新的故障");
+    // 结论变了（换了个原因）→ 必须立刻记新的一行
+    __noteAutostartFailure(env.relayDir, "failed", "运行环境入口脚本不存在");
+    assert.equal(lines().length, 3, "原因变了就是新信息，要记");
+    // 成功后清状态 → 下次失败重新记第一行
+    __clearAutostartFailure(env.relayDir);
+    assert.equal(__noteAutostartFailure(env.relayDir, "unsupported", "当前平台（linux）暂不支持自启动服务"), 1);
+    assert.equal(lines().length, 4);
+  } finally {
+    killPidFile(env.relayDir);
+    await env.restore();
+  }
 });

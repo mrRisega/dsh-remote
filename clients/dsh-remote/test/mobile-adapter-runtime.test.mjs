@@ -168,7 +168,9 @@ function harness({ collapsedAttr = undefined, detailsAttr = undefined, sidebarRe
     removeEventListener() {},
     getComputedStyle: () => ({ getPropertyValue: () => "" }),
     requestAnimationFrame: (fn) => { const id = setImmediate(fn); return id; },
-    setTimeout: (fn, ms) => { const id = setTimeout(fn, ms); timers.set(id, fn); return id; },
+    // unref：同上 —— 适配层的 4 分钟兜底计时器会让测试进程空等到期（本来 240s，只剩 0.2s）。
+    // 用例里的 `_pendingTimers` 仍会被 runAdapter() 主动跑一轮，行为不变。
+    setTimeout: (fn, ms) => { const id = setTimeout(fn, ms); try { id.unref?.(); } catch { /* 忽略 */ } timers.set(id, fn); return id; },
     clearTimeout: (id) => clearTimeout(id),
     MutationObserver: class { observe() {} disconnect() {} },
     ResizeObserver: class { observe() {} disconnect() {} },

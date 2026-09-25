@@ -32,6 +32,7 @@
  *   浏览器里的真实结果另在 headless Chromium + 官方 GUI 上验证过（见报告）。
  */
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 import { injectMobileAdapter } from "../mobile-adapter.mjs";
@@ -349,7 +350,10 @@ function harness({
     MutationObserver: MutationObserverStub,
     ResizeObserver: class { observe() {} disconnect() {} },
     requestAnimationFrame: (fn) => setImmediate(fn),
-    setTimeout: (fn, ms) => setTimeout(fn, ms),
+    // unref：适配层自带 8s/30s/**4 分钟**的兜底计时器（首屏提示），不 unref 的话
+    // 测试进程会一直等到最后一个定时器到期才退出 —— 实测这个文件因此**空等 4 分钟**，
+    // 单次全量测试的 94% 时间都花在这里（2026-09-25 实测：240s vs 其余 20 个文件合计 30s）。
+    setTimeout: (fn, ms) => { const id = setTimeout(fn, ms); try { id.unref?.(); } catch { /* 忽略 */ } return id; },
     clearTimeout: (id) => clearTimeout(id),
     setInterval: (fn) => { intervals.push(fn); return intervals.length; },
     clearInterval: (id) => { if (id) intervals[id - 1] = null; },
@@ -829,4 +833,17 @@ test("自动收抽屉：桌面宽屏(>820)不收起", async () => {
   env.row.dispatchEvent(new Ev("click", {}));
   await waitTick();
   assert.equal(clicks(), 0, "宽屏没有离屏抽屉这回事 —— 窄屏门必须继续有效");
+});
+
+test("★ 迭代速度护栏：适配层测试的假定时器**必须 unref**（否则每个文件空等 4 分钟）", () => {
+  // 2026-09-25 实测：适配层会挂 8s / 30s / **4 分钟** 的首屏提示兜底计时器，
+  // 而两个适配层测试文件的假 setTimeout 直接转给 Node 的真定时器 → 测试全跑完后
+  // 进程还要等最后一个定时器到期才退出：单文件 **240 秒**，而其余 20 个文件合计只有 30 秒。
+  // 也就是说"每轮迭代全量测试 8.5 分钟"里 **94% 是纯空等**。
+  // 这条护栏把 unref 钉住 —— 它一丢，迭代速度立刻退回 8 分钟级。
+  const files = ["mobile-adapter-guards.test.mjs", "mobile-adapter-runtime.test.mjs", "mobile-adapter-image.test.mjs"];
+  for (const f of files) {
+    const src = readFileSync(new URL(`./${f}`, import.meta.url), "utf8");
+    assert.match(src, /id\.unref\?\.\(\)/, `${f} 的假 setTimeout 必须 unref（否则该文件会空等数分钟）`);
+  }
 });

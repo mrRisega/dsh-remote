@@ -951,6 +951,13 @@ class EventSubscriber extends EventEmitter {
           clearTimeout(entry.settleTimer);
           entry.settleTimer = null;
         }
+        // ★ 2026-09-25：一次 follow 失败不该把这条会话**永久**钉死。
+        //   旧行为是失败即 `#followBlocked.add()`，此后**本代**（直到 mux 重连）再也不订阅它 ——
+        //   而「这一轮又跑起来了」（status:true）恰恰是重新订阅的正当理由。
+        //   不清掉的话：一次 `session/agent-busy`/`session/not-found` 抖动 = 该会话这一整轮的
+        //   turn/end 全部丢失 = 完成推送静默消失（与上面定时任务那个自我关停是同一类事故）。
+        //   重试天然有界：一次 running 边沿最多触发一次重新订阅，不会打转。
+        this.#followBlocked.delete(sessionId);
         this.#ensureFollow(sessionId);
       } else {
         this.#running.delete(sessionId);
@@ -1092,8 +1099,21 @@ class EventSubscriber extends EventEmitter {
     const timer = setTimeout(() => {
       this.#discoverTimer = null;
       if (this.#closed || this.#state !== "ready") return;
-      // 没有 follow 流就没有可对账的东西；但**每代**至少发现过一次（连接时就做过了）。
-      if (this.#follows.size > 0) void this.discoverRunningSessions().catch(() => {});
+      // ★ 2026-09-25 事故修复：这里原本写成 `if (this.#follows.size > 0)`，注释是
+      //   「没有 follow 流就没有可对账的东西（每代至少发现过一次）」。
+      //   它漏掉了这条定时任务的**另一半职责：发现**。丢一次边沿事件（mux 重连、status:true
+      //   早于我们订阅、帧被丢）就会让 `#follows` 长期为 0，而这条任务又因为「0 个流」把自己关掉
+      //   → **从此再也不发现任何会话** → 该会话的 turn/end 永远收不到 → 完成推送**静默消失**。
+      //
+      //   真机现场（业主本人，2026-09-25）：任务跑完一条微信都没收到，bridge 日志里也
+      //   **没有任何报错**（因为确实什么都没发生）。活体探针（以微信通道同款方式订阅本机）显示：
+      //     · 新起的订阅器 **163ms** 就发现并 follow 了正在跑的会话 —— 机制本身是好的；
+      //     · 而当时在跑的 bridge 进程到 3080 只有 **2 条** WS（mux + control）、**没有 follow 流**，
+      //       可它明明有一个正在跑长任务的会话 —— 正是这里的自我关停把发现能力锁死了。
+      //
+      //   代价：一次 `session/list`（本机实测 291 个会话约 200ms）。每 120s 一次完全承受得起，
+      //   换来的是「丢了边沿也能在两分钟内自愈」。
+      void this.discoverRunningSessions().catch(() => {});
       this.#scheduleDiscovery();
     }, interval);
     timer.unref?.();

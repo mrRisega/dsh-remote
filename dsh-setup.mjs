@@ -170,6 +170,7 @@ function printHelp() {
   dsh-remote status       查看配置与服务状态
   dsh-remote plugin       手动安装 dsh web 远程访问插件（--uninstall 卸载）
   dsh-remote repair       修复插件挂载（dsh web 起不来时用；只碰 profile，不联网）
+  dsh-remote doctor       一条命令自检「为什么连不上」（只读；含上游/进程/微信/日志尾部）
   dsh-remote --help       显示本用法（等同 dsh-remote help）
 
 自建模式（可选）:
@@ -202,7 +203,11 @@ const KNOWN_FLAGS = new Set([
     process.exit(1);
   }
 }
-try { ensureRuntimeCopy(); } catch (e) { console.warn(`⚠️ 运行时固化跳过: ${e.message}`); }
+// `doctor` 承诺"只读"：它连运行时脚本同步都不做 —— 否则"自检"会先往用户磁盘写 9 个文件，
+// 与承诺不符（也会把"我什么都没改却多了文件"变成新的困惑）。
+if (process.argv[2] !== "doctor") {
+  try { ensureRuntimeCopy(); } catch (e) { console.warn(`⚠️ 运行时固化跳过: ${e.message}`); }
+}
 
 /** 自启动服务应指向的 dsh-setup.mjs：优先配置目录内的固化副本，否则当前执行文件。 */
 function runtimeSetupPath() {
@@ -2352,6 +2357,134 @@ async function pluginCmd(argv) {
  *   resolve = dsh 的裸包名解析能不能走通（浏览器半注入面板就靠它）
  *   client = dsh.client.platform 声明在不在
  */
+/**
+ * `dsh-remote doctor` —— **一条命令回答「为什么连不上」**（只读，不改任何东西）。
+ *
+ * 【为什么产品上必须有它】2026-09-25 排查两条用户反馈（fb_7b4ee6ec9862 / fb_4cc2c9df749c）时，
+ * 判断"bridge 到底有没有被拉起来"花了大量时间，而且**只能靠翻日志行数估时间** ——
+ * 因为当时的日志连时间戳都没有，用户端也没有任何一个入口能把
+ * 「上游端口 / 守护状态 / 事件订阅 / 待补发队列」一次性说清楚。
+ * 那两个用户都是 linux + 「starting / bridge 未运行」，而我们的自愈当时在 Linux 上**根本没有实现**
+ * （见 0.6.15 的 startBridgeLinux）：如果有一份这样的自检，用户自己 10 秒就能看出问题在哪。
+ *
+ * 输出四段：① 身份与版本 ② 上游（含来源与探测结论） ③ 进程与自启动 ④ 通道（微信/加密/待补发）
+ * ⑤ 日志尾部（带时间戳）。任何一项失败都只影响那一行，绝不中断整份自检。
+ *
+ * @param {string[]} argv 额外参数（--profile <dir> 透传给插件挂载诊断）
+ */
+async function doctorCmd(argv = []) {
+  const mask = (s) => (s ? String(s).slice(0, 3) + "****" + String(s).slice(-2) : "");
+  const ms = (t) => (t ? new Date(Number(t)).toISOString().replace("T", " ").slice(0, 19) : "-");
+  const readJson = (p) => { try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return null; } };
+  const readText = (p) => { try { return fs.readFileSync(p, "utf8"); } catch { return ""; } };
+  const alive = (pid) => {
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    try { process.kill(pid, 0); return true; } catch (e) { return e && e.code === "EPERM"; }
+  };
+
+  console.log("dsh-remote 自检（doctor，只读，不改任何东西）");
+  console.log("时间:", new Date().toISOString(), "| 平台:", `${process.platform}/${process.arch}`, "| node:", process.version);
+  console.log("配置目录:", CONFIG_DIR);
+
+  // ── ① 插件与运行环境版本 ────────────────────────────────────────────────
+  const pluginPkg = readJson(path.join(CONFIG_DIR, "node_modules", PLUGIN_ID, "package.json"))
+    || readJson(new URL("./packages/dsh-remote-web/package.json", import.meta.url));
+  const setupVersion = readText(path.join(CONFIG_DIR, ".dsh-setup-version")).trim();
+  console.log("\n① 版本");
+  console.log(`   插件        : ${pluginPkg && pluginPkg.version ? "v" + pluginPkg.version : "（读不到）"}`);
+  console.log(`   运行环境     : ${setupVersion ? "v" + setupVersion : "（未固化 / 未知）"}`);
+  console.log(`   运行环境入口 : ${fs.existsSync(runtimeSetupPath()) ? runtimeSetupPath() : "缺失！"}`);
+  try {
+    const profileDir = resolveProfileDir(argv);
+    if (fs.existsSync(path.join(profileDir, "package.json"))) printPluginDiagnostics(profileDir);
+    else console.log(`   [plugin]  未找到 profile（${profileDir}）`);
+  } catch (e) { console.log(`   [plugin]  诊断失败：${e.message}`); }
+
+  // ── ② 上游 dsh web（bridge 要连的那个本机地址） ──────────────────────────
+  console.log("\n② 上游 dsh web");
+  const hint = resolveUpstreamHint({ relayDir: CONFIG_DIR });
+  const probed = await discoverUpstream({ relayDir: CONFIG_DIR, log: (m) => console.log(`   ${m}`) });
+  console.log(`   提示来源     : ${hint.url ? `${hint.url}（${hint.source}）` : "（无）"}`);
+  console.log(`   最终采用     : ${probed.url}（${probed.source}）`);
+  console.log(`   身份校验     : ${probed.source === "fallback" ? "⚠️ 未找到在听的 dsh web（会一直重试）" : "✅ 已确认为本机 dsh web"}`);
+  if (probed.probed && probed.probed.length) console.log(`   探测过的端口 : ${probed.probed.join(", ")}`);
+
+  // ── ③ 守护与 bridge 进程 ───────────────────────────────────────────────
+  console.log("\n③ 进程与自启动");
+  const watcherPid = readPidFile(WATCHER_PID_FILE);
+  const bridgePid = readPidFile(BRIDGE_PID_FILE);
+  console.log(`   watcher pid  : ${watcherPid || "-"}${watcherPid ? (alive(watcherPid) ? "（在跑）" : "（已死，pid 文件过期）") : ""}`);
+  console.log(`   bridge pid   : ${bridgePid || "-"}${bridgePid ? (alive(bridgePid) ? "（在跑）" : "（已死，pid 文件过期）") : ""}`);
+  // 进程扫描（平台各自的方式）：只报数量，不猜
+  try {
+    const r = process.platform === "win32"
+      ? sh("tasklist /FI \"IMAGENAME eq node.exe\" /FO CSV 2>NUL")
+      : sh("pgrep -fl 'dsh-setup.mjs|dsh-bridge.mjs' 2>/dev/null");
+    const lines = String(r.stdout || "").split("\n").map((l) => l.trim()).filter((l) => l && !/pgrep/.test(l));
+    const watchers = lines.filter((l) => /dsh-setup\.mjs/.test(l));
+    const bridges = lines.filter((l) => /dsh-bridge\.mjs/.test(l)).filter((l) => !/dsh-setup/.test(l));
+    console.log(`   实测进程     : watcher ${watchers.length} 个 / bridge ${bridges.length} 个`);
+    if (watchers.length && !bridges.length) console.log("   ⚠️ 守护在跑、bridge 没起来 —— 这类情况看日志尾部（通常是在等 dsh web 或登录限流）");
+    if (!watchers.length && !bridges.length) {
+      console.log("   ⚠️ 一个进程都没在跑。手动起一次看报错：`dsh-remote run`（前台，能直接看到输出）");
+    }
+  } catch (e) { console.log(`   实测进程     : 扫描失败（${e.message}）`); }
+  if (process.platform === "linux") {
+    const hasUser = Boolean(process.env.XDG_RUNTIME_DIR);
+    console.log(`   自启动       : systemd --user ${hasUser ? "（有 runtime dir）" : "（无 XDG_RUNTIME_DIR → 本机没有 user systemd，插件会用后台进程兜底）"}`);
+    if (hasUser) {
+      const r = sh("systemctl --user is-active dsh-bridge");
+      console.log(`   systemd 状态 : ${r.ok ? r.stdout.trim() : (r.stderr || "").trim() || "查不到"}`);
+    }
+  }
+
+  // ── ④ 通道：E2EE / 微信 / 待补发 ───────────────────────────────────────
+  console.log("\n④ 通道");
+  const e2ee = readJson(path.join(CONFIG_DIR, ".e2ee-state.json"));
+  console.log(`   端到端加密   : ${e2ee ? (e2ee.enabled ? `已启用（${e2ee.reason || "ok"}）` : `未启用（${e2ee.reason || "?"}）`) : "（无状态文件 = 明文）"}`);
+  const wx = readJson(path.join(CONFIG_DIR, ".wechat-state.json"));
+  if (!wx) {
+    console.log("   微信通道     : 未使用（无状态文件）");
+  } else {
+    const outbox = Array.isArray(wx.pending_outbox) ? wx.pending_outbox.length : 0;
+    const faults = wx.last_fault && wx.last_fault.code ? `${wx.last_fault.code}（${ms(wx.last_fault.at)}）` : "无";
+    console.log(`   微信通道     : ${wx.bound ? "已绑定" : "未绑定"} | 最近成功推送 ${ms(wx.last_push_ok_at)}`);
+    console.log(`   待补发通知   : ${outbox ? `⚠️ ${outbox} 条（下次在微信里发一句话就会补上）` : "0 条"}`);
+    console.log(`   最近订阅异常 : ${faults}`);
+    console.log(`   当前会话     : ${wx.current_session_title || "-"}（${wx.current_session_id || "-"}）`);
+    console.log(`   最近完成     : ${wx.last_completed_session_title || "-"}（${ms(wx.last_completed_at)}）`);
+    if (outbox) console.log(`   ℹ️ 入站消息的形状（字段名，用于定位 context_token 缺失）：${wx.inbound_shape || "（还没记到）"}`);
+  }
+  const cfg = loadConfig();
+  console.log(`   账号         : ${mask(cfg.phone) || (cfg.local_key ? "自建（本地密钥）" : "（未登录）")}`);
+  console.log(`   中继/API     : ${cfg.tunnel_url || "-"} ${cfg.api_url ? `| ${cfg.api_url}` : ""}`);
+
+  // ── ⑤ 日志尾部（现在每行都有时间戳，直接能对时间） ─────────────────────
+  console.log("\n⑤ 日志尾部（bridge + 安装）");
+  for (const name of [".dsh-bridge.log", ".dsh-setup-install.log"]) {
+    const p = path.join(CONFIG_DIR, name);
+    if (!fs.existsSync(p)) { console.log(`   ${name}: （无）`); continue; }
+    let tail = "";
+    try {
+      const st = fs.statSync(p);
+      const len = Math.min(st.size, 8 * 1024);
+      const fd = fs.openSync(p, "r");
+      const buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, Math.max(0, st.size - len));
+      fs.closeSync(fd);
+      tail = buf.toString("utf8");
+    } catch { /* 读不了就当没有 */ }
+    const lines = tail.split("\n").map((l) => l.trim()).filter(Boolean).slice(-12);
+    console.log(`   --- ${name}（末尾 ${lines.length} 行 / ${p}）---`);
+    for (const l of lines) console.log("   " + l.slice(0, 220));
+    console.log("");
+  }
+  console.log("结论怎么读：① 版本对不上 → 面板点「一键修复 / 重装运行环境」；");
+  console.log("           ② 上游 fallback → 把 dsh web 起在本机可回环访问的端口（插件会自动发现）；");
+  console.log("           ③ 没有任何进程 → 先手动 `dsh-remote run` 看前台输出；");
+  console.log("           ④ 待补发 > 0 → 在微信里随便发一句话即可补收。");
+}
+
 function printPluginDiagnostics(profileDir) {
   const nmPlugin = path.join(profileDir, "node_modules", PLUGIN_ID);
   const link = describePluginLink(profileDir);
@@ -2437,6 +2570,7 @@ else if (cmd === "settings") settingsHint();
 else if (cmd === "run") await runBridge();
 else if (cmd === "plugin") await pluginCmd(process.argv.slice(3));
 else if (cmd === "repair") repairProfile(process.argv.slice(3));
+else if (cmd === "doctor") await doctorCmd(process.argv.slice(3));
 else if (cmd === "status") {
   const cfg = loadConfig();
   const local = Boolean(cfg.local_key);

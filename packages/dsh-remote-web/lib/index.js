@@ -1191,6 +1191,9 @@ function manualStatus(relayDir) {
 
 // ---------- 插件市场一键全功能：缺桌面运行环境时自动后台安装 dsh-remote ----------
 
+/** 「上一次自动启动失败的原话 + 连续次数」——同一条结论不重复刷日志（见 ensureConnection 的注释）。 */
+const lastAutostartFailure = new Map();
+
 const PROVISION_MARKER = ".dsh-setup-installing";
 const AUTO_INSTALL_LOG = ".dsh-setup-install.log";
 const STALE_MARKER_MS = 30 * 60 * 1000; // 超过该时长视为上次进程残留，插件启动时清理
@@ -4439,10 +4442,49 @@ function ensureConnection(relayDir, opts = {}) {
   book.attempts += 1;
   const r = startBridge(relayDir);
   if (r && r.ok === false) {
-    appendLogLine(relayDir, AUTO_INSTALL_LOG,
-      `[dsh-remote-web] 自动启动 bridge 未成功(${r.status || "?"}): ${r.detail || ""}`);
+    // ★ 2026-09-25：**同一条失败不要每轮都写一遍**。
+    //   两条用户反馈（fb_7b4ee6ec9862 / fb_4cc2c9df749c）的安装日志里，同一行
+    //   `自动启动 bridge 未成功(unsupported): 当前平台（linux）暂不支持自启动服务`
+    //   分别重复了 **19 次 / 13 次** —— 自愈每轮重试是对的，但把同一条结论一遍遍写进日志
+    //   会变成噪音：用户复制过来的诊断里全是重复行，真正的"第一现场"反而被淹没
+    //   （那次我们只能靠数行数才能推出时间线）。现在：结论没变就只累加计数。
+    noteAutostartFailure(relayDir, r.status, r.detail);
+  } else if (r && r.ok) {
+    clearAutostartFailure(relayDir); // 起来了 → 下次失败要重新记第一行
   }
   return { action: "start", result: r };
+}
+
+/**
+ * 记一条「自动启动 bridge 失败」，但**同一条结论只写一次**。
+ *
+ * 【2026-09-25 用户反馈】两条反馈的安装日志里，同一行
+ * `自动启动 bridge 未成功(unsupported): 当前平台（linux）暂不支持自启动服务`
+ * 分别重复了 **19 次 / 13 次**（自愈每轮重试，每次都写一行）。用户复制过来的诊断里全是重复行，
+ * 第一现场被淹没 —— 那次我们只能靠"数行数 ÷ 每分钟行数"才推出时间线。
+ * 现在：结论没变就只累加计数；只在 5/10/50/100/500 这些节点补一行「还在失败、已 N 次」。
+ * （500 次失败总共只留 6 行，而不是 500 行 —— 结论没变的信息量是零。）
+ * @returns {number} 累计次数
+ */
+function noteAutostartFailure(relayDir, status, detail) {
+  const line = `自动启动 bridge 未成功(${status || "?"}): ${detail || ""}`;
+  const prev = lastAutostartFailure.get(relayDir);
+  if (!prev || prev.line !== line) {
+    lastAutostartFailure.set(relayDir, { line, count: 1 });
+    appendLogLine(relayDir, AUTO_INSTALL_LOG, `[dsh-remote-web] ${line}`);
+    return 1;
+  }
+  prev.count += 1;
+  if ([5, 10, 50, 100, 500].includes(prev.count)) {
+    appendLogLine(relayDir, AUTO_INSTALL_LOG,
+      `[dsh-remote-web] ${line}（已连续 ${prev.count} 次，结论未变，不再重复刷日志）`);
+  }
+  return prev.count;
+}
+
+/** 启动成功后清掉去重状态（下次失败要重新记第一行）。 */
+function clearAutostartFailure(relayDir) {
+  lastAutostartFailure.delete(relayDir);
 }
 
 // ---------- 匿名装机/连接遥测（客户端半；契约与隐私边界见 docs/telemetry.md） ----------
@@ -6350,4 +6392,6 @@ export function apply(ctx, config = {}) {
 // test hooks：cordis 只读 name/inject/apply，这些导出只给用例（见 test/picker-pin.test.mjs）。
 // 为什么不放进 apply 内部直接测：apply 是"装载即副作用"的同步函数，选择器固定是异步且带重试窗口的，
 // 单独导出才能把「**先摘 auto、后建 browse**」这个顺序契约钉死。
-export { pinBrowseDirectoryPicker as __pinBrowseDirectoryPicker, pickerPinState as __pickerPinState, directoryPickerKind as __directoryPickerKind, PICKER_AUTO_ENTRY_ID as __PICKER_AUTO_ENTRY_ID, PICKER_AUTO_PACKAGE as __PICKER_AUTO_PACKAGE, PICKER_BROWSE_PACKAGES as __PICKER_BROWSE_PACKAGES };
+export { pinBrowseDirectoryPicker as __pinBrowseDirectoryPicker, pickerPinState as __pickerPinState, directoryPickerKind as __directoryPickerKind, PICKER_AUTO_ENTRY_ID as __PICKER_AUTO_ENTRY_ID, PICKER_AUTO_PACKAGE as __PICKER_AUTO_PACKAGE, PICKER_BROWSE_PACKAGES as __PICKER_BROWSE_PACKAGES,
+  // 日志去重（同一条失败不刷屏）也要能被单测钉住 —— 它属于「诊断可读性」，见 test/linux-bridge.test.mjs
+  noteAutostartFailure as __noteAutostartFailure, clearAutostartFailure as __clearAutostartFailure };
