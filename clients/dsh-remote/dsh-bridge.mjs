@@ -859,8 +859,10 @@ export async function handleHttpFrame(dchOrSend, frame) {
       const req = decodeHttpRequestPlain(opened.data);
       // 客户端是否声明"响应用二进制明文框架"（省掉正文那一层 base64，见 e2ee-client.mjs 长注释）。
       // 老客户端（native.html 的 WC-CORE / 企业版内置那份）不声明 → 照旧走 JSON，零影响。
+      // ★ 这个头**无条件**摘掉再转发：它是端到端内部协商头，不是业务头，不该出现在上游请求里
+      //   （哪怕客户端给了个我们看不懂的值，也不能原样漏给 dsh web）。
       const wantBinPlain = wantsBinaryResponsePlain(req.headers);
-      const upstreamHeaders = wantBinPlain ? stripPlainWantHeader(req.headers) : req.headers;
+      const upstreamHeaders = stripPlainWantHeader(req.headers);
       const reply = await doHttp(req.method, req.path, upstreamHeaders, req.bodyB64, true);
       const bodyBuffer = Buffer.from(reply.body, "base64");
       const plain = encodeHttpResponsePlain({ status: reply.status, headers: reply.headers, bodyBuffer, binary: wantBinPlain });

@@ -28,6 +28,9 @@ All notable changes to dsh-remote are documented here. This project follows
   （开机自启 + 崩溃自愈），**没有就退到脱离进程**（NAS/容器是常态，与 Windows 同一条路径）；
   `serviceManager` 也如实上报 `systemd` / `detached`（以前一律写 systemd，面板文案跟着错）。
   `dsh-setup.mjs` 的 Linux 重启路径同样补上脱离进程兜底。
+- 同版一并修：`stopBridge()` 在 Linux 上也直接落到「没有 launchd 服务可停」的死路 ——
+  面板「停止」与**切换账号时的重置**都会失败（旧 bridge 继续用旧凭据跑，新账号设备列表里
+  永远看不到这台机器）。现在 Linux 先停 systemd unit（有的话），再用脱离进程那条路收干净。
 
 ### ② 上游端口发现：NAS 上 dsh web 在 2298，五条路径全都没命中
 
@@ -100,9 +103,9 @@ gzip 后 5.35 MiB 的聚合包，经三层 base64 变成 bridge→中继 12.69 M
 
 ### 测试
 
-- 新增 `packages/dsh-remote-web/test/linux-bridge.test.mjs` 7 条（无 systemd 时必须真的派生守护、
-  有 systemd 时写 unit 且带 `DSH_BRIDGE_UPSTREAM`、候选端口里必须有 2298 且排在静态候选之前、
-  `/dsh-remote/self` 第二判据、/proc 解析、静态接线护栏）。
+- 新增 `packages/dsh-remote-web/test/linux-bridge.test.mjs` 8 条（无 systemd 时必须真的派生守护、
+  有 systemd 时写 unit 且带 `DSH_BRIDGE_UPSTREAM`、`/dsh-remote/stop` 必须真的停掉守护、
+  候选端口里必须有 2298 且排在静态候选之前、`/dsh-remote/self` 第二判据、/proc 解析、静态接线护栏）。
 - 新增 `clients/dsh-remote/test/mobile-adapter-image.test.mjs` 7 条（HEIC 转码、空 type 无损改 MIME、
   白名单零行为、解码失败/无 DataTransfer 时原样重发、混合选择保序）。
 - 重写 `packages/dsh-remote-web/test/picker-pin.test.mjs`（12 条，含"顺序反过来必炸"的回归锁）。

@@ -27,6 +27,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import * as nodeFs from "node:fs";
 import { existsSync, readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -206,6 +207,35 @@ test("★ linux 有 user systemd：写 unit + enable + restart，状态报 syste
     const st = await getJson(srv.base, "/dsh-remote/status");
     assert.equal(st.body.service.serviceManager, "systemd", "有会话时如实报 systemd");
   } finally {
+    await srv.close();
+    routes.dispose();
+    await env.restore();
+  }
+});
+
+// ─────────────────── ①b 停止路径：Linux 也不能是「没有 launchd 服务可停」的死路 ───────────────────
+
+test("★ linux：/dsh-remote/stop 必须真的把守护停掉（旧版只会回「没有 launchd 服务可停」）", async () => {
+  const env = await makeEnv({ haveSystemd: false });
+  const routes = boot(env.relayDir);
+  const srv = await serve(routes);
+  try {
+    await postJson(srv.base, "/dsh-remote/connect/retry"); // 先把守护拉起来
+    for (let i = 0; i < 100 && !existsSync(env.marker); i += 1) await sleep(50);
+    assert.ok(existsSync(env.marker), "前置条件：守护已被拉起");
+    const pid = Number(readFileSync(path.join(env.relayDir, ".dsh-watcher.pid"), "utf8").trim());
+    assert.ok(Number.isInteger(pid) && pid > 1, "pid 文件里应有真实 pid");
+
+    const stop = await postJson(srv.base, "/dsh-remote/stop");
+    assert.equal(stop.status, 200, `停止必须成功，实际 ${JSON.stringify(stop.body && stop.body.detail)}`);
+    assert.ok(!/launchd/.test(String(stop.body.detail || "")), "不该再说「没有 launchd 服务可停」");
+    // 进程真的没了。⚠️ 不能用 `process.kill(pid, 0)` 单独判：已死但**尚未被 reap** 的进程
+    // 处于僵尸态（Z），对它发信号仍然成功 —— 直接断言会把"其实已经停了"判成失败（实测踩到）。
+    const stat = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8" }).stdout.trim();
+    assert.ok(stat === "" || /^Z/.test(stat),
+      `★ 停止后守护进程必须真的退出（当前 stat=${stat || "已不存在"}）—— 否则切换账号会继续用旧凭据跑`);
+  } finally {
+    killPidFile(env.relayDir);
     await srv.close();
     routes.dispose();
     await env.restore();

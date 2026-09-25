@@ -1596,7 +1596,7 @@ function startBridgeDetached(relayDir, fallbackReason = "") {
     }),
     stdio: ["ignore", out, out],
     windowsHide: true,
-    onError: (e) => appendLogLine(relayDir, AUTO_INSTALL_LOG, `[dsh-remote-web] Windows 启动 bridge 失败: ${e.message}`),
+    onError: (e) => appendLogLine(relayDir, AUTO_INSTALL_LOG, `[dsh-remote-web] 脱离进程启动 bridge 失败(${osPlatform()}): ${e.message}`),
   });
   if (typeof out === "number") { try { closeSync(out); } catch { /* 已随子进程继承，父进程这份可以关 */ } }
   if (error || !child) {
@@ -1756,12 +1756,33 @@ function scheduleRuntime(relayDir) {
   return () => clearInterval(iv);
 }
 
-/** 停止 bridge：macOS/Linux 走 launchctl bootout；Windows 结束 watcher/bridge 进程。 */
+/** 停止 bridge：macOS 走 launchctl bootout；Linux 走 systemd/脱离进程；Windows 结束 watcher/bridge 进程。 */
 function stopBridge(relayDir) {
   if (isWindows()) return stopBridgeDetached(relayDir);
   // 测试隔离：置位时绝不对真实 launchd/systemd 下手（切换账号也会走到这里，
   // 少了这一条，用例就会去 bootout 开发者本机上真实运行的 bridge —— 实测过的污染风险）。
   if (skipsSystemOps()) return { ok: false, status: "skipped", detail: "测试隔离（DSH_RELAY_SKIP_SERVICE=1）：跳过真实服务操作" };
+  // ★ Linux（0.6.15）：以前这里直接落到「没有 launchd 服务可停」的死路 —— Linux 用户的
+  //   面板「停止」、以及**切换账号时的重置**都会失败（旧 bridge 继续用旧凭据跑）。
+  //   现在：有 user systemd 就先停 unit，再统一用脱离进程那条路把 pid 文件/残留进程收干净。
+  if (isLinux()) {
+    let systemdStopped = false;
+    if (systemdUserAvailableCached()) {
+      sh("systemctl --user stop dsh-bridge");
+      const a = sh("systemctl --user is-active dsh-bridge");
+      systemdStopped = !(a.ok && a.stdout.trim() === "active");
+    }
+    const d = stopBridgeDetached(relayDir);
+    if (d.ok) {
+      return {
+        ok: true,
+        status: "stopped",
+        pid: null,
+        detail: systemdStopped ? "已停止 bridge（systemd --user 与后台进程均已结束）" : void 0,
+      };
+    }
+    return { ...d, detail: [d.detail, systemdStopped ? "systemd unit 已停" : ""].filter(Boolean).join("；") };
+  }
   const targets = launchTargets();
   if (!targets.length) return { ok: false, status: "unsupported", detail: `当前平台（${osPlatform()}）没有 launchd 服务可停，请手动结束 \`dsh-remote run\` 进程` };
   // 两个域都要停：作业可能由安装器装在 user/<uid>，而旧版插件只会去 gui/<uid> 找不到（实测事故）

@@ -218,8 +218,10 @@
   var SE_WANT_BIN_HEADER = "x-dsh-e2ee-want";
   function seEncodeHttpReqPlain(opt) {
     var b = opt.bodyBytes && opt.bodyBytes.length ? seBytesToB64(opt.bodyBytes) : "";
-    var h = opt.headers || {};
-    h[SE_WANT_BIN_HEADER] = "bin";
+    var src = opt.headers || {};
+    var h = {};
+    for (var k in src) { if (Object.prototype.hasOwnProperty.call(src, k)) h[k] = src[k]; }
+    h[SE_WANT_BIN_HEADER] = "bin"; // 只加在信封明文里（外层 HTTP 头不带它）
     return seUtf8(JSON.stringify({ m: String(opt.method || "GET").toUpperCase(), p: opt.path, h: h, b: b }));
   }
   function seDecodeHttpRespPlain(buf) {
