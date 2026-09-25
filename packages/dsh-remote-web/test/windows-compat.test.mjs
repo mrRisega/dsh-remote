@@ -32,9 +32,9 @@ import test from "node:test";
 import { apply } from "../lib/index.js";
 
 const HERE = path.dirname(new URL(import.meta.url).pathname);
-const INDEX_SRC = readFileSync(path.join(HERE, "..", "lib", "index.js"), "utf8");
-const CLIENT_SRC = readFileSync(path.join(HERE, "..", "lib", "client.js"), "utf8");
-const SETUP_SRC = readFileSync(path.join(HERE, "..", "..", "..", "dsh-setup.mjs"), "utf8");
+const INDEX_SRC = readFileSync(path.join(HERE, "..", "lib", "index.js"), "utf8").replace(/\r\n/g, "\n"); // 本文件就是 Windows 专项：CRLF 检出时源码锚点必须仍然匹配
+const CLIENT_SRC = readFileSync(path.join(HERE, "..", "lib", "client.js"), "utf8").replace(/\r\n/g, "\n");
+const SETUP_SRC = readFileSync(path.join(HERE, "..", "..", "..", "dsh-setup.mjs"), "utf8").replace(/\r\n/g, "\n");
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 

@@ -28,7 +28,9 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SETUP = path.join(HERE, "..", "..", "..", "dsh-setup.mjs");
 const PLUGIN_SRC = path.join(HERE, "..");
 const PLUGIN_ID = "dsh-remote-web";
-const SETUP_SRC = fs.readFileSync(SETUP, "utf8");
+// ⚠️ 必须归一到 LF：源码切片用的锚点串里带 "\n"，而 Windows 检出（autocrlf）是 CRLF，
+// 于是 indexOf 全部 -1 → 8 个用例一起红（CI 的 Windows 专项从 0.6.9 起一直红，根因就在这）。
+const SETUP_SRC = fs.readFileSync(SETUP, "utf8").replace(/\r\n/g, "\n");
 
 // ─────────────── 源码内取函数（安装器是 CLI 脚本，import 会直接执行 main） ───────────────
 

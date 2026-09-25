@@ -24,8 +24,8 @@ const REPO = join(HERE, "..", "..", "..");
 const INDEX = join(HERE, "..", "lib", "index.js");
 const CLIENT = join(HERE, "..", "lib", "client.js");
 
-const indexSrc = readFileSync(INDEX, "utf8");
-const clientSrc = readFileSync(CLIENT, "utf8");
+const indexSrc = readFileSync(INDEX, "utf8").replace(/\r\n/g, "\n"); // CRLF 检出时下面的源码锚点会全部失配
+const clientSrc = readFileSync(CLIENT, "utf8").replace(/\r\n/g, "\n");
 
 test("清单：dsh.client 不得声明不存在的宿主包（幻影 inject 会让插件永不装载）", () => {
   // 注：旧名别名包 dsh-remote-ui 已于 2026-09-15 退役并从仓库删除（npm 上已 deprecate），

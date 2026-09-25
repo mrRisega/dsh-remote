@@ -27,10 +27,10 @@ import { fileURLToPath } from "node:url";
 import { apply } from "../lib/index.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const INDEX_SRC = fs.readFileSync(path.join(HERE, "..", "lib", "index.js"), "utf8");
-const CLIENT_SRC = fs.readFileSync(path.join(HERE, "..", "lib", "client.js"), "utf8");
+const INDEX_SRC = fs.readFileSync(path.join(HERE, "..", "lib", "index.js"), "utf8").replace(/\r\n/g, "\n"); // CRLF 检出时源码锚点失配
+const CLIENT_SRC = fs.readFileSync(path.join(HERE, "..", "lib", "client.js"), "utf8").replace(/\r\n/g, "\n");
 const SETUP = path.join(HERE, "..", "..", "..", "dsh-setup.mjs");
-const SETUP_SRC = fs.readFileSync(SETUP, "utf8");
+const SETUP_SRC = fs.readFileSync(SETUP, "utf8").replace(/\r\n/g, "\n");
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const PLUGIN_ID = "dsh-remote-web";

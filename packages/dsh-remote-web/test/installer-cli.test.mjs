@@ -71,7 +71,7 @@ test("参数拼错：明确报错、退出码 1、也不落盘", async () => {
 });
 
 test("源码级：用法文本只有一处实现（避免提前退出与末尾分派两处漂移）", () => {
-  const src = fs.readFileSync(SETUP, "utf8");
+  const src = fs.readFileSync(SETUP, "utf8").replace(/\r\n/g, "\n"); // CRLF 检出时源码锚点失配
   const hits = src.match(/dsh-remote — 手机远程控制 dsh web/g) || [];
   assert.equal(hits.length, 1, "用法文案应只出现一次（共用 printHelp()）");
   assert.match(src, /function printHelp\(\)/, "应有 printHelp()");

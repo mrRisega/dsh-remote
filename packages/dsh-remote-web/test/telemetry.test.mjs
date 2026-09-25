@@ -366,7 +366,7 @@ test("隐私审计：对抗性 extra 字段（手机号/hostname/machine_fp/路�
       assert.ok(!raw.includes(bad), "payload 泄漏了敏感取值：" + bad);
     }
     // 源码级约束：唯一的 payload 构造点里不得出现禁止字段名
-    const src = readFileSync(new URL("../lib/index.js", import.meta.url), "utf8");
+    const src = readFileSync(new URL("../lib/index.js", import.meta.url), "utf8").replace(/\r\n/g, "\n"); // CRLF 检出时源码锚点失配
     const start = src.indexOf("function telemetryEventOf(");
     assert.ok(start > 0, "必须存在唯一的 payload 构造点 telemetryEventOf");
     const body = src.slice(start, src.indexOf("\n}\n", start));
@@ -746,7 +746,7 @@ test("不为遥测创建配置目录 / 测试隔离：隔离开关下零副作�
     assert.equal(relay.count("/api/telemetry/events"), 0, "隔离开关下绝不得把事件发到真实端点");
     assert.equal(TELEMETRY.record(env.relayDir, "install_started"), false, "隔离开关下不得入队");
     // 源码级：遥测段落不得出现「为统计创建配置目录」的动作（否则会改变卸载/安装判定的既有语义）
-    const src = readFileSync(new URL("../lib/index.js", import.meta.url), "utf8");
+    const src = readFileSync(new URL("../lib/index.js", import.meta.url), "utf8").replace(/\r\n/g, "\n"); // CRLF 检出时源码锚点失配
     const section = src.slice(src.indexOf("// ---------- 匿名装机/连接遥测"), src.indexOf("/**\n * 安装信息上报（插件侧通道）"));
     assert.ok(section.length > 2000, "必须定位到遥测段落");
     assert.ok(!/mkdirSync\(\s*relayDir/.test(section), "遥测不得为统计创建配置目录");
@@ -755,7 +755,7 @@ test("不为遥测创建配置目录 / 测试隔离：隔离开关下零副作�
 });
 
 test("面板可见性：关于卡片写明「匿名统计 + 关闭方式」，但不在面板里堆文档链接", () => {
-  const client = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
+  const client = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8").replace(/\r\n/g, "\n");
   assert.match(client, /匿名装机统计/, "面板必须有匿名统计说明");
   assert.match(client, /DSH_REMOTE_TELEMETRY=0/, "面板必须写明关闭方法");
   assert.match(client, /不含任何账号、手机号、会话或文件内容/, "面板必须写明不采集什么");
