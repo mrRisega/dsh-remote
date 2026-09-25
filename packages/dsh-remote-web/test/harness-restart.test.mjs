@@ -247,7 +247,11 @@ test("重启实现：被 launchd 托管 → 交回监管者（kickstart -k，pid
     const { host, base } = await serve(routes);
     try {
       const body = await (await fetch(`${base}/dsh-remote/harness/restart`, { method: "POST" })).json();
-      if (process.platform !== "darwin") {
+      // ⚠️ 判据必须与**被测代码**同源：插件用 osPlatform() = `DSH_RELAY_PLATFORM || process.platform`
+      //    （CI 里显式声明了 darwin，好让结果不随 runner 变），而本用例以前只看 process.platform
+      //    → Linux runner 上「代码走 launchd、用例却断言 relaunch」→ 红。两处判据一致才不会打架。
+      const effectivePlatform = process.env.DSH_RELAY_PLATFORM || process.platform;
+      if (effectivePlatform !== "darwin") {
         assert.equal(body.mode, "relaunch", "非 macOS 不检测 launchd");
       } else {
         assert.equal(body.mode, "launchd");
