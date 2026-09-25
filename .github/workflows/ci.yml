@@ -28,6 +28,13 @@ jobs:
         run: npm run check
 
       - name: Run tests
+        env:
+          # 插件套件是按 **macOS** 写的（launchd 域名阶梯、重启模式 launchd/systemd/relaunch…），
+          # 而 runner 是 Linux：不声明平台的话，同一个用例会随 runner 环境给出不同结果
+          # （实测：harness-restart 在 CI 上拿到 systemd，用例却断言 relaunch）。
+          # 这里显式声明平台 = 让结果**确定**。需要别的平台的用例会各自覆盖：
+          #   windows-compat 用例自带 DSH_RELAY_PLATFORM=win32、linux-bridge 自带 linux（用完还原）。
+          DSH_RELAY_PLATFORM: darwin
         run: npm test
 
   # Windows 专项：0.6.7-beta.1 的插件挂载缺陷（symlinkSync(...,'dir') 在非特权进程下
