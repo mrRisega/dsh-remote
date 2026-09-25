@@ -22,7 +22,7 @@
  * 用法: node --test test/sse-streaming-contract.test.mjs
  */
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -105,10 +105,20 @@ test("★ 能力协商:bridge 只在**中继声明** http-stream 时才用流式
   assert.match(ROUTER, /const ROUTER_FRAME_CAPS = \["http-stream"\]/);
   assert.match(ROUTER, /type: "tunnel-register-ok", deviceId, caps: ROUTER_FRAME_CAPS/);
 
-  const SAAS = readFileSync(
-    path.resolve(ROOT, "..", "dsh-relay-enterprise", "relay-router", "src", "index.mjs"),
-    "utf8"
-  );
-  assert.match(SAAS, /const ROUTER_FRAME_CAPS = \["http-stream"\]/, "SaaS 中继也要声明(线上跑的是它)");
-  assert.match(SAAS, /type: "tunnel-register-ok", deviceId, caps: ROUTER_FRAME_CAPS/);
 });
+
+/**
+ * SaaS（闭源）中继的同一条契约。
+ *
+ * ⚠️ 它读的是**同级检出的另一个仓库**（dsh-relay-enterprise）—— 开源仓库的 CI 里没有它，
+ * 老写法直接 readFileSync → ENOENT → 整个 `npm test` 从这里开始全红（而且掩盖了后面所有用例）。
+ * 现在：没有检出就**显式跳过**（并说明原因），有就照旧断言。
+ */
+const SAAS_ROUTER = path.resolve(ROOT, "..", "dsh-relay-enterprise", "relay-router", "src", "index.mjs");
+test("SaaS 中继也必须声明同一组能力（需要同级检出闭源仓库，否则跳过）",
+  { skip: existsSync(SAAS_ROUTER) ? false : "未检出同级 dsh-relay-enterprise（开源仓库 CI 的正常情况）" },
+  () => {
+    const SAAS = readFileSync(SAAS_ROUTER, "utf8");
+    assert.match(SAAS, /const ROUTER_FRAME_CAPS = \["http-stream"\]/, "SaaS 中继也要声明(线上跑的是它)");
+    assert.match(SAAS, /type: "tunnel-register-ok", deviceId, caps: ROUTER_FRAME_CAPS/);
+  });

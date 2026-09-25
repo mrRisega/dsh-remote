@@ -18,6 +18,7 @@
  * ⚠️ 隔离：unset 隔离开关的用例必须同时伪造 HOME 与 PATH（否则会碰真实 HOME 下的 launchd）。
  */
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import http from "node:http";
 import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
@@ -44,7 +45,7 @@ fi
 exit 0
 `;
 
-async function makeEnv({ fakeLaunchd = true } = {}) {
+async function makeEnv({ fakeLaunchd = true, fakeBridgeJobs = false } = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), "dsh-acct-dev-"));
   const fakeHome = path.join(root, "home");
   const fakeBin = path.join(root, "bin");
@@ -65,9 +66,24 @@ async function makeEnv({ fakeLaunchd = true } = {}) {
   process.env.DSH_TEST_LAUNCH_LOG = path.join(root, "launchctl.log");
   process.env.DSH_REMOTE_TELEMETRY = "0";
   process.env.DSH_RELAY_SKIP_SERVICE = "1"; // 默认隔离：用例按需 unset
+  // 假的 pgrep/ps：让 manualStatus「看得见」一个**旧账号的 bridge 进程**。
+  // 🔴 2026-09-25：本文件测的现场就是「旧账号的 bridge 还在跑」（否则面板压根看不到 accountCurrent=false）,
+  //   而旧实现只伪造了 launchctl、**没伪造 pgrep/ps** —— 于是用例偷偷依赖「开发机上正好有 bridge 在跑」：
+  //   开发机有 → 绿；CI 上没有 → 红（`npm test` 在 router 那步就断了，所以这个红一直被挡住）。
+  //   真实进程状态不该影响用例结果，所以这里显式伪造。
+  let fakeJob = null;
+  if (fakeBridgeJobs) {
+    fakeJob = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: "ignore" });
+    const stub = (body) => `#!/bin/sh\n${body}\n`;
+    await writeFile(path.join(fakeBin, "pgrep"), stub(`echo "${fakeJob.pid} node /x/clients/dsh-remote/dsh-bridge.mjs"`));
+    await chmod(path.join(fakeBin, "pgrep"), 0o755);
+    await writeFile(path.join(fakeBin, "ps"), stub('echo "1"')); // ppid=1 → 不会被当成 launchd 托管
+    await chmod(path.join(fakeBin, "ps"), 0o755);
+  }
   return {
     root, relayDir, fakeHome, launchLog: path.join(root, "launchctl.log"),
     async restore() {
+      try { fakeJob?.kill("SIGKILL"); } catch { /* 已退出 */ }
       for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
       await rm(root, { recursive: true, force: true });
     },
@@ -101,7 +117,9 @@ const json = async (p, init) => {
 // ─────────── ① 旧账号的 bridge 不得被当成「已连接」 ───────────
 
 test("切换账号后：旧账号留下的 online 状态不得再当作注册证据", async () => {
-  const env = await makeEnv();
+  // fakeBridgeJobs：这个现场的前提就是「旧账号的 bridge 进程还在跑」——必须伪造出来，
+  // 而不是指望跑用例的那台机器上恰好有一个（CI 上没有 → 曾经必红）。
+  const env = await makeEnv({ fakeBridgeJobs: true });
   try {
     await writeFile(path.join(env.relayDir, "dsh-setup.mjs"), "// runtime stub");
     // 切账号后的配置：新账号、device_id 已被清空

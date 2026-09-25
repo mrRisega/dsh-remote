@@ -29,10 +29,13 @@ import { chmodSync, existsSync, readFileSync, statSync, utimesSync, writeFileSyn
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { apply } from "../lib/index.js";
 
-const HERE = path.dirname(new URL(import.meta.url).pathname);
+// ⚠️ 必须用 fileURLToPath：Windows 上 `new URL(...).pathname` 得到的是 "/D:/a/..."（带前导斜杠），
+// path.join 之后会拼成 "D:\\D:\\a\\..." → ENOENT。CI 的 Windows 专项就死在这条上。
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SETUP_SRC = readFileSync(path.join(HERE, "..", "..", "..", "dsh-setup.mjs"), "utf8");
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

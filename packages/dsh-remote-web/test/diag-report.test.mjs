@@ -13,10 +13,13 @@ import { readFileSync, rmSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { apply } from "../lib/index.js";
 
-const HERE = path.dirname(new URL(import.meta.url).pathname);
+// ⚠️ 必须用 fileURLToPath：Windows 上 `new URL(...).pathname` 得到的是 "/D:/a/..."（带前导斜杠），
+// path.join 之后会拼成 "D:\\D:\\a\\..." → ENOENT。CI 的 Windows 专项就死在这条上。
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 const readOrEmpty = async (p) => { try { return await readFile(p, "utf8"); } catch { return ""; } };
 
 /** 假反馈服务：只收 /api/feedback 与 /api/feedback/:id/replies（与企业端契约同构）。 */
