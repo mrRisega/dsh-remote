@@ -847,3 +847,30 @@ test("★ 迭代速度护栏：适配层测试的假定时器**必须 unref**（
     assert.match(src, /id\.unref\?\.\(\)/, `${f} 的假 setTimeout 必须 unref（否则该文件会空等数分钟）`);
   }
 });
+
+test("★ 护栏：解析期绝不许往页面塞东西（0.6.14 首屏提示层就是这么做、然后永久盖住 UI 的）", () => {
+  // 事故 3（2026-09-25，业主实测）：「界面都已经加载完了…但这个遮罩一直不消失」，
+  // 截图里官方 UI 就在 88% 不透明的全屏层下面透出来，秒表走到 187 秒 —— 刷新也一样。
+  //
+  // 根因是**设计错误**：那个提示层是 `position:fixed; inset:0; z-index:2147483000` 的全屏层，
+  // 退出条件却是 DOM 启发式（官方 data-* 属性 / 类名前缀 / textarea…）。官方一改版，
+  // 两组信号全不命中 → 层永远留着。当时我写的"pointer-events:none 所以不会挡点击"是自我安慰：
+  // **盖住视线和进不去对用户没区别**。
+  //
+  // 业主决定：直接删掉。这条护栏守两件事：
+  //   ① `dsh-ma-boot` 不许回来；
+  //   ② **解析期**（主机门之前）不许有任何 `appendChild` —— 页面还没确认是官方 dsh web，
+  //      更不该有任何覆盖层；所有注入节点都必须在 boot() 里、过了主机门之后才做。
+  const { js: script, css } = injected();
+  const gate = script.indexOf("/* —— 主机门解除");
+  assert.ok(gate > 0, "找不到主机门锚点（脚本结构变了，请同步更新本用例）");
+  const preGate = script.slice(script.indexOf('"use strict";'), gate);
+  assert.ok(!/appendChild/.test(preGate),
+    "★ 解析期不得往页面 appendChild 任何节点（首屏提示层就是在这里挂上去、然后永远不消失的）");
+  assert.ok(!/dsh-ma-boot/.test(script), "首屏提示层必须已彻底删除");
+
+  // 全屏 + 超高 z-index 的组合本身就是"一旦判断失误就永远进不去"，不许出现
+  assert.ok(!/z-index:\s*[0-9]{7,}/.test(css),
+    "不得出现 1000000 以上的 z-index（压过一切的全屏层 = 判断错一次就锁死用户）");
+  assert.ok(!/dsh-ma-boot/.test(css), "首屏提示层的样式必须已彻底删除");
+});
