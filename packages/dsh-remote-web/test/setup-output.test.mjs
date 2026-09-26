@@ -134,3 +134,25 @@ test("版本比较：预设版 < 同号正式版；beta.10 < beta.11（更新提
   assert.match(src, /const cmp = compareVersions\(latest, current\)/, "update-check 应用 semver 比较");
   assert.match(src, /cmp === null \? Boolean\(latest && latest !== current\) : cmp > 0/);
 });
+
+test("★ 插件覆盖必须原子：staging → 必需文件自检 → rename 切换（2026-09-26「dsh 起不来」事故）", () => {
+  // 事故：旧实现 `rmSync(dest)` → `cpSync(pluginDir, dest)`，于是拷贝期间 dest 是"半个插件"：
+  //   dsh 恰在此刻启动 → package.json 已声明 bundle，但 cordis.patch.yml 还没拷到 →
+  //   `failed to read overlay … cordis.patch.yml: ENOENT` → **整个 GUI 起不来**。
+  //   时间证据：dsh 报错 23:46:03，cordis.patch.yml 写完 23:46:05（差 2 秒）。
+  const reqFn = src.slice(src.indexOf("const PLUGIN_REQUIRED_FILES"), src.indexOf("function copyPluginIntoProfile"));
+  for (const f of ["package.json", "lib/index.js", "lib/client.js", "cordis.patch.yml"]) {
+    assert.match(reqFn, new RegExp(f.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), `必需文件清单缺 ${f}（缺了就又会出现"半个插件"）`);
+  }
+  const fn = src.slice(src.indexOf("function copyPluginIntoProfile"), src.indexOf("function ensurePluginLinked"));
+  assert.match(fn, /\.staging-/, "必须先拷到 staging（全程不碰 dest）");
+  assert.match(fn, /missingPluginFiles\(stage\)/, "🔴 切换前必须自检必需文件");
+  assert.ok(fn.indexOf("missingPluginFiles(stage)") < fn.indexOf("renameSync(stage, dest)"),
+    "🔴 自检必须发生在 rename 切换**之前**");
+  assert.match(fn, /renameSync\(dest, backup\)/, "旧版本要先挪成 backup");
+  assert.match(fn, /renameSync\(backup, dest\)/, "切换失败必须把 backup 改回来（旧版仍可用）");
+  // 反向锁：绝不允许回到"先 rm dest、再 cpSync 逐文件"的旧写法
+  assert.ok(!/fs\.rmSync\(dest,\s*\{\s*recursive:\s*true,\s*force:\s*true\s*\}\);\s*\n\s*fs\.cpSync\(/.test(fn),
+    "🔴 不得再出现「先删 dest 再原地逐文件拷贝」——那正是这次事故的成因");
+  assert.match(fn, /\.staging-\$\{process\.pid\}|\.staging-/, "被强杀留下的 staging 要能清理");
+});
