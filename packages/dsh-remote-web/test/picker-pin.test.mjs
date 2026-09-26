@@ -30,6 +30,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   __pinBrowseDirectoryPicker,
+  __schedulePickerPin,
   __pickerPinState,
   __PICKER_AUTO_ENTRY_ID,
   __PICKER_AUTO_PACKAGE,
@@ -188,8 +189,37 @@ test("诊断面板必须显示目录选择器状态(这类'按钮没反应'才�
   assert.match(SRC, /系统原生（远程时对话框弹在电脑那台机器上/, "原生时要给出可操作的解释");
 });
 
-test("接线:apply 里挂了选择器固定（eff/effect），并且是 fire-and-forget 不阻塞装载", () => {
-  assert.match(SRC, /ctx\.effect\(\(\) => \{[\s\S]{0,200}?pinBrowseDirectoryPicker\(ctx\)[\s\S]{0,120}?\}, "dsh-remote-web: pin browser directory picker"\);/);
+test("接线:apply 挂的是**延后**接线（schedulePickerPin），绝不在启动期直接切 Loader", () => {
+  // 🔴 2026-09-26 事故锁：旧实现是 apply() 里直接 `pinBrowseDirectoryPicker(ctx)`，
+  //    于是 dsh 还在装配插件图时就去 loader.remove/create → dsh-client-modules 反复 compose
+  //    整张前端图（buildCombo/newlineCount/identitySectionMap 热点）→ dsh web 3 分钟不监听、
+  //    表现为假死。DSH_REMOTE_NATIVE_PICKER=1 能立刻恢复，正是这条链的证据。
+  assert.match(SRC, /ctx\.effect\(\(\) => schedulePickerPin\(ctx\), "dsh-remote-web: pin browser directory picker"\);/,
+    "apply 必须走延后接线");
+  assert.ok(!/ctx\.effect\(\(\) => \{[\s\S]{0,200}?pinBrowseDirectoryPicker\(ctx\)/.test(SRC),
+    "apply() 里不得再直接调用 pinBrowseDirectoryPicker —— 那正是启动假死的成因");
+});
+
+test("延后闸门:必须等宿主 listen（boundWebPort）并静置，且只在 native 时换一次", () => {
+  const fn = SRC.slice(SRC.indexOf("function schedulePickerPin"), SRC.indexOf("export function apply"));
+  assert.ok(fn.length > 400, "找不到 schedulePickerPin 的实现");
+  assert.match(fn, /boundWebPort\(\) > 0/, "必须先等宿主 HTTP 服务 listen 起来（‘宿主已启动’最可靠的信号）");
+  assert.match(fn, /PICKER_PIN_SETTLE_MS/, "listen 之后必须静置，避开首轮 client-module compose");
+  assert.match(fn, /kind !== "native"/, "只有认得出是 native 才换");
+  assert.match(fn, /attempts: 1, gapMs: 0/, "只换一次，不再轮询（避免反复触发 compose）");
+  // 认不出/超时一律保留原生，绝不动 Loader
+  assert.match(fn, /action: "skipped"/, "认不出时必须优雅跳过");
+});
+
+test("延后接线可取消(ctx.effect 清理)：返回取消函数且取消后不再动作", async () => {
+  const loader = { store: {}, removed: [], created: [], async remove(id) { this.removed.push(id); }, async create(o) { this.created.push(o); return "id"; }, ctx: {} };
+  const ctx = { get: (n) => (n === "loader" ? loader : null), logger: {} };
+  const cancel = __schedulePickerPin(ctx);
+  assert.equal(typeof cancel, "function", "必须返回可取消的清理函数（宿主随时可能关掉我们）");
+  cancel();
+  await new Promise((r) => setTimeout(r, 30));
+  assert.deepEqual(loader.removed, [], "取消后不得动 Loader");
+  assert.deepEqual(loader.created, [], "取消后不得动 Loader");
 });
 
 test("回归锁:源码里不得再出现「先建 browse、后摘 auto」的顺序（0.6.14 的坏版本）", () => {

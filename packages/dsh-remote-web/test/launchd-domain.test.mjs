@@ -178,3 +178,29 @@ test("★ watcher 退出前必须确保子进程真的死了（只『请』不�
   assert.match(tail, /bridgeProc\.exitCode === null/, "判活要用 exitCode（已退出就别再杀）");
   assert.match(src, /function looksLikeBridge\(pid\)/, "应有 looksLikeBridge 供回收前校验命令行");
 });
+
+test("★ 守护惊群：启动锁必须排在去重读取**之前**，且先写 pid 再释放锁", () => {
+  // 2026-09-26 真机事故：一次重启窗口里同时活下来 6 个 `dsh-setup.mjs run` + 6 个 bridge，
+  // 全部用同一 deviceId 抢 router 注册（日志刷满 `replaced by new connection`），隧道无限抖动。
+  // 成因：去重是"先读 pid 文件、后写 pid 文件"，N 个实例同时启动时每个都读到"没有别人"。
+  const rb = src.slice(src.indexOf("async function runBridge()"), src.indexOf("// ---------- setup"));
+  const iLock = rb.indexOf("tryAcquireSpawnLock()");
+  const iRead = rb.indexOf("const other = readPidFile(WATCHER_PID_FILE)");
+  assert.ok(iLock > 0, "runBridge 必须有启动锁");
+  assert.ok(iRead > 0, "找不到去重读取点");
+  assert.ok(iLock < iRead, "🔴 抢锁必须在读 pid 文件之前，否则惊群照旧");
+  assert.match(rb, /writePidFile\(WATCHER_PID_FILE, process\.pid\);\s*\n\s*releaseSpawnLock\(\);/,
+    "🔴 必须先把自己的 pid 落盘再释放锁 —— 否则'释放 → 1373 行才写'之间又是一个空窗");
+  assert.match(rb, /另一个守护正在启动（启动锁被占用）/, "抢不到锁的实例必须让位并留下可诊断的日志");
+});
+
+test("★ 启动锁：必须是排他创建 + 带陈旧可抢占（绝不能让一把残留锁把 bridge 永久挡在门外）", () => {
+  const fn = src.slice(src.indexOf("function tryAcquireSpawnLock()"), src.indexOf("function releaseSpawnLock()"));
+  assert.match(fn, /openSync\(f, "wx"\)/, "必须用 wx 排他创建（原子的'要么拿到要么没有'）");
+  assert.match(fn, /SPAWN_LOCK_STALE_MS/, "必须有陈旧阈值");
+  assert.match(fn, /!pidAlive\(pid\)/, "持锁进程已死 → 视为陈旧，可抢占");
+  assert.match(fn, /fs\.rmSync\(f, \{ force: true \}\)/, "陈旧锁必须被清掉再抢");
+  const rel = src.slice(src.indexOf("function releaseSpawnLock()"), src.indexOf("// ---------- run："));
+  assert.match(rel, /owner === process\.pid/, "只删自己那把锁（别把接管者的锁删了）");
+  assert.match(src, /XPC_SERVICE_NAME/, "被监管者要能等到锁（它必须能接管）");
+});

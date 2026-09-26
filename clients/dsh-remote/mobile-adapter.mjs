@@ -136,6 +136,19 @@ const STYLE = `
   html.dsh-ma-sidebar-open div.pI_x6G_sidebarCol:not(.dsh-ma-details),
   html.dsh-ma-sidebar-open div.dsh-ma-sidebar:not(.dsh-ma-details) { z-index: 310; }
 
+  /* 🔒 0.6.18 白柱兜底（用户报的「点官方抽屉里的收起按钮 → 左半边一片白色占位，只有刷新能出去」）：
+     **官方说收起 + 我们此刻没有活的展开意图** → 这一列一律留在屏外，不管别的 class 怎么说。
+     为什么必须放在 CSS 层：那根白柱是 sidebarCol 被钉成 fixed + translateX(0) + z-index:310 的
+     **空壳**（官方已把列宽压成 0、内容收起，只剩一个没有内容的白色固定柱盖住左半屏），
+     而且它几何上"在视口里"，连遮罩不变量都会误判成"抽屉还在" → 整屏被困、只有刷新能出去。
+     JS 侧已经会在官方收起时放弃过期意图（见 sync() 的 collapsedEdge 判定），这一条是不依赖任何
+     JS 判定链的最后一道硬保证。
+     ⚠️ 必须带 :not(.dsh-ma-user-wants-open)：用户明确要开时必须能开 —— 哪怕官方 toggle 坏了、
+        属性永远停在"收起"（那是 0.6.9-beta.2 就定下的自救路径，护栏用例守着）。
+        "官方收起 + 用户仍要开"是**合法**状态（离屏抽屉滑进来），不是白柱。 */
+  html.dsh-ma-official-collapsed:not(.dsh-ma-user-wants-open) div.pI_x6G_sidebarCol:not(.dsh-ma-details),
+  html.dsh-ma-official-collapsed:not(.dsh-ma-user-wants-open) div.dsh-ma-sidebar:not(.dsh-ma-details) { transform: translateX(-103%) !important; }
+
   div.pI_x6G_detailsCol, div.pI_x6G_rightbarCol, div.dsh-ma-details, div.dsh-ma-rightbar {
     position: fixed; right: 0; top: 0; bottom: 0; margin: 0;
     width: min(92vw, 400px); max-width: 96vw;
@@ -321,6 +334,24 @@ button.dsh-ma-fab .dsh-ma-fab-lock {
   background: var(--dsw-alias-bg-elevated, #fff);
   box-shadow: 0 0 0 .5px var(--dsw-alias-border-l3, rgba(127,127,127,.3));
 }
+/* 手机图标（内联 SVG，0.6.18 起替代原来的「字」）：flex 居中，颜色继承按钮的 color
+   （暗色主题/官方变量变化都跟着走），尺寸由 SVG 的 width/height 决定。 */
+button.dsh-ma-fab .dsh-ma-fab-ico { display: flex; align-items: center; justify-content: center; color: inherit; }
+/* 延迟角标：**必须**在 FAB 内部（绝对定位子元素）——右上角已经是 .dsh-ma-fab-lock 的位置
+   （top:-3px;right:-3px），所以放正下方；也**不得**做成 body 级浮层（护栏：
+   test/mobile-adapter-guards.test.mjs「提示行必须在菜单内、不得有固定层」）。
+   pointer-events:none：角标压在按钮下沿外，别把按钮的拖动/轻点热区吃掉。 */
+button.dsh-ma-fab .dsh-ma-fab-rtt {
+  position: absolute; left: 50%; bottom: -13px; transform: translateX(-50%);
+  font-size: 9.5px; line-height: 1; padding: 1px 4px; border-radius: 999px; white-space: nowrap;
+  pointer-events: none;
+  background: var(--dsw-alias-bg-elevated, #fff); color: var(--dsw-alias-label-tertiary, #6b7280);
+  box-shadow: 0 0 0 .5px var(--dsw-alias-border-l3, rgba(127,127,127,.3));
+}
+button.dsh-ma-fab .dsh-ma-fab-rtt[hidden] { display: none !important; }
+button.dsh-ma-fab .dsh-ma-fab-rtt[data-rtt="ok"] { color: var(--dsw-alias-label-success, #1a7f37); }
+button.dsh-ma-fab .dsh-ma-fab-rtt[data-rtt="mid"] { color: var(--dsw-alias-label-warning, #9a6700); }
+button.dsh-ma-fab .dsh-ma-fab-rtt[data-rtt="bad"] { color: var(--dsw-alias-label-danger, #cf222e); }
 /* 菜单卡片:fixed 贴右下，最大高度受限可滚动 */
 div.dsh-ma-menu {
   position: fixed;
@@ -365,18 +396,23 @@ div.dsh-ma-menu .dsh-ma-menu-ticks {
   display: flex; justify-content: space-between;
   color: var(--dsw-alias-label-tertiary, #6b7280); font-size: 11px;
 }
-div.dsh-ma-menu .dsh-ma-menu-preview {
-  margin-top: 8px; padding-top: 8px; font-size: 14px;
-  border-top: .5px solid var(--dsw-alias-border-l3, rgba(127,127,127,.22));
-}
-div.dsh-ma-menu .dsh-ma-menu-e2ee {
+/* 网络延迟行（0.6.18）：与「加密状态」行同款方块，纯只读。
+   ⚠️ 它**不是**测速：样本全部来自适配层已经包装过的 window.fetch（会话过期探测那一处），
+   零新增请求；没有样本时显示「测速中…」而不是 0ms（0ms 是谎言，见 SCRIPT 里的注释）。 */
+div.dsh-ma-menu .dsh-ma-menu-e2ee,
+div.dsh-ma-menu .dsh-ma-menu-net {
   display: flex; align-items: flex-start; gap: 8px;
   font-size: 12.5px; line-height: 1.6;
   background: var(--dsw-alias-bg-base, rgba(127,127,127,.08));
   border-radius: 10px; padding: 9px 11px;
 }
-div.dsh-ma-menu .dsh-ma-menu-e2ee .ico { flex: none; }
-div.dsh-ma-menu .dsh-ma-menu-e2ee .txt { min-width: 0; overflow-wrap: anywhere; }
+div.dsh-ma-menu .dsh-ma-menu-e2ee .ico,
+div.dsh-ma-menu .dsh-ma-menu-net .ico { flex: none; }
+div.dsh-ma-menu .dsh-ma-menu-e2ee .txt,
+div.dsh-ma-menu .dsh-ma-menu-net .txt { min-width: 0; overflow-wrap: anywhere; }
+div.dsh-ma-menu .dsh-ma-menu-net[data-rtt="ok"] .txt { color: var(--dsw-alias-label-success, #1a7f37); }
+div.dsh-ma-menu .dsh-ma-menu-net[data-rtt="mid"] .txt { color: var(--dsw-alias-label-warning, #9a6700); }
+div.dsh-ma-menu .dsh-ma-menu-net[data-rtt="bad"] .txt { color: var(--dsw-alias-label-danger, #cf222e); }
 /* ⚠️ 必须显式写 [hidden]：UA 的 [hidden]{display:none} 会被上面的 display:flex 盖过（实测过）。 */
 div.dsh-ma-menu .dsh-ma-e2ee-sec[hidden],
 div.dsh-ma-menu .dsh-ma-menu-e2ee[hidden] { display: none !important; }
@@ -384,7 +420,8 @@ button.dsh-ma-fab .dsh-ma-fab-lock[hidden] { display: none !important; }
 div.dsh-ma-menu .dsh-ma-menu-e2ee.is-warn .txt { color: var(--dsw-alias-label-warning, #9a6700); }
 div.dsh-ma-menu .dsh-ma-menu-e2ee.is-err .txt { color: var(--dsw-alias-label-danger, #cf222e); }
 div.dsh-ma-menu .dsh-ma-menu-e2ee a { color: var(--dsw-alias-brand-primary, #4d6bfe); }
-button.dsh-ma-menu-back {
+button.dsh-ma-menu-back,
+button.dsh-ma-menu-right {
   display: block; width: 100%; box-sizing: border-box;
   margin-top: 12px; padding: 11px 12px;
   border-radius: 10px; border: .5px solid var(--dsw-alias-border-l3, rgba(127,127,127,.3));
@@ -394,7 +431,15 @@ button.dsh-ma-menu-back {
   cursor: pointer; touch-action: manipulation;
   -webkit-tap-highlight-color: transparent;
 }
-button.dsh-ma-menu-back:active { transform: scale(.98); }
+button.dsh-ma-menu-back:active,
+button.dsh-ma-menu-right:active { transform: scale(.98); }
+/* 「打开右侧栏」是本层**唯一**能主动把第三列（官方右栏）滑进手机的入口，
+   用品牌色描边与「返回设备列表」区分开（后者是退路，前者是功能）。 */
+button.dsh-ma-menu-right {
+  margin-top: 8px;
+  color: var(--dsw-alias-brand-primary, #4d6bfe);
+  border-color: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d6bfe) 45%, transparent);
+}
 div.dsh-ma-menu .dsh-ma-menu-note {
   margin-top: 8px; font-size: 11.5px; line-height: 1.7;
   color: var(--dsw-alias-label-tertiary, #6b7280);
@@ -439,6 +484,23 @@ html[data-dsh-ma-merged-e2ee] #dsh-e2ee-badge { display: none !important; }
 /* 桌面宽屏(>820px):只有上面这些 .dsh-ma-* 元素可见(悬浮按钮/菜单/引导条)，
    官方界面本身不受任何影响。 */
 `;
+
+/**
+ * 悬浮按钮上的手机图标（0.6.18 起替代原来的「字」）。
+ *
+ * 为什么内联 SVG：仓库里**没有**可复用的手机图标 —— 全工作区唯一的 SVG 是
+ * `image/icon.svg`（应用图标，含「远程控制」文字 + 显示器，viewBox 512，做 20px 图标不可用）；
+ * 产品其它地方用的「手机图标」是 📱 emoji（client.js:804/4287），但 emoji 的字形与基线随系统变，
+ * 放在 46×46 的圆形按钮里会偏。写法照本文件汉堡按钮（viewBox 24 + stroke="currentColor"），
+ * 这样颜色跟着按钮的 color 走，暗色主题/官方变量变化都不用另写规则。
+ */
+const FAB_PHONE_SVG =
+  '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+  'stroke-width="1.8" stroke-linecap="round" aria-hidden="true">' +
+  '<rect x="6" y="2.5" width="12" height="19" rx="3"/>' +
+  '<path d="M10 5.5h4"/>' +
+  '<circle cx="12" cy="18.6" r="1.1" fill="currentColor" stroke="none"/>' +
+  "</svg>";
 
 const SCRIPT = `(() => {
   "use strict";
@@ -510,7 +572,8 @@ const SCRIPT = `(() => {
 
      ⚠️ 刻意**不**做成页面顶部/底部的固定细条：那种细条同样会盖住官方 UI 的一部分，
         而且同样有"永不消失"的失败方向。菜单是被动展开的，天然没有这个问题。 */
-  var maLoadWatch = { startedAt: Date.now(), slow: false, wired: false, bound: false, warnEl: null, warnTxt: null };
+  var maLoadWatch = { startedAt: Date.now(), slow: false, wired: false, bound: false, warnEl: null, warnTxt: null,
+                      reported: false, reportMs: 0 };
   /** 官方界面是否已经可用（只看最强信号；只用于决定"要不要多显示一行字"）。 */
   function maLoadReadyNow() {
     try {
@@ -520,6 +583,67 @@ const SCRIPT = `(() => {
   }
   function maLoadWaitedSec() {
     return Math.max(0, Math.round((Date.now() - maLoadWatch.startedAt) / 1000));
+  }
+  /**
+   * 单调时钟（performance.now；不可用时退回 Date.now）。
+   * 延迟采样与 mirror_load 量测共用：**同一次量测的两端必须用同一个时钟**，
+   * 否则 performance.now 与 Date.now 混用会算出负数/巨值。
+   */
+  function maNowMs() {
+    try {
+      if (typeof performance !== "undefined" && performance && typeof performance.now === "function") return performance.now();
+    } catch (e) { /* 继续退化 */ }
+    return Date.now();
+  }
+  /**
+   * 镜像页就绪耗时（毫秒）——**口径见 docs/TELEMETRY-CONTRACT.md / 迭代冻结文档 §2.3**：
+   *   · 起点 = **导航开始**（performance.now() 的零点 = performance.timeOrigin ≈ 导航开始），
+   *     所以一条值同时覆盖 DNS+TLS+HTML TTFB + 解析 + 界面就绪；
+   *   · **不能**用 Date.now() - maLoadWatch.startedAt：那个起点是"注入脚本解析时刻"，会**漏掉
+   *     HTML TTFB**（HAR 实测那 79 秒里 TTFB 就有 8.7 秒），报出来的数会系统性小于用户体感；
+   *     而且 bfcache 恢复（pageshow persisted）不会重置 startedAt，那口径还能报出几十分钟。
+   *   · 没有 performance 时退化回 startedAt 口径（老浏览器兜底，宁可粗糙也不能漏报）。
+   */
+  function maLoadElapsedMs() {
+    try {
+      if (typeof performance !== "undefined" && performance && typeof performance.now === "function") {
+        var v = performance.now();
+        if (typeof v === "number" && isFinite(v) && v >= 0) return v;
+      }
+    } catch (e) { /* 继续退化 */ }
+    return Math.max(0, Date.now() - maLoadWatch.startedAt);
+  }
+  /**
+   * 上报镜像页加载耗时（事件名 mirror_load；宿主半路由由 D6 线新增）。
+   *
+   * 纪律（三条都来自"绝不打扰用户"）：
+   *   ① **同一页只报一次**（reported 标志）—— bfcache 恢复/多路兜底重复触发都不再报；
+   *   ② **全程静默**：任何异常都吞掉，失败绝不影响页面，也绝不做重试；
+   *   ③ 只在**已有的**同一批请求之外发这一次（一次 POST，几十字节），不是测速、不轮询。
+   * body = { ms, outcome, at }：ms=耗时毫秒（截到 [0,600000]，与契约一致）；outcome ∈ {ok,slow}
+   * （slow = 25 秒看门狗兜底，是"删失下限"，后台只把 ok 计入 P50/P90）；at=事件发生的 epoch ms。
+   */
+  function maReportMirrorLoad(outcome) {
+    if (maLoadWatch.reported) return;
+    maLoadWatch.reported = true;
+    try {
+      var ms = Math.round(maLoadElapsedMs());
+      if (!isFinite(ms) || ms < 0) ms = 0;
+      if (ms > 600000) ms = 600000;
+      maLoadWatch.reportMs = ms;
+      var body = JSON.stringify({ ms: ms, outcome: outcome === "slow" ? "slow" : "ok", at: Date.now() });
+      var p = null;
+      try {
+        p = fetch("/dsh-remote/telemetry/mirror-load", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: body,
+          keepalive: true
+        });
+      } catch (e) { p = null; }
+      // 失败静默：不重试、不提示、不 console.error（这是纯遥测，任何噪音都是打扰）
+      if (p && typeof p.catch === "function") p.catch(function () { /* 忽略 */ });
+    } catch (e) { /* 遥测绝不把页面拖挂 */ }
   }
   /** 给客服看的一句话（含等待时长与 UA，便于直接定位）。 */
   function maLoadCopyLine() {
@@ -566,11 +690,14 @@ const SCRIPT = `(() => {
   }
   // 25 秒后仍认不出官方界面 → 置慢标记（**只改状态，不碰 DOM**）。
   // 阈值取得很宽松：宁可漏报（什么都不显示，与今天一致），也不要误报吓人。
+  // 同一处顺手把 mirror_load 的**兜底样本**发出去（outcome="slow"）：25 秒没就绪的页面上报的
+  // 必然是"≥25 秒"，这是**删失下限**而不是真实耗时，后台只把它单列，不混进 P50/P90。
   setTimeout(function () {
     try {
       if (maLoadReadyNow()) return;
       maLoadWatch.slow = true;
       if (maLoadWatch.wired) maLoadRenderWarn();
+      maReportMirrorLoad("slow");
     } catch (e) { /* 忽略 */ }
   }, 25 * 1000);
 
@@ -877,6 +1004,34 @@ const SCRIPT = `(() => {
 
     /* 悬浮按钮/菜单：任何宽度都要有（电脑端访问镜像页同样需要「返回设备列表」的出口），
        与手机端布局改造分开守门；失败也不影响布局适配。 */
+    /* —— 「打开右侧栏」的接线（落点见 buildRemoteMenu 里的按钮注释）——
+       buildRemoteMenu 在**任何宽度**都会建（电脑端也要有返回设备列表的出口），而驱动第三列滑入的
+       状态机（detailsSticky / centerTouchedAt / sync）只在 boot() 的窄屏段里存在 ——
+       两者作用域不同、执行顺序也不保证（fab 先建）。所以用**一个模块级回调**做唯一接口：
+       菜单按钮只调 maRightPaneRequest()，状态机自己决定怎么开，两边永不互相引用私有变量。 */
+    let maOpenRightPane = null;   // 由 boot() 的窄屏段注入；null = 还没建好或当前是宽屏
+    /** 官方第三列（右栏）的「展开」按钮探测 —— 只用官方 aria-label / 结构，不认第三方标记。
+        官方 0.1.5-rc.2：收起态下会话头有一颗 ExpandButton，展开后它就消失 ——
+        所以"找不到"是正常情况（宽屏本来就不需要），不是错误。 */
+    const maRightPaneExpandBtn = () => {
+      try {
+        const sels = [
+          '[aria-label="Expand right sidebar"]', '[aria-label="Open right sidebar"]',
+          '[aria-label="Expand right pane"]',
+          '[aria-label="展开右侧栏"]', '[aria-label="打开右侧栏"]', '[aria-label="展开右栏"]'
+        ];
+        for (let i = 0; i < sels.length; i++) {
+          const el = document.querySelector(sels[i]);
+          if (el) return el;
+        }
+      } catch (e) { /* 选择器异常/老浏览器：当作找不到 */ }
+      return null;
+    };
+    const maRightPaneRequest = () => {
+      if (typeof maOpenRightPane === "function") { try { maOpenRightPane(); return; } catch (e) { /* 落到下面兜底 */ } }
+      // 宽屏 / 状态机还没建好：至少替用户点一下官方那颗展开按钮（没有就什么都不做，绝不报错）
+      try { const b = maRightPaneExpandBtn(); if (b && b.click) b.click(); } catch (e2) { /* 忽略 */ }
+    };
     let fabDone = false;
     const buildRemoteMenu = () => {
       /* ===== 统一「远程控制」悬浮按钮：字号 + 加密状态 + 返回设备列表 =====
@@ -938,11 +1093,19 @@ const SCRIPT = `(() => {
         '<div class="dsh-ma-menu-sub">当前 <b class="dsh-ma-menu-fsval">最小</b> · 只影响这台设备的远程页面</div>' +
         '<input type="range" min="0" max="3" step="1" value="0" aria-label="显示字号">' +
         '<div class="dsh-ma-menu-ticks"><span>最小</span><span>中</span><span>大</span><span>超大</span></div>' +
-        '<div class="dsh-ma-menu-preview">预览：手机远程控制，随手可用。</div>' +
+        // 网络延迟（0.6.18）：样本来自**已有**的 fetch 包装，零新增请求；无样本时显示「测速中…」。
+        // ⚠️ 单独一小节（不塞进「加密状态」）：两者是独立的可观测项，混在一起会让"加密好好的、
+        //    但网很慢"这种情况读起来像加密出了问题。
+        '<div class="dsh-ma-menu-sec">网络延迟</div>' +
+        '<div class="dsh-ma-menu-net" data-role="net"><span class="ico">📶</span><span class="txt">测速中…</span></div>' +
         '<div class="dsh-ma-e2ee-sec" data-role="e2ee-sec">' +
           '<div class="dsh-ma-menu-sec">加密状态</div>' +
           '<div class="dsh-ma-menu-e2ee" data-role="e2ee"><span class="ico">🔒</span><span class="txt">正在读取…</span></div>' +
         '</div>' +
+        // 「打开右侧栏」（0.6.18）：手机端第三列是离屏浮层，滑入闸门要求"用户 8 秒内在正文点过"，
+        // 而把按钮注册进官方右栏的第三方插件（如 dsh-better-sidebar）只翻它自己的 store，
+        // 官方 cols.rightbar 永远是 0 → 面板永远不滑进来。这里给用户一条明路（详见下方 click 处理）。
+        '<button type="button" class="dsh-ma-menu-right" data-role="right-pane">📋 打开右侧栏</button>' +
         '<button type="button" class="dsh-ma-menu-back">← 返回设备列表</button>' +
         '<div class="dsh-ma-load-warn" data-role="load-warn" hidden>' +
           '<span class="ico">⚠</span>' +
@@ -1006,20 +1169,25 @@ const SCRIPT = `(() => {
       fab.type = "button";
       fab.className = "dsh-ma-fab";
       fab.setAttribute("aria-label", "远程控制菜单（可拖动）");
-      fab.title = "远程控制：字号 / 加密状态 / 返回设备列表（可拖动移动位置）";
-      fab.innerHTML = '<span class="dsh-ma-fab-ico">字</span><span class="dsh-ma-fab-lock" data-role="lock">🔒</span>';
+      fab.title = "远程控制：字号 / 网络延迟 / 加密状态 / 返回设备列表（可拖动移动位置）";
+      /* 图标（0.6.18 起）:原来的「字」换成手机图标 —— 用户口述「要我们自己用的那个手机的图标」。
+         锁 🔒 依旧在右上角（.dsh-ma-fab-lock），延迟角标在**正下方**（.dsh-ma-fab-rtt，见 CSS）。 */
+      fab.innerHTML = '<span class="dsh-ma-fab-ico" aria-hidden="true">' + ${JSON.stringify(FAB_PHONE_SVG)} + '</span>'
+        + '<span class="dsh-ma-fab-lock" data-role="lock">🔒</span>'
+        + '<span class="dsh-ma-fab-rtt" data-role="rtt" hidden></span>';
       fab.style.left = Math.round(clampFabXY(fabXY(fabPos)).left) + "px";
       fab.style.top = Math.round(clampFabXY(fabXY(fabPos)).top) + "px";
       document.body.appendChild(fab);
 
       const fsRange = menu.querySelector('input[type="range"]');
       const fsVal = menu.querySelector(".dsh-ma-menu-fsval");
-      const fsPreview = menu.querySelector(".dsh-ma-menu-preview");
+      /* 注:原来的「预览：手机远程控制，随手可用。」那一行（.dsh-ma-menu-preview）已按用户要求删除
+         —— DOM / CSS / 这里的联动三处一起删。字号是否生效不需要一行示例文案：改滑块时
+         官方正文（--dsh-content-font-size）与整页文本缩放是立刻可见的。 */
       const setLevel = (level, persist) => {
         const L = applyFsLevel(level);
         if (fsVal) fsVal.textContent = L.name;
         if (fsRange && Number(fsRange.value) !== level) fsRange.value = String(level);
-        if (fsPreview) fsPreview.style.fontSize = L.content + "px";
         if (persist) { try { window.localStorage && window.localStorage.setItem(FS_KEY, String(level)); } catch (e3) { /* 忽略 */ } }
       };
       setLevel(readFsLevel(), false);
@@ -1059,6 +1227,88 @@ const SCRIPT = `(() => {
       renderE2ee();
       [600, 2000, 5000].forEach((ms) => setTimeout(renderE2ee, ms)); // shim 可能晚于本层挂牌
 
+      /* ---- 网络延迟（0.6.18）-------------------------------------------------------
+         需求原话是「要能看见网络延迟」。这里**绝不主动测速**：任何 ping/定时打点都会给手机
+         加流量、给中继加请求，而镜像页本来就有 HTTP 流量。样本全部取自下面那个**已经存在**的
+         window.fetch 包装（0.6.17 起为「会话过期探测」而装，只读 res.status）。
+         注入顺序保证了语义正确：bridge 先注入 adapter、后注入 e2ee shim
+         （dsh-bridge.mjs:763 → :770），两者都 splice 到 </head> 前 → adapter 的 fetch 包装在
+         **内层** → 它量到的是"去掉加解密后的真实网络往返"（这正是用户想要的"网速"）。
+
+         统计口径：最近 RTT_KEEP(8) 次**成功**样本取中位数。
+           · 用中位数而不是均值/EWMA：偶发的一次 GC/系统调度卡顿会把均值永久带偏，
+             中位数对单次离群点免疫，同时比"最小值"更贴近体感（最小值永远偏乐观）；
+           · 失败（reject）/超时（>20s）/亚毫秒（同一帧内的缓存命中）都不进样本：
+             前者不是网络耗时，后者会算出 0ms 这种"谎言"；
+           · **无样本时显示「测速中…」而不是 0ms** —— 0ms 会让人以为网络飞快。
+         分档：≤120ms 顺畅 / ≤300ms 一般 / >300ms 较慢（移动网络下这三档比较贴合体感）。 */
+      const RTT_KEEP = 8, RTT_MAX_MS = 20000;
+      const rttSamples = [];
+      const rttEl = fab.querySelector('[data-role="rtt"]');
+      const netEl = menu.querySelector('[data-role="net"]');
+      const rttValue = () => {
+        if (!rttSamples.length) return null;
+        const s = rttSamples.slice().sort((a, b) => a - b);
+        const mid = s.length >> 1;
+        return s.length % 2 ? s[mid] : Math.round((s[mid - 1] + s[mid]) / 2);
+      };
+      const rttGrade = (ms) => (ms <= 120 ? "ok" : ms <= 300 ? "mid" : "bad");
+      const rttLabel = (g) => (g === "ok" ? "顺畅" : g === "mid" ? "一般" : "较慢");
+      const FAB_TITLE_BASE = "远程控制：字号 / 网络延迟 / 加密状态 / 返回设备列表（可拖动移动位置）";
+      const renderRtt = () => {
+        try {
+          const ms = rttValue();
+          const g = ms === null ? "" : rttGrade(ms);
+          if (rttEl) {
+            if (ms === null) { rttEl.hidden = true; rttEl.textContent = ""; rttEl.removeAttribute("data-rtt"); }
+            else {
+              rttEl.hidden = false;
+              rttEl.textContent = ms + "ms";
+              rttEl.setAttribute("data-rtt", g);
+            }
+          }
+          if (netEl) {
+            netEl.setAttribute("data-rtt", g || "");
+            const ico = netEl.querySelector(".ico");
+            const txt = netEl.querySelector(".txt");
+            if (ico) ico.textContent = ms === null ? "📶" : (g === "bad" ? "📵" : "📶");
+            if (txt) txt.textContent = ms === null ? "测速中…（等一次网络请求后显示）" : (ms + " ms · " + rttLabel(g));
+          }
+          try { fab.title = ms === null ? FAB_TITLE_BASE : ("远程控制：网络延迟 " + ms + "ms（" + rttLabel(g) + "） / 字号 / 加密状态 / 返回设备列表（可拖动）"); } catch (e) { /* 忽略 */ }
+        } catch (e) { /* 延迟显示失败绝不影响主功能 */ }
+      };
+      /** 记一个成功样本（由 fetch 包装在**响应到达**时调用；失败/超时不调用）。 */
+      const noteRtt = (ms) => {
+        if (typeof ms !== "number" || !isFinite(ms)) return;
+        const r = Math.round(ms);
+        if (r < 1 || r > RTT_MAX_MS) return;      // 亚毫秒=同帧缓存命中；>20s=卡住/超时 → 都不是"网络延迟"
+        rttSamples.push(r);
+        while (rttSamples.length > RTT_KEEP) rttSamples.shift();
+        renderRtt();
+      };
+      renderRtt();
+
+      /* 「打开右侧栏」：手机端第三列（官方右栏）是**离屏浮层**，唯一滑入闸门在 sync() 里：
+            detailsAttrLive() && !detailsCollapsed() && (用户 8s 内在正文点过 || detailsSticky)
+         而 better-sidebar 这类"把按钮注册进官方右栏"的插件只翻它**自己**的 store，官方 cols.rightbar
+         永远是 0 → 面板永远不会滑进来（用户报的「右侧按钮区看不见」）。
+         这里给用户一条**明路**：把"我要看右侧栏"登记成和"在正文里点了一下"等价的意图（不受 8s 窗口
+         限制），并在官方确实有展开按钮时替用户点一下。
+         ⚠️ 探测只用**官方类名/aria-label/结构**，绝不依赖 better-sidebar 的私有标记
+            （data-rightbar-col / data-dsh-center-col）—— 那正是 0.6.15/0.6.16 反复踩的坑：
+             插件换版本或被卸载，标记就没了，适配层会跟着失灵。
+         ⚠️ 状态机在 boot() 的窄屏段里（buildRemoteMenu 宽窄都建、且可能更早执行），
+            所以通过模块级回调 maOpenRightPane 单向调用；拿不到回调（宽屏/还没建好）时
+            退化成"只点官方那颗展开按钮"。 */
+      const rightBtn = menu.querySelector('[data-role="right-pane"]');
+      if (rightBtn) {
+        rightBtn.addEventListener("click", (e) => {
+          e.stopPropagation(); e.preventDefault();
+          closeMenu();
+          maRightPaneRequest();
+        });
+      }
+
       /* ---- 交互 ---- */
       /* 菜单跟随按钮：按钮在上半屏 → 菜单挂在它下方；按钮靠左 → 菜单左对齐（都不超出视口）。 */
       const placeMenu = () => {
@@ -1084,7 +1334,9 @@ const SCRIPT = `(() => {
         } catch (e) { /* 定位失败不影响功能（退回 CSS 默认位置） */ }
       };
       const closeMenu = () => { menu.hidden = true; };
-      const openMenu = () => { renderE2ee(); menu.hidden = false; placeMenu(); };
+      // 打开菜单时刷新一次延迟显示（与 renderE2ee 同理：被动展开的 UI 不需要定时器，
+      // 打开的那一刻就是最新的）
+      const openMenu = () => { renderE2ee(); renderRtt(); menu.hidden = false; placeMenu(); };
       let suppressClickUntil = 0; // 拖完的那一下不要当成"点击打开菜单"
       let tapHandledAt = 0;        // 轻点已在 pointerup 里处理过（避免 click 再翻一次）
       const toggleMenu = () => { if (menu.hidden) openMenu(); else closeMenu(); };
@@ -1198,14 +1450,24 @@ const SCRIPT = `(() => {
             window.fetch = function (input, init) {
               let url = "";
               try { url = typeof input === "string" ? input : (input && input.url) || ""; } catch (e5) { url = ""; }
+              /* 网络延迟采样（0.6.18）：**复用这处已有的包装**，零新增请求。
+                 t0 取在真正发请求之前、响应到达之后读差值 —— 量到的就是这一趟的真实往返。
+                 ⚠️ 只在同源且"像 API"的请求上量（与下面会话过期探测同一组判定）：
+                    静态壳/图片/字体不该代表"网络延迟"；telemetry 那条 /dsh-remote/telemetry/... 也
+                    不在 apiish 里（它既不含 "/api/" 也不含 "/remote/"，只有 "-remote/"），
+                    所以一次性的遥测上报不会污染样本。
+                 ⚠️ 失败(reject)/超时(>20s)不进样本 —— 那不是"延迟"，是"没通"（noteRtt 里已过滤）。 */
+              const t0 = maNowMs();
               const p = origFetch.call(this, input, init);
               try {
                 const abs = url.slice(0, 8).toLowerCase();
                 const sameOrigin = !(abs.indexOf("http://") === 0 || abs.indexOf("https://") === 0) || url.indexOf(window.location.origin) === 0;
                 const apiish = url.indexOf("/api/") >= 0 || url.indexOf("/remote/") >= 0 || url.indexOf("_devices") >= 0 || url.indexOf("_quota") >= 0;
                 if (sameOrigin && apiish && p && typeof p.then === "function") {
-                  p.then((res) => { try { noteStatus(res && res.status); } catch (e6) { /* 忽略 */ } },
-                         () => { /* 网络错误不算会话过期 */ });
+                  p.then((res) => {
+                    try { noteStatus(res && res.status); } catch (e6) { /* 忽略 */ }
+                    try { noteRtt(maNowMs() - t0); } catch (e6b) { /* 忽略 */ }
+                  }, () => { /* 网络错误不算会话过期，也不算延迟样本 */ });
                 }
               } catch (e7) { /* 忽略 */ }
               return p;
@@ -1382,6 +1644,7 @@ const SCRIPT = `(() => {
         e.stopPropagation();
         userWantsOpen = false;                    // 用户明确要关(遮罩的作用就是关抽屉)
         centerTouchedAt = 0; detailsSticky = false; // 顺带收回"要看详情"的意图(下次在正文里点一下即可恢复)
+        rightPaneWanted = false;                    // 也收回「打开右侧栏」的显式请求
         const t = toggleOf();
         if (t) { t.click(); }
         /* 兜底 + 保险:无论官方 toggle 在不在,都确保"点空白处"能关掉/不再拦截 */
@@ -1400,10 +1663,15 @@ const SCRIPT = `(() => {
         e.stopPropagation(); e.preventDefault();
         const nowOpen = document.documentElement.classList.contains("dsh-ma-sidebar-open");
         // 先登记用户意图:即便官方 toggle 不存在、或几何判定一时不满足,这次展开也必须成立
-        userWantsOpen = !nowOpen;
+        const desired = !nowOpen;
+        userWantsOpen = desired;
         const t = toggleOf();
-        if (t && !nowOpen) { t.click(); }        // 官方 toggle 存在 → 交给官方(state 一致)
-        else if (t && nowOpen) { t.click(); }
+        /* ⚠️ 0.6.18 修（用户报的「点官方抽屉里的收起按钮 → 白柱 + 整屏被困，只有刷新能出去」）：
+           旧实现无论官方当前是什么状态都无条件 t.click() —— 于是"适配层以为开着、官方其实已收起"时，
+           这一点会把官方**推回展开**，而我们的 class 被摘掉 → 抽屉隐形；再点一次又反过来，
+           两态互相打架、白柱反复重现。现在只在**官方当前态 ≠ 期望态**时才点官方 toggle：
+           状态一致时点它只会把官方推到相反方向。 */
+        if (t && expanded() !== desired) { t.click(); }
         sync();                                   // 立刻按意图生效(不依赖官方属性回调)
       });
 
@@ -1437,6 +1705,31 @@ const SCRIPT = `(() => {
       };
       const sidebarInView = () => isDrawer(sidebar || document.querySelector(".dsh-ma-sidebar"));
       const detailsInView = () => isDrawer(details || document.querySelector(".dsh-ma-details, .dsh-ma-rightbar"));
+      /**
+       * 抽屉列是不是**空壳**：官方已经把内容收起来了，只剩一个宽度还在的固定柱。
+       *
+       * 为什么需要（0.6.18 用户报的白柱）：用户点官方抽屉里的收起按钮后，userWantsOpen 仍为 true
+       * → html.dsh-ma-sidebar-open 常亮 → CSS 把 sidebarCol 钉成 fixed + translateX(0) + z-index:310，
+       * 而官方已把列宽压成 0、内容收起 → 剩下一个**没有内容的白色固定柱**盖住左半屏；
+       * 它几何上"在视口里"（width≈340 < 0.98vw），连遮罩不变量都会误判成"抽屉还在"→ 整屏被困。
+       * 这里让"空壳"不算可交互抽屉，遮罩就有机会被摘掉（不变量见 enforceScrimInvariant）。
+       *
+       * ⚠️ 判不出来时一律当作"不是空壳"（保守：宁可多留遮罩一帧，也绝不在正常抽屉上误摘）。
+       * ⚠️ 只对**抽屉列**判：详情列在"还没挂内容"时是合法状态（官方按需挂载），
+       *    对它用同一条判据会把"详情列展开"的正常路径一起判死。
+       */
+      const isShellColumn = (el) => {
+        if (!el) return true;
+        try {
+          // ① 有实质子节点 → 不是空壳（折叠≠卸载：官方收起时面板仍挂载）
+          const kids = el.children;
+          if (!kids || typeof kids.length !== "number") return false;
+          if (kids.length > 0) return false;
+          // ② 真浏览器里还能再看一眼可视高度：高度为 0 = 内容确实没了
+          if (typeof el.clientHeight === "number" && el.clientHeight === 0) return true;
+          return true;   // 子节点为空 → 空壳（官方折叠后内容被卸载的情况）
+        } catch (e) { return false; }
+      };
       /* 第三列折叠态:官方 0.1.2-rc.1 是 data-details-collapsed,0.1.5-rc.2 起是 data-rightbar-collapsed;
          两个都认;都不存在(未来再改名)时**不当作展开**(见下面 detailsAttrLive)。 */
       const detailsCollapsed = () =>
@@ -1457,6 +1750,12 @@ const SCRIPT = `(() => {
             点菜单按钮加 class → 动画未开始、rect 仍在屏外 → sync 立刻把 class 摘掉 → 抽屉永远打不开。
             现在只让几何判定决定**遮罩能否拦截点击**（最后一道保险），不再否决用户的展开意图。 */
       let userWantsOpen = null; // null=未表达意图（跟随官方）; true/false=用户已明确开/关
+      /* 0.6.18 白柱修复的辅助状态（见 sync() 的长注释）：
+         · lastOfficialCollapsed —— 上一次 sync 时官方说的折叠态；用它识别"官方**刚刚**收起"
+           这个**边沿**（只有边沿才算"用户点了抽屉内的收起按钮"，才不会误杀用户刚表达的展开意图）；
+         · officialExpandedSeen —— 是否**见过官方说"展开"**（与上一条共同构成边沿的合法性）。 */
+      let officialExpandedSeen = false;
+      let lastOfficialCollapsed = null;
       let scrimTimer = 0, scrimWatchdog = 0;
       /* ---- 详情列(第三列)在手机端的显示条件 ----------------------------------------
          ⚠️ 为什么不能"官方属性说展开就滑进来"(2026-09-19 白框事故的根因之一):
@@ -1483,6 +1782,32 @@ const SCRIPT = `(() => {
       const CENTER_TOUCH_MS = 8000;
       let centerTouchedAt = 0;
       let detailsSticky = false;
+      /* 「打开右侧栏」的**显式**请求（0.6.18，来自悬浮菜单那颗按钮）。
+         与 centerTouchedAt/detailsSticky 的区别：那两个是"用户大概想看点细节"的弱信号，
+         这个是"我就是要看官方右栏"的强信号 —— 强信号才允许跳过"官方说未收起"这一条
+         （better-sidebar 这类只翻自己 store 的插件永远不会让官方 cols.rightbar 变正）。 */
+      let rightPaneWanted = false;
+      /**
+       * 官方右栏里到底有没有"宿主注册的内容"？—— 有内容才值得滑进来。
+       * 判据只用**官方结构 + 几何**，绝不认 better-sidebar 的私有标记
+       * （data-rightbar-col / data-dsh-center-col —— R2 明确记录那是 0.6.15/0.6.16 反复踩的坑：
+       *  插件换版本/被卸载，标记就没了，适配层跟着失灵）。
+       * 为什么重要：官方右栏收起时**面板仍然挂载**（只是平移出 frame 右缘），所以"有子节点"
+       * 就足以说明"这颗按钮后面真有东西可看"，而不是一片空白。
+       */
+      const rightPaneHasContent = () => {
+        try {
+          const el = details || document.querySelector(".dsh-ma-details, .dsh-ma-rightbar");
+          if (!el) return false;
+          const kids = el.children;
+          if (!kids || typeof kids.length !== "number") return false;
+          if (kids.length === 0) return false;
+          /* 官方折叠时宽度会被压到 0；但我们自己在窄屏把它改成 fixed + translateX(103%)，
+             所以宽度不再是"官方有没有内容"的判据，只用来排除"被压成 0 宽的列"。 */
+          if (typeof el.clientWidth === "number" && el.clientWidth === 0) return false;
+          return true;
+        } catch (e2) { return false; }
+      };
       /* scrim 的"到底有没有在拦"以浏览器算出来的 pointer-events 为准(class 只是我们的意图) */
       const scrimBlocks = () => {
         const html = document.documentElement;
@@ -1494,7 +1819,8 @@ const SCRIPT = `(() => {
         } catch (e2) { /* 忽略 */ }
         return true; // 认不出实际样式 → 以 class 为准(保守:当成在拦)
       };
-      const anyDrawerInView = () => sidebarInView() || detailsInView();
+      const anyDrawerInView = () =>
+        (sidebarInView() && !isShellColumn(sidebar || document.querySelector(".dsh-ma-sidebar"))) || detailsInView();
       /* 遮罩闸门：**只有此刻真的看得见抽屉**才允许拦截点击。
          抽屉是滑入动画（.22s），所以同步判定必然"还看不见" —— 那一瞬间不下闸即可，
          真正的下闸交给下一帧与动画结束后的复核（applyScrim），既不误拦也不影响手感。
@@ -1539,6 +1865,27 @@ const SCRIPT = `(() => {
         } catch (e2) { scrimWatchdog = 0; }
       };
       const sync = () => {
+        /* ★ 0.6.18 修（用户报的「点官方抽屉里的收起按钮 → 左半边一片白色占位，只有刷新能出去」）：
+           识别的关键是**边沿**而不是状态 —— 官方"刚刚从展开翻转成收起"（collapsedEdge）才是
+           "用户点了抽屉内的收起按钮"这个动作。为什么不能只看"官方说收起"：用户点汉堡展开时
+           官方属性往往还没跟上（toggle 点了 store 还没提交，或官方 toggle 压根不存在），
+           只按状态复位会把用户的展开意图当场掐掉 → 抽屉永远打不开（0.6.6-beta.3 的回归点，
+           护栏用例守着）；也不能只靠几何（白柱 width≈340，"在视口里"，几何判不出它是空壳）。 */
+        const officialCollapsed = collapsed();
+        const collapsedEdge = officialCollapsed && lastOfficialCollapsed === false;
+        if (!officialCollapsed) officialExpandedSeen = true;
+        lastOfficialCollapsed = officialCollapsed;
+        if (userWantsOpen === true && collapsedEdge) userWantsOpen = null;   // 官方收起 → 放弃过期意图
+        /* 把**官方**的折叠态与我们**当前的展开意图**一起镜像到 <html>：
+           CSS 依据这两者做最后一道不依赖任何 JS 判定的硬保证（见 STYLE 里的
+           html.dsh-ma-official-collapsed:not(.dsh-ma-user-wants-open) 那条）——
+           "官方说收起、且我们已经没有活的展开意图"时，这一列一律留在屏外。
+           为什么这样收窄：用户明确要开（意图为 true）时必须能开，哪怕官方 toggle 坏了、
+           属性永远是"收起"（那是 0.6.9-beta.2 就定下的自救路径，护栏用例守着）。 */
+        try {
+          document.documentElement.classList.toggle("dsh-ma-official-collapsed", officialCollapsed);
+          document.documentElement.classList.toggle("dsh-ma-user-wants-open", userWantsOpen === true);
+        } catch (e0) { /* 忽略 */ }
         const open = userWantsOpen !== null ? userWantsOpen : expanded();
         document.documentElement.classList.toggle("dsh-ma-sidebar-open", open);
         /* 汉堡按钮**始终可见**：以前判定为"展开"时会把它 display:none 隐藏，
@@ -1546,14 +1893,21 @@ const SCRIPT = `(() => {
            保持可见 + 点它可开可关（见其 click 处理），任何异常状态下都留一条出路。
            它的 z-index(320) 高于抽屉(310)/详情列(300)/遮罩(290) —— 判定怎么错都点得到。 */
         if (hamburger) hamburger.style.display = "";
-        /* 第三列(详情/rightbar)在手机端要不要滑进来:
-           ① 属性说不清(官方未来再改名) → **不显示**,绝不靠几何去猜
-              (0.1.5 事故:被误标成 details 的 overlay 层/滑出屏外的列满足"几何可见" → 遮罩常亮 + 白框);
-           ② 见过官方写出折叠态 → 证明 details/rightbar 里有一个属性名是活的(见 detailsAttrLive);
-           ③ 官方收起 → 立刻退出,并复位"用户要看详情"的粘性标记(下次点正文即可恢复)。 */
-        if (detailsCollapsed()) { detailsSeenCollapsed = true; detailsSticky = false; }
+        /* 第三列(详情/rightbar)在手机端要不要滑进来（0.6.18 四层判据）:
+           ① 官方说得清（detailsAttrLive）+ 官方未收起 + 用户此刻想看 → 滑入（原判据）；
+           ② **用户从 FAB 明确要求**（rightPaneWanted）+ 右栏确实有内容 → 也滑入。为什么必须绕过
+              "官方未收起"：better-sidebar 这类把按钮注册进官方右栏的插件只翻它**自己**的 store，
+              官方 cols.rightbar 永远是 0 → 等它松口 = 面板永远打不开（用户报的「右侧按钮区看不见」）。
+             而"有没有内容"用官方结构/几何判，**绝不**认任何第三方私有标记；
+           ③ 官方属性改名了（detailsAttrLive 为假）但右栏里确实有内容 → 在用户已表达"要看"的前提下
+              也允许滑入（未来官方再改名的兜底；"载入即滑出白框"由 wantsRightPane 挡掉 —— 它要求
+              先有用户动作，那正是 2026-09-19 白框事故的根因）；
+           ④ 官方收起 → 立刻退出，并复位所有粘性意图（下次点正文 / 点 FAB 即可恢复）。 */
+        if (detailsCollapsed()) { detailsSeenCollapsed = true; detailsSticky = false; rightPaneWanted = false; }
         const touchedRecently = centerTouchedAt !== 0 && (Date.now() - centerTouchedAt) <= CENTER_TOUCH_MS;
-        const dOpen = detailsAttrLive() && !detailsCollapsed() && (touchedRecently || detailsSticky);
+        const wantsRightPane = touchedRecently || detailsSticky || rightPaneWanted;
+        const officialOpen = detailsAttrLive() && !detailsCollapsed();
+        const dOpen = wantsRightPane && (officialOpen || rightPaneHasContent());
         if (dOpen) detailsSticky = true;
         document.documentElement.classList.toggle("dsh-ma-details-open", dOpen);
         // 遮罩:同步先按当前几何下闸(抽屉已在视口内时无延迟),再在动画开始/结束后复核两次
@@ -1564,6 +1918,23 @@ const SCRIPT = `(() => {
           scrimTimer = setTimeout(() => { enforceScrimInvariant(); applyScrim(); }, 300);
         } catch (e2) { /* 忽略 */ }
         armScrimWatchdog();
+      };
+      /* 「打开右侧栏」的真正实现（0.6.18；悬浮菜单那颗按钮通过模块级 maOpenRightPane 回调进来）——
+         状态机在这里，菜单那边看不到 detailsSticky/sync（两者作用域与创建时机都不同：
+         菜单宽窄都建、可能更早；状态机只在 boot() 的窄屏段）。
+         ① 登记"我就是要看官方右栏"的强意图（不受 8s 窗口限制）；
+         ② 官方若真有展开按钮就替用户点一下（探测失败是正常的：宽屏/已展开时它本来就不在）；
+         ③ sync() 立刻按意图生效；官方展开是异步的，动画结束（≈260ms）后再对齐一次。 */
+      maOpenRightPane = () => {
+        rightPaneWanted = true;
+        detailsSticky = true;                    // 双保险：即便官方 toggle 点不动，判据②也放行
+        centerTouchedAt = Date.now();
+        try {
+          const b = maRightPaneExpandBtn();
+          if (b && b.click && detailsCollapsed()) b.click();
+        } catch (eR) { /* 探测/点击失败不影响下面的 sync */ }
+        sync();
+        try { setTimeout(() => { try { sync(); } catch (eS) { /* 忽略 */ } }, 260); } catch (eS2) { /* 忽略 */ }
       };
       /* 用户在主内容列里点一下 → 视为"他要看详情"(手机端显示详情列的唯一开关)。
          为什么必须由用户动作来解锁:官方表达"详情展开"的方式有两种 —— 属性被移除,或写成 =false,
@@ -1695,6 +2066,10 @@ const SCRIPT = `(() => {
       if (maTorn) return;
       if (bootUseful()) { try { boot(); } catch (eBoot) { /* 幂等重试 */ } }
       try { ensureDrawerChrome(); } catch (eChrome2) { /* 忽略 */ }
+      /* 镜像页就绪探测（mirror_load 的量测终点）：pump 本来就被 MutationObserver(子树) + 1s 兜底表
+         驱动，官方 frame/输入框一挂上就会在**这一拍或下一拍**（≤1s）命中 —— 这正是契约要求的
+         "终点的时刻"，而且不需要再加任何定时器或观察者。只在还没上报过时判一次（reported 挡重复）。 */
+      if (!maLoadWatch.reported) { try { if (maLoadReadyNow()) maReportMirrorLoad("ok"); } catch (eLoadOk) { /* 忽略 */ } }
       if (!whaleGuardsOn || !settingsWatchOn) {
         try { whaleHookInit(); watchSettings(); } catch (eHook) { /* 两者内部都自带一次性守卫 */ }
       }

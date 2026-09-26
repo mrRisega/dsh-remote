@@ -2938,6 +2938,88 @@ async function proxyFeedback(relayDir, req, res, pathname) {
   }
 }
 
+/**
+ * 把 `/dsh-remote/announcements*` 代理到云端公告 API（契约冻结见
+ * dsh-relay-enterprise/docs/announcements-contract.md §3）：
+ *   · GET  /dsh-remote/announcements       → 上游 GET  {api}/api/announcements?client=desktop[&install_id=…]
+ *   · POST /dsh-remote/announcements/click → 上游 POST {api}/api/announcements/click  {id[, install_id]}
+ *
+ * 三条刻意的设计（都是"服务端契约之外"的客户端纪律，写在这里免得后人"顺手优化"掉）：
+ *
+ * ① **身份维度二选一，绝不混用**：能拿到账号 JWT 就只带 `Authorization: Bearer`（服务端按 user 维度去重，
+ *    同一个人手机看过电脑就不再弹）；拿不到才退回 `install_id`（装机维度）。
+ *    两者**同时**带上会让唯一索引 (announcement_id, user_id, install_id) 把"同一人两台机器"
+ *    算成两行 —— UV 直接翻倍。所以下面是有 Bearer 就不带 install_id，反之亦然。
+ * ② **install_id 复用本机既有的 device_id，绝不新造 ID**：服务端那个维度就是"这台电脑"，
+ *    再生成一个 ID 只会让同一台机器在统计里变成两台（且新 ID 与反馈/设备列表的口径对不上）。
+ *    注意 `cfg.device_id` 是**本机设备标识**，与遥测的 `.telemetry-install-id` 不是一回事：
+ *    后者在 DSH_REMOTE_TELEMETRY=0 时根本不生成，公告不该被遥测开关牵连。
+ * ③ **失败一律软着陆**：上游 404（老服务端）/ 不可达 / 超时都只回一个 JSON，**绝不抛**。
+ *    浏览器半对这一切的既定反应是 fail closed（不显示入口、不弹窗），所以这里透传状态码即可，
+ *    既不用把它改写成 200（那会让"接口通不通"这件事查不出来），也不会把面板打挂。
+ */
+async function proxyAnnouncements(relayDir, req, res, pathname) {
+  const method = String(req.method || "GET").toUpperCase();
+  try {
+    const cfg = loadConfig(relayDir);
+    const api = String(cfg.api_url || DEFAULT_API).replace(/\/+$/, "");
+    const suffix = pathname.replace(/^\/dsh-remote\/announcements/, "") || "/";
+    const isClick = method === "POST" && suffix === "/click";
+    // 未知子路径：老/新浏览器半都可能拼错，直接 404（不抛、不代理到奇怪的上游路径）
+    if (!(isClick || (method === "GET" && (suffix === "/" || suffix === "")))) {
+      return sendJson(res, 404, { ok: false, error: "unknown announcements route" });
+    }
+
+    const headers = { "x-dsh-client": `dsh-remote-web/${PLUGIN_VERSION}` };
+    // 浏览器已带的 Bearer 优先透传（与 proxyFeedback 同口径：那是请求方自己的身份）；
+    // 否则由 node 半附当前账号 JWT —— 只有"确实配了账号"才值得为此跑一次 device-login。
+    const auth = req.headers.authorization;
+    let bearer = "";
+    if (auth && /^Bearer\s+/i.test(auth)) bearer = String(auth);
+    else if (cfg.local_key || (cfg.phone && cfg.password)) {
+      const t = await feedbackAuthToken(relayDir).catch(() => "");
+      if (t) bearer = `Bearer ${t}`;
+    }
+    if (bearer) headers.authorization = bearer;
+
+    let url;
+    let init = { method, headers };
+    if (isClick) {
+      url = `${api}/api/announcements/click`;
+      let payload = {};
+      try {
+        const buf = await readBodyBuffer(req);
+        const parsed = JSON.parse(buf.toString("utf8") || "{}");
+        if (parsed && typeof parsed === "object") payload = parsed;
+      } catch { payload = {}; }   // 请求体读不到/不是 JSON → 上游按无 id 处理（404），不在这里抛
+      // 无账号维度时补 install_id，保证点击也能记到"这台电脑"名下（有 Bearer 时**不补**，见上面 ① ）
+      if (!bearer) {
+        const installId = String(cfg.device_id || "").trim();
+        if (installId && !payload.install_id) payload.install_id = installId;
+      }
+      init = { ...init, headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify(payload) };
+    } else {
+      url = `${api}/api/announcements?client=desktop`;
+      if (!bearer) {
+        const installId = String(cfg.device_id || "").trim();
+        if (installId) url += `&install_id=${encodeURIComponent(installId)}`;
+      }
+    }
+
+    const r = await fetch(url, { ...init, signal: AbortSignal.timeout(8000) });
+    if (r.status === 401) fbTokenCache = { token: "", exp: 0 };   // token 失效 → 下次请求重取
+    const text = await r.text();
+    res.writeHead(r.status, {
+      "content-type": r.headers.get("content-type") || "application/json; charset=utf-8",
+      "cache-control": "no-store",
+    });
+    res.end(text);
+  } catch (e) {
+    // 网络不可达 / 超时 / JSON 异常：一律 502 + 人话，绝不把异常抛回 webServer（那会变成 500 堆栈）
+    return sendJson(res, 502, { ok: false, error: `公告服务不可达: ${e.message}` });
+  }
+}
+
 // ---------- 自管理：版本 / 在线更新 / 彻底卸载（面板内“版本与更新”卡片） ----------
 
 /** 插件 id / 包名（2026-09 由 dsh-remote-ui 更名）。 */
@@ -3263,6 +3345,8 @@ async function runOnlineUpdate(relayDir) {
     // 既不把内测装机降级到稳定版，也不让它错过已发布的正式版。
     const target = await resolveUpdateTarget();
     const spec = `@mrrisega/dsh-remote@${target.tag}`;
+    // 新一轮开始 → 先把上一轮的日志归档（见 rotateUpdateLog 注释：无界增长 + 面板黑框拉回旧尾巴）
+    rotateUpdateLog(relayDir);
     appendLogLine(relayDir, UPDATE_LOG,
       `[update] 开始在线更新 ${spec}（通道 ${UPDATE_TAG}；${target.why}）(${new Date().toISOString()})`);
     telemetryRecord(relayDir, "update_started"); // 匿名遥测：在线更新开始
@@ -3343,6 +3427,8 @@ async function runOnlineUpdate(relayDir) {
           telemetryRecord(relayDir, "update_failed", { fail_code: fc });
         } else {
           updateFailures.delete(String(relayDir));
+          // 更新成功 → 落一条「必须重启 dsh web」的强提醒（见 run() 成功分支的同款注释）
+          markRestartPending(relayDir, "restart", "插件已更新，重启 dsh web 后生效");
         }
       });
       child.unref();
@@ -3417,6 +3503,19 @@ async function runOnlineUpdate(relayDir) {
           telemetryRecord(relayDir, "update_failed", { fail_code: fc });
         } else {
           updateFailures.delete(String(relayDir)); // 成功即清掉旧失败
+          // 【2026-09-26】更新成功 → 写一条 kind="restart" 的待重启标记。
+          //
+          // 修的是"文案与状态机不一致"：版本卡一直写「请重启 dsh web 后生效」（client.js 的
+          // `updated` 分支），但**没有任何一处**在成功路径上写过待重启状态 —— 于是那句文案是个
+          // 无人兑现的承诺，用户在页面上也看不到任何"要动一下"的强提示。
+          //
+          // kind 用 "restart" 而**不是**既有的 "refresh"：两者是**不同的动作**
+          //   · refresh  = 插件文件在运行中被改写，刷新浏览器即可（客户端半新的，node 半也是新的）
+          //   · restart  = 在线更新刚换了插件包，需要重启 dsh web 才载入新的 node 半
+          // 客户端按 kind 一一对应地换文案与主按钮（见 client.js 的 restartAlert），
+          // 混用一个 kind 就会再次出现"文案说刷新、状态其实是重启"。
+          // settleRestartState() 靠 bootId 自动结清 —— 用户真的重启后这条提示自己消失，不需要额外清理。
+          markRestartPending(relayDir, "restart", "插件已更新，重启 dsh web 后生效");
         }
       });
       child.unref();
@@ -3443,6 +3542,28 @@ function tailOf(filePath, lines = 24) {
     const all = readFileSync(filePath, "utf8").split("\n");
     return all.slice(-lines).join("\n");
   } catch { return ""; }
+}
+
+/**
+ * 新一轮在线更新**开始前**轮转 `.dsh-update.log`：旧内容归档成 `.dsh-update.log.1`（只留一份）。
+ *
+ * 为什么必须在"开始"时做，而不是"成功"时清空：
+ *   ① 这份日志是 `openSync(..., "a")` **只 append 从不截断**的 —— 一轮轮更新下来会无界增长，
+ *      违反工作区 AGENTS.md「日志必须有轮转」；而失败现场恰恰是最需要保留的那一份，
+ *      所以在成功时删反而会把证据毁掉。归档旧的一轮、新的一轮另起一页才是对的分界。
+ *   ② 面板的「更新日志」黑框读的就是这个文件的尾部（tailOf）：不轮转的话，**刷新页面还会把
+ *      上一次的尾巴拉回来**，用户看到的"更新黑框永不消失"有一半责任在这里。
+ *      客户端那半已经按 running 状态 gate 住了（见 client.js 的 updShowLog），这一条是宿主侧的根治。
+ * 轮转失败（权限/占用）不致命：退化成继续 append 的旧行为，绝不影响更新本身。
+ */
+function rotateUpdateLog(relayDir) {
+  try {
+    const file = join(relayDir, UPDATE_LOG);
+    if (!existsSync(file)) return;
+    const prev = `${file}.1`;
+    try { rmSync(prev, { force: true }); } catch { /* 上一份归档删不掉就覆盖写，继续 */ }
+    renameSync(file, prev);
+  } catch { /* 轮转失败：静默，退化为 append */ }
 }
 
 /**
@@ -4574,6 +4695,11 @@ const TELEMETRY_EVENT_NAMES = new Set([
   "tunnel_disconnected", "first_remote_ok", "plugin_loaded", "panel_opened", "harness_restart",
   "update_started", "update_failed",
   "wechat_bound", "wechat_unbound",
+  // 2026-09-26（926 迭代）新增：手机镜像页**就绪耗时**。这一条是"慢加载"唯一的量化来源 ——
+  // 在此之前只能靠用户体感反馈。字段 ms（耗时）/ at（客户端事件时刻）/ outcome（ok|slow）
+  // 由路由 /dsh-remote/telemetry/mirror-load 校验后带入（见 telemetryEventOf）。
+  // 与服务端 TELEMETRY_EVENTS 必须逐字对齐（少一个 = 服务端静默丢弃）。
+  "mirror_load",
 ]);
 /**
  * fail_code 白名单 —— **必须与服务端 TELEMETRY_FAIL_CODES 完全一致**。
@@ -4855,6 +4981,17 @@ function telemetryEventOf(name, extra = {}) {
   if (name === "install_failed" || name === "update_failed") {
     const code = String(extra.fail_code || "");
     ev.fail_code = TELEMETRY_FAIL_CODES.has(code) ? code : "unknown"; // 白名单外 → unknown
+  }
+  // mirror_load：唯一带**数值**的事件。契约 §2 的两列语义：
+  //   · at  = 客户端事件发生时刻（epoch ms）→ 服务端 at_ms
+  //   · ms  = 耗时毫秒                      → 服务端 value_ms
+  // at 允许缺省（0 = 没给）→ 保留上面那个 Date.now()（= 服务端收包时刻的近似），
+  // 但**绝不把 0 发出去**：0 在分析里会被读成"1970 年"，比"没有值"更糟。
+  // ms 同样只在有限数时写入（越界/非法由路由先挡掉，这里是第二道防线）。
+  if (name === "mirror_load") {
+    if (Number.isFinite(Number(extra.at)) && Number(extra.at) > 0) ev.at = Math.round(Number(extra.at));
+    if (Number.isFinite(Number(extra.ms))) ev.ms = Math.max(0, Math.min(600000, Math.round(Number(extra.ms))));
+    ev.outcome = extra.outcome === "slow" ? "slow" : "ok";
   }
   return ev;
 }
@@ -5708,6 +5845,36 @@ function registerRoutes(ctx, relayDir) {
         sendJson(res, 200, { ok: true });
       },
     },
+    // 镜像页就绪耗时（D1 在 clients/dsh-remote/mobile-adapter.mjs 里量，经此入队）：
+    //   body = { ms: 耗时毫秒, at: 事件时刻 epoch ms, outcome: "ok"|"slow" }
+    // 契约（926 迭代 §2）：事件名固定 mirror_load，ms 钳制 [0, 600000]，outcome ∈ {ok, slow}。
+    //
+    // 🔒 入参校验失败**静默丢弃**但仍回 200 {ok:true}：这条上报是手机镜像页加载路径上的
+    //    fire-and-forget，任何 4xx 都可能被页面当成"功能坏了"而冒泡给用户；统计丢一条无所谓，
+    //    打扰用户不可接受。校验放在**路由里**（而不是 telemetryRecord 里）是因为遥测入队
+    //    必须保持"只认白名单、绝不抛"的既有语义，业务校验不属于那一层。
+    {
+      method: "POST",
+      path: "/dsh-remote/telemetry/mirror-load",
+      handler: async (req, res) => {
+        try {
+          const buf = await readBodyBuffer(req);
+          let body = null;
+          try { body = JSON.parse(buf.toString("utf8") || "{}"); } catch { body = null; }
+          const ms = Number(body && body.ms);
+          if (body && Number.isFinite(ms) && ms >= 0 && ms <= 600000) {
+            const atRaw = Number(body.at);
+            const at = Number.isFinite(atRaw) && atRaw > 0 ? Math.round(atRaw) : 0;
+            telemetryRecord(relayDir, "mirror_load", {
+              ms: Math.round(ms),
+              at,
+              outcome: body.outcome === "slow" ? "slow" : "ok",
+            });
+          }
+        } catch { /* 体读不到/超限：静默 */ }
+        sendJson(res, 200, { ok: true });
+      },
+    },
     // 手动重试（error 阶段的「重试」按钮）：清掉退避计数立刻再走一遍闭环。
     {
       method: "POST",
@@ -6192,6 +6359,19 @@ function registerRoutes(ctx, relayDir) {
         await proxyFeedback(relayDir, req, res, url.pathname + url.search);
       },
     },
+    // 📣 公告（面板「未读公告」入口 + 电脑端弹窗）：
+    //   声明成 prefix:true + 自行判别子路径，与 feedback 同一形态 ——
+    //   `/dsh-remote/announcements`（列表）与 `/dsh-remote/announcements/click`（点击/已读上报）
+    //   是一对，拆成两条 exact 会在以后加子接口（比如详情）时又要动路由表。
+    {
+      method: "ALL",
+      path: "/dsh-remote/announcements",
+      prefix: true,
+      handler: async (req, res) => {
+        const url = new URL(req.url ?? "/", "http://x");
+        await proxyAnnouncements(relayDir, req, res, url.pathname);
+      },
+    },
   ];
 
   const disposers = [];
@@ -6389,6 +6569,101 @@ async function pinBrowseDirectoryPicker(ctx, { attempts = 6, gapMs = 700 } = {})
   return pickerPinState;
 }
 
+/** 不持有进程的 sleep（未 ref：宿主随时可以正常退出，不被我们的定时器拖住）。 */
+function sleepUnref(ms) {
+  return new Promise((resolve) => {
+    const t = setTimeout(resolve, ms);
+    if (t && typeof t.unref === "function") t.unref();
+  });
+}
+
+/* ── 延后接线的闸门参数（全部只为"别在宿主启动期动 Loader"，不是功能参数） ───────────── */
+const PICKER_PIN_READY_WAIT_MS = 120_000; // 等宿主 HTTP 服务 listen 的上限
+const PICKER_PIN_SETTLE_MS = 8_000;       // listen 之后再静置，避开首轮 client-module compose
+const PICKER_PIN_PROBE_WAIT_MS = 30_000;  // 等服务挂出来的上限（只等，不换）
+const PICKER_PIN_PROBE_GAP_MS = 3_000;    // 上面那段轮询间隔
+
+/**
+ * 目录选择器的**延后**接线 —— 这是 2026-09-26 启动事故的直接修复。
+ *
+ * 🔴 事故：旧实现在 `apply()` 里**立刻**调 `pinBrowseDirectoryPicker(ctx)`（最多 6 次 × 700ms 轮询）。
+ *    `loader.remove()` / `loader.create()` 会触发 dsh 的 `internal/plugin` 事件，而
+ *    `@deepseek-ai/dsh-client-modules` 收到事件就**重新 compose 整张前端插件图**
+ *    （`ClientModuleRegistry.flush() → buildCombo() → newlineCount()/identitySectionMap()`）。
+ *    启动期本来就在装载几十个插件，此时再改 Loader = 昂贵的重复组合。真机 CPU profile 与实测都
+ *    指向这里：把 `DSH_REMOTE_NATIVE_PICKER=1` 写进 launchd plist 后 dsh web 立刻恢复正常启动
+ *    （3080 监听、401 约 2ms、单实例）；不设时出现过"进程活着、3 分钟不监听、CPU 一直转、
+ *    日志不更新"的假死。
+ *
+ * 所以现在（与旧实现的四点区别）：
+ *   ① **等宿主把 HTTP 服务 listen 起来**（`boundWebPort() > 0`）—— 这是"宿主已启动"最可靠的信号；
+ *      `apply()` 时它还没 listen 完，旧实现正是在"插件图还在装配"的窗口里动 Loader，最坏；
+ *   ② listen 之后再**静置** `PICKER_PIN_SETTLE_MS`，让首轮 compose 先跑完；
+ *   ③ 之后只在"服务还认不出"时短轮询；**一旦认出 native 就换，且只换这一次**（换失败也不再来回折腾）；
+ *   ④ 认不出/超时/出错 → **静默保留原生选择器**（= 原始行为），绝不影响宿主启动。
+ *
+ * @returns {() => void} 取消函数（供 `ctx.effect` 做清理）
+ */
+function schedulePickerPin(ctx) {
+  let cancelled = false;
+  const gone = () => cancelled;
+
+  const waitUntil = async (cond, timeoutMs, stepMs) => {
+    const t0 = Date.now();
+    for (;;) {
+      if (gone()) return false;
+      let ok = false;
+      try { ok = !!cond(); } catch { ok = false; }
+      if (ok) return true;
+      if (Date.now() - t0 >= timeoutMs) return false;
+      await sleepUnref(stepMs);
+    }
+  };
+
+  void (async () => {
+    try {
+      if (String(process.env.DSH_REMOTE_NATIVE_PICKER || "") === "1") {
+        pickerPinState = { kind: directoryPickerKind(ctx), action: "skipped", detail: "DSH_REMOTE_NATIVE_PICKER=1，保留系统原生对话框" };
+        return;
+      }
+      // ① 等宿主 listen（apply 时还没 listen 完）
+      const up = await waitUntil(() => boundWebPort() > 0, PICKER_PIN_READY_WAIT_MS, 1000);
+      if (gone()) return;
+      if (!up) {
+        pickerPinState = { kind: "", action: "skipped", detail: "宿主监听端口未在等待窗口内就绪，本次不干预目录选择器（保留原生）" };
+        ctx.logger?.info?.("dsh-remote-web: 宿主监听端口未就绪，跳过目录选择器切换（不影响启动）");
+        return;
+      }
+      // ② 静置，避开首轮 client-module compose
+      await sleepUnref(PICKER_PIN_SETTLE_MS);
+      if (gone()) return;
+      // ③ 等服务挂出来（**只等不换**）
+      await waitUntil(() => directoryPickerKind(ctx) !== "", PICKER_PIN_PROBE_WAIT_MS, PICKER_PIN_PROBE_GAP_MS);
+      if (gone()) return;
+      const kind = directoryPickerKind(ctx);
+      if (!kind) {
+        pickerPinState = { kind: "", action: "skipped", detail: "窗口内未确认到选择器服务，保留原生（下次重启再试）" };
+        return;
+      }
+      if (kind === "browse") {
+        pickerPinState = { kind, action: "none", detail: "已经是浏览器内选择器" };
+        return;
+      }
+      if (kind !== "native") {
+        pickerPinState = { kind, action: "skipped", detail: "选择器服务当前是 " + kind + "，不认识，保留原样" };
+        return;
+      }
+      // ④ 只换一次（attempts:1 → 内部不会再轮询）
+      await pinBrowseDirectoryPicker(ctx, { attempts: 1, gapMs: 0 });
+    } catch (e) {
+      // 目录选择器是**锦上添花**：任何异常都必须静默，绝不把宿主拖下水
+      try { ctx.logger?.warn?.("dsh-remote-web: 目录选择器延后切换异常（已忽略）：" + (e && e.message ? e.message : e)); } catch { /* ignore */ }
+    }
+  })();
+
+  return () => { cancelled = true; };
+}
+
 export function apply(ctx, config = {}) {
   const relayDir = config.relayDir || process.env.DSH_RELAY_DIR || DEFAULT_RELAY_DIR;
   // 记住宿主 ctx：上游地址要问 dsh web 自己的监听端口（见 upstreamUrl）。
@@ -6429,11 +6704,9 @@ export function apply(ctx, config = {}) {
   // 0.1.2-rc.1+ 浏览器会话代持：换取 Harness 会话 Cookie 供 bridge 上游携带（手机点设备不再 401 白页）
   ctx.effect(() => scheduleHarnessMint(ctx, relayDir), "dsh-remote-web: harness browser-session mint");
   // 目录选择器:远程控制下必须用浏览器内实现(否则手机点「添加工作区」像没反应) —— 见上方长注释
-  ctx.effect(() => {
-    let alive = true;
-    void pinBrowseDirectoryPicker(ctx).catch(() => { /* 绝不影响宿主 */ });
-    return () => { alive = false; void alive; };
-  }, "dsh-remote-web: pin browser directory picker");
+  // ⚠️ **必须延后**：绝不能在 apply() 里直接切 Loader —— 会把宿主启动拖成假死（2026-09-26 事故，
+  //    见 schedulePickerPin 上方长注释）。schedulePickerPin 自己等"宿主已 listen + 静置"再动手。
+  ctx.effect(() => schedulePickerPin(ctx), "dsh-remote-web: pin browser directory picker");
   // 插件市场一键全功能:缺桌面运行环境则自动安装,登录后自动拉起 bridge(不依赖用户跑 npx)
   ctx.effect(() => scheduleRuntime(relayDir), "dsh-remote-web: runtime self-provision");
   // 匿名遥测：插件停摆（卸载/重载）时停掉发送心跳；磁盘队列留给下次装载补发。
@@ -6455,6 +6728,6 @@ export function apply(ctx, config = {}) {
 // test hooks：cordis 只读 name/inject/apply，这些导出只给用例（见 test/picker-pin.test.mjs）。
 // 为什么不放进 apply 内部直接测：apply 是"装载即副作用"的同步函数，选择器固定是异步且带重试窗口的，
 // 单独导出才能把「**先摘 auto、后建 browse**」这个顺序契约钉死。
-export { pinBrowseDirectoryPicker as __pinBrowseDirectoryPicker, pickerPinState as __pickerPinState, directoryPickerKind as __directoryPickerKind, PICKER_AUTO_ENTRY_ID as __PICKER_AUTO_ENTRY_ID, PICKER_AUTO_PACKAGE as __PICKER_AUTO_PACKAGE, PICKER_BROWSE_PACKAGES as __PICKER_BROWSE_PACKAGES,
+export { pinBrowseDirectoryPicker as __pinBrowseDirectoryPicker, schedulePickerPin as __schedulePickerPin, pickerPinState as __pickerPinState, directoryPickerKind as __directoryPickerKind, PICKER_AUTO_ENTRY_ID as __PICKER_AUTO_ENTRY_ID, PICKER_AUTO_PACKAGE as __PICKER_AUTO_PACKAGE, PICKER_BROWSE_PACKAGES as __PICKER_BROWSE_PACKAGES,
   // 日志去重（同一条失败不刷屏）也要能被单测钉住 —— 它属于「诊断可读性」，见 test/linux-bridge.test.mjs
   noteAutostartFailure as __noteAutostartFailure, clearAutostartFailure as __clearAutostartFailure };

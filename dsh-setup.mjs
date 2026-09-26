@@ -1125,6 +1125,61 @@ function loginRateLimitUntil() {
   return 0;
 }
 
+/* ── 守护启动锁：把"一堆守护同时被拉起"的惊群收敛成串行 ─────────────────────────────
+ *
+ * 🔴 2026-09-26 真机事故（dsh web 启动故障的连带伤害）：一次重启窗口里同时出现了
+ *    **6 个 `dsh-setup.mjs run` 守护 + 6 个 bridge**，全部用同一个 deviceId 去 router 注册，
+ *    互相把对方顶掉 —— bridge 日志刷满
+ *      `隧道断开(code=4000, replaced by new connection)` → `2s 后重连` → 再被顶掉，
+ *    手机侧表现为隧道无限抖动、随机不可用。
+ *    成因是 `runBridge()` 的去重是**先读 pid 文件、后写 pid 文件**：N 个实例在同一瞬间启动时，
+ *    每个都读到"还没有别人" → 一起活下来。launchd 的 `com.dshremote.bridge`(KeepAlive) 与
+ *    插件自愈拉起的脱离进程又都会各自拉一个，正好构成惊群。
+ *
+ * 修法：进入去重逻辑**之前**先抢一把原子锁（`wx` = 排他创建）。抢到的人才继续走原来的
+ *       supervisor 判定；抢不到的人只在"被监管者"时才稍等（它必须能接管），否则直接让位。
+ *      锁文件带 `pid:时间戳`，超过 STALE 就视为残留（进程被强杀时留下的），可安全抢占 ——
+ *      **绝不允许一把陈旧的锁把 bridge 永久挡在门外**。
+ */
+const WATCHER_SPAWN_LOCK = ".dsh-watcher-spawn.lock";
+const SPAWN_LOCK_STALE_MS = 30_000;
+const SPAWN_LOCK_WAIT_MS = 15_000;
+
+function tryAcquireSpawnLock() {
+  const f = path.join(CONFIG_DIR, WATCHER_SPAWN_LOCK);
+  try {
+    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+    const fd = fs.openSync(f, "wx");           // 排他创建：要么拿到，要么 EEXIST
+    fs.writeSync(fd, `${process.pid}:${Date.now()}`);
+    fs.closeSync(fd);
+    return true;
+  } catch {
+    // 已存在：可能是残留（强杀留下的），也可能是真有人在启动
+    try {
+      const [pidStr, tsStr] = String(fs.readFileSync(f, "utf8")).split(":");
+      const pid = Number(pidStr);
+      const ts = Number(tsStr);
+      const stale = !Number.isFinite(ts) || Date.now() - ts > SPAWN_LOCK_STALE_MS || !pidAlive(pid);
+      if (stale) {
+        fs.rmSync(f, { force: true });
+        const fd = fs.openSync(f, "wx");
+        fs.writeSync(fd, `${process.pid}:${Date.now()}`);
+        fs.closeSync(fd);
+        return true;
+      }
+    } catch { /* 读不到/抢不到 → 当作没拿到 */ }
+    return false;
+  }
+}
+
+function releaseSpawnLock() {
+  const f = path.join(CONFIG_DIR, WATCHER_SPAWN_LOCK);
+  try {
+    const owner = Number(String(fs.readFileSync(f, "utf8")).split(":")[0]);
+    if (owner === process.pid) fs.rmSync(f, { force: true });  // 只删自己那把
+  } catch { /* 没锁/已被抢 → 忽略 */ }
+}
+
 // ---------- run：前台跑 bridge（带配置 + 自启动 watcher） ----------
 async function runBridge() {
   // 去重（所有平台）：自启动服务、登录任务、插件半的脱离进程兜底都可能拉起 watcher，
@@ -1138,6 +1193,18 @@ async function runBridge() {
   //    只剩插件面板的「启动」能救回来。
   //    被监管者拉起 = 我们才是那个该活下来的实例 → 请游离实例让位，然后接管。
   {
+    // 抢启动锁（见上方长注释）：把同时被拉起的多个实例串行化，杜绝"大家都读到没有别人"。
+    const supervised = String(process.env.XPC_SERVICE_NAME || "");
+    let locked = tryAcquireSpawnLock();
+    if (!locked && supervised) {
+      // 被监管者必须能接管：等一会儿再抢（游离实例写完 pid 文件就会释放）
+      const deadline = Date.now() + SPAWN_LOCK_WAIT_MS;
+      while (!locked && Date.now() < deadline) { sleepSync(150); locked = tryAcquireSpawnLock(); }
+    }
+    if (!locked) {
+      console.log("[dsh-remote] 另一个守护正在启动（启动锁被占用），本进程直接退出，避免重复实例。");
+      return;
+    }
     const other = readPidFile(WATCHER_PID_FILE);
     if (other && other !== process.pid && pidAlive(other)) {
       const supervisor = String(process.env.XPC_SERVICE_NAME || "");
@@ -1157,9 +1224,15 @@ async function runBridge() {
         writePidFile(WATCHER_PID_FILE, process.pid);
       } else {
         console.log(`[dsh-remote] 已有一个 bridge 守护在运行（pid=${other}），本进程直接退出，避免重复实例。`);
+        releaseSpawnLock();
         return;
       }
     }
+    // 🔒 关键顺序：**先把自己的 pid 落盘，再释放启动锁**。
+    //    否则"释放锁 → 下面 1373 行才 writePidFile"之间又是一个空窗，第二个实例会读到
+    //    "没有别人" → 惊群只是被缩小、并没有消除。1373 行那次写入保持原样（它还负责注册退出清理）。
+    writePidFile(WATCHER_PID_FILE, process.pid);
+    releaseSpawnLock();
     // ── 回收「上一任留下的 bridge 子进程」────────────────────────────────────
     //
     // 🔴 真机 bug（2026-09-23 用户实测）：一条微信指令**回两条**。
@@ -1900,9 +1973,49 @@ function normalizePatchBase(patch) {
 }
 
 /**
+ * 插件目录里**必须存在且非空**的文件。缺任何一个都说明这次拷贝是"半个插件"。
+ *
+ * 🔴 为什么必须有这一步（2026-09-26 23:46 真实事故）：当时是"先 rmSync 整个 dest、再逐文件 cpSync"，
+ *    而 dsh 恰好在这个空窗里启动 → `package.json` 已经声明 bundle，但 `cordis.patch.yml` 还没拷到
+ *    → dsh 读 overlay 直接 `ENOENT: no such file or directory` 退出，**整个 GUI 起不来**：
+ *
+ *        Error: dsh: failed to read overlay
+ *        .../node_modules/dsh-remote-web/cordis.patch.yml: ENOENT
+ *
+ *    拷贝完成时间 23:46:05，dsh 报错时间 23:46:03 —— 差 2 秒。
+ *    所以"拷完必须先自检，再切换"不是优化，是**防止宿主起不来**的硬闸门。
+ */
+const PLUGIN_REQUIRED_FILES = ["package.json", "lib/index.js", "lib/client.js", "cordis.patch.yml"];
+
+/** 校验某个插件目录是否"完整可加载"；返回缺失/为空的相对路径数组（空数组 = 通过）。 */
+function missingPluginFiles(dir) {
+  const missing = [];
+  for (const rel of PLUGIN_REQUIRED_FILES) {
+    try {
+      const st = fs.statSync(path.join(dir, rel));
+      if (!st.isFile() || st.size === 0) missing.push(`${rel}(空)`);
+    } catch {
+      missing.push(rel);
+    }
+  }
+  return missing;
+}
+
+/**
  * 把插件整目录拷贝进 profile 的固定子目录并返回该目录。
  * 源(本包 packages/${PLUGIN_ID})可能在 npx 临时缓存里,因此必须拷到 profile 内持久化,
  * include 用相对路径直接指向拷贝出的入口,不写依赖、不跑任何包管理器。
+ *
+ * 🔴 **原子覆盖（2026-09-26 事故后的硬要求）**：
+ *   1. 先整份拷到同级的 `.staging-<pid>`，**全程不碰 dest** —— dsh 任何时刻读到的
+ *      要么是完整的旧版、要么是完整的新版；
+ *   2. 拷完**校验**必需文件（见 `PLUGIN_REQUIRED_FILES`），不通过就丢弃 staging、抛错、
+ *      **保留旧版可用**；
+ *   3. 再 `renameSync` 原子切换（同目录内 rename 是原子操作，空窗只有两次 syscall 之间，
+ *      相比旧实现"整个拷贝过程都处于半空状态"是数量级的改善）；
+ *   4. 切换失败 → 立刻把 backup 改回 dest；成功 → 删 backup。
+ *
+ * 另外清掉上次被强杀留下的 `.staging-*` / `.backup-*`，不留垃圾。
  */
 function copyPluginIntoProfile(profileDir, pluginDir) {
   // 清理历史名残留目录（≤0.4.9 的 dsh-remote-ui-plugin），避免与新版并存
@@ -1910,8 +2023,9 @@ function copyPluginIntoProfile(profileDir, pluginDir) {
     try { fs.rmSync(path.join(profileDir, `${id}-plugin`), { recursive: true, force: true }); } catch { /* ignore */ }
   }
   const dest = path.join(profileDir, PLUGIN_LOCAL_DIR);
-  fs.rmSync(dest, { recursive: true, force: true });
-  fs.cpSync(pluginDir, dest, {
+  const stage = `${dest}.staging-${process.pid}`;
+  const backup = `${dest}.backup-${process.pid}`;
+  const cpOpts = {
     recursive: true,
     // 注意：插件源(npx 缓存 / npm 全局)本身就位于某个 node_modules 之下，
     // 过滤必须基于“相对插件目录”的路径片段，绝不能整条 src 路径包含判断，
@@ -1921,7 +2035,42 @@ function copyPluginIntoProfile(profileDir, pluginDir) {
       const rel = path.relative(pluginDir, src);
       return !String(rel).split(path.sep).some((seg) => seg === "node_modules" || seg === ".git" || seg === ".DS_Store");
     }
-  });
+  };
+
+  // 0) 清掉上次被强杀（或本次同 pid 重入）留下的临时目录
+  for (const d of [stage, backup]) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* ignore */ } }
+
+  // 1) 拷到 staging —— **绝不动 dest**
+  try {
+    fs.cpSync(pluginDir, stage, cpOpts);
+  } catch (e) {
+    try { fs.rmSync(stage, { recursive: true, force: true }); } catch { /* ignore */ }
+    throw new Error(`插件拷贝失败（已保留原目录不动）：${e && e.message ? e.message : e}`);
+  }
+
+  // 2) 自检：必需文件一个都不能少（这一步就是 23:46 那次事故的闸门）
+  const missing = missingPluginFiles(stage);
+  if (missing.length > 0) {
+    try { fs.rmSync(stage, { recursive: true, force: true }); } catch { /* ignore */ }
+    throw new Error(
+      `插件拷贝不完整，缺少必需文件：${missing.join("、")}（已保留原目录不动，避免宿主读 overlay 失败起不来）`
+    );
+  }
+
+  // 3) 原子切换
+  try {
+    if (fs.existsSync(dest)) fs.renameSync(dest, backup);
+    try {
+      fs.renameSync(stage, dest);
+    } catch (e) {
+      if (fs.existsSync(backup)) { try { fs.renameSync(backup, dest); } catch { /* 尽力回滚 */ } }
+      throw e;
+    }
+    try { fs.rmSync(backup, { recursive: true, force: true }); } catch { /* ignore */ }
+  } catch (e) {
+    try { fs.rmSync(stage, { recursive: true, force: true }); } catch { /* ignore */ }
+    throw new Error(`插件切换失败（旧版仍在原位）：${e && e.message ? e.message : e}`);
+  }
   return dest;
 }
 

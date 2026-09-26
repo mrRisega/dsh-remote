@@ -1173,12 +1173,35 @@ export class WeChatRuntime {
     } catch { return false; }
   }
 
-  /** 拉一次会话列表(带标题),并记住 1-based 序号供 /use 使用。 */
+  /**
+   * 可切换会话列表（`/ls` 与 `/use` **共用同一份**）—— 过滤必须收口在这里。
+   *
+   * 为什么（业主反馈「/ls 列出一堆(未命名)会话」）：`listSessions` 返回的会话里有大量**空白会话**
+   * （新建后一句话没说的坑），官方已经在数据里标了 `blank`（`dsh-events.mjs:1654` 解析出来却
+   * 一直没人用）。规则：只留 **有名字 / 正在跑 / 当前选中** 的会话；`blank === true` 一律剔除。
+   *
+   * ⚠️ 过滤**只能**放在这里（或同步过滤 sessionIndex）：`/ls` 渲染 1..N 编号、`/use <n>` 按下标取
+   *    会话、而 `sessionIndex`（/use 的列表来源）就是本函数的返回值 —— 任何一处单独过滤都会让
+   *    两边编号分叉（用户 `/ls` 看到第 2 条是 A，`/use 2` 却切到 B）。
+   * ⚠️ 老版本 DSH 不带 `blank` 字段：`undefined === true` 为假 → 自动退化成"有名字/在跑/当前"，
+   *    不会因为升级或降级把整张列表清空。
+   */
+  #usableSessions(list) {
+    return (Array.isArray(list) ? list : []).filter((s) => {
+      if (!s || typeof s !== "object") return false;
+      if (s.blank === true) return false;                       // 官方明确标记的空白会话
+      if (s.sessionId === this.currentSessionId) return true;    // 当前选中：永远留在列表里
+      if (s.running === true) return true;                       // 正在跑
+      return Boolean(String(s.title || "").trim());              // 有名字
+    });
+  }
+
+  /** 拉一次会话列表(带标题),并记住 1-based 序号供 /use 使用(列表已按 #usableSessions 过滤)。 */
   async #sessions() {
     if (!this.subscriber || typeof this.subscriber.listSessions !== "function") return null;
     const r = await this.subscriber.listSessions();
     if (!r || !r.ok) return null;
-    this.sessionIndex = r.sessions || [];
+    this.sessionIndex = this.#usableSessions(r.sessions || []);
     return this.sessionIndex;
   }
 

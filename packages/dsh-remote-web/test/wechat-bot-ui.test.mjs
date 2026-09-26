@@ -511,10 +511,15 @@ test("首屏导览：未绑定时就在最上面（DOM 顺序在「连接微信�
   const btnAt = domIndex(tree, (n) => n.type === "button" && (n.children || []).some((c) => typeof c === "string" && c.includes("连接微信机器人")));
   assert.ok(introAt >= 0 && btnAt >= 0, "导览与连接按钮都必须存在");
   assert.ok(introAt < btnAt, `导览必须排在连接按钮之前（导览 #${introAt}，按钮 #${btnAt}）`);
-  // 而且导览是内容体的**第一个**孩子：不会把连接按钮推到需要滚动才看得见的地方
+  // 而且紧凑块排在内容体最前面：不会把连接按钮推到需要滚动才看得见的地方
   // （harness 渲染时会对普通节点做浅拷贝，所以拿树里的同一个节点比，不比组件里的原对象）
-  assert.equal(embed.children[0], find(embed, (n) => n.props?.className === "dru-wx-intro"),
-    "导览必须是内嵌内容体的第一个孩子（连接按钮仍在首屏）");
+  // 【0.6.18】内容体第一个孩子变成了「两步走」操作引导块（.dru-wx-guide）：用户口径是
+  //   先在微信通道首屏讲清"这是干啥用的 + 两步怎么接"，再给"你现在能用哪些能力"的清单 ——
+  //   所以导览降为**第二个**孩子，连接按钮仍在首屏（两块都是紧凑小字卡片）。
+  assert.equal(embed.children[0], find(embed, (n) => n.props?.className === "dru-wx-guide"),
+    "两步走引导必须是内嵌内容体的第一个孩子（先讲用途与做法）");
+  assert.equal(embed.children[1], find(embed, (n) => n.props?.className === "dru-wx-intro"),
+    "能力清单紧随引导块之后（连接按钮仍在首屏）");
   // 紧凑小字（不是宣传横幅）：样式里明确给了小字号
   assert.match(SOURCE, /\.dru-wx-intro-row\{[^}]*font-size:12px/, "导览行必须是小字（不挤占首屏）");
 

@@ -45,7 +45,11 @@ class El {
       toggle: (c, on) => { if (on === undefined) { this._cls.has(c) ? this._cls.delete(c) : this._cls.add(c); } else if (on) this._cls.add(c); else this._cls.delete(c); return this._cls.has(c); },
     };
   }
-  // 极简 innerHTML：只认本用例需要的那点结构（class / input[type=range] / 文本）
+  // 极简 innerHTML：只认本用例需要的那点结构（class / 任意 attr="v" / input[type=range]）
+  // ⚠️ 必须把**任意** `attr="v"` 都收进 el.attrs：0.6.18 新增的 FAB 延迟角标
+  //    （`<span class="dsh-ma-fab-rtt" data-role="rtt" hidden>`）就是靠 data-role 找的，
+  //    只认 class 的旧解析器会让 fab.querySelector('[data-role="rtt"]') 恒为 null，
+  //    "角标到底有没有出现"就永远测不出来（假 DOM 失真 → 假绿灯）。
   set innerHTML(html) {
     this._html = String(html);
     this.children = [];
@@ -53,10 +57,8 @@ class El {
       const tag = m[1];
       const attrs = m[2] || "";
       const el = new El(tag);
-      const cls = /class="([^"]*)"/.exec(attrs);
-      if (cls) el.className = cls[1];
-      const type = /type="([^"]*)"/.exec(attrs);
-      if (type) el.attrs.type = type[1];
+      for (const a of attrs.matchAll(/([\w-]+)="([^"]*)"/g)) el.attrs[a[1]] = a[2];
+      if (el.attrs.class) el.className = el.attrs.class;
       this.children.push(el);
     }
   }
@@ -81,6 +83,9 @@ class El {
       if (s2.includes('input[type="range"]')) return el.tagName === "INPUT" && el.attrs.type === "range";
       if (s2.startsWith(".")) return el._cls.has(s2.slice(1));
       if (s2.startsWith("input")) return el.tagName === "INPUT";
+      // `[attr="v"]` / `[attr]`（0.6.18 的 FAB 角标、菜单里的网络延迟行都靠它找）
+      const at = /^\[([\w-]+)(?:="([^"]*)")?\]$/.exec(s2);
+      if (at) return at[2] === undefined ? at[1] in el.attrs : String(el.attrs[at[1]]) === at[2];
       return false;
     };
     return this.children.find(match) || null;
@@ -100,7 +105,7 @@ class El {
  * 折叠时**没有拖拽把手**——这正是 2026-09-19 线上"整屏遮罩"的现场结构。
  */
 function harness({ collapsedAttr = undefined, detailsAttr = undefined, sidebarRect = null, width = 390, withToggle = true,
-  variant = "rc1", rightbarAttr = undefined, overlayRect = null, rightbarRect = null } = {}) {
+  variant = "rc1", rightbarAttr = undefined, overlayRect = null, rightbarRect = null, fetchImpl = null } = {}) {
   const html = new El("html");
   // HOSTISH 门禁会读 documentElement.outerHTML 找官方特征（__ModuleLoader__ / DeepSeek Harness）
   html.outerHTML = '<html><head><script>window.__ModuleLoader__ = { mode: "queue" }</script>'
@@ -168,6 +173,9 @@ function harness({ collapsedAttr = undefined, detailsAttr = undefined, sidebarRe
     removeEventListener() {},
     getComputedStyle: () => ({ getPropertyValue: () => "" }),
     requestAnimationFrame: (fn) => { const id = setImmediate(fn); return id; },
+    /* 0.6.18：适配层会在**已有的** window.fetch 包装里采网络延迟样本（零新增请求）。
+       不传 fetchImpl 时保持"页面没有 fetch"的旧现场（适配层会跳过包装，零行为）。 */
+    fetch: fetchImpl || undefined,
     // unref：同上 —— 适配层的 4 分钟兜底计时器会让测试进程空等到期（本来 240s，只剩 0.2s）。
     // 用例里的 `_pendingTimers` 仍会被 runAdapter() 主动跑一轮，行为不变。
     setTimeout: (fn, ms) => { const id = setTimeout(fn, ms); try { id.unref?.(); } catch { /* 忽略 */ } timers.set(id, fn); return id; },
@@ -440,4 +448,85 @@ test("悬浮按钮：菜单跟随按钮位置（按钮在上半屏 → 菜单挂
   assert.equal(menu.style.top, "66px", "按钮在上半屏 → 菜单挂在按钮下方（bottom+8）");
   assert.equal(menu.style.left, "20px", "按钮靠左 → 菜单左对齐到按钮");
   assert.equal(menu.style.right, "auto", "左对齐时不应残留 right");
+});
+
+// ── 0.6.18：悬浮按钮图标化 + 去掉预览行 + 网络延迟（用户需求 1 / 1a） ────────────
+// 需求原话：①「手机端的悬浮按钮，把那个『字』改成我们自己用的那个手机的图标」；
+//          ②「设置面板里那行预览的字去掉」；③「要能看见网络延迟」。
+
+test("悬浮按钮：图标化为手机 SVG（不再是「字」），且延迟角标在 FAB 内部", () => {
+  const env = runAdapter(harness({ width: 390 }));
+  const fab = findFab(env);
+  assert.ok(fab, "悬浮按钮应存在");
+  const html = fab.innerHTML;
+  assert.ok(!/>字</.test(html), "按钮里不得再有原来的「字」");
+  assert.match(html, /<svg[^>]*viewBox="0 0 24 24"/, "应内联一个 24×24 的 SVG 图标（照汉堡按钮的写法）");
+  assert.match(html, /stroke="currentColor"/, "图标颜色必须继承 currentColor（暗色主题/官方变量变化都跟着走）");
+  assert.match(html, /class="dsh-ma-fab-ico"/, "图标应包在 .dsh-ma-fab-ico 里（CSS 负责居中）");
+  // 延迟角标：必须是 FAB 的**子元素**（护栏：适配层不得新增 body 级固定层）
+  const rtt = fab.querySelector('[data-role="rtt"]');
+  assert.ok(rtt, "延迟角标必须是 FAB 内的绝对定位子元素（不是新的浮层）");
+  assert.equal(rtt.hidden, true, "还没有任何网络样本时角标必须隐藏（显示 0ms 是谎言）");
+  // 锁图标仍在（且仍在右上角样式里，角标不许抢它的位置）
+  assert.ok(fab.querySelector('[data-role="lock"]'), "加密锁图标不能被图标化改掉");
+});
+
+test("悬浮菜单：预览行已彻底删除（DOM 里不得再有 .dsh-ma-menu-preview）", () => {
+  const env = runAdapter(harness({ width: 390 }));
+  const menu = findMenu(env);
+  assert.equal(menu.querySelector(".dsh-ma-menu-preview"), null, "「预览：手机远程控制，随手可用。」那一行必须删除");
+  assert.ok(!/预览：手机远程控制/.test(menu.innerHTML), "菜单 HTML 里不得再出现那行预览文案");
+  // 删的是"那一行"，不是功能：字号滑块与档位文案必须还在（这条回归守着误删）
+  assert.ok(menu.querySelector('input[type="range"]'), "字号滑块必须还在");
+  assert.match(menu.innerHTML, /只影响这台设备的远程页面/, "字号说明文案应保留");
+});
+
+test("悬浮菜单：新增「网络延迟」一行与「打开右侧栏」按钮（只读文案 + 显式出口）", () => {
+  const env = runAdapter(harness({ width: 390 }));
+  const menu = findMenu(env);
+  assert.ok(menu.querySelector(".dsh-ma-menu-net"), "菜单里应有网络延迟块");
+  assert.match(menu.innerHTML, /网络延迟/, "应有「网络延迟」小标题");
+  assert.ok(menu.querySelector('[data-role="net"]'), "延迟块要带 data-role=net（供渲染函数更新）");
+  assert.ok(menu.querySelector('[data-role="right-pane"]'), "菜单里应有「打开右侧栏」按钮");
+});
+
+test("网络延迟：只在**已有**的 fetch 包装里采样，成功样本显示成角标（绝不主动测速）", async () => {
+  const calls = [];
+  // 刻意让响应"慢" 5ms：亚毫秒（同帧缓存命中）会被刻意丢弃，见 noteRtt 的注释
+  const env = harness({
+    width: 390,
+    fetchImpl: async (input) => { calls.push(String(input)); await new Promise((r) => setTimeout(r, 5)); return { status: 200, ok: true }; },
+  });
+  runAdapter(env);
+  const fab = findFab(env);
+  const rtt = fab.querySelector('[data-role="rtt"]');
+  assert.equal(rtt.hidden, true, "前提：还没有样本");
+  await env.win.fetch("/api/session/list");
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(calls.length, 1, "适配层不得额外发探测请求（只包装、不加请求）");
+  assert.equal(rtt.hidden, false, "有成功样本后角标应出现");
+  assert.match(String(rtt.textContent), /^\d+ms$/, `角标应是「<数字>ms」，实际:${rtt.textContent}`);
+  assert.ok(["ok", "mid", "bad"].includes(rtt.getAttribute("data-rtt")), "角标应带分档（ok/mid/bad）供 CSS 上色");
+  assert.equal(rtt.hidden === false, true);
+  // 菜单里的那一行也要跟着更新（同一个 renderRtt）
+  const menu = findMenu(env);
+  const net = menu.querySelector(".dsh-ma-menu-net");
+  assert.ok(["ok", "mid", "bad"].includes(net.getAttribute("data-rtt")), "菜单行也应按同一分档着色");
+});
+
+test("网络延迟：无样本 / 失败请求绝不显示 0ms（显示「测速中…」是唯一正确的空态）", async () => {
+  const env = harness({
+    width: 390,
+    fetchImpl: async () => { throw new Error("network down"); },
+  });
+  runAdapter(env);
+  const fab = findFab(env);
+  const rtt = fab.querySelector('[data-role="rtt"]');
+  // 失败的请求：连会话过期探测都不该被触发，更不该产生延迟样本
+  await env.win.fetch("/api/session/list").catch(() => {});
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(rtt.hidden, true, "只有失败/超时样本时角标必须保持隐藏");
+  assert.notEqual(String(rtt.textContent), "0ms", "绝不能显示 0ms（那是谎言）");
+  const menu = findMenu(env);
+  assert.match(menu.innerHTML, /测速中…/, "空态文案必须是「测速中…」");
 });

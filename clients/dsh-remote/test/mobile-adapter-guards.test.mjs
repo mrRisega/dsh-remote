@@ -125,10 +125,11 @@ class El {
     this.children = [];
     for (const m of String(html).matchAll(/<(\w+)([^>]*)>/g)) {
       const el = new El(m[1]);
-      const cls = /class="([^"]*)"/.exec(m[2] || "");
-      if (cls) el.className = cls[1];
-      const type = /type="([^"]*)"/.exec(m[2] || "");
-      if (type) el.attrs.type = type[1];
+      /* 任意 `attr="v"` 都要收进 attrs：0.6.18 新增的 FAB 延迟角标（data-role="rtt"）、
+         菜单里的网络延迟行（data-role="net"）与「打开右侧栏」按钮（data-role="right-pane"）
+         都是靠属性找的 —— 只认 class 的旧解析器会让它们恒为 null，护栏就变成假绿灯。 */
+      for (const a of (m[2] || "").matchAll(/([\w-]+)="([^"]*)"/g)) el.attrs[a[1]] = a[2];
+      if (el.attrs.class) el.className = el.attrs.class;
       this.appendChild(el);
     }
   }
@@ -896,4 +897,144 @@ test("★ 加载疑似失败时的提示：只在**已有的悬浮菜单**里多
   // 一句话要能直接发给客服
   assert.match(script, /dsh-remote 手机端加载疑似卡住/, "必须给一句可直接发给客服的话");
   assert.match(script, /maLoadCopyLine/, "要能复制（否则用户只能截图）");
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Bug 4（0.6.18，用户实测）：「点官方抽屉里的收起按钮 → 左半边一片白色占位，只有刷新能出去」
+//
+// 根因：userWantsOpen 一旦为 true 就**永不复位** → html.dsh-ma-sidebar-open 常亮 →
+// CSS 把 sidebarCol 钉成 fixed + translateX(0) + z-index:310 的**空壳**（官方已把列宽压成 0、
+// 内容收起，只剩一个没有内容的白色固定柱盖住左半屏）；它几何上"在视口里"（width≈340 < 0.98vw），
+// 遮罩不变量也跟着误判 → 整屏被困；而汉堡按钮又**无条件**点官方 toggle → 两态互相打架。
+// 四层修复：① sync() 里放弃过期意图；② 汉堡按钮仅在"官方态 ≠ 期望态"时才点 toggle；
+//          ③ 官方折叠态镜像到 <html> + CSS 硬兜底；④ 遮罩不变量把"空壳"排除在外。
+// ══════════════════════════════════════════════════════════════════════════════
+
+/** 模拟"用户点了官方抽屉内的收起按钮"：官方写回折叠属性（真机就是这个动作）。 */
+function officialCollapse(env) {
+  env.frame.setAttribute("data-sidebar-collapsed", "true");
+  const obs = MutationObserverStub.instances.find((o) => o.targets.some((t) => t.t === env.frame));
+  if (obs) obs.fire("data-sidebar-collapsed");
+}
+
+test("白柱：官方抽屉被收起后，适配层必须放弃自己的展开意图（不留空壳、不困住用户）", () => {
+  const { js, css } = injected();
+  // 现场：官方初始是**展开**的（属性缺席）+ 抽屉已在视口里 → 用户点过正文让详情列滑入过；
+  // 随后官方把侧栏收起来（用户点了抽屉内的收起按钮）
+  // ⚠️ 2026-09-27 修（本用例原先的前提不成立，是**假红**）：
+  //    原来先用 `collapsedAttr: null` 造"官方不写属性"，再中途改成 `="false"` 并 fire 观察者回调，
+  //    然后点汉堡 —— 但 `collapsed()` 对"从没见过这个属性"的返回值是**收起**（`return !sidebarAttrSeen`），
+  //    于是那次 fire 恰好构成一次"官方由收起→展开"的边沿，`lastOfficialCollapsed` 的记录与
+  //    随后的点击时序耦合，前提断言 `dsh-ma-sidebar-open === true` 就不成立了。
+  //    现在直接照**已通过的**兄弟用例（「汉堡按钮不再无条件点官方 toggle」）的写法：官方一开始就说"展开"。
+  const env = run(harness({ collapsedAttr: "false", detailsAttr: "true" }), js);
+  const ham = findHamburger(env);
+  // 官方一开始说"展开" ⇒ 启动时 class 就是开的（`open = expanded()`）。要点出"**用户**的展开意图"，
+  // 需要走一次"关 → 开"：第一次点=关（并让官方 toggle 走一次），第二次点=用户明确要开。
+  ham.dispatchEvent(new Ev("click", {}));                        // 关
+  assert.equal(env.html.classList.contains("dsh-ma-sidebar-open"), false, "第一次点：关掉");
+  ham.dispatchEvent(new Ev("click", {}));                        // 开（建立用户意图）
+  assert.equal(env.html.classList.contains("dsh-ma-sidebar-open"), true, "前提：抽屉是展开的（用户意图已建立）");
+
+  officialCollapse(env);                                        // ← 用户点了**官方抽屉内**的收起按钮
+  assert.equal(env.html.classList.contains("dsh-ma-official-collapsed"), true,
+    "官方折叠态必须镜像到 <html>（CSS 据此做不依赖 JS 判定的硬兜底）");
+  assert.equal(env.html.classList.contains("dsh-ma-sidebar-open"), false,
+    "官方收起后适配层必须放弃展开意图 —— 否则就是那根白色空壳柱（只有刷新能出去）");
+  assert.equal(env.html.classList.contains("dsh-ma-scrim-on"), false, "不得留下任何拦截层");
+  // CSS 硬兜底必须在（哪怕 JS 判定全部失手，也不会留下可见空壳）
+  assert.match(css, /html\.dsh-ma-official-collapsed[^{]*\{\s*transform:\s*translateX\(-103%\)\s*!important/,
+    "必须有 html.dsh-ma-official-collapsed 的 translateX(-103%) 兜底规则（不依赖任何 JS 判定）");
+});
+
+test("白柱：官方已收起时不留下「白色空壳」——空壳不算可交互抽屉，遮罩必须摘掉", () => {
+  const { js } = injected();
+  const env = run(harness({ collapsedAttr: "true", detailsAttr: "true" }), js);
+  // 造出"空壳"：这一列被判成展开、几何也在视口里，但里面一个可交互内容都没有
+  env.html.classList.add("dsh-ma-sidebar-open", "dsh-ma-scrim-on");
+  env.sidebar.children = [];                       // 官方把内容收走了（卸载）
+  env.sidebar.getBoundingClientRect = () => IN_LEFT;
+  env.doc.dispatchEvent(new Ev("resize", {}));
+  env.tickTimers();                                // 800ms 看门狗
+  assert.equal(env.html.classList.contains("dsh-ma-scrim-on"), false,
+    "空壳在视口里不等于「可交互抽屉」→ 遮罩必须被摘掉（用户不能被一张看不见的遮罩困住）");
+});
+
+test("白柱：汉堡按钮不再无条件点官方 toggle（两态不得互相打架）", () => {
+  const { js } = injected();
+  const env = run(harness({ collapsedAttr: "false", detailsAttr: "true" }), js);
+  // 官方明确说"展开"，而我们这边还没表达意图 → 点汉堡 = 要关（官方态 ≠ 期望态 → 该点 toggle）
+  const clicks = toggleClicks(env);
+  const ham = findHamburger(env);
+  ham.dispatchEvent(new Ev("click", {}));
+  assert.equal(clicks(), 1, "期望态与官方态不一致时必须点官方 toggle（走官方 store）");
+  assert.equal(env.html.classList.contains("dsh-ma-sidebar-open"), false, "点击后应关掉抽屉");
+  // 再点一次：官方此刻仍是"展开"（假 DOM 的 toggle 不改属性）→ 期望是展开、官方已是展开
+  // → 不得再点官方 toggle（那会把官方推到**相反**方向，正是"两个状态互相打架"的来源）
+  ham.dispatchEvent(new Ev("click", {}));
+  assert.equal(clicks(), 1, "官方态与期望态一致时**不得**再点官方 toggle（否则交替打架、白柱反复重现）");
+  assert.equal(env.html.classList.contains("dsh-ma-sidebar-open"), true, "第二次点击应把抽屉打开（意图生效）");
+});
+
+test("打开右侧栏：官方右栏里有宿主注册的内容时，FAB 菜单那颗按钮必须能把它滑进来", () => {
+  const { js } = injected();
+  // 现场（用户报的「右侧按钮区看不见」）：better-sidebar 这类插件把 tab 注册进官方右栏，
+  // 但它只翻自己的 store → 官方 cols.rightbar 永远是 0（data-rightbar-collapsed 恒为 true）。
+  const env = harness({ collapsedAttr: "true", variant: "rc2", detailsAttr: null, rightbarAttr: "true" });
+  env.third.appendChild(env.doc.createElement("div"));   // 官方右栏里确实有内容（插件注册的 tab 面板）
+  run(env, js);
+  assert.equal(env.html.classList.contains("dsh-ma-details-open"), false, "前提：默认不显示右栏");
+  const menu = env.body.children.find((c) => c._cls.has("dsh-ma-menu"));
+  assert.ok(menu, "应有悬浮菜单");
+  const btn = menu.querySelector('[data-role="right-pane"]');
+  assert.ok(btn, "菜单里必须有「打开右侧栏」按钮（用户唯一的明路）");
+  btn.dispatchEvent(new Ev("click", {}));
+  assert.equal(env.html.classList.contains("dsh-ma-details-open"), true,
+    "点「打开右侧栏」后，即便官方说收起（第三方插件不会让官方展开），也必须把有内容的右栏滑进来");
+  assert.equal(menu.hidden, true, "点完应关闭菜单（让用户看见滑入的面板）");
+});
+
+test("打开右侧栏：右栏里没有任何内容时不得滑出一个空白面板（2026-09-19 白框事故的回归）", () => {
+  const { js } = injected();
+  const env = run(harness({ collapsedAttr: "true", variant: "rc2", detailsAttr: null, rightbarAttr: "true" }), js);
+  const menu = env.body.children.find((c) => c._cls.has("dsh-ma-menu"));
+  menu.querySelector('[data-role="right-pane"]').dispatchEvent(new Ev("click", {}));
+  assert.equal(env.html.classList.contains("dsh-ma-details-open"), false,
+    "官方右栏里什么都没有 → 宁可什么都不发生，也不弹一个空白白面板（那正是白框事故）");
+});
+
+test("打开右侧栏：绝不允许「载入即滑出白框」——必须由用户动作解锁", () => {
+  const { js } = injected();
+  // 载入时官方右栏就是"有内容"的（面板挂载着）+ 官方属性说不清 → 旧实现在这里弹白框
+  const env = harness({ collapsedAttr: "true", variant: "rc2", detailsAttr: null, rightbarAttr: null });
+  env.third.appendChild(env.doc.createElement("div"));
+  run(env, js);
+  assert.equal(env.html.classList.contains("dsh-ma-details-open"), false,
+    "没有任何用户动作时，绝不允许因为「右栏有内容」就把面板滑出来（白框必须是用户要的才出现）");
+  assert.equal(env.html.classList.contains("dsh-ma-scrim-on"), false, "同理：遮罩不得跟着拦点击");
+});
+
+test("护栏：延迟角标必须是 FAB 内的子元素（不得新增 body 级固定层）", () => {
+  const { js, css } = injected();
+  const env = run(harness({ collapsedAttr: "true", detailsAttr: "true" }), js);
+  const fab = env.body.children.find((c) => c._cls.has("dsh-ma-fab"));
+  assert.ok(fab, "应有悬浮按钮");
+  const rtt = fab.querySelector('[data-role="rtt"]');
+  assert.ok(rtt, "延迟角标必须在 FAB 内部（绝对定位子元素）");
+  // body 下不得多出"角标层"这种节点。
+  // ⚠️ 2026-09-27 修：`body.children` 里**还有官方 frame**（`pI_x6G_frame`，测试脚手架自己放进去的），
+  //    它不是适配层注入的。原来的写法拿"白名单命中数 === body.children.length"去比，
+  //    等于要求官方 frame 也得命中白名单 → 恒差 1（假红）。现在改成**指名道姓找漏网节点**，
+  //    既排除了官方 frame，又比原来更严：多出来的节点会被打印出来。
+  const allowed = ["dsh-ma-fab", "dsh-ma-menu", "dsh-ma-scrim", "dsh-ma-hamburger", "dsh-ma-sessionbar"];
+  const stray = env.body.children
+    .filter((c) => !c._cls.has("pI_x6G_frame"))                                  // 官方 frame 不是我们注入的
+    .filter((c) => !allowed.some((k) => c._cls.has(k)));
+  assert.deepEqual(stray.map((c) => [...c._cls].join(".")), [],
+    "适配层注入到 body 的节点只能是既有那几个（角标必须挂在 FAB 里，不许新建浮层）");
+  // CSS 侧：角标规则不得出现 fixed / 超高 z-index
+  assert.match(css, /button\.dsh-ma-fab \.dsh-ma-fab-rtt\s*\{[^}]*position:\s*absolute/, "角标应绝对定位在 FAB 内");
+  assert.ok(!/\.dsh-ma-fab-rtt\s*\{[^}]*position:\s*fixed/.test(css), "角标不得是 fixed 浮层");
+  assert.ok(!/\.dsh-ma-fab-rtt\s*\{[^}]*z-index/.test(css), "角标不得自带 z-index（它活在 FAB 的层叠上下文里）");
+  void js;
 });

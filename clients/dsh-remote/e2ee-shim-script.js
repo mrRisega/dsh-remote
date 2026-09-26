@@ -277,6 +277,46 @@
   }
 
   /* ---- 上游路径 / channel|device 形态归一(与 router resolveRoute / native wcUpstreamPathOf 同构) ---- */
+  /**
+   * 从镜像页路径取出 deviceId：`/remote/<deviceId>/…` → deviceId（其余形态返回 ""）。
+   * 与 mobile-adapter.mjs 的 deviceIdOfPath() 同一套判据；这里不查任何 cookie。
+   */
+  function seDeviceIdOfPath(pathname) {
+    try {
+      var parts = String(pathname || "").split("/").filter(Boolean);
+      if (parts[0] !== "remote" || !parts[1]) return "";
+      var id = decodeURIComponent(parts[1]);
+      return /^[A-Za-z0-9._-]{1,64}$/.test(id) ? id : "";
+    } catch (e) { return ""; }
+  }
+  /**
+   * 把**根路径**的受保护请求改写成"设备作用域"形态：`/api/x` → `/remote/<deviceId>/api/x`。
+   *
+   * 为什么必须（2026-09-26 线上事故，nginx access/error 日志为证）：
+   *   官方客户端把 mux WS 的地址固定按 **`location.origin`** 拼成 `/api/remote.mux`
+   *   （@deepseek-ai/dsh-api-gateway/lib/client.js:544 的 remoteStreamUrl()）—— 它**永远**不带设备前缀，
+   *   于是中继只能靠 **`dsh_device` cookie** 来判"这是哪台设备"（relay-router/src/index.mjs:626-627
+   *   的根路径兜底）。该 cookie 是会过期的：拿不到就 resolveRoute → null → upgrade 直接
+   *   `rejectUpgrade(socket, 404)`（:1294），nginx 侧只看到 `009`/`404 9` 这种截断响应。
+   *   而设备作用域形态 `/remote/<deviceId>/api/remote.mux` 由**路径本身**携带设备身份，
+   *   不依赖任何 cookie（同 rc 的测试就是这么连的：relay-router/test/router-e2e.test.mjs:267）。
+   *
+   * 安全性：中继对两种形态会归一到**同一个上游路径**（resolveRoute 的 device 分支取 m[2]），
+   *   bridge/宿主看到的 path/label 与改写前逐字节一致 —— 只是"设备凭据从 cookie 挪到了 URL"。
+   * 保守性：只有在**页面路径里能读到 deviceId**（`/remote/<id>/…`，也就是 2026-09-19 起的标准入口）
+   *   且该路径确实是根形态的受保护前缀时才改写；读不到（老入口/根路径打开）就原样不动，
+   *   行为与今天完全一致 —— 宁可退化，也绝不猜设备。
+   */
+  function seScopeToDevice(fullPath, deviceId) {
+    if (!deviceId) return String(fullPath || "");
+    var p = String(fullPath || "");
+    if (p.indexOf("/remote/") === 0) return p;               // 已经是设备/通道形态 → 不动
+    var qIdx = p.indexOf("?");
+    var path = qIdx === -1 ? p : p.slice(0, qIdx);
+    var qs = qIdx === -1 ? "" : p.slice(qIdx);
+    if (!seIsProtectedPath(path)) return p;                  // 只改写受保护前缀(与加密策略同源)
+    return "/remote/" + encodeURIComponent(deviceId) + path + qs;
+  }
   function seUpstreamPathOf(fullPath) {
     var p = String(fullPath || "");
     var query = "";
@@ -384,6 +424,58 @@
     if (typeof console !== "undefined" && console.warn) console.warn("[dsh-e2ee-shim]", message);
   }
 
+  /* ---- 会话失效自愈(2026-09-26 线上事故:unknown_session 502 + 刷新也好不了) -------------
+     链路:手机镜像页 → 加密信封 → 中继透明转发 → 桥端 e2ee-client 查会话表 → 查不到就回
+     **明文** 502 + `x-dsh-e2ee-error: unknown_session`(桥端会话表是进程内存 + 24h TTL + CAP=32 LRU,
+     桥重启/被挤掉之后就没了)。而手机侧靠 **localStorage 持久交接单**长期复用同一个 sessId
+     (见 _boot 的"记住本机"分支)→ 每个受保护路径全 502,且**刷新只会把同一张失效交接单再装回去**。
+     修法(只做两件事,绝不静默降级):
+       ① 收到该头 → 立刻清掉 sessionStorage/localStorage 的交接单 → 下一次进入镜像页时
+          "没有交接单"→ 走正常流程回设备列表重新解锁;
+       ② 通过 seStaleSessionHook 把**明确原因**交给 DOM 层写进徽标(需要重新解锁),
+          不再让用户看到"加密好好的,但什么都点不动"。
+     ⚠️ 不改 SE_PROTECTED_PREFIXES:把 /sidebar 移出白名单会让 fs.read/write、pty.*、git.commit
+        明文过境(见 :39 的策略表),那是安全红线。 */
+  var seStaleSessionHook = null;
+  var seLastStaleCode = "";
+  /** 清掉本机保存的 E2EE 交接单(sessionStorage 一次性 + localStorage 持久)。node 测试无 storage → 静默跳过。 */
+  function seForgetHandoverStores() {
+    try { if (typeof sessionStorage !== "undefined" && sessionStorage && sessionStorage.removeItem) sessionStorage.removeItem(DSH_E2EE_HANDOVER_KEY); } catch (e) { /* ignore */ }
+    try { if (typeof localStorage !== "undefined" && localStorage && localStorage.removeItem) localStorage.removeItem(DSH_E2EE_HANDOVER_KEY); } catch (e) { /* ignore */ }
+  }
+  /** 读响应头里的桥端 E2EE 错误码(非信封响应才有;取不到返回 "")。 */
+  function seE2eeErrorOf(res) {
+    try { return String((res && res.headers && res.headers.get && res.headers.get("x-dsh-e2ee-error")) || ""); } catch (e) { return ""; }
+  }
+  /** 收到带 x-dsh-e2ee-error 的响应 → 清失效会话 + 上报(同一个码只报一次,避免刷屏)。 */
+  function seNoteE2eeError(res) {
+    var code = seE2eeErrorOf(res);
+    if (!code) return "";
+    seForgetHandoverStores();
+    if (code !== seLastStaleCode) {
+      seLastStaleCode = code;
+      try { if (typeof seStaleSessionHook === "function") seStaleSessionHook(code); } catch (e) { /* ignore */ }
+      seNotifyFail("加密会话已失效(" + code + "):本机保存的会话已不可用,需要重新解锁。");
+    }
+    return code;
+  }
+
+  /* ---- 数据 WS 握手失败上报(2026-09-26:线上 mux 握手 404/009 → 用户只看到"什么都没发生") ----
+     mux WS 是镜像页与电脑端之间**唯一**的实时数据通道;它连不上时页面不报错,只是所有数据都停住。
+     这里只做**可观测**:把"没连上"作为明确原因交给徽标(区分"会话未建立/设备离线/网络中断"),
+     绝不在这里做重连 —— 官方客户端自己会重连,我们再加一层只会变成"静默无限重连"。 */
+  var seWsFailHook = null;
+  var seWsFailCount = 0;
+  var seWsFailReported = false;
+  function seNoteWsHandshakeFail(label, detail) {
+    seWsFailCount++;
+    if (seWsFailReported) return;
+    seWsFailReported = true;
+    try { if (typeof seWsFailHook === "function") seWsFailHook(String(label || ""), String(detail || ""), seWsFailCount); } catch (e) { /* ignore */ }
+  }
+  /** 握手成功后复位(下一次再断时还能再报一次;不清 count,用于展示"重试了几次")。 */
+  function seNoteWsOpened() { seWsFailReported = false; }
+
   /* ---- HTTP 信封传输包装(与 native e2eeFetchEnveloped 同构;输入/输出为 fetch 语义) ---- */
   var SE_OUTER_STRIP = {
     "host": 1, "origin": 1, "referer": 1, "cookie": 1, "connection": 1, "upgrade": 1,
@@ -464,7 +556,9 @@
         signal: req.signal
       });
     } catch (e) { throw e; }
-    if (!seIsEnvelopeResponse(res)) return res; // router/桥端明文错误页原样透传
+    /* router/桥端明文错误页 → 原样透传(零行为)，但**先看一眼**是不是桥端在说"会话我不认识"
+       (x-dsh-e2ee-error)——是的话清掉本机失效交接单并给出明确原因(见 seNoteE2eeError)。 */
+    if (!seIsEnvelopeResponse(res)) { seNoteE2eeError(res); return res; }
     var envResp = null;
     try { envResp = await res.json(); } catch (e) {
       seNotifyFail("响应信封非法");
@@ -506,10 +600,18 @@
     this._recvQ = Promise.resolve();
     this.binaryType = "blob";
     var inner = this._inner;
-    inner.onopen = function (ev) { self._state = 1; if (typeof self._onopen === "function") self._onopen(ev || { type: "open", target: self }); };
-    inner.onerror = function (ev) { if (typeof self._onerror === "function") self._onerror(ev || { type: "error", target: self }); };
+    this._opened = false;   // 是否**曾经**握手成功(区分"没连上"与"连上后断开")
+    inner.onopen = function (ev) { self._state = 1; self._opened = true; seNoteWsOpened(); if (typeof self._onopen === "function") self._onopen(ev || { type: "open", target: self }); };
+    inner.onerror = function (ev) {
+      /* 握手上就失败(error 早于任何 open)→ 让用户知道"加密数据通道没建立"。
+         这是 2026-09-26 事故里最缺的一条信号:mux 被 404 掐掉时页面**一声不响**,
+         用户只看到所有数据都停住。 */
+      if (!self._opened) seNoteWsHandshakeFail(self._meta && self._meta.wsLabel, "error");
+      if (typeof self._onerror === "function") self._onerror(ev || { type: "error", target: self });
+    };
     inner.onclose = function (ev) {
       self._state = 3;
+      if (!self._opened) seNoteWsHandshakeFail(self._meta && self._meta.wsLabel, (ev && (ev.code || ev.reason)) || "close");
       if (typeof self._onclose === "function") self._onclose(ev || { type: "close", target: self });
     };
     inner.onmessage = function (ev) { self._enqueueInbound(ev); };
@@ -608,14 +710,28 @@
   /** 生成 window.WebSocket 的替换构造函数:命中策略才套 SeE2eeWs,否则原样放行。 */
   function seMakeWsCtor(NativeWS, ctx) {
     function SeWs(url, protocols) {
-      var full = "", should = false;
+      var full = "", should = false, scoped = String(url);
       try {
         var base = ctx.origin || (typeof window !== "undefined" ? window.location.href : undefined);
         var uo = new URL(url, base);
-        if (seSameWebContext(uo, ctx.origin)) { full = uo.pathname + uo.search; should = seShouldEncryptWs(full); }
+        if (seSameWebContext(uo, ctx.origin)) {
+          /* ★ 设备作用域改写（2026-09-26 事故）：官方客户端把 mux WS 固定拼成**根路径**
+             `/api/remote.mux`（dsh-api-gateway/lib/client.js:544 用 location.origin 拼），
+             于是中继只能靠 `dsh_device` cookie 判设备；cookie 一过期/缺失就是 404（upgrade 被
+             rejectUpgrade 掐掉，nginx 只看到 009）→ E2EE 会话永远建不起来 → 之后每个受保护请求
+             全是 unknown_session 502。镜像页的标准入口是 `/remote/<deviceId>/`（2026-09-19 起），
+             deviceId 就在地址里 —— 拿它把 WS 改写成 `/remote/<deviceId>/api/remote.mux`，
+             设备身份由路径携带，不再依赖任何 cookie（中继会把两种形态归一到同一上游路径）。
+             ⚠️ 只改 WS：HTTP 那条链路影响面大得多，且线上证据显示它当时是通的
+                （502 是桥端回的**信封响应**，说明 HTTP 请求已经到达该设备）。 */
+          scoped = seScopeToDevice(uo.pathname + uo.search, ctx.deviceId);
+          var so = scoped === (uo.pathname + uo.search) ? uo : new URL(scoped, base);
+          full = so.pathname + so.search;
+          should = seShouldEncryptWs(full);
+        }
       } catch (e) { should = false; }
       if (!should) return new NativeWS(url, protocols);
-      var target = seBuildWsTarget(url, ctx.sess.sessId, seRandomHex(8), base);
+      var target = seBuildWsTarget(scoped, ctx.sess.sessId, seRandomHex(8), base);
       if (!target) return new NativeWS(url, protocols);
       return new SeE2eeWs(NativeWS, target.href, protocols, { sess: ctx.sess, wsLabel: target.wsLabel });
     }
@@ -731,6 +847,33 @@
   function _reportFail(message) {
     _badge("err", "无法解密", String(message || "会话异常"));
   }
+  /* 桥端回了 x-dsh-e2ee-error（unknown_session / not_verified / auth_failed …）：
+     会话已经**不可恢复**，本机交接单已由 seNoteE2eeError 清掉 —— 这里只负责把"为什么"
+     说清楚（用户看到的必须是"需要重新解锁"，而不是一个说不清的 502 或一句"已失效"）。 */
+  var _STALE_HINT = {
+    unknown_session: "电脑端已不认识这个加密会话(通常是电脑端重启过，或会话太多被挤掉)。",
+    not_verified: "这个加密会话还没完成校验。",
+    auth_failed: "解密校验失败:密码与电脑端不一致，或传输被篡改。",
+    replay: "检测到重放。",
+    bad_envelope: "响应信封非法。",
+    bad_plain: "响应明文非法。"
+  };
+  function _reportStaleSession(code) {
+    var hint = _STALE_HINT[String(code || "")] || ("电脑端返回:" + String(code || "") + "。");
+    _badge("warn", "加密会话已失效，需要重新解锁", hint + " 已清除本机保存的会话；返回设备列表重新点选设备解锁即可恢复加密。");
+  }
+  /* 加密数据 WS（mux）**握手就没成功**：官方客户端只会安静地重连，页面不报错、数据全停。
+     这里把原因分档说清楚（会话/设备/网络），但**不做任何重连**（重连是官方的事，
+     我们再叠一层就变成"静默无限重连"——正是这次要修掉的形态）。 */
+  function _reportWsFail(label, detail, count) {
+    var n = Number(count) || 1;
+    var why = String(detail || "") === "error"
+      ? "电脑端可能未连接(设备离线)、网络中断，或加密会话已失效。"
+      : ("连接被关闭(" + String(detail || "close") + ")，多半是握手被拒或被中继/代理掐断。");
+    _badge("warn", "加密数据通道未建立(第 " + n + " 次)",
+      "与电脑端的加密 WebSocket 没连上:" + why + " 弱网时官方客户端会自动重连，稍等即可；"
+      + "一直这样请返回设备列表重新解锁（会自动重建加密通道）。");
+  }
 
   /* ---- 安装 fetch/WS 加密补丁(有会话才安装) ---- */
   var _installed = false;
@@ -738,7 +881,12 @@
     if (_installed) return;
     _installed = true;
     seFailureHook = _reportFail;
-    var ctx = { sess: sess, origin: window.location.origin };
+    seStaleSessionHook = _reportStaleSession;
+    seWsFailHook = _reportWsFail;
+    /* deviceId 取自**页面路径**（`/remote/<deviceId>/…`，2026-09-19 起的标准入口）：
+       WS 侧用它把根路径的 mux 改写成设备作用域形态，从而不再依赖会过期的 dsh_device cookie
+       （见 seScopeToDevice 的长注释与 2026-09-26 的 nginx 日志证据）。读不到就留空 = 不改写。 */
+    var ctx = { sess: sess, origin: window.location.origin, deviceId: seDeviceIdOfPath(window.location.pathname) };
     try {
       if (window.fetch) {
         var origFetch = window.fetch.bind(window);
@@ -772,7 +920,19 @@
           try { lsSess = seSessionOfHandover(lsRaw); } catch (e) { lsSess = null; }
           if (lsSess) {
             _install(lsSess);
-            _badge("ok", "端到端加密已开启", "刷新后已自动恢复端到端加密(记住本机);密钥仅存内存。");
+            /* ⚠️ 0.6.18 起这句文案不再无条件说"加密好好的"（2026-09-26 事故的教训）：
+               从 localStorage 恢复的会话**没法在本机验证**桥端是否还认它（桥端会话表是进程内存 +
+               24h TTL + CAP=32 LRU，桥重启/被挤掉之后这张交接单就是死票）。真实校验只能等
+               第一个受保护请求 —— 那一步由 seNoteE2eeError 兜底：一旦桥端回 unknown_session，
+               会话被清掉、徽标转 warn 并明说"需要重新解锁"。
+               这里**刻意仍用 ok 态**（而不是一刷新就报 ⚠）：99% 的刷新会话是有效的，
+               照 R2 的建议无条件降级会让每次刷新都出现一个假告警 —— 本仓库一贯的取向是
+               "宁可漏报，也不要误报吓人"（见 mobile-adapter 的 load-warn 看门狗注释）。
+               折中做法：文案如实说明"恢复但未验证"，并把出口写清楚。 */
+            _badge("ok", "端到端加密已开启(本机记忆恢复)",
+              "刷新后已自动恢复端到端加密(记住本机)，密钥仅存内存。"
+              + "注意:这次恢复的会话要到第一个数据请求才能确认电脑端仍认可它 —— "
+              + "若稍后提示「加密会话已失效」，说明电脑端已重启或会话被挤掉，请返回设备列表重新解锁。");
             return;
           }
         }

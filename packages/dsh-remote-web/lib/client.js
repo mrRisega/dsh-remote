@@ -463,6 +463,50 @@ window.__ModuleLoader__.load({
       // Phase-5:端到端加密(E2EE)状态行 —— 启用=绿字绿点,未启用=灰字(纯文字状态行,不打扰)
       ".dru-e2ee-line{display:flex;align-items:center;gap:7px;margin-top:6px;font-size:12px;line-height:1.5;color:var(--dru-fg-muted)}",
       ".dru-e2ee-line.ok{color:var(--dru-success)}",
+      // ── 📣 公告（0.6.18）──────────────────────────────────────────────────────
+      // 侧栏入口上的**未读数字徽标**：与首次引导红点（.dru-nav-remote-dot）同一落点。
+      // 两者同时出现会叠在一起，所以 JS 侧是"徽标优先"（有未读就不挂红点，见 mountNavEntry）。
+      // 数字用白字蓝底（不是红底）：红点=「你还没点过我」，未读数=「有多少条内容」，
+      // 语义不同就不该长一样；红色在这个面板里已经被"危险/未读公告本身"占用了。
+      ".dru-nav-remote-badge{position:absolute;top:-7px;right:-7px;min-width:16px;height:16px;box-sizing:border-box;padding:0 4px;border-radius:999px;background:var(--dru-accent-fill);color:var(--dru-on-accent);font:700 10.5px/16px inherit;text-align:center;box-shadow:0 0 0 2px var(--dru-surface-2);pointer-events:none}",
+      // 状态 chip 行：把原来"各自独占一行"的状态描述收进一行（换行交给 flex-wrap，窄屏不挤）
+      ".dru-chiprow{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:8px}",
+      ".dru-chiprow .dru-status-line,.dru-chiprow .dru-e2ee-line{margin-top:0}",
+      ".dru-chip{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;line-height:1.5;color:var(--dru-fg);background:var(--dru-surface-2);border:1px solid var(--dru-border-soft);border-radius:999px;padding:3px 10px;max-width:100%}",
+      // 二维码右列下方的**提醒区**（引导性内容集中在这里，而不是散落在卡片各处）
+      ".dru-access-tips{display:flex;flex-direction:column;gap:6px;margin-top:4px;padding-top:8px;border-top:1px dashed var(--dru-border-soft)}",
+      ".dru-access-tips-title{font-size:11.5px;font-weight:700;color:var(--dru-fg-muted);letter-spacing:.5px}",
+      ".dru-access-tip-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;line-height:1.6;color:var(--dru-fg-muted)}",
+      ".dru-access-tip-row b{color:var(--dru-fg)}",
+      // 公告列表（设置面板「📣 公告」卡）
+      ".dru-ann-list{display:flex;flex-direction:column;gap:8px}",
+      ".dru-ann-item{display:flex;align-items:flex-start;gap:8px;width:100%;box-sizing:border-box;text-align:left;background:var(--dru-surface-2);border:1px solid var(--dru-border-soft);border-radius:8px;padding:10px 12px;cursor:pointer;font-family:inherit;color:var(--dru-fg)}",
+      ".dru-ann-item:hover{border-color:var(--dru-accent);background:var(--dru-hover)}",
+      ".dru-ann-item-main{flex:1;min-width:0}",
+      ".dru-ann-item-title{font-size:13px;font-weight:600;color:var(--dru-fg);word-break:break-word}",
+      ".dru-ann-item-body{font-size:12.5px;line-height:1.6;color:var(--dru-fg-muted);margin-top:3px;white-space:pre-wrap;word-break:break-word}",
+      ".dru-ann-item-time{font-size:11.5px;color:var(--dru-fg-muted);flex:none;white-space:nowrap}",
+      ".dru-ann-unread{font-size:11px;border-radius:999px;padding:1px 8px;flex:none;color:var(--dru-danger);background:var(--dru-danger-soft);border:1px solid var(--dru-danger-border)}",
+      ".dru-ann-pinned{font-size:11px;border-radius:999px;padding:1px 8px;flex:none;color:var(--dru-tip-fg);background:var(--dru-accent-tint);border:1px solid var(--dru-accent-tint-border)}",
+      ".dru-ann-img{display:block;width:100%;max-width:420px;margin:10px auto 0;border-radius:8px;border:1px solid var(--dru-border)}",
+      // 公告弹窗右上角的 ✕（视觉 28px，命中区用 ::after 补到 ≥44px，与 .dru-tip-close 同一手法）
+      ".dru-popup-x{position:absolute;top:6px;right:6px;width:28px;height:28px;display:flex;align-items:center;justify-content:center;padding:0;border:none;background:none;color:var(--dru-fg-muted);font-size:13px;line-height:1;cursor:pointer;border-radius:6px;font-family:inherit}",
+      ".dru-popup-x::after{content:\"\";position:absolute;left:-8px;right:-8px;top:-8px;bottom:-8px}",
+      ".dru-popup-x:hover{background:var(--dru-hover);color:var(--dru-fg)}",
+      // 「更多」的行内变体：账号卡那一颗原来 width:100% 撑满整行，宽而丑；
+      // ⚠️ 只用于账号卡（`.dru-disclose-inline`），邀请页的规则披露仍用整行的 .dru-disclose。
+      ".dru-disclose-inline{width:auto;min-width:96px;justify-content:center;gap:8px}",
+      // 重启强提醒（kind="restart"）：软提示升级为**实底 + 左侧色条**，让人一眼看到"必须动一下"。
+      // 保持基类 .dru-restart-alert（用例按这个类名定位），只叠加加强态。
+      ".dru-restart-alert-strong{background:var(--dru-warn-soft);border-color:var(--dru-warn-border-2);border-left:4px solid var(--dru-warn-border-2);box-shadow:0 2px 10px var(--dru-shadow)}",
+      ".dru-restart-alert-strong .dru-restart-alert-title{font-size:14.5px}",
+      // ── 🤖 微信机器人「两步走」操作引导（在 .dru-wx-intro 之上，先讲用途再讲怎么接）──
+      ".dru-wx-guide{display:flex;flex-direction:column;gap:6px;background:var(--dru-accent-tint-2);border:1px solid var(--dru-accent-tint-border);border-radius:10px;padding:11px 12px}",
+      ".dru-wx-guide-title{font-size:12.5px;font-weight:700;color:var(--dru-tip-fg-strong)}",
+      ".dru-wx-guide-step{font-size:12.5px;line-height:1.65;color:var(--dru-fg)}",
+      ".dru-wx-guide-step b{color:var(--dru-tip-fg-strong)}",
+      ".dru-wx-guide-cmds{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;line-height:1.7;color:var(--dru-fg-muted);background:var(--dru-surface-2);border:1px solid var(--dru-border-soft);border-radius:8px;padding:7px 9px;white-space:pre-wrap;word-break:break-word;margin:0}",
+      ".dru-wx-guide-note{font-size:11.5px;line-height:1.6;color:var(--dru-fg-muted)}",
       // 侧栏「远程访问」快捷按钮(2026-09 恢复注入,与官方「设置」按钮共存不遮挡):
       // 独立 button(非 clone),插在官方「设置」按钮之前,同源同布局不覆盖官方热区。
       ".dru-nav-remote{display:inline-flex;align-items:center;gap:6px;height:30px;margin:0 0 2px;padding:0 10px;border:1px solid var(--dru-border-ctl);border-radius:8px;background:var(--dru-surface-2);color:var(--dru-accent);font:500 12.5px/1 inherit;cursor:pointer;white-space:nowrap;user-select:none}",
@@ -808,11 +852,15 @@ window.__ModuleLoader__.load({
           openRemoteSettings();
         });
         wrap.insertBefore(btn, host);
-        if (!dotSeen()) {
+        // 徽标优先于首次引导红点：两者落点相同（右上角），同时挂会叠在一起。
+        // 有未读公告时"有多少条内容"比"你还没点过我"更值得占那个位置；红点本来也只到用户点一次为止。
+        var badgeOn = !!(annState.ok && annState.bubble && annState.unread > 0);
+        if (!dotSeen() && !badgeOn) {
           var d = document.createElement("span");
           d.className = "dru-nav-remote-dot";
           btn.appendChild(d);
         }
+        annRenderNavBadge();
       } catch (e) { /* 忽略 */ }
     }
     /** 常驻确保：官方「设置」按钮出现后在它前面挂一次入口(去重；2s 心跳，成本极低)。 */
@@ -828,6 +876,304 @@ window.__ModuleLoader__.load({
         } catch (e) { /* 忽略 */ }
       }, 2000);
       try { if (iv && typeof iv.unref === "function") iv.unref(); } catch (e) {} // node 测试环境不阻塞退出
+    }
+
+    // ══ 📣 公告（0.6.18）模块级状态 ═══════════════════════════════════════════
+    //
+    // 契约：dsh-relay-enterprise/docs/announcements-contract.md（冻结 v1）+ 926 迭代 §1（`client=desktop`）。
+    //   GET  /dsh-remote/announcements?client=desktop → { bubble_enabled, items[], unread_count, popup|null }
+    //   POST /dsh-remote/announcements/click { id }   → 记 clicked_at（= 已读上报；现契约**没有** /read）
+    //
+    // 🔴 三条硬约束（每条都对应一个真实会踩的坑）：
+    //
+    // ① **绝不轮询**：服务端 GET 是「判定即记账」—— 命中弹窗候选就写 shown_at。
+    //    轮询/重复拉取会把本来该弹给用户的公告**静默消耗掉**（用户永远看不到，后台却显示"已曝光"）。
+    //    所以自动拉取用 sessionStorage 标记「每次页面加载只拉一次」；用户主动打开面板要看列表时
+    //    才允许再拉一次（那是他自己的动作，且**只用于列表，绝不用它的返回值去弹窗**）。
+    //
+    // ② **apply() 里绝不碰产品 DOM**：客户端插件入口跑在 app mount **之前**，那时页面里
+    //    还没有任何产品节点（连 body 结构都未必就绪）。所有 UI 都交给 slot；这里只做"拉一次数据"。
+    //
+    // ③ **服务端才是已读权威**：`dsh web` 没显式指定端口时 origin 每次都可能变，
+    //    而 localStorage 按 origin 隔离 —— 本地记忆**只当 60s 级防抖**，绝不能当"已读"。
+    //    同理，本地"同 id 不再弹"只是"服务端已经不给"的镜像，不是我们自己判的。
+    var ANN_PULLED_KEY = "dsh-remote-ann-pulled-v1";   // sessionStorage：本页已自动拉过
+    var ANN_POPUP_KEY = "dsh-remote-ann-popup-v1";     // localStorage：弹窗防抖记忆（作用域见 annScopeOf）
+    var ANN_REPEAT_MS = 60 * 1000;                     // popup.always 的本地去抖窗口（契约 §3 要求客户端兜底）
+    var ANN_ITEM_MAX = 50;                             // 单次渲染上限（防御：服务端异常下发巨量条目）
+    /**
+     * 公告的内存快照 + 订阅（用 useSyncExternalStore 暴露给面板与弹窗）。
+     * 之所以是模块级的：拉取发生在 apply() 里（组件还没挂载），而消费方有两个
+     * （设置面板的卡片 / shell.overlay 上的弹窗），模块级 store 才能让两边看到同一份数据。
+     */
+    var annState = {
+      ok: false,          // 拉取成功且结构是我们认识的那一种（老服务端 404 / 结构不符 → 一直是 false）
+      bubble: false,      // bubble_enabled === true 才置真（字段缺失一律当 false = fail closed）
+      items: [],
+      unread: 0,
+      popup: null,        // 待弹出的那一条（仅自动拉取会置；面板主动刷新不置）
+      scope: "anon",      // 本地防抖的作用域（账号/设备）——由面板拿到 st 后回填
+    };
+    var annVersion = 0;
+    var annListeners = new Set();
+    function annSnapshot() { return annVersion; }
+    function annSubscribe(cb) {
+      annListeners.add(cb);
+      return function () { annListeners.delete(cb); };
+    }
+    function annEmit() {
+      annVersion++;
+      // 订阅者（React 组件）出错绝不连坐其他人；侧栏徽标是 DOM 订阅者，也一并在这里刷新。
+      annListeners.forEach(function (l) { try { l(); } catch (e) { /* 忽略 */ } });
+      annRenderNavBadge();
+    }
+    /** 本地防抖记忆的作用域：按账号（掩码手机号）优先，其次设备，都没有才 anon。 */
+    function annScopeKey() {
+      return ANN_POPUP_KEY + ":" + (annState.scope || "anon");
+    }
+    function annSetScope(v) {
+      var next = String(v || "").trim() || "anon";
+      if (next === annState.scope) return;
+      annState.scope = next;
+      annEmit();
+    }
+    /**
+     * 读本地弹窗记忆。
+     *
+     * 🔒 关键细节：**扫全部作用域键**，取时间最新的一条 —— 而不是只读当前作用域那一个键。
+     *    原因：自动拉取发生在 apply() 里（app mount 之前），那一刻面板还没渲染，
+     *    `annState.scope` 仍是默认的 "anon"；等面板渲染出账号并回填 scope 时，弹窗可能早就判完了。
+     *    只看当前作用域键会导致"弹出决策用 anon、记已读用手机号"两把钥匙对不上 ——
+     *    表现为**同一条公告每次开页面都弹一遍**（防打扰彻底失效）。
+     *    扫全量则与作用域无关，代价是多次弹窗的选择变保守（宁可少弹），这正是我们要的方向。
+     * 坏数据/不可用一律当"没记过"（宁可多弹一次，也不要因为 localStorage 抛异常而静默失效）。
+     */
+    function annPopMemo() {
+      try {
+        var prefix = ANN_POPUP_KEY;
+        var n = 0;
+        try { n = Number(localStorage.length) || 0; } catch (e) { n = 0; }
+        var best = null;
+        for (var i = 0; i < n; i++) {
+          var k = null;
+          try { k = localStorage.key(i); } catch (e) { k = null; }
+          if (!k || k.indexOf(prefix) !== 0) continue;
+          var v = null;
+          try { v = JSON.parse(localStorage.getItem(k) || "null"); } catch (e) { v = null; }
+          if (!v || !isFinite(Number(v.id))) continue;
+          if (!best || Number(v.at || 0) > Number(best.at || 0)) best = v;
+        }
+        if (best) return best;
+      } catch (e) { /* 落到单键读 */ }
+      try { return JSON.parse(localStorage.getItem(annScopeKey()) || "null"); } catch (e) { return null; }
+    }
+    function annPopRemember(id) {
+      try { localStorage.setItem(annScopeKey(), JSON.stringify({ id: id, at: Date.now() })); } catch (e) { /* 忽略 */ }
+    }
+    /**
+     * 归一化服务端响应。**认识不了的一律返回 null**（fail closed）：
+     *   · 不是对象 / ok:false / 404 体          → null
+     *   · bubble_enabled 缺失或非 true           → false（后台没开入口，绝不猜成开）
+     *   · items 缺失/非数组                      → []
+     *   · popup 缺失/没有 id / id 不是有限数     → null（**绝不能**把"缺字段"当成"有公告"弹一个空窗）
+     * unread_count 非法时退回"数 items 里 unread 的条数"，而不是编一个 0（0 会让徽标消失）。
+     */
+    function annNormalize(b) {
+      if (!b || typeof b !== "object" || Array.isArray(b)) return null;
+      if (b.ok === false) return null;
+      var rawItems = Array.isArray(b.items) ? b.items : [];
+      var items = [];
+      for (var i = 0; i < rawItems.length && items.length < ANN_ITEM_MAX; i++) {
+        var it = rawItems[i];
+        if (!it || typeof it !== "object") continue;
+        var id = Number(it.id);
+        if (!isFinite(id)) continue;                     // 没有 id 的条目点不了、也上报不了 → 直接丢
+        items.push({
+          id: id,
+          title: typeof it.title === "string" ? it.title : "",
+          body: typeof it.body === "string" ? it.body : "",
+          image: typeof it.image === "string" ? it.image : "",
+          pinned: it.pinned === 1 || it.pinned === true,
+          created_at: Number(it.created_at) || 0,
+          // unread 缺失 → 当成**已读**（宁可不显示红点，也不要把已读的重新标成未读骗点击）
+          unread: it.unread === true,
+        });
+      }
+      var unread = Number(b.unread_count);
+      if (!isFinite(unread) || unread < 0) {
+        unread = items.filter(function (x) { return x.unread; }).length;
+      }
+      var popup = null;
+      var p = b.popup;
+      if (p && typeof p === "object" && !Array.isArray(p)) {
+        var pid = Number(p.id);
+        if (isFinite(pid)) {
+          popup = {
+            id: pid,
+            title: typeof p.title === "string" ? p.title : "",
+            body: typeof p.body === "string" ? p.body : "",
+            image: typeof p.image === "string" ? p.image : "",
+          };
+        }
+      }
+      return { bubble: b.bubble_enabled === true, items: items, unread: Math.max(0, Math.floor(unread)), popup: popup };
+    }
+    /**
+     * 本次响应要不要弹？
+     *   · 服务端没给 popup → 不弹（老后台 / 运营没开 / once 模式已记账过）
+     *   · 本地记忆里**同一条**在 60s 内弹过 → 不弹（`always` 模式的防抖）
+     *
+     * ⚠️ 为什么用"id + 60s 时间窗"而不是"同 id 永不再弹"：响应里**没有** `mode` 字段
+     *    （契约 §3 的 popup 只有 id/title/body/image），客户端根本区分不出 once / always。
+     *    这个规则的语义是两者的**安全超集**：
+     *      · once：服务端记账后**不再返回**这条 → 本地永远没机会再弹（等价于"永不再弹"）；
+     *      · always：服务端每次都返回 → 本地把频率压到 ≥60s 一次。
+     *    反过来说：**绝不能**把它做成"同 id 永久记住" —— 那会把服务端的 always
+     *    静默压成 once（契约 §3 明确警告过服务端不得这么"优化"，客户端同理）。
+     */
+    function annShouldPopup(popup) {
+      if (!popup) return false;
+      var memo = annPopMemo();
+      if (memo && Number(memo.id) === popup.id && Date.now() - Number(memo.at || 0) < ANN_REPEAT_MS) return false;
+      return true;
+    }
+    /** 侧栏「📱 远程访问」入口上的未读数字徽标（模块级 DOM 维护；徽标优先于首次引导红点）。 */
+    function annRenderNavBadge() {
+      try {
+        var btn = document.getElementById(NAV_ENTRY_ID);
+        if (!btn) return;
+        var old = btn.querySelector(".dru-nav-remote-badge");
+        var show = !!(annState.ok && annState.bubble && annState.unread > 0);
+        if (!show) {
+          if (old && old.parentNode) old.parentNode.removeChild(old);
+          return;
+        }
+        var txt = annState.unread > 9 ? "9+" : String(annState.unread);
+        if (old) { if (old.textContent !== txt) old.textContent = txt; return; }
+        var b = document.createElement("span");
+        b.className = "dru-nav-remote-badge";
+        b.setAttribute("aria-hidden", "true");   // 纯装饰：可访问名字来自按钮文字
+        b.textContent = txt;
+        btn.appendChild(b);
+      } catch (e) { /* 忽略：徽标失败绝不影响入口本身 */ }
+    }
+    /**
+     * 主动拉一次公告。
+     * @param {{openPopup?:boolean}} [opts] openPopup=true 仅用于**每次页面加载的自动拉取**；
+     *   面板主动刷新时传 false —— 用它的返回值弹窗会让"用户主动看列表"变成一次打扰。
+     */
+    function annFetch(opts) {
+      var withPopup = !!(opts && opts.openPopup);
+      return api("/dsh-remote/announcements?client=desktop").then(function (b) {
+        var norm = annNormalize(b);
+        if (!norm) { annState.ok = false; annState.bubble = false; annState.items = []; annState.unread = 0; annEmit(); return false; }
+        annState.ok = true;
+        annState.bubble = norm.bubble;
+        annState.items = norm.items;
+        annState.unread = norm.unread;
+        if (withPopup && annShouldPopup(norm.popup)) {
+          annState.popup = norm.popup;
+        }
+        annEmit();
+        return true;
+      }).catch(function () {
+        // 404（老服务端）/ 不可达 / 超时：fail closed —— 不显示入口、不弹窗，**绝不抛**
+        annState.ok = false;
+        annState.bubble = false;
+        annState.items = [];
+        annState.unread = 0;
+        annEmit();
+        return false;
+      });
+    }
+    /** 每次页面加载的自动拉取（sessionStorage 一次性标记；已在 apply() 里整段 try/catch）。 */
+    function annPullOnce() {
+      try {
+        if (sessionStorage.getItem(ANN_PULLED_KEY) === "1") return;  // 本页已拉过 → 绝不重复（"判定即记账"）
+        sessionStorage.setItem(ANN_PULLED_KEY, "1");
+      } catch (e) {
+        // sessionStorage 不可用（隐私模式）：**宁可少拉一次也不要多拉**（重复拉会吃掉待弹公告），
+        // 所以这里直接放弃这次自动拉取 —— 入口欠显示比"公告被静默消耗"代价小得多。
+        return;
+      }
+      annFetch({ openPopup: true });
+    }
+    /** 已读上报（点击/关闭 = 同一次上报：现契约只有 /click，没有 /read）。 */
+    function annReportClick(id) {
+      try { post("/dsh-remote/announcements/click", { id: id }).catch(function () { /* 静默：服务端才是权威 */ }); } catch (e) { /* 忽略 */ }
+    }
+    /** 本地把某条标记为已读（只为了让徽标/标签立刻更新；真正的已读在服务端）。 */
+    function annMarkReadLocal(id) {
+      var hit = false;
+      annState.items = annState.items.map(function (x) {
+        if (x.id !== id || !x.unread) return x;
+        hit = true;
+        return Object.assign({}, x, { unread: false });
+      });
+      if (hit) { annState.unread = Math.max(0, annState.unread - 1); annEmit(); }
+    }
+
+    // ── 🤖 微信机器人「命令帮助」镜像 ─────────────────────────────────────────
+    // ⚠️ 真身是 clients/dsh-remote/wechat-channel.mjs 的 HELP_TEXT（用户在微信里看到的唯一说明书）。
+    //    浏览器半与 bridge 是两个 bundle，**没有**可用的 require 通道，所以沿用本文件顶部
+    //    WECHAT_FREE_CAPS 那套既定做法：这里放一份**给面板看的镜像**，由测试逐条与 HELP_TEXT
+    //    对账（wechat-bot-ui.test.mjs / announcements-ui.test.mjs）。面板多写一条命令，
+    //    用户照着发就会拿到"不认识这条指令" —— 所以这条测试是硬约束，不是装饰。
+    //    只列**指令类**（`/xxx`）那几行：`回数字` / `直接发一句话` 属于自然语言用法，
+    //    由 .dru-wx-guide 的正文讲，不进这份命令清单。
+    var WECHAT_HELP_CMDS = [
+      "/new <任务> 开新任务并把任务发下去",
+      "/ls 列出会话，用 /use <编号> 切换",
+      "/use <编号> 切换到某个会话，之后你发的话都进它",
+      "/stop 中断当前会话正在跑的回合",
+      "/summary 重发当前会话的最近结论",
+      "/status 查看绑定与推送状态",
+      "/quiet 暂停推送（回复任意消息恢复）",
+      "/unbind 解除微信绑定",
+      "/help 显示本帮助"
+    ];
+
+    // ══ 📶 网络延迟（0.6.18）——**绝不主动测速**，只在既有周期请求上量 ══════════
+    //
+    // 用户口径原话：「根据网络请求实际情况显示延迟。**不要主动测速**，可以根据最近一次心跳
+    // 检测或者必要的本身有的请求来进行测算。」
+    //
+    // 所以这里**不新增任何请求**：面板本来就有 `/dsh-remote/status` 的周期轮询
+    // （STATUS_POLL_MS）与打开面板时的一次 refresh —— 就在这两处用 performance.now() 量差值。
+    // 这也是"用户真正感受到的延迟"：一次真实的同源请求往返，而不是 ping 一个假地址。
+    //
+    // 三条纪律：
+    //   ① 只在**成功**拿到响应时记样本（失败/超时不是"延迟"，是"没有网络"，混进来会把均值拉爆）；
+    //   ② 明显异常的值（>30s，多半是挂起后又被 AbortController 收掉）直接丢弃；
+    //   ③ 用 EWMA（指数滑动平均）而不是"最后一次"或"全部平均"：前者会跟着一次抖动乱跳，
+    //      后者对"网络刚刚变慢"反应太迟钝 —— 面板上要的是"现在大概多快"。
+    var RTT_ALPHA = 0.3;                 // 新样本权重（越大越跟手，越小越平滑）
+    var RTT_MAX_MS = 30000;              // 超过这个值不当样本（挂起/超时的产物，不是延迟）
+    var netLat = { ms: 0, samples: 0 };
+    /** 高精度时钟；没有 performance 的旧环境退回 Date.now（精度差但不会抛）。 */
+    function netNow() {
+      try {
+        if (typeof performance !== "undefined" && performance && typeof performance.now === "function") return performance.now();
+      } catch (e) { /* 忽略 */ }
+      return Date.now();
+    }
+    /** 记一次 RTT 样本（只在成功的请求上调用，见上面的纪律 ①）。 */
+    function noteRtt(ms) {
+      var v = Number(ms);
+      if (!isFinite(v) || v <= 0 || v > RTT_MAX_MS) return;
+      netLat.ms = netLat.samples === 0 ? v : (netLat.ms * (1 - RTT_ALPHA) + v * RTT_ALPHA);
+      netLat.samples++;
+    }
+    /**
+     * 延迟 → 人话。
+     * 🔒 无样本时必须说「测速中…」而**不是 0ms**：0ms 是句谎话（这个页面根本还没量过），
+     *    而"测速中"如实表达了"还没有样本"。分档：≤120 顺畅 / ≤300 一般 / >300 较慢。
+     */
+    function netLatText() {
+      if (!netLat.samples) return "测速中…";
+      var ms = Math.max(1, Math.round(netLat.ms));
+      var tone = ms <= 120 ? "顺畅" : ms <= 300 ? "一般" : "较慢";
+      return "网络延迟 " + ms + "ms · " + tone;
     }
 
     // ── 宿主 API ────────────────────────────────────────────────────────────
@@ -1637,6 +1983,70 @@ window.__ModuleLoader__.load({
       );
     }
 
+    // ── 📣 电脑端公告弹窗（shell.overlay 的**第二个**槽位）────────────────────
+    //
+    // 为什么是 shell.overlay：官方**没有** notice / toast / dialog / modal 服务，也没有宿主→客户端的
+    // 通用通知通道（客户端服务全集里没有这一类），`shell.overlay` 是唯一现成的弹窗落点 ——
+    // 本插件自己已经用它挂过满意度弹窗（FeedbackPopup），第三方 @max-null/dsh-plugin-center 的
+    // WhatsNewDialog 也是"打开弹一次 + 点任意按钮即已读 + 不频繁打扰"的完整先例。
+    //
+    // 行为（对齐需求与契约）：
+    //   · 服务端没给 popup（老后台/运营关掉/once 已记账）→ 直接 return null，什么都不渲染；
+    //   · **任意按钮 / 遮罩 / ✕ 都算已读**：先记账（POST /click）+ 写本地防抖 + 关闭，
+    //     顺序是"先关后报"—— 上报失败也**不能**把用户困在弹窗里（服务端才是权威，下次会再给）；
+    //   · 整段逻辑包 try/catch：客户端插件抛异常 = 整个 web app 起不来（"Failed to load plugins"），
+    //     公告这种锦上添花的东西绝没有资格把门关上。
+    function AnnouncementPopup() {
+      var theme = useSyncExternalStore(themeSubscribe, themeGet);
+      // 订阅模块级 store：公告是 apply() 里异步拉回来的，组件必须先挂上、数据到了再渲染。
+      useSyncExternalStore(annSubscribe, annSnapshot);
+      var closingArr = useState(false); var closing = closingArr[0]; var setClosing = closingArr[1];
+      var popup = annState.popup;
+      if (!popup) return null;
+
+      /** 关闭 + 记已读。无论上报成功与否都关闭（绝不因为网络问题把用户留在弹窗里）。 */
+      var dismiss = function () {
+        if (closing) return;
+        setClosing(true);
+        try { annPopRemember(popup.id); } catch (e) { /* 忽略 */ }
+        try { annReportClick(popup.id); } catch (e) { /* 忽略 */ }
+        try { annMarkReadLocal(popup.id); } catch (e) { /* 忽略 */ }
+        try { annState.popup = null; } catch (e) { /* 忽略 */ }
+        setClosing(false);
+        annEmit();
+      };
+
+      return h("div", {
+        className: "dru-popup",
+        "data-dru-theme": theme,
+        // 点遮罩 = 已读（与 FeedbackPopup 同一交互；用户"看过并关掉"就是最诚实的已读信号）
+        onMouseDown: function (e) { if (e.target === e.currentTarget) dismiss(); },
+      },
+        h("div", { className: "dru-popup-card", role: "dialog", "aria-modal": "true", "aria-label": "公告", style: { position: "relative" } },
+          // ✕ 也是"已读"：三个入口（✕ / 遮罩 / 底部按钮）必须走**同一个** dismiss，
+          // 任何一个漏了都会造成"我明明看到了，后台却显示没看过"。
+          h("button", {
+            type: "button",
+            className: "dru-popup-x",
+            "aria-label": "关闭公告（记为已读）",
+            title: "关闭并记为已读",
+            onClick: dismiss,
+          }, "✕"),
+          h("div", { className: "dru-popup-body", style: { textAlign: "left" } },
+            h("div", { className: "dru-popup-icon", style: { textAlign: "center" } }, "📣"),
+            h("div", { className: "dru-popup-title", style: { textAlign: "center" } }, popup.title || "公告"),
+            popup.body ? h("div", { className: "dru-ann-item-body", style: { marginTop: 8 } }, popup.body) : null,
+            popup.image ? h("img", { className: "dru-ann-img", src: popup.image, alt: "公告图片" }) : null
+          ),
+          h("div", { className: "dru-popup-foot" },
+            h("button", { type: "button", title: "关闭并记为已读", onClick: dismiss }, "关闭"),
+            // 「已读」与「关闭」走**同一个**收尾函数（契约只有一个 /click，两个入口不该有两种行为）
+            h("button", { type: "button", disabled: closing, onClick: dismiss }, closing ? "处理中…" : "已读")
+          )
+        )
+      );
+    }
+
     // ── 图标 ────────────────────────────────────────────────────────────────
     // 「远程访问」栏目图标沿用面板 emoji 图标体系：📱 更贴合“手机/另一台电脑远程访问”语义
     // （原 🖥 已随入口迁移调整）；栏目导航 label 与栏目头部均使用它。
@@ -1701,6 +2111,13 @@ window.__ModuleLoader__.load({
       var cxBusyArr = useState(false); var cxBusy = cxBusyArr[0]; var setCxBusy = cxBusyArr[1];
       var cxOkArr = useState(null); var cancelOk = cxOkArr[0]; var setCancelOk = cxOkArr[1]; // null=未知 true=可用 false=旧宿主无此接口
       var cxMsgArr = useState(null); var cxMsg = cxMsgArr[0]; var setCxMsg = cxMsgArr[1];    // {kind, text}
+      // 【0.6.18】「查看最近一次更新日志」折叠态（追加在既有 state 之后，不动上面的 hook 序号）。
+      // 它是"主动查看"的出路：日志自动展开只在更新中/卡住时发生（见 updShowLog），
+      // 更新一结束黑框就收起来 —— 但用户事后想回看时必须还有地方点。
+      var logOpenArr = useState(false); var logOpen = logOpenArr[0]; var setLogOpen = logOpenArr[1];
+      // 最近一次拉到的日志尾巴（**与 log 分开存**的原因见 applyUpdLog 收尾分支：
+      // log 只服务于"正在更新"的黑框，收尾即清空；lastLog 留给用户主动回看）。
+      var lastLogArr = useState(""); var lastLog = lastLogArr[0]; var setLastLog = lastLogArr[1];
 
       var loadVer = useCallback(function () {
         api("/dsh-remote/self").then(function (b) {
@@ -1762,6 +2179,12 @@ window.__ModuleLoader__.load({
         } else {
           setUpdated(true);
         }
+        // 【0.6.18】收尾时必须**主动收起黑框**：`log` 来自宿主那个只增不减的持久文件，
+        // 不清掉的话下一次渲染（以及刷新页面后的 mount 探针）会把它原样拉回来 ——
+        // 那就是"更新早就结束了、黑框却永远挂在面板上"的另一半原因。
+        // 主动查看的路留在「查看最近一次更新日志」折叠里：把这份尾巴另存进 lastLog 再清空 log。
+        setLastLog(nextLog);
+        setLog("");
         loadVer();
         doCheck();
       }, [loadVer, doCheck]);
@@ -1902,6 +2325,19 @@ window.__ModuleLoader__.load({
       var stalled = !!(prog && prog.stalled);
       var canCancel = updating && cancelOk !== false && ((prog && prog.stalled) || idleShown >= cancelAfterMs);
       var idleHint = progRunning && !stalled && idleShown >= UPDATE_IDLE_HINT_MS;
+      /**
+       * 更新日志黑框**什么时候自动展开**（0.6.18 修的"永久不消失"）：
+       *   只有「更新真的在跑」或「服务端判定卡住」时才自动摊开 —— 那是用户此刻需要看的唯一信息。
+       *
+       * 为什么原来会永久显示：`log` 来自宿主持久文件 `.dsh-update.log` 的 24 行尾
+       * （`/self/update-log` 的 `tailOf`），文件只 append 从不截断；而收尾分支
+       * （applyUpdLog 的 running=false 路径）只 `setUpdating(false)`、**从不 `setLog("")`**。
+       * 于是"更新结束"这个事实在界面上只体现为进度指标消失，黑框还在；刷新页面又会重新拉回旧尾巴。
+       *
+       * 注意判据里**保留 `prog.stalled`**：更新进程已退出但被判为卡住时，日志正是证据，
+       * 不能跟着 running=false 一起收起来（那等于把失败现场藏了）。
+       */
+      var updShowLog = !!(updating || (prog && prog.stalled));
 
       return h("div", { className: "dru-card", style: { marginTop: 2 } },
         h("h3", null, "🔄 版本与更新"),
@@ -1988,8 +2424,31 @@ window.__ModuleLoader__.load({
           ? h("div", { className: "dru-msg dru-msg-ok" },
               "✅ 更新已完成，最新代码已就位。请", h("strong", null, "重启 dsh web"), "后生效；后台服务会随系统自启自动运行新版本。")
           : null,
-        // ④ 更新日志（失败时同样靠近上面的错误提示）
-        log ? h("div", { className: "dru-up-log", title: "更新日志（尾部）" }, log) : null,
+        // ④ 更新日志：**只在真的在更新（或服务端判定卡住）时**自动摊开。
+        //    旧实现是 `log ? … : null` —— 只看"日志非空"，而日志来自宿主持久文件、
+        //    收尾又不清空 → 更新结束后黑框仍在，刷新页面还把它拉回来（用户报的"永久不消失"）。
+        updShowLog && log ? h("div", { className: "dru-up-log", title: "更新日志（尾部）" }, log) : null,
+        // ⑤ 主动回看：更新结束后黑框收起，但日志不该消失得无影无踪（排查还要用）。
+        //    复用 .dru-disclose（账号卡那一处才是 .dru-disclose-inline，这里保持整行）。
+        !updShowLog && h("button", {
+          type: "button",
+          className: "dru-disclose",
+          style: { marginTop: 8 },
+          "aria-expanded": logOpen ? "true" : "false",
+          onClick: function () {
+            var next = !logOpen;
+            setLogOpen(next);
+            if (next) logTimer();   // 展开时才去拉一次（不展开就不打扰宿主）
+          }
+        },
+          h("span", null, "查看最近一次更新日志"),
+          h("span", { className: "dru-disclose-caret", "aria-hidden": "true" }, logOpen ? "收起 ▲" : "展开 ▼")
+        ),
+        !updShowLog && logOpen
+          ? (log || lastLog
+              ? h("div", { className: "dru-up-log", title: "更新日志（尾部）" }, log || lastLog)
+              : h("div", { className: "dru-hint", style: { marginTop: 6 } }, "还没有更新日志（本机没跑过在线更新）。"))
+          : null,
         selfMsg ? h("div", { className: "dru-msg dru-msg-" + selfMsg.kind }, selfMsg.text) : null,
         h("div", { className: "dru-hint", style: { marginTop: 8 } },
           armed ? "⚠ 再次点击后即开始彻底卸载：① 移除 dsh web 配置中的插件引用与本地文件；② 停止并移除 bridge 自启动服务（即让「后台服务」不再开机自启：macOS com.dshremote.bridge / Linux dsh-bridge / Windows 任务计划程序 dsh-remote-bridge）并结束残留进程；③ 清空本地配置目录（~/.dsh-remote：账号、设备密钥、固化运行时等）。此操作不可撤销，如需再次使用：在插件市场搜索「dsh-remote-web」重新安装，或执行 npx @mrrisega/dsh-remote。" :
@@ -2126,7 +2585,9 @@ window.__ModuleLoader__.load({
 
       var refresh = useCallback(function () {
         setBusy("status");
+        var t0 = netNow();   // 📶 延迟采样点①：打开面板时这一次 /status（既有请求，不新增）
         api("/dsh-remote/status").then(function (body) {
+          noteRtt(netNow() - t0);   // 先记样本再 setSt —— 这一次的延迟当轮就能显示出来
           setSt(body);
           setMode(body && body.config && body.config.mode === "local" ? "local" : "saas");
           setMessage(null);
@@ -2166,6 +2627,13 @@ window.__ModuleLoader__.load({
       // kind === "refresh" = 插件文件在运行中被改写(装完/更新完),只需刷新页面;
       // 其余情况(极为罕见)才提重启 dsh web。
       var isRefreshOnly = restartPending && restartInfo.kind === "refresh";
+      // 【0.6.18】kind === "restart" = **在线更新已完成、必须重启 dsh web 才生效**（宿主在
+      // runOnlineUpdate 成功收尾时写的）。它与 refresh 是两种不同动作，文案与主按钮必须一一对应
+      // （混用就会出现"文案说刷新、状态其实是重启"这种自相矛盾）。
+      // 🔴 这一种**绝不自动倒计时重启**：在线更新的收尾时刻，用户很可能正在一段会话中间 ——
+      //    15 秒后替他把 dsh web 杀掉，正是代码里反复强调的"不能替他做的决定"。
+      //    所以这里只给**强提醒 + 主按钮「立即重启」**，什么时候重启由他点。
+      var isRestartHard = restartPending && restartInfo.kind === "restart";
       // 连接阶段（node 半下发）：轮询拿到的新鲜结果优先，其次用 /status 里带的那一份；
       // 旧版 host（响应里没有 connect 字段）→ 回退到原来的 service.running 文案（行为不变）。
       var connInfo = conn || (st && st.connect) || null;
@@ -2205,7 +2673,9 @@ window.__ModuleLoader__.load({
       /** 轻量状态轮询：只更新 st，不改 mode（mode 由用户 Tab 选择决定，避免轮询把自建/云端来回切）。 */
       function pollStatus() {
         if (document.hidden) return; // 页面隐藏时不空转(审计:降低请求频率)
+        var t0 = netNow();           // 📶 延迟采样点②：面板停留期间的周期心跳（30s 一次，既有请求）
         api("/dsh-remote/status").then(function (body) {
+          noteRtt(netNow() - t0);
           if (!body || !body.ok) return;
           setSt(body);
         }).catch(function () {});
@@ -3332,6 +3802,18 @@ window.__ModuleLoader__.load({
               onClick: function () { setView("invite"); loadInvite(); }
             }, "🎁 带新用户换会员") : null,
             h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "", onClick: function () { setView("feedback"); } }, "💬 用户反馈"),
+            // 💬 加入交流群（0.6.18 从「关于」卡搬到这里）：它和「用户反馈」是同一类东西 ——
+            // 「跟我们联系」的两个入口。原来它躺在最底下的「关于 dsh-remote」里，用户要读完
+            // 六段技术说明才找得到，而那时的位置离"有事想找人问"的场景已经很远了。
+            // 未配置二维码（后台上传才有）→ 整体不渲染，不留空壳按钮。
+            community && community.qrcode
+              ? h("button", {
+                  type: "button",
+                  className: "dru-btn dru-btn-ghost",
+                  disabled: busy !== "",
+                  onClick: function () { setCommOpen(true); }
+                }, "💬 加入交流群")
+              : null,
             h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "", onClick: togglePwdForm }, pwdOpen ? "收起修改密码" : "🔒 修改密码"),
             h("button", { type: "button", className: "dru-btn dru-btn-danger", disabled: busy !== "", onClick: function () { doLogout(false); } }, "退出登录")
           ),
@@ -3346,10 +3828,14 @@ window.__ModuleLoader__.load({
           // :focus-visible 基线），开合状态用「展开 ▼ / 收起 ▲」**文字**加箭头表达，不靠颜色区分。
           // 无障碍：aria-expanded 表达开合，aria-controls 指向下面的内容体（内容体始终在 DOM 里、
           // 收起时 hidden，所以 aria-controls 永远指向一个真实存在的元素，不指向空气）。
+          // 【0.6.18】加 .dru-disclose-inline：原来它继承 .dru-disclose 的 width:100%，
+          //   在账号卡里被撑成一条横贯整卡的宽条，和上面那排按钮完全不是一个视觉重量（业主："宽而丑"）。
+          //   ⚠️ 变体只加在**这一处**：邀请页的「活动规则」披露仍是整行，那是对的（它是那一屏的主折叠）。
+          //   id / aria-controls / aria-expanded 一个都不能动 —— remote-access-ui.test.mjs 按它们定位。
           h("button", {
             type: "button",
             id: MKT_MORE_TOGGLE_ID,
-            className: "dru-disclose",
+            className: "dru-disclose dru-disclose-inline",
             style: { marginTop: 10 },
             "aria-expanded": moreOpen ? "true" : "false",
             "aria-controls": MKT_MORE_BODY_ID,
@@ -3874,12 +4360,26 @@ window.__ModuleLoader__.load({
             h("span", null, e.text));
         }
         return card("📱 远程访问", [
-          h("div", { className: "dru-status-line" },
-            h("span", { className: dotCls }),
-            h("span", null, statusTxt)
+          // 【0.6.18 面板重排】状态性描述（连接状态 + E2EE）从"各自独占一行"收敛成**一行内的 chip**：
+          //   · 用 flex-wrap 而不是硬挤：窄屏（手机镜像页也是同一份面板）自动换行，绝不横向溢出；
+          //   · 文字标签始终在（点 + 文案），颜色只是辅助，不靠颜色单独表意；
+          //   · `.dru-e2ee-line` 这个 class **必须保留**（remote-access-ui.test.mjs 按它定位）。
+          // E2EE 徽标仍留在这一层而不是搬进右列：未生成访问链接（hasKey=false）时右列不存在，
+          // 搬过去会让"服务端说加密已开"这条信息凭空消失。
+          h("div", { className: "dru-chiprow" },
+            h("span", { className: "dru-chip" },
+              h("span", { className: dotCls, "aria-hidden": "true" }),
+              h("span", null, statusTxt)
+            ),
+            // 📶 网络延迟 chip：数字来自**既有** /status 请求的往返耗时（refresh + 30s 轮询），
+            //    没有样本时显示「测速中…」而不是 0ms（见 netLatText）。
+            h("span", { className: "dru-chip dru-net-chip", title: "最近一次面板请求的往返耗时（不额外测速）" },
+              h("span", { "aria-hidden": "true" }, "📶"),
+              h("span", null, netLatText())
+            ),
+            renderE2eeBadge()
           ),
           renderConnectBlock(),
-          renderE2eeBadge(),
           akeyMsg
             ? h("div", { className: "dru-msg dru-msg-" + akeyMsg.kind, style: { marginTop: 8 } },
                 akeyMsg.text,
@@ -3907,12 +4407,9 @@ window.__ModuleLoader__.load({
                   h("button", { type: "button", className: "dru-btn dru-btn-primary", disabled: akeyBusy, onClick: openKeyUrl }, "直接打开"),
                   h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: akeyBusy, onClick: loadAccessKey }, akeyBusy ? "生成中…" : "刷新二维码/访问链接")
                 ),
-                h("div", { className: "dru-hint", style: { marginTop: 4 } },
-                  !serviceRunning
-                    ? (connInfo && connPhase !== "online"
-                        ? "本机后台服务正在自动准备中（" + connText + "）：连上后这个链接/二维码即可使用，无需其他操作。"
-                        : "本机后台服务未运行：先在下方「🖥 后台服务」卡启动。")
-                    : "打开链接/扫码进入即登录态；同设备重复扫码只更新授权，不新增设备。")
+                // 【0.6.18】原来这里只有一行 hint，右列下方空着一大片 —— 现在改成**提醒区**：
+                // 未读公告入口 / 重启提醒 / 使用提示集中在此（引导用户"下一步做什么"，而不是散落各处）。
+                renderAccessTips(hasKey)
               )
             )
           ]) : h("div", null, [
@@ -4090,6 +4587,9 @@ window.__ModuleLoader__.load({
             renderAccessCard(),
             // 已授权设备：仅登录后展示（登录前不显示，避免空列表/误导）
             loggedIn && st.config.phone ? renderDevicesCard() : null,
+            // 📣 公告（0.6.18）：插在「🔑 账号」之前 —— 未读公告与"远程访问/账号"同属首屏要紧信息；
+            //   没有可显示的内容时整卡不存在（见 renderAnnouncementsCard 的 fail closed 说明）。
+            renderAnnouncementsCard(),
             card("🔑 账号",
               st === null
                 ? h("div", { className: "dru-hint" }, "正在读取远控状态…")
@@ -4200,7 +4700,14 @@ window.__ModuleLoader__.load({
                 )
               : null
           ),
-          // 关于 dsh-remote（v0.5+ 远程访问价值说明卡片）
+          // 版本与更新（自管理：检测新版 / 一键在线更新 / 彻底卸载）
+          h(SelfManageCard, null),
+          // 📖 关于 dsh-remote（**挪到最底**，0.6.18 面板重排）：
+          //   原来它夹在「🖥 后台服务」与「🔄 版本与更新」之间，六段技术说明把
+          //   "需要你动一下"（版本/重启）和"日常会用的入口"（账号/微信/公告）全挤到了它上面 ——
+          //   用户为了找版本卡要先滚过一整屏说明文字。关于是**背景阅读**，天然属于最后一屏。
+          //   ⚠️ 整块必须留在 renderHome 的返回树里，**不能**塞进 SelfManageCard 的返回树 ——
+          //   那会让它跟着那个组件的状态生命周期一起消失/重建。
           card("📖 关于 dsh-remote", [
             // 一句话定位（面向非技术用户先讲清楚"这是什么"），下面 4 条为既有技术说明（文案受源码契约锁定）
             h("div", { className: "dru-hint", style: { marginBottom: 6 } }, "📱 一句话：用手机随时接管这台电脑上的 DeepSeek Harness——装上即得专属加密地址，人在外面也能全功能操作（免内网穿透、免公网 IP、全程加密）。"),
@@ -4214,20 +4721,10 @@ window.__ModuleLoader__.load({
             h("div", { className: "dru-hint", style: { marginTop: 6 } },
               "📊 匿名装机统计：只上报「装机/连接是否成功」这类事件（安装开始与失败原因、后台服务是否注册成功、是否首次远程打通）——"
               + "不含任何账号、手机号、会话或文件内容、主机名、路径、设备指纹与 IP；标识是本机随机 ID（重装即变）。"
-              + "用环境变量 DSH_REMOTE_TELEMETRY=0 可完全关闭（不生成 ID、不发任何请求）。"),
-            // 加入交流群（后台上传二维码后出现；点击弹出二维码大图便于扫码）
-            community && community.qrcode
-              ? h("div", { className: "dru-actions", style: { marginTop: 10 } },
-                  h("button", {
-                    type: "button",
-                    className: "dru-btn dru-btn-ghost",
-                    style: { width: "100%" },
-                    onClick: function () { setCommOpen(true); }
-                  }, "💬 加入交流群"))
-              : null
+              + "用环境变量 DSH_REMOTE_TELEMETRY=0 可完全关闭（不生成 ID、不发任何请求）。")
+            // ⚠️ 「💬 加入交流群」按钮已搬到「🔑 账号」卡的功能区（与「💬 用户反馈」并列）——
+            //    那里才是"有事想找人问"时会看的地方；这里只剩阅读性内容。
           ]),
-          // 版本与更新（自管理：检测新版 / 一键在线更新 / 彻底卸载）
-          h(SelfManageCard, null),
           message && h("div", { className: "dru-msg dru-msg-" + message.kind }, message.text)
         );
       }
@@ -4235,8 +4732,10 @@ window.__ModuleLoader__.load({
       // 【自动化】待重启时自动倒计时重启(见 autoRestartCancelled 说明);倒计时只在面板可见且无其他操作时推进。
       // ⚠️ isRefreshOnly(插件更新后只需刷新)时**不**自动重启:刷新是零风险动作,重启 dsh web 会打断
       // 用户正在进行的会话,不能替他做这个决定 —— 让他点「刷新页面」即可。
+      // ⚠️ isRestartHard(在线更新完成,kind="restart")同理**不**自动重启:这一种现在会在每次
+      // 在线更新成功后出现,若照旧 15 秒自动重启,等于"更新完必定打断用户正在做的事"。
       useEffect(function () {
-        if (!restartPending || isRefreshOnly || busy !== "" || restartCancelled) { setRestartCountdown(null); return undefined; }
+        if (!restartPending || isRefreshOnly || isRestartHard || busy !== "" || restartCancelled) { setRestartCountdown(null); return undefined; }
         var at = restartInfo.at || 0;
         if (autoRestartCancelled(at)) { setRestartCountdown(null); return undefined; }
         var left = Math.round(AUTO_RESTART_DELAY_MS / 1000);
@@ -4250,7 +4749,20 @@ window.__ModuleLoader__.load({
           restartHarness(); // 已有实现:重启 + 轮询等它回来 + 自动刷新页面
         }, 1000);
         return function () { clearInterval(iv); };
-      }, [restartPending, isRefreshOnly, restartInfo.at, busy, restartCancelled]);
+      }, [restartPending, isRefreshOnly, isRestartHard, restartInfo.at, busy, restartCancelled]);
+
+      // ── 📣 公告（0.6.18）：本组件的 hook 全部追加在**最后一个既有 hook 之后** ──────
+      // 🔒 hook 序号铁律（见本组件顶部 2029-2036 的注释）：本组件大量 useState/useCallback/useEffect
+      //    依赖稳定序号，新增 hook 只能接在**最后一个**既有 hook 后面。所以这两条放在这里
+      //    （而不是紧跟上面那堆 useState）—— React 的 hook 是一条**按调用顺序**的线性表，
+      //    只有"顺序稳定"才是硬要求，而"位置在末尾"是最不容易被后人插队的地方。
+      var annVer = useSyncExternalStore(annSubscribe, annSnapshot); // 订阅模块级公告 store（返回值只是版本号，仅用于触发重渲染）
+      // 当前展开的公告详情（null = 不展开）。点列表里的一条 → 展开详情 + （未读则）上报已读。
+      var annOpenArr = useState(null); var annOpenId = annOpenArr[0]; var setAnnOpenId = annOpenArr[1];
+      // 本地防抖记忆的作用域随账号/设备变化：面板拿到 status 后回填一次（见 annScopeKey 的说明）。
+      useEffect(function () { annSetScope(phoneKey); }, [phoneKey]);
+      // annVer 只用于让 useSyncExternalStore 的重渲染生效，本身不参与任何计算 —— 显式丢弃，免得被读成漏用。
+      void annVer;
 
       /** 取消本次自动重启(按事件持久化:同一 pending 事件不再自动重启)。 */
       var cancelAutoRestart = function () {
@@ -4282,6 +4794,130 @@ window.__ModuleLoader__.load({
         );
       }
 
+      // ── 📣 公告（0.6.18）：面板入口卡 / 详情弹窗 / 远程访问卡里的提醒入口 ──────────
+      //
+      // 数据来源只有一个：模块级的 annState（由 apply() 里的一次性拉取填充，见 annPull）。
+      // 🔴 本卡**不主动拉取**：服务端 GET 是"判定即记账"，每打开一次面板就拉一次会把
+      //    还没被用户看到的弹窗候选静默消耗掉。用户要看最新的，点卡片里的「刷新」——
+      //    那是明确的主动动作（且只用于列表，绝不用它的返回值弹窗）。
+      /**
+       * 打开发布项详情：置 annOpenId；**未读**才上报点击（已读的重复上报只会在服务端
+       * 保留首次 clicked_at，没有副作用，但白白多一次请求 —— 契约 §3 的口径是"点击即已读证据"）。
+       */
+      function openAnnItem(it) {
+        if (!it) return;
+        setAnnOpenId(it.id);
+        if (it.unread) {
+          annReportClick(it.id);
+          annMarkReadLocal(it.id);
+        }
+      }
+      /**
+       * 📣 公告卡：插在「🔑 账号」卡**之前**（运营要用户看到的东西，与"远程访问/账号"同属首屏）。
+       * fail closed 的全部情形一律**整卡不渲染**（绝不留一个点进去没内容的空壳入口）：
+       *   · 拉取失败 / 老服务端 404      → annState.ok === false
+       *   · bubble_enabled !== true（含缺失）→ annState.bubble === false
+       *   · items 为空                    → 没有可看的
+       * 🔒 列表顺序**完全照搬服务端**（契约 §3：sort DESC, id DESC 即权威），客户端不得重排。
+       */
+      function renderAnnouncementsCard() {
+        if (!annState.ok || !annState.bubble) return null;
+        var items = annState.items;
+        if (!items.length) return null;
+        var unread = annState.unread;
+        return card("📣 公告" + (unread > 0 ? "（" + unread + " 条未读）" : ""), [
+          h("div", { className: "dru-ann-list" }, items.map(function (it) {
+            return h("button", {
+              key: it.id,
+              type: "button",
+              className: "dru-ann-item",
+              onClick: function () { openAnnItem(it); }
+            },
+              h("span", { className: "dru-ann-item-main" },
+                h("span", { className: "dru-ann-item-title" }, it.title || "(无标题公告)"),
+                // 未读/置顶用**文字标签**表达（不靠颜色单独表意）
+                h("span", { style: { display: "inline-flex", gap: 6, marginLeft: 8, verticalAlign: "1px" } },
+                  it.unread ? h("span", { className: "dru-ann-unread" }, "未读") : null,
+                  it.pinned ? h("span", { className: "dru-ann-pinned" }, "置顶") : null)
+              ),
+              h("span", { className: "dru-ann-item-time" }, it.created_at ? fmtDate(it.created_at) : "")
+            );
+          })),
+          h("div", { className: "dru-hint", style: { marginTop: 8 } },
+            "点开即视为已读（后台按已读与点击分别统计）；公告顺序由后台设定。"),
+          h("div", { className: "dru-actions", style: { marginTop: 8 } },
+            h("button", {
+              type: "button",
+              className: "dru-btn dru-btn-ghost",
+              onClick: function () { annFetch({ openPopup: false }); }   // 主动刷新：只更新列表，不弹窗
+            }, "刷新公告"))
+        ]);
+      }
+      /** 公告详情（复用 .dru-popup 视觉；点遮罩/关闭即收起）。正文按**纯文本**渲染（一期不做富文本）。 */
+      function renderAnnouncementDetail() {
+        if (annOpenId === null) return null;
+        var it = annState.items.filter(function (x) { return x.id === annOpenId; })[0];
+        if (!it) return null;   // 列表被刷新掉了 → 弹层跟着消失（不留一个指向不存在条目的空壳）
+        var close = function () { setAnnOpenId(null); };
+        return h("div", { className: "dru-popup", "data-dru-theme": theme, onMouseDown: function (e) { if (e.target === e.currentTarget) close(); } },
+          h("div", { className: "dru-popup-card", role: "dialog", "aria-label": "公告详情" },
+            h("div", { className: "dru-popup-body", style: { textAlign: "left" } },
+              h("div", { className: "dru-popup-title", style: { textAlign: "center" } }, it.title || "(无标题公告)"),
+              it.created_at ? h("div", { className: "dru-popup-sub", style: { textAlign: "center" } }, fmtDate(it.created_at)) : null,
+              it.body ? h("div", { className: "dru-ann-item-body", style: { marginTop: 8 } }, it.body) : null,
+              it.image ? h("img", { className: "dru-ann-img", src: it.image, alt: "公告图片" }) : null
+            ),
+            h("div", { className: "dru-popup-foot" },
+              h("span", null, "已读状态已同步到后台"),
+              h("button", { type: "button", onClick: close }, "关闭")
+            )
+          )
+        );
+      }
+      /**
+       * 「📱 远程访问」卡右列下方的**提醒区**（0.6.18 面板重排）：
+       * 这一块原来是一大片空白（左列二维码 180px，右列 flex:1 撑满，按钮下面只剩一行 hint）。
+       * 现在把"引导用户下一步做什么"的东西集中摆在这里 —— 而不是在各个位置各占一行。
+       * 内容按优先级：未读公告 → 重启提醒 → 使用提示；E2EE 徽标仍在卡片顶部（避免两处重复）。
+       */
+      function renderAccessTips(hasKey) {
+        var rows = [];
+        if (annState.ok && annState.bubble && annState.unread > 0) {
+          var firstUnread = annState.items.filter(function (x) { return x.unread; })[0] || null;
+          rows.push(h("div", { className: "dru-access-tip-row", key: "ann" },
+            h("span", null, "📣 有 ", h("b", null, String(annState.unread)), " 条未读公告"),
+            firstUnread
+              ? h("button", { type: "button", className: "dru-linkbtn", onClick: function () { openAnnItem(firstUnread); } }, "查看")
+              : null
+          ));
+        }
+        if (restartPending) {
+          rows.push(h("div", { className: "dru-access-tip-row", key: "restart" },
+            h("span", null, isRestartHard ? "🔄 插件已更新：重启 dsh web 后生效" : "🔄 插件已更新：刷新页面即可生效"),
+            h("button", {
+              type: "button",
+              className: "dru-linkbtn",
+              disabled: busy !== "",
+              onClick: function () {
+                if (isRefreshOnly) { try { location.reload(); } catch (e) { /* 忽略 */ } }
+                else restartHarness();
+              }
+            }, isRefreshOnly ? "刷新页面" : "立即重启")
+          ));
+        }
+        rows.push(h("div", { className: "dru-access-tip-row", key: "hint" },
+          h("span", null, !serviceRunning
+            ? (connInfo && connPhase !== "online"
+                ? "本机后台服务正在自动准备中（" + connText + "）：连上后这个链接/二维码即可使用，无需其他操作。"
+                : "本机后台服务未运行：先在下方「🖥 后台服务」卡启动。")
+            : (hasKey ? "打开链接/扫码进入即登录态；同设备重复扫码只更新授权，不新增设备。" : "生成链接后即可扫码或直接打开。"))
+        ));
+        return h("div", { className: "dru-access-tips" },
+          h("div", { className: "dru-access-tips-title" }, "接下来"),
+          rows
+        );
+      }
+
       return h("div", { className: "dru-settings-section", role: "region", "aria-label": "远程访问", "data-dru-theme": theme },
         h("div", { className: "dru-settings-head" },
           h("span", { className: "dru-settings-icon" }, "📱"),
@@ -4293,17 +4929,29 @@ window.__ModuleLoader__.load({
         ),
         h("div", { className: "dru-settings-body" },
           restartPending
-            ? h("div", { className: "dru-restart-alert", role: "status" },
-                h("span", { className: "dru-restart-alert-icon" }, "🔔"),
+            // 【0.6.18】三种"待用户动一下"的情形，文案与主按钮**按 kind 一一对应**：
+            //   · refresh（插件文件在运行中被改写）→ 软提示 + 主按钮「刷新页面」（零风险动作）
+            //   · restart（在线更新刚换完插件包）  → **强提醒**（实底 + 左侧色条）+ 主按钮「立即重启」
+            //   · 其它（历史遗留 kind）            → 保持旧文案，不擅自改语义
+            // 位置仍在 .dru-settings-body 的首位，也就是整屏最顶 —— 这是"置顶强提醒"的落点。
+            ? h("div", {
+                className: "dru-restart-alert" + (isRestartHard ? " dru-restart-alert-strong" : ""),
+                role: isRestartHard ? "alert" : "status"
+              },
+                h("span", { className: "dru-restart-alert-icon" }, isRestartHard ? "⚠️" : "🔔"),
                 h("div", { style: { flex: "1" } },
                   h("div", { className: "dru-restart-alert-title" },
                     // 插件已改为 patch 热加载:装插件/在线更新都不再需要重启 harness,
                     // 唯一要用户动一下的情形是"插件文件在运行中被改写"→ 刷新页面即可。
-                    isRefreshOnly ? "插件已更新，刷新页面即可生效" : "需要重启 dsh web 才能载入新插件"),
+                    isRestartHard ? "插件已更新，重启 dsh web 后生效"
+                      : isRefreshOnly ? "插件已更新，刷新页面即可生效"
+                        : "需要重启 dsh web 才能载入新插件"),
                   h("div", { className: "dru-restart-alert-sub" },
-                    isRefreshOnly
-                      ? "刚装好/刚更新的插件已在磁盘上，浏览器里的面板还是旧版本。刷新一下这个页面即可（手机端连接与已登录状态都不受影响）。"
-                      : "当前运行中的 dsh web 里还没有载入这个插件。先刷新页面；如果刷新后仍然看不到面板，再重启一次 dsh web。"),
+                    isRestartHard
+                      ? "新版本已经装到这台电脑上，但当前运行的 dsh web 还是旧代码（新的后台路由与面板要等它重新载入）。手机端连接与已登录状态都不受影响；重启期间页面会短暂断开，然后自动恢复。"
+                      : isRefreshOnly
+                        ? "刚装好/刚更新的插件已在磁盘上，浏览器里的面板还是旧版本。刷新一下这个页面即可（手机端连接与已登录状态都不受影响）。"
+                        : "当前运行中的 dsh web 里还没有载入这个插件。先刷新页面；如果刷新后仍然看不到面板，再重启一次 dsh web。"),
                   // 【自动化】待重启时自动倒计时重启(用户零操作);倒计时期间可一键取消
                   restartCountdown !== null && restartCountdown > 0
                     ? h("div", { className: "dru-restart-auto", role: "status" },
@@ -4329,7 +4977,9 @@ window.__ModuleLoader__.load({
                       className: "dru-btn " + (isRefreshOnly ? "dru-btn-ghost" : "dru-btn-primary"),
                       disabled: busy !== "",
                       onClick: function () { restartHarness(); }
-                    }, busy === "restart" ? "重启中…" : (restartCountdown !== null && restartCountdown > 0 ? "立即重启（不用等）" : "重启 dsh web")),
+                    }, busy === "restart" ? "重启中…"
+                      : isRestartHard ? "立即重启"
+                        : (restartCountdown !== null && restartCountdown > 0 ? "立即重启（不用等）" : "重启 dsh web")),
                     restartCountdown !== null && restartCountdown > 0
                       ? h("button", {
                           type: "button",
@@ -4361,10 +5011,11 @@ window.__ModuleLoader__.load({
             onClick: function () { restartHarness(); }
           }, busy === "restart" ? "重启中…" : "🔄 重启 dsh web")
         ),
-        renderCommunityModal()
+        renderCommunityModal(),
+        // 📣 公告详情弹窗（与交流群弹窗同一层：都挂在面板根上，点遮罩即收起）
+        renderAnnouncementDetail()
       );
     }
-
     // ══ 🤖 微信机器人（「📱 远程访问」面板里的第三个 tab：微信机器人通道） ═════════
     // 【0.6.11 业主口径】「不要给它单独弄一个菜单，直接放到面板里面。在面板里单开一个
     // table 页，命名为『微信机器人通道』，并增加上微信的绿泡泡小图标，点开后可以进行绑定设置。」
@@ -4694,6 +5345,43 @@ window.__ModuleLoader__.load({
         quotaRow
       );
 
+      // ── 🧭 「这东西是干啥用的 + 两步怎么接」操作型引导（0.6.18）─────────────────────
+      // 位置：**在 .dru-wx-intro 之上** —— 第一次进来的人先要知道"这功能解决什么问题、
+      // 我要动手做哪两步"，然后才是"我能用哪些能力"的清单（intro 是清单，不是说明书）。
+      //
+      // 命令帮助**不另写一份**：真身是 clients/dsh-remote/wechat-channel.mjs 的 HELP_TEXT
+      // （用户在微信里发 /help 收到的就是它）。浏览器半与 bridge 是两个 bundle，没有可用的
+      // require 通道，所以这里放一份**镜像**（WECHAT_HELP_CMDS，见顶层注释），由测试逐条对账。
+      //
+      // ClawBot 三条说明是"第二步"的正文（用户口径：把这一步讲清楚，否则他不知道去哪儿找入口）：
+      //   · 微信 ClawBot = 在微信里与 OpenClaw 收发消息；
+      //   · 只接收 OpenClaw 在 24 小时内的回复；
+      //   · 有「我的 ClawBot」与「连接新的 OpenClaw」两个入口。
+      // 截图资源走**后台上传 + public-config**（与 community.qrcode 同一条路，零发版可换图），
+      // 因此这里**不打包任何图片**；图片可缺省，缺省时整块引导照样完整可读。
+      var wxGuideImg = String((wx && (wx.guide_image || wx.clawbot_image)) || "");
+      var guide = h("div", { className: "dru-wx-guide", role: "note", "aria-label": "怎么连接微信机器人（两步）" },
+        h("div", { className: "dru-wx-guide-title" }, "微信机器人是做什么的"),
+        h("div", { className: "dru-wx-guide-note" },
+          "它把「电脑上跑着的 DeepSeek Harness」接到你的微信里：任务跑完/报错/需要你拍板时，"
+          + "它主动给你发一条微信；你在微信里回一个数字或一句话，就能放行、拒绝或继续交代任务 —— "
+          + "不用打开电脑，也不用一直盯着屏幕。"),
+        h("div", { className: "dru-wx-guide-step" },
+          h("b", null, "第一步：绑定（就在下面）"),
+          " 点下面的「连接微信机器人」，用手机微信扫一扫，扫码后手机上会出现一串数字配对码，回到这里填进去即可。"),
+        h("div", { className: "dru-wx-guide-step" },
+          h("b", null, "第二步：在微信里找到 ClawBot 并连上这台电脑"),
+          " 微信 ClawBot 就是在微信里与 OpenClaw 收发消息的入口 —— 你在这条会话里发给它的消息，"
+          + "会转给 OpenClaw 处理。注意它**只接收 OpenClaw 在 24 小时内的回复**（更早的过期，"
+          + "需要你重新发一次）。入口有两个：「我的 ClawBot」（已有的机器人）与「连接新的 OpenClaw」"
+          + "（第一次接入时用这个）。"),
+        wxGuideImg ? h("img", { className: "dru-ann-img", src: wxGuideImg, alt: "微信 ClawBot 入口示意" }) : null,
+        h("div", { className: "dru-wx-guide-step" },
+          h("b", null, "在微信里能发这些指令"),
+          "（也可以直接发一句话，等于说给当前任务）："),
+        h("pre", { className: "dru-wx-guide-cmds" }, WECHAT_HELP_CMDS.join("\n"))
+      );
+
       if (loading && !wx && !fail) {
         // 只在**第一次**读状态时转圈；失败或读到结果后立刻换成具体内容（不留永久 spinner）。
         body.push(h("div", { className: "dru-card" },
@@ -4908,6 +5596,7 @@ window.__ModuleLoader__.load({
       // 导览（intro）永远排在最前面 → 在「连接」按钮之前（DOM 顺序亦然），未绑定时先讲用途。
       if (embedded) {
         return h("div", { className: "dru-wx-embed", role: "region", "aria-label": "微信机器人通道", "data-dru-theme": theme },
+          guide,
           intro,
           bodyNode,
           liveMsg
@@ -4922,6 +5611,7 @@ window.__ModuleLoader__.load({
             h("div", { className: "dru-settings-sub" }, "把关键节点推到微信，并让你在微信里回一个数字就完成放行 / 拒绝 / 选择。")
           )
         ),
+        guide,
         intro,
         bodyNode,
         liveMsg
@@ -4951,6 +5641,31 @@ window.__ModuleLoader__.load({
       ctx.slots.inject("shell.overlay", function () {
         return ctx.slots.register({ name: "shell.overlay", id: "dsh-feedback-popup", order: 90 }, FeedbackPopup);
       });
+      // 📣 公告弹窗 = shell.overlay 的**第二个**槽位（与反馈弹窗并列）。
+      // order 91 > 90：两个弹窗万一同时出现，公告排在反馈**之后**（后注册的在上层）——
+      // 公告是运营信息、反馈是用户自己的评价流程，不该被压在下面。
+      // ⚠️ 老 DSH 本体没有 shell.overlay 时 ctx.slots.inject 对不存在的槽位**不会抛**
+      //    （ui-renderer 的注入表行为），所以这里不需要额外探测；面板与徽标照常工作，只是不弹窗。
+      try {
+        ctx.slots.inject("shell.overlay", function () {
+          return ctx.slots.register({ name: "shell.overlay", id: "dsh-announcement-popup", order: 91 }, AnnouncementPopup);
+        });
+      } catch (e) {
+        // 🔴 客户端插件抛异常 = 整个 web app 起不来（壳里的 assertEntriesActive 会 throw）。
+        //    公告是锦上添花，**没有任何资格**把门关上 —— 任何异常都只是"这次没有弹窗"。
+      }
+
+      // 📣 公告：每次页面加载**只拉一次**（sessionStorage 一次性标记，见 annPullOnce）。
+      //    放在 apply() 里是刻意的：apply 跑在 app mount **之前**，所以这里**绝不能碰产品 DOM**
+      //    （那时还没有），只做数据拉取；UI 全部交给上面那个槽位与面板卡片。
+      //    整段 try/catch：拉公告失败绝不能让插件装载失败。
+      try {
+        // 侧栏徽标的 DOM 订阅者（非 React）：store 一变就重画徽标。
+        // 即便入口按钮此刻还没注入（官方「设置」按钮尚未出现），订阅本身也是零成本的 ——
+        // mountNavEntry 挂上按钮时会主动画一次。
+        annSubscribe(annRenderNavBadge);
+        annPullOnce();
+      } catch (e) { /* 静默降级：不显示公告入口/徽标，页面照常 */ }
 
       // 首次安装引导小红点（localStorage dsh-remote-seen-dot；点击后不再显示）
       dotWatch();

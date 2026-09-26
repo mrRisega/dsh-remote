@@ -57,7 +57,13 @@
 `bridge_started`（bridge 进程拉起）· `bridge_registered`（设备已在中继注册成功 = 真正可用）·
 `tunnel_disconnected` · `first_remote_ok`（首次远程打通）· `plugin_loaded` · `panel_opened` ·
 `harness_restart`（自动重启触发）· `update_started` · `update_failed`（附 `fail_code`）·
-`wechat_bound` / `wechat_unbound`（微信机器人通道的**绑定态跳变**，语义见下）
+`wechat_bound` / `wechat_unbound`（微信机器人通道的**绑定态跳变**，语义见下）·
+`mirror_load`（手机镜像页**就绪耗时**；附 `ms` 耗时毫秒、`at` 客户端事件时刻、`outcome` = `ok` / `slow`）
+
+> `mirror_load` 是唯一带**数值**的事件：`ms` 由客户端量测（口径见下），服务端把它落在
+> `telemetry_events.value_ms`，`at` 落在 `at_ms`（`created_at` 仍是服务端收包时刻，语义不变）。
+> 量测起点是导航开始（`performance.timeOrigin` 对齐）、终点是页面真正可用；`outcome` 为 `slow`
+> 表示触发了看门狗兜底。**不采集**任何页面内容、URL、设备信息。
 
 ### 微信机器人通道的绑定 / 解绑（`wechat_bound` / `wechat_unbound`）
 

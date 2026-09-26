@@ -502,8 +502,11 @@ test("冻结契约：既有事件名与既有字段一字不改（本次只新�
   ];
   assert.deepEqual(TELEMETRY.eventNames.slice(0, FROZEN_EVENT_NAMES.length), FROZEN_EVENT_NAMES,
     "既有 12 个事件名一字不能改、不能删、不能重排（只允许在末尾追加新事件）");
-  assert.deepEqual(TELEMETRY.eventNames, [...FROZEN_EVENT_NAMES, "wechat_bound", "wechat_unbound"],
-    "事件名白名单只允许在末尾追加：本次追加微信通道的绑定/解绑，其余必须与服务端字面量冻结对齐");
+  // 【926 迭代】再在末尾追加 mirror_load（手机镜像页就绪耗时；由 D6 新增的
+  // /dsh-remote/telemetry/mirror-load 路由入队，字段 ms / at / outcome 见 telemetryEventOf）。
+  // 仍是"末尾追加"：上面那条前缀比对已把"既有项一位都没动"钉死。
+  assert.deepEqual(TELEMETRY.eventNames, [...FROZEN_EVENT_NAMES, "wechat_bound", "wechat_unbound", "mirror_load"],
+    "事件名白名单只允许在末尾追加：本次追加微信通道绑定/解绑与镜像页加载耗时，其余必须与服务端字面量冻结对齐");
   const ev = TELEMETRY.eventOf("bridge_registered");
   assert.deepEqual(Object.keys(ev), ["name", "at", "version", "harness_version", "channel", "os", "arch", "node"],
     "字段白名单：既有的 7 个一个不少，只多 harness_version / channel");
@@ -760,11 +763,27 @@ test("面板可见性：关于卡片写明「匿名统计 + 关闭方式」，�
   assert.match(client, /DSH_REMOTE_TELEMETRY=0/, "面板必须写明关闭方法");
   assert.match(client, /不含任何账号、手机号、会话或文件内容/, "面板必须写明不采集什么");
   // 面板只讲结论,不放「隐私说明: README… · docs/telemetry.md」这类文档链接行(用户明确要求)
-  const about = client.slice(client.indexOf("关于 dsh-remote"), client.indexOf("加入交流群"));
-  assert.ok(!/隐私说明/.test(about), "关于卡片不应再出现「隐私说明:」链接行");
-  assert.ok(!/完整字段清单/.test(about), "关于卡片不应再出现「完整字段清单」链接");
-  assert.ok(!about.includes("README.md#匿名装机统计与隐私"), "关于卡片不应链 README 锚点");
-  assert.ok(!about.includes("docs/telemetry.md"), "关于卡片不应链 docs/telemetry.md");
+  //
+  // 🔴 取片必须按**卡片边界**取，不能再用 `slice(indexOf("关于 dsh-remote"), indexOf("加入交流群"))`：
+  //    那两个锚点本来就**不在同一个地方** —— 第一个命中文件头的模块注释、第二个命中
+  //    「交流群配置」的注释，于是切片覆盖的是整个文件的一大段，四条 `!` 断言等于什么都没校验；
+  //    0.6.18 面板重排（「加入交流群」搬进账号卡）之后更是会变成空串 → 断言全部平凡通过。
+  //    这是"静默失守"：比变红更危险（它看起来一直是绿的）。
+  //    现在取片边界是「关于卡片开头 → renderHome 结尾」，并**显式断言切片非空且像样**。
+  const aboutStart = client.indexOf('card("📖 关于 dsh-remote"');
+  assert.ok(aboutStart > 0, "必须能定位到「关于」卡片的开头");
+  const aboutEnd = client.indexOf("\n      // 【自动化】待重启时自动倒计时", aboutStart);
+  assert.ok(aboutEnd > aboutStart, "必须能定位到「关于」卡片的结束边界（renderHome 末尾）");
+  const about = client.slice(aboutStart, aboutEnd);
+  assert.ok(about.length > 400, "「关于」卡片切片不能是空串/碎片（空串会让下面四条断言全部平凡通过）");
+  assert.ok(about.includes("关于 dsh-remote"), "切片必须真的包含「关于」卡片本体");
+  // ⚠️ 断言的是**渲染出来的文案**：上面那条"不再单列隐私说明行"的解释性注释本身就写着这些词，
+  //    所以先剥掉整行注释再断言（注释不会出现在用户屏幕上，不该被当成"面板里放了链接"）。
+  const aboutText = about.split("\n").filter((l) => !/^\s*\/\//.test(l)).join("\n");
+  assert.ok(!/隐私说明/.test(aboutText), "关于卡片不应再出现「隐私说明:」链接行");
+  assert.ok(!/完整字段清单/.test(aboutText), "关于卡片不应再出现「完整字段清单」链接");
+  assert.ok(!aboutText.includes("README.md#匿名装机统计与隐私"), "关于卡片不应链 README 锚点");
+  assert.ok(!aboutText.includes("docs/telemetry.md"), "关于卡片不应链 docs/telemetry.md");
   assert.ok(client.includes("/dsh-remote/telemetry/panel-opened"), "面板打开事件必须走本地路由（浏览器半不直连遥测端点）");
   // 披露文档本身仍必须存在且可查(面板不再链,但 README 链,公开发布物包含)
   const readme = readFileSync(new URL("../../../README.md", import.meta.url), "utf8");
