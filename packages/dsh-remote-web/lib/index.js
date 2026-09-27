@@ -5654,6 +5654,53 @@ async function sendWeChatProxy(relayDir, res, routePath, init) {
   return sendJson(res, r.status, { ok: false, code: r.code, error: r.error });
 }
 
+// ============================================================
+// 本地宿主路由的跨站防护（2026-09-27 安全审计）
+//
+// 背景：本插件把 /dsh-remote/* 注册在**本机** dsh web 上，这一层没有任何鉴权
+//   （设计如此：桌面端面板与页面同源，靠"只有本机能访问"来保证安全）。
+//   但"只有本机能访问"不等于"同源" —— 浏览器里任何网页都能向 127.0.0.1:3080 发请求：
+//     · 经典 CSRF：evil.com 表单/fetch(no-cors) POST /dsh-remote/self/uninstall、/config
+//     · DNS rebinding：把 evil.com 解析到 127.0.0.1，浏览器视为同源，于是能**读到**
+//       /dsh-remote/diag/bundle（诊断包，含本机路径与配置）与
+//       /dsh-remote/access-key（能签发设备访问密钥 = 拿到这台电脑的远程控制权）
+//   这些路由里有卸载插件、改配置、重启 harness、签发访问密钥，必须挡住。
+//
+// 判据（两条独立）：
+//   ① Host 白名单：只认 loopback authority。rebinding 时 Host 是攻击者域名 → 拒；
+//   ② Origin / Sec-Fetch-Site：带 Origin 且与 Host 不同源 → 拒；sec-fetch-site: cross-site → 拒。
+//
+// 为什么不会误伤手机端：隧道请求由 dsh-bridge 剥掉 host/origin/sec-fetch-*
+//   （clients/dsh-remote/dsh-bridge.mjs 的 STRIP_REQ_HEADERS），再由 undici 补上
+//   Host: 127.0.0.1:<port>。所以隧道流量天然过 ①、且不带 Origin 而过 ②。
+//
+// 逃生舱：DSH_REMOTE_LOCAL_GUARD=0 关闭整层；
+//   DSH_REMOTE_TRUSTED_HOSTS=a.com,b（放在 dsh web 前面的反向代理需要它）。
+// ============================================================
+const LOOPBACK_HOST_RE = /^(127\.0\.0\.1|localhost|\[::1\]|::1)(:\d+)?$/i;
+const LOCAL_GUARD_LOGGED = new Map(); // reason -> 上次告警时间（同一原因 60s 只报一次，避免刷日志）
+
+/** 只读地判断一个请求是否来自"本机同源页面"。返回 null=放行，否则返回拒绝原因。
+ *  导出仅为可测（见 test/local-route-guard.test.mjs）。 */
+export function localRequestBlocked(req) {
+  if (String(process.env.DSH_REMOTE_LOCAL_GUARD || "") === "0") return null;
+  const extra = String(process.env.DSH_REMOTE_TRUSTED_HOSTS || "")
+    .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  const headers = (req && req.headers) || {};
+  const host = String(headers.host || "").trim().toLowerCase();
+  if (!host) return "missing-host";
+  if (!LOOPBACK_HOST_RE.test(host) && !extra.includes(host)) return "bad-host";
+  const origin = String(headers.origin || "").trim().toLowerCase();
+  // Origin: null（file:// 或 sandbox iframe）不在这里判，交给下面的 sec-fetch-site
+  if (origin && origin !== "null") {
+    let oh = "";
+    try { oh = new URL(origin).host.toLowerCase(); } catch { return "bad-origin"; }
+    if (oh !== host && !extra.includes(oh)) return "origin-mismatch";
+  }
+  if (String(headers["sec-fetch-site"] || "").trim().toLowerCase() === "cross-site") return "cross-site";
+  return null;
+}
+
 function registerRoutes(ctx, relayDir) {
   // 本插件所在 profile(由插件自身文件位置推导,覆盖市场 git 安装与本地 include 两种形态)
   let profileDir = join(homedir(), ".dsh", "profiles", "web");
@@ -6388,6 +6435,21 @@ function registerRoutes(ctx, relayDir) {
         if (!match || !methodOk) {
           res.writeHead(404);
           res.end();
+          return;
+        }
+        // 跨站防护：详见 localRequestBlocked 的注释（DNS rebinding / CSRF）
+        const blocked = localRequestBlocked(req);
+        if (blocked) {
+          const now = Date.now();
+          const last = LOCAL_GUARD_LOGGED.get(blocked) || 0;
+          if (now - last > 60_000) {
+            LOCAL_GUARD_LOGGED.set(blocked, now);
+            ctx.logger?.warn?.(
+              `dsh-remote-web: 已拦截跨站请求 ${route.method} ${route.path}（${blocked}）` +
+              ` host=${req.headers?.host || "-"} origin=${req.headers?.origin || "-"}`
+            );
+          }
+          sendJson(res, 403, { ok: false, error: "forbidden", reason: blocked });
           return;
         }
         Promise.resolve(route.handler(req, res)).catch((e) => {
