@@ -641,6 +641,31 @@ test("遮罩点击：只关左抽屉，不碰第三列", () => {
   // （不要求"清掉" —— 我们连碰都不该碰第三列。）
 });
 
+test("★ ③ CSS 打底：JS 没跑（或中途挂了）时，页面必须是官方原样、绝不被困住", () => {
+  // 这是「③ 纯 CSS 打底」唯一可被机器验证的硬性质：
+  //   适配层的**所有**劫持（把官方列改成浮层/移出屏外/隐藏/拦截点击）都必须挂在
+  //   我们自己 add 的 `dsh-ma-*` 类上 —— 那些类只有 JS 跑起来才会有。
+  //   于是"JS 没执行/中途抛错"⇒ 一个劫持类都不存在 ⇒ 页面就是官方原样。
+  //   反过来，任何**不依赖我们类名**就去 translate/隐藏官方内容列的规则，都是"JS 挂了也会困住用户"的地雷。
+  const { css } = injected();
+  const code = String(css).replace(/\/\*[\s\S]*?\*\//g, "");
+  const OFFICIAL = /pI_x6G_|hHd-Xa_|VOzbGW_|YDXeBa_|_2ctAZa_|P3OORG_|wSkVaW_|uV2eYG_/;
+  const HIJACK = /(transform\s*:\s*[^;]*translate|visibility\s*:\s*hidden|display\s*:\s*none|pointer-events\s*:\s*none|translateX\s*\()/;
+  const bad = [];
+  for (const chunk of code.split("}")) {
+    const i = chunk.lastIndexOf("{");
+    if (i < 0) continue;
+    const sel = chunk.slice(0, i).replace(/\s+/g, " ").trim();
+    const body = chunk.slice(i);
+    if (!OFFICIAL.test(sel)) continue;        // 只关心"碰官方元素"的规则
+    if (/dsh-ma-/.test(sel)) continue;        // 有我们的类做闸门 ⇒ JS 不跑就不会生效
+    if (/::/.test(sel)) continue;             // 伪元素（如 ::-webkit-scrollbar）困不住人，不算劫持
+    if (HIJACK.test(body)) bad.push(sel.slice(0, 120));
+  }
+  assert.deepEqual(bad, [],
+    "★ 这些规则没有 dsh-ma-* 闸门却会移动/隐藏/拦截官方元素 —— JS 一旦不跑，用户就被困住了");
+});
+
 test("★ 源码契约：适配层代码里不许再出现任何「驱动第三列」的符号（去注释后扫）", () => {
   const src = readFileSync(ADAPTER, "utf8");
   // 只看**代码**：STYLE 是模板字符串、注释也是文本，直接扫会命中"历史说明"
