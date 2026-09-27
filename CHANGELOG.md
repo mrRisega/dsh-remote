@@ -3,6 +3,41 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.18-beta.2] - 2026-09-27
+
+> 接 beta.1。**这一版修的是「远程页面根本用不了」的根因**（诊断报告 P0-1，已有生产日志实锤）。
+
+### 🔴 mux 的设备作用域改写：以前只在"已经有会话"时才装，于是永远建不起会话
+
+**现象**：手机打开镜像页 → 能加载 → 但所有数据接口 502「e2ee 会话已失效」，什么都点不开。
+
+**根因（一条死循环）**：
+官方客户端把 mux WebSocket 拼成**根路径** `/api/remote.mux`；中继对根路径只认
+`dsh_device` cookie，cookie 一过期/缺失就是 404（且旧的 `rejectUpgrade` 会把响应截断，
+nginx 只看到不透明的 `009`）→ `e2ee-hello` 永远送不到你的电脑 → **会话永远建不起来**
+→ 之后每个受保护请求都是 `unknown_session` 502。
+而我们的补丁（负责把根路径改写成 `/remote/<deviceId>/api/remote.mux`）**只在"已经有会话"时才安装**
+—— 恰好是最需要它的那个场景不装。上线中继拒绝日志后，生产立刻打出
+`WS 升级被拒: reason=route_unresolved status=404 path=/api/remote.mux`。
+
+**修法**（两处，都在 `e2ee-shim-script.js`）：
+1. 补丁改为在页面 boot 阶段**无条件安装**（会话先留空，解锁后再填进去）；
+2. 不改加密、只做改写的那条"放行"分支，以前 return 的是**原始 url** —— 等于把算好的设备作用域
+   又丢回根路径。现在带上改写后的地址。
+
+顺带修掉一个自己引入的崩溃：补丁改成无条件安装后，"是否加密"必须同时要求**有会话**
+（`!!ctx.sess && …`）；少了它，未解锁页面上任何 `new WebSocket("/api/…")` 都会抛 TypeError
+把页面打挂 —— 比原来更糟。这条是测试先红后绿抓出来的。
+
+### 附录：同一轮里还改了（不在本包内，但你会在服务端看到）
+- 中继新增**档位快照覆盖**：改完档位 ≤10 秒生效（以前要等 token 过期，实测滞后过 6 小时）。
+- 中继的插件包缓存不再写死 gzip（为将来换 brotli 留路，否则缓存会静默失效）。
+
+### 测试
+- `e2ee-shim` 新增 ①放行分支必须带改写后的 URL（含"已在设备作用域/非受保护前缀/拿不到 deviceId"
+  三个反向用例）②三条放弃会话的早退分支都必须在 return 之前装补丁 ③重复安装只能更新会话、
+  不得重复包装 `window.fetch/WebSocket`。
+- 全量：router 48 / plugin 380 / bridge 431。
 ## [0.6.18-beta.1] - 2026-09-27
 
 > 预发版（内测验收）。本轮的两条主线：
