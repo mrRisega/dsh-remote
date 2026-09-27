@@ -710,7 +710,7 @@
   /** 生成 window.WebSocket 的替换构造函数:命中策略才套 SeE2eeWs,否则原样放行。 */
   function seMakeWsCtor(NativeWS, ctx) {
     function SeWs(url, protocols) {
-      var full = "", should = false, scoped = String(url);
+      var full = "", should = false, scoped = String(url), passUrl = url;
       try {
         var base = ctx.origin || (typeof window !== "undefined" ? window.location.href : undefined);
         var uo = new URL(url, base);
@@ -727,12 +727,19 @@
           scoped = seScopeToDevice(uo.pathname + uo.search, ctx.deviceId);
           var so = scoped === (uo.pathname + uo.search) ? uo : new URL(scoped, base);
           full = so.pathname + so.search;
-          should = seShouldEncryptWs(full);
+          /* ★ 关键：改写结果要**留住**。原来不改写分支 return 的是原始 url，等于把
+             `/remote/<dev>/api/remote.mux` 又丢回根路径 —— 那正是 404 的来源。 */
+          passUrl = so.href;
+          /* ⚠️ 必须同时要求"有会话"：URL 改写在无会话时也要做（这是 2026-09-26 事故的正题），
+             但**加密**没有会话就做不了 —— 少了这个判断，未解锁的页面上任何
+             `new WebSocket("/api/…")` 都会在 ctx.sess.sessId 上抛 TypeError，
+             把整个页面打挂（比原来"不装补丁"还糟）。 */
+          should = !!ctx.sess && seShouldEncryptWs(full);
         }
       } catch (e) { should = false; }
-      if (!should) return new NativeWS(url, protocols);
+      if (!should) return new NativeWS(passUrl, protocols);
       var target = seBuildWsTarget(scoped, ctx.sess.sessId, seRandomHex(8), base);
-      if (!target) return new NativeWS(url, protocols);
+      if (!target) return new NativeWS(passUrl, protocols);
       return new SeE2eeWs(NativeWS, target.href, protocols, { sess: ctx.sess, wsLabel: target.wsLabel });
     }
     SeWs.OPEN = 1; SeWs.CONNECTING = 0; SeWs.CLOSING = 2; SeWs.CLOSED = 3;
@@ -875,9 +882,28 @@
       + "一直这样请返回设备列表重新解锁（会自动重建加密通道）。");
   }
 
-  /* ---- 安装 fetch/WS 加密补丁(有会话才安装) ---- */
+  /* ---- 补丁安装：**URL 改写永远装，加密按会话开关** ----
+   *
+   * 🔴 2026-09-27 修（P0-1 收尾）：原来 fetch/WS 补丁只在"有会话"时安装（`_install(sess)`），
+   *    可**这正是它最需要生效的场景**：镜像页没有会话 → 不装补丁 → 官方客户端把 mux WS 拼成根路径
+   *    `/api/remote.mux` → 中继 `resolveRoute` 只认 `dsh_device` cookie，cookie 过期/缺失就 404
+   *    （`rejectUpgrade` 写状态行后立刻 destroy → nginx 只看到不透明的 009）→
+   *    `e2ee-hello` 永远送不到宿主机 → **会话永远建不起来** → 之后每个受保护请求都是
+   *    `unknown_session` 502。**死循环**：没会话→不装补丁→建不了会话。
+   *    生产已有实锤：上线 reject 分支日志后中继立刻打出
+   *    `WS 升级被拒: reason=route_unresolved status=404 path=/api/remote.mux`。
+   *
+   * 现在：`_install()` 在 boot 阶段**无条件**安装（`ctx.sess` 先为 null），会话到了再填进去。
+   * 补丁里"不改写就原样放行"的分支也会带上改写后的 URL（见 seMakeWsCtor 的 passUrl）——
+   * 否则改写算出来又被丢掉，等于没做。
+   */
   var _installed = false;
+  var _ctx = null;
   function _install(sess) {
+    if (sess) {
+      // 会话后到：只更新 ctx（补丁已装好，闭包读的是同一个对象）
+      if (_ctx) { _ctx.sess = sess; return; }
+    }
     if (_installed) return;
     _installed = true;
     seFailureHook = _reportFail;
@@ -886,7 +912,8 @@
     /* deviceId 取自**页面路径**（`/remote/<deviceId>/…`，2026-09-19 起的标准入口）：
        WS 侧用它把根路径的 mux 改写成设备作用域形态，从而不再依赖会过期的 dsh_device cookie
        （见 seScopeToDevice 的长注释与 2026-09-26 的 nginx 日志证据）。读不到就留空 = 不改写。 */
-    var ctx = { sess: sess, origin: window.location.origin, deviceId: seDeviceIdOfPath(window.location.pathname) };
+    _ctx = { sess: sess || null, origin: window.location.origin, deviceId: seDeviceIdOfPath(window.location.pathname) };
+    var ctx = _ctx;
     try {
       if (window.fetch) {
         var origFetch = window.fetch.bind(window);
@@ -906,6 +933,7 @@
   function _boot() {
     try {
       if (!(window.crypto && window.crypto.subtle && window.crypto.getRandomValues)) {
+        _install(null);
         _badge("warn", "未加密:环境不支持", "当前浏览器环境不支持 WebCrypto(需 HTTPS 安全上下文),镜像页数据流保持明文。");
         return;
       }
@@ -936,12 +964,16 @@
             return;
           }
         }
+        /* ⚠️ 即使没有会话也必须先装补丁：WS 的设备作用域改写与加密无关（见 _install 长注释）。
+           否则这里 return 掉 → mux 打根路径 → 404 → 会话永远建不起来（死循环）。 */
+        _install(null);
         _badge("warn", "未加密:未解锁(明文)", "本次为明文连接。密钥只存内存;请返回设备列表重新点选设备解锁后,镜像页的数据请求与 WebSocket 将自动加密。");
         return;
       }
       var sess = null;
       try { sess = seSessionOfHandover(raw); } catch (e) { sess = null; }
       if (!sess) {
+        _install(null);
         _badge("warn", "未加密:交接单无效", "一次性交接单无法解析(可能已损坏或过期)。请返回设备列表重新解锁。");
         return;
       }

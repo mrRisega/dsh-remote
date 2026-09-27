@@ -39,7 +39,7 @@ import {
   maybeInjectE2eeShim,
   e2eeShimEnabled
 } from "../e2ee-shim.mjs";
-import { loadShimCore, extractShimCore } from "./lib-e2ee-shim.mjs";
+import { loadShimCore, extractShimCore, readShimScript } from "./lib-e2ee-shim.mjs";
 import { loadNativeHandoverCore, extractNativeHandoverCore, loadNativeWcCore } from "./lib-native-e2ee.mjs";
 
 const OFFICIAL_HTML = `<!doctype html>
@@ -561,4 +561,46 @@ test("fetch 包装:真实字节往返(shim 密封 → 桥端打开 → 封回 �
     assert.equal(await res.text(), "echo:" + body);
     assert.equal(res.headers.get("x-round"), String(i));
   }
+});
+
+// ─────────────── 2026-09-27：P0-1 收尾（设备作用域必须在"没有会话"时也生效） ───────────────
+
+test("★ WS 设备作用域：不改写就走放行分支时，也必须用**改写后**的 URL", () => {
+  // 事故现场：镜像页**没有会话**（未解锁）→ 不加密 → 走放行分支。
+  // 官方客户端把 mux 拼成根路径 `/api/remote.mux`，中继只认会过期的 dsh_device cookie → 404
+  // （rejectUpgrade 写状态行后立刻 destroy → nginx 只看到 009）→ e2ee-hello 送不到 →
+  // 会话永远建不起来 → 每个受保护请求 unknown_session 502。死循环。
+  const ORIGIN = "http://relay.local";
+  const patched = shim.seMakeWsCtor(FakeNative, { sess: null, origin: ORIGIN, deviceId: "dev-8e5fb209cdc8" });
+  const ws = patched(ORIGIN + "/api/remote.mux?e2ee=abc&w=def");
+  assert.ok(ws instanceof FakeNative, "无会话 → 不套加密代理（放行）");
+  assert.equal(ws.url, ORIGIN + "/remote/dev-8e5fb209cdc8/api/remote.mux?e2ee=abc&w=def",
+    "🔴 放行分支必须带**改写后**的设备作用域 URL —— 否则改写算了又被丢掉，等于没做");
+
+  // 反向：本来就在设备作用域里 → 一个字节都不改
+  const ws2 = patched(ORIGIN + "/remote/dev-x/api/remote.mux?w=1");
+  assert.equal(ws2.url, ORIGIN + "/remote/dev-x/api/remote.mux?w=1", "已在设备作用域 → 原样放行");
+
+  // 反向：非受保护路径（如静态资源）不做设备改写，保持原样
+  const ws3 = patched(ORIGIN + "/assets/index.js");
+  assert.equal(ws3.url, ORIGIN + "/assets/index.js", "非受保护前缀不改写");
+
+  // 反向：拿不到 deviceId（例如旧入口 `/`）→ 不改写，且不得崩
+  const patchedNoDev = shim.seMakeWsCtor(FakeNative, { sess: null, origin: ORIGIN, deviceId: "" });
+  const ws4 = patchedNoDev(ORIGIN + "/api/remote.mux");
+  assert.equal(ws4.url, ORIGIN + "/api/remote.mux", "没有 deviceId 时保持原样（宁可 404 也不要乱拼）");
+});
+
+test("★ 补丁必须在 boot 阶段**无条件**安装（没会话也要装，否则建不了会话）", () => {
+  const src = readShimScript();
+  // 三条"放弃会话"的早退分支，都必须在 return 之前先装补丁
+  for (const marker of ["未加密:未解锁(明文)", "未加密:交接单无效", "未加密:环境不支持"]) {
+    const i = src.indexOf(marker);
+    assert.ok(i > 0, `找不到分支 ${marker}`);
+    const before = src.slice(Math.max(0, i - 320), i);
+    assert.match(before, /_install\(null\)/, `🔴 「${marker}」分支必须在 return 之前先 _install(null)，否则 WS 改写根本不生效`);
+  }
+  // 会话后到时只填 ctx，不重复包装（否则 fetch/WS 会被套多层）
+  assert.match(src, /if \(sess\) \{[\s\S]{0,200}?_ctx\.sess = sess; return;/,
+    "同一页面重复 _install(sess) 只能更新会话，不得重复包装 window.fetch/WebSocket");
 });
