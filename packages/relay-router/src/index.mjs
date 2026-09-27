@@ -28,7 +28,7 @@
 
 import http from "node:http";
 import fs from "node:fs";
-import { createHmac } from "node:crypto";
+import { createHmac, randomBytes } from "node:crypto";
 import { WebSocket, WebSocketServer } from "ws";
 import { verifyJwt } from "./jwt.mjs";
 import { createLogger } from "./logger.mjs";
@@ -444,8 +444,15 @@ const pendingUpgrade = new Map();
 const tunnelSessions = new Map();
 
 let frameSeq = 0;
+/**
+ * 分配帧号。**必须不可猜**（2026-09-27 安全审计 F-01）：
+ * 以前是全局自增的 `r1,r2,…`，任何账号的 bridge 都能算出别家 in-flight 请求的帧号，
+ * 再回一帧同 id 的响应，把自己的响应**注入到别人的手机浏览器**。帧号不可猜 + 下面
+ * `onBridgeFrame` 的逐分支归属校验 = 纵深防御（后者才是真正的修复）。
+ * 保留自增序号只为日志可读（能看出先后），随机后缀才是安全边界。
+ */
 function nextFrameId() {
-  return `r${(++frameSeq).toString(36)}`;
+  return `r${(++frameSeq).toString(36)}x${randomBytes(6).toString("hex")}`;
 }
 
 function sendToBridge(dev, obj) {
@@ -839,6 +846,22 @@ bridgeWss.on("connection", (ws, req) => {
         }
         const existing = devices.get(deviceId);
         if (existing && existing.ws !== ws) {
+          // 跨账号抢占 deviceId 的观测（2026-09-27 安全审计）。
+          // `deviceId` 在 tunnel-register 里是**自述**的（只校验格式），任何有效 JWT 都能用
+          // 别人的 deviceId 注册并把现有隧道顶掉。影响仅限 DoS：HTTP/WS 两侧都会校验
+          // `dev.userId === claims.sub`（见 authorizeRemote），受害者只会拿到 403/offline，
+          // 请求**不会**被路由到攻击者的 bridge；且 deviceId 是 48bit CSPRNG
+          // （bridge: "dev-"+randomBytes(6)），跨用户不可枚举。
+          // 这里只观测不改语义——真正的修法是"deviceId 归属绑定"，需要企业端内部接口 + fail-open
+          // 设计，改错会让全体设备注册失败，不能顺手改。
+          const fromUser = String(existing.userId);
+          const toUser = String(claims.sub);
+          if (fromUser !== toUser) {
+            logger.warn(
+              `[router] ⚠️ 跨账号顶掉隧道: deviceId=${deviceId} 原属 user=${fromUser} → 新连接 user=${toUser}` +
+              ` (原连接存活 ${Math.round((Date.now() - (existing.connectedAt || Date.now())) / 1000)}s)`
+            );
+          }
           try {
             existing.ws.close(4000, "replaced by new connection");
           } catch {
@@ -931,9 +954,18 @@ function onBridgeFrame(dev, frame) {
   const { id, type } = frame;
   if (id === undefined || id === null) return;
 
+  // 🔴 这里查到的每一条待回包记录都必须校验**归属**（2026-09-27 安全审计 F-01）。
+  //    `pendingHttp` / `pendingUpgrade` / `tunnelSessions` 都是**全局** Map，键是帧号；
+  //    而帧号原先是全局自增可猜的。若不校验，任意账号的 bridge 只要回一帧同 id 的响应，
+  //    就能把 body 写进**别人**的 HTTP 响应（在 relay 源上执行任意脚本 → 读走非 HttpOnly 的
+  //    dsh_token → 以受害者身份驱动其电脑）、或往别人的 WS 隧道里塞数据。
+  //    判据统一为 `x.deviceId === dev.deviceId`（与本文件 cleanupDevice 早已在做的比对一致）。
+  //    ⚠️ 每个分支各自查不同的表，所以校验必须**分别写**，不要在函数开头统一拦。
+
   if (type === "http") {
     const p = pendingHttp.get(id);
     if (!p) return;
+    if (p.deviceId !== dev.deviceId) return; // 归属校验(F-01)：不许回别人的包
 
     // ── SSE 流式响应(2026-09-23)────────────────────────────────────────────
     // bridge 遇到 `text/event-stream` 时不再整包缓冲:先发**仅头部**帧(streaming:true),
@@ -976,6 +1008,7 @@ function onBridgeFrame(dev, frame) {
   if (type === "http-chunk") {
     const p = pendingHttp.get(id);
     if (!p || p.streaming !== true) return;
+    if (p.deviceId !== dev.deviceId) return; // 归属校验(F-01)
     const cbuf = frame.bodyBase64
       ? Buffer.from(String(frame.body || ""), "base64")
       : Buffer.from(String(frame.body || ""), "utf8");
@@ -990,6 +1023,7 @@ function onBridgeFrame(dev, frame) {
   if (type === "http-end") {
     const p = pendingHttp.get(id);
     if (!p || p.streaming !== true) return;
+    if (p.deviceId !== dev.deviceId) return; // 归属校验(F-01)
     pendingHttp.delete(id);
     try { if (!p.res.writableEnded) p.res.end(); } catch { /* ignore */ }
     return;
@@ -998,6 +1032,7 @@ function onBridgeFrame(dev, frame) {
   if (type === "ws-open") {
     const pu = pendingUpgrade.get(id);
     if (!pu) return;
+    if (pu.deviceId !== dev.deviceId) return; // 归属校验(F-01)：不许替别人开隧道
     pendingUpgrade.delete(id);
     clearTimeout(pu.timer);
     const dev2 = devices.get(pu.deviceId);
@@ -1033,6 +1068,7 @@ function onBridgeFrame(dev, frame) {
   if (type === "ws-msg") {
     const sess = tunnelSessions.get(id);
     if (!sess) return;
+    if (sess.deviceId !== dev.deviceId) return; // 归属校验(F-01)：不许往别人的隧道塞帧
     enqueueWsMsg(sess, frame);
     return;
   }
@@ -1040,6 +1076,7 @@ function onBridgeFrame(dev, frame) {
   if (type === "ws-close") {
     const sess = tunnelSessions.get(id);
     if (!sess) return;
+    if (sess.deviceId !== dev.deviceId) return; // 归属校验(F-01)：不许关别人的隧道
     tunnelSessions.delete(id);
     try {
       sess.ws.close(frame.code && typeof frame.code === "number" ? frame.code : 1000, String(frame.reason || ""));
