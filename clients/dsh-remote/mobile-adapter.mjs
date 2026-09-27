@@ -1238,7 +1238,11 @@ const SCRIPT = `(() => {
            · 失败（reject）/超时（>20s）/亚毫秒（同一帧内的缓存命中）都不进样本：
              前者不是网络耗时，后者会算出 0ms 这种"谎言"；
            · **无样本时显示「测速中…」而不是 0ms** —— 0ms 会让人以为网络飞快。
-         分档：≤120ms 顺畅 / ≤300ms 一般 / >300ms 较慢（移动网络下这三档比较贴合体感）。 */
+         分档（2026-09-27 业主口径调整）：≤500ms 顺畅 / ≤1000ms 正常 / ≤2000ms 偏慢 / >2000ms 很慢。
+         为什么放宽：这是个**文本窗口**的远程操作界面（看输出、敲字、点按钮），
+         对往返延迟本来就宽容 —— 业主原话「500ms 以内的延迟都不叫事，1000ms 使用起来也是正常流畅的」。
+         旧的 120/300 分档是照"网页首屏"的体感定的，会把大量正常可用的移动网络误报成"较慢"，
+         反而让用户以为哪里坏了。 */
       const RTT_KEEP = 8, RTT_MAX_MS = 20000;
       const rttSamples = [];
       const rttEl = fab.querySelector('[data-role="rtt"]');
@@ -1249,8 +1253,10 @@ const SCRIPT = `(() => {
         const mid = s.length >> 1;
         return s.length % 2 ? s[mid] : Math.round((s[mid - 1] + s[mid]) / 2);
       };
-      const rttGrade = (ms) => (ms <= 120 ? "ok" : ms <= 300 ? "mid" : "bad");
-      const rttLabel = (g) => (g === "ok" ? "顺畅" : g === "mid" ? "一般" : "较慢");
+      /* 分档（2026-09-27 按业主口径放宽）：文本窗口的远程操作，500ms 内都算顺畅、1000ms 内正常流畅。
+         ok=顺畅 / mid=正常 / slow=偏慢 / bad=很慢 —— 颜色只用于区分，**不把"正常"渲染成告警色**。 */
+      const rttGrade = (ms) => (ms <= 500 ? "ok" : ms <= 1000 ? "mid" : ms <= 2000 ? "slow" : "bad");
+      const rttLabel = (g) => (g === "ok" ? "顺畅" : g === "mid" ? "正常" : g === "slow" ? "偏慢" : "很慢");
       const FAB_TITLE_BASE = "远程控制：字号 / 网络延迟 / 加密状态 / 返回设备列表（可拖动移动位置）";
       const renderRtt = () => {
         try {

@@ -509,12 +509,30 @@ test("网络延迟：只在**已有**的 fetch 包装里采样，成功样本显
   assert.equal(calls.length, 1, "适配层不得额外发探测请求（只包装、不加请求）");
   assert.equal(rtt.hidden, false, "有成功样本后角标应出现");
   assert.match(String(rtt.textContent), /^\d+ms$/, `角标应是「<数字>ms」，实际:${rtt.textContent}`);
-  assert.ok(["ok", "mid", "bad"].includes(rtt.getAttribute("data-rtt")), "角标应带分档（ok/mid/bad）供 CSS 上色");
+  assert.ok(["ok", "mid", "slow", "bad"].includes(rtt.getAttribute("data-rtt")), "角标应带分档（ok/mid/slow/bad）供 CSS 上色");
   assert.equal(rtt.hidden === false, true);
   // 菜单里的那一行也要跟着更新（同一个 renderRtt）
   const menu = findMenu(env);
   const net = menu.querySelector(".dsh-ma-menu-net");
-  assert.ok(["ok", "mid", "bad"].includes(net.getAttribute("data-rtt")), "菜单行也应按同一分档着色");
+  assert.ok(["ok", "mid", "slow", "bad"].includes(net.getAttribute("data-rtt")), "菜单行也应按同一分档着色");
+});
+
+test("网络延迟分档：500ms 以内=顺畅、1000ms 以内=正常（远程文本窗口的判定尺度，不得再苛）", async () => {
+  // 用户 2026-09-27 明确：这类远程访问的文本窗口，500ms 以内不叫事，1000ms 用起来也正常流畅。
+  // 这条锁把「顺畅/正常/偏慢/很慢」的边界钉死，防止以后再被改苛。
+  const cases = [[5, "ok"], [600, "mid"], [1500, "slow"], [2600, "bad"]];
+  for (const [delay, want] of cases) {
+    const env = harness({
+      width: 390,
+      fetchImpl: async () => { await new Promise((r) => setTimeout(r, delay)); return { status: 200, ok: true }; },
+    });
+    runAdapter(env);
+    const rtt = findFab(env).querySelector('[data-role="rtt"]');
+    await env.win.fetch("/api/session/list");
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(rtt.getAttribute("data-rtt"), want,
+      `≈${delay}ms 应判为 ${want}，实际 ${rtt.getAttribute("data-rtt")}（显示 ${rtt.textContent}）`);
+  }
 });
 
 test("网络延迟：无样本 / 失败请求绝不显示 0ms（显示「测速中…」是唯一正确的空态）", async () => {
