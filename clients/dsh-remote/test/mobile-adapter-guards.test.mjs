@@ -37,6 +37,9 @@ import test from "node:test";
 import vm from "node:vm";
 import { injectMobileAdapter } from "../mobile-adapter.mjs";
 
+/** 适配层源码路径（源码契约类断言直接读它）。 */
+const ADAPTER = new URL("../mobile-adapter.mjs", import.meta.url);
+
 /** 取注入结果里的真实 <script> / <style> 内容（不加壳，原样执行）。 */
 function injected() {
   const { html } = injectMobileAdapter("<!doctype html><html><head></head><body></body></html>");
@@ -218,8 +221,8 @@ function zIndexes(css) {
     // 抽屉规则都带 :not(.dsh-ma-details) 兜底（防止一列被同时标成抽屉与详情列）
     sidebar: num(/div\.pI_x6G_sidebarCol(?::not\([^)]*\))?,\s*div\.dsh-ma-sidebar(?::not\([^)]*\))?\s*\{[\s\S]{0,500}?z-index:\s*(\d+)/),
     sidebarOpen: num(/html\.dsh-ma-sidebar-open\s+div\.pI_x6G_sidebarCol(?::not\([^)]*\))?,[\s\S]{0,200}?\{\s*z-index:\s*(\d+)/),
-    details: num(/div\.pI_x6G_detailsCol,[\s\S]{0,300}?z-index:\s*(\d+)/),
     hamburger: num(/button\.dsh-ma-hamburger\s*\{[\s\S]{0,700}?z-index:\s*(\d+)/),
+    // ❌ 2026-09-27 根治：不再解析 details 的 z-index —— 适配层已不给第三列写任何 CSS。
   };
 }
 
@@ -568,21 +571,47 @@ test("白框：官方属性说「展开」但页面刚载入时不得自动滑�
   assert.equal(env.html.classList.contains("dsh-ma-scrim-on"), false, "没有抽屉 → 遮罩不得拦点击");
 });
 
-test("白框：官方 收起→展开 的实际切换（用户点了工具行）仍然要能滑入详情", () => {
-  const { js } = injected();
+test("★ 第三列（官方右栏）的显隐**完全交还官方**：适配层一个字节都不许干预", () => {
+  const { js, css } = injected();
   const env = run(harness({ detailsAttr: "true" }), js);
   const obs = MutationObserverStub.instances.find((o) => o.targets.some((t) => t.t === env.frame));
   assert.ok(obs, "应挂了 frame 属性观察器");
-  assert.equal(env.html.classList.contains("dsh-ma-details-open"), false, "前提：初始为收起");
-  env.toolRow.dispatchEvent(new Ev("click", {}));          // 用户点正文里的工具行
-  assert.equal(env.html.classList.contains("dsh-ma-details-open"), false, "官方此刻还说收起 → 不得弹面板");
-  env.frame.removeAttribute("data-details-collapsed");     // 官方展开详情（属性被移除）
+
+  // 反例一：用户点了正文里的工具行（旧实现在这里"解锁"详情列的滑入）
+  env.toolRow.dispatchEvent(new Ev("click", {}));
+  assert.equal(env.html.classList.contains("dsh-ma-details-open"), false, "适配层不得再驱动第三列显隐");
+
+  // 反例二：官方把属性移除 = 官方自己展开了右栏 —— 我们**既不滑入也不拦截**，只是什么都不做
+  env.frame.removeAttribute("data-details-collapsed");
   obs.fire("data-details-collapsed");
-  assert.equal(env.html.classList.contains("dsh-ma-details-open"), true,
-    "用户点过正文 + 官方展开详情 → 必须能滑入（不能为了防白框把功能废掉）");
-  // 详情列真的滑进视口后，遮罩才允许拦住它背后 —— 正常行为不能被改坏
   env.doc.dispatchEvent(new Ev("resize", {}));
-  assert.equal(env.html.classList.contains("dsh-ma-scrim-on"), true, "详情列真的在视口里时，遮罩应正常生效");
+  assert.equal(env.html.classList.contains("dsh-ma-details-open"), false,
+    "官方展开右栏时，适配层不得再插一脚（官方的全屏浮层由官方自己摆）");
+  assert.equal(env.html.classList.contains("dsh-ma-scrim-on"), false,
+    "★ 也**绝对不得**为第三列开遮罩 —— 那正是「点开变整屏黑」的直接成因");
+
+  // 样式侧：不得给第三列设定位/位移/层级（祖先 transform 会给 fixed 后代创建包含块 → 把官方全屏面板推出屏外）
+  // ⚠️ 必须**只看生效的 CSS**：STYLE 是一个模板字符串，注释也是文本，直接扫会命中「历史说明」里的字样。
+  const cssCode = String(css).replace(/\/\*[\s\S]*?\*\//g, "");
+  assert.ok(!/translateX\(103%\)/.test(cssCode), "★ 不得再把第三列推到屏外（官方窄屏是全屏浮层，会被一起推走）");
+  assert.ok(!/dsh-ma-details-open/.test(cssCode), "★ 不得再有 dsh-ma-details-open 驱动的样式");
+  assert.equal(/div\.pI_x6G_detailsCol[^{]*\{[^}]*\}/.exec(cssCode), null,
+    "★ 适配层不得给第三列写任何 CSS 规则（position/transform/width/z-index 一律不许）");
+  assert.equal(/div\.dsh-ma-details[^{]*\{[^}]*\}/.exec(cssCode), null,
+    "★ 也不得给 dsh-ma-details 标记写规则");
+});
+
+test("★ 遮罩只跟左抽屉走：第三列（右栏）在视口里也绝不让遮罩下闸", () => {
+  const { js } = injected();
+  const env = run(harness({ collapsedAttr: "true", detailsAttr: "true" }), js);
+  const obs = MutationObserverStub.instances.find((o) => o.targets.some((t) => t.t === env.frame));
+  // 人为把第三列摆进视口（模拟官方自己展开了右栏）
+  env.third.getBoundingClientRect = () => ({ left: 40, top: 0, right: 380, bottom: 800, width: 340, height: 800 });
+  env.frame.removeAttribute("data-details-collapsed");
+  obs.fire("data-details-collapsed");
+  env.doc.dispatchEvent(new Ev("resize", {}));
+  assert.equal(env.html.classList.contains("dsh-ma-scrim-on"), false,
+    "★ 第三列在视口里 ≠ 我们要开遮罩：官方右栏（尤其窄屏全屏浮层）不需要我们的遮罩");
 });
 
 test("白框：没有用户动作时官方自己翻转成展开（改名/重渲染）不得弹白框", () => {
@@ -597,38 +626,49 @@ test("白框：没有用户动作时官方自己翻转成展开（改名/重渲�
   assert.equal(env.html.classList.contains("dsh-ma-scrim-on"), false, "同理：遮罩不得跟着拦点击");
 });
 
-test("白框：详情面板显示后点空白（遮罩）能关掉，且不会自己弹回来", () => {
+test("遮罩点击：只关左抽屉，不碰第三列", () => {
   const { js } = injected();
-  const env = run(harness({ detailsAttr: "true" }), js);
-  const obs = MutationObserverStub.instances.find((o) => o.targets.some((t) => t.t === env.frame));
-  env.toolRow.dispatchEvent(new Ev("click", {}));
-  env.frame.removeAttribute("data-details-collapsed");
-  obs.fire("data-details-collapsed");
+  const env = run(harness({ collapsedAttr: "true", detailsAttr: "true" }), js);
+  const ham = findHamburger(env);
+  ham.dispatchEvent(new Ev("click", {}));
   env.doc.dispatchEvent(new Ev("resize", {}));
-  assert.equal(env.html.classList.contains("dsh-ma-details-open"), true, "前提：用户点过正文后详情已显示");
+  env.html.classList.add("dsh-ma-details-open");           // 人为制造"第三列也开着"的遗留状态
+  assert.equal(env.html.classList.contains("dsh-ma-scrim-on"), true, "前提：抽屉展开、遮罩在拦");
   findScrim(env).dispatchEvent(new Ev("click", {}));
-  assert.equal(env.html.classList.contains("dsh-ma-details-open"), false, "点空白应关掉详情面板");
-  // 后续任何一次兜底 re-sync 都不得把用户明确关掉的面板又弹回来
-  env.doc.dispatchEvent(new Ev("resize", {}));
-  obs.fire("data-rightbar-collapsed");
-  assert.equal(env.html.classList.contains("dsh-ma-details-open"), false,
-    "用户点空白关掉之后，「要看详情」的意图必须被收回，不得自己弹回");
+  assert.equal(env.html.classList.contains("dsh-ma-sidebar-open"), false, "点空白应关掉左抽屉");
+  assert.equal(env.html.classList.contains("dsh-ma-scrim-on"), false, "遮罩也要撤掉");
+  // 我们**根本不设置** dsh-ma-details-open，所以这里断言的是"源码里不许出现它"（见下面的源码契约）。
+  // （不要求"清掉" —— 我们连碰都不该碰第三列。）
 });
 
-test("白框：详情列在视口里时遮罩生效；官方收起来后遮罩立刻撤掉", () => {
+test("★ 源码契约：适配层代码里不许再出现任何「驱动第三列」的符号（去注释后扫）", () => {
+  const src = readFileSync(ADAPTER, "utf8");
+  // 只看**代码**：STYLE 是模板字符串、注释也是文本，直接扫会命中"历史说明"
+  const code = src
+    .replace(/\/\*[\s\S]*?\*\//g, "")   // 块注释
+    .split("\n").map((l) => l.replace(/\/\/(?![^"'\n]*["']).*$/, ""))  // 行注释（粗略：不动 http:// 之类）
+    .join("\n");
+  for (const sym of ["dsh-ma-details-open", "detailsSticky", "centerTouchedAt", "rightPaneWanted",
+                     "rightPaneHasContent", "detailsAttrLive", "detailsCollapsed", "detailsSeenCollapsed",
+                     "maRightPaneRequest", "maOpenRightPane", "maRightPaneExpandBtn"]) {
+    assert.ok(!code.includes(sym),
+      `★ 代码里不得再出现 ${sym} —— 第三列的显隐已完全交还官方（2026-09-27 根治）`);
+  }
+});
+
+test("★ 回归锁：第三列在视口里 + 官方收起，遮罩都不为它动一下", () => {
   const { js } = injected();
   const env = run(harness({ detailsAttr: "true" }), js);
   const obs = MutationObserverStub.instances.find((o) => o.targets.some((t) => t.t === env.frame));
-  env.toolRow.dispatchEvent(new Ev("click", {}));
+  env.third.getBoundingClientRect = () => ({ left: 40, top: 0, right: 380, bottom: 800, width: 340, height: 800 });
   env.frame.removeAttribute("data-details-collapsed");
   obs.fire("data-details-collapsed");
   env.doc.dispatchEvent(new Ev("resize", {}));
-  assert.equal(env.html.classList.contains("dsh-ma-scrim-on"), true, "前提：详情列展开且遮罩生效");
+  assert.equal(env.html.classList.contains("dsh-ma-scrim-on"), false, "第三列展开 → 遮罩不为它下闸");
   env.frame.setAttribute("data-details-collapsed", "true");
   obs.fire("data-details-collapsed");
   env.doc.dispatchEvent(new Ev("resize", {}));
-  assert.equal(env.html.classList.contains("dsh-ma-details-open"), false, "官方收起 → 详情 class 撤掉");
-  assert.equal(env.html.classList.contains("dsh-ma-scrim-on"), false, "官方收起 → 遮罩必须一起撤掉");
+  assert.equal(env.html.classList.contains("dsh-ma-scrim-on"), false, "第三列收起 → 遮罩也不为它变化");
 });
 
 test("遮罩不变量：遮罩在拦点击但视口内没有任何可交互抽屉 → 看门狗立刻摘掉", () => {
@@ -664,9 +704,9 @@ test("抽屉可点：抽屉展开时抽屉内点击命中抽屉自身（不被�
   const z = zIndexes(css);
   assert.ok(z.sidebarOpen > z.scrim,
     `抽屉展开时的层级(${z.sidebarOpen})必须高于遮罩(${z.scrim}) —— 否则抽屉里所有点击都被遮罩吃掉`);
-  assert.ok(z.sidebarOpen > z.details,
-    `抽屉展开时的层级(${z.sidebarOpen})必须高于详情列(${z.details}) —— 详情列在 frame 里排在抽屉之后，同级会压住抽屉`);
-  assert.ok(z.hamburger > z.details && z.hamburger > z.sidebarOpen,
+  // ❌ 2026-09-27 根治：不再断言「抽屉必须高于详情列」 —— 适配层已不给第三列设 z-index，
+  //    它回到官方布局里，不再是我们自绘的浮层，也就不可能压住抽屉。
+  assert.ok(z.hamburger > z.sidebarOpen,
     "汉堡按钮必须始终在最上层（判定怎么错都点得到 = 唯一自救出口）");
 
   const env = run(harness({ collapsedAttr: "true", detailsAttr: "true" }), js);
@@ -677,7 +717,7 @@ test("抽屉可点：抽屉展开时抽屉内点击命中抽屉自身（不被�
   const r = env.row.getBoundingClientRect();
   const hit = hitTest(env, z, r.left + r.width / 2, r.top + r.height / 2);
   assert.equal(hit, env.row, "抽屉展开时，抽屉内的点击必须落在抽屉内容上");
-  // 最坏情况：详情列也同时被判成展开 —— 抽屉仍然必须压得住（能在抽屉里点选）
+  // 最坏情况：即便有人（旧版本/官方）把 dsh-ma-details-open 挂上，抽屉内的点击也必须有效
   env.html.classList.add("dsh-ma-details-open");
   const hit2 = hitTest(env, z, r.left + r.width / 2, r.top + r.height / 2);
   assert.equal(hit2, env.row, "即便详情列同时展开，抽屉内的点击也必须有效（不能把用户困住）");
@@ -976,31 +1016,40 @@ test("白柱：汉堡按钮不再无条件点官方 toggle（两态不得互相�
   assert.equal(env.html.classList.contains("dsh-ma-sidebar-open"), true, "第二次点击应把抽屉打开（意图生效）");
 });
 
-test("打开右侧栏：官方右栏里有宿主注册的内容时，FAB 菜单那颗按钮必须能把它滑进来", () => {
+test("★ 官方右栏里有内容时：适配层**不插手**（交还官方 openRightbar），菜单里也不再有「打开右侧栏」按钮", () => {
   const { js } = injected();
-  // 现场（用户报的「右侧按钮区看不见」）：better-sidebar 这类插件把 tab 注册进官方右栏，
-  // 但它只翻自己的 store → 官方 cols.rightbar 永远是 0（data-rightbar-collapsed 恒为 true）。
+  // 现场（用户 2026-09-27 反馈）：better-sidebar 把 tab 注册进官方右栏，官方 cols.rightbar 仍为 0。
+  // 旧做法是我们自绘浮层 + 手动按钮 → 祖先 transform 把官方全屏面板推出屏外 + 我们再开遮罩
+  // → 用户看到「整屏一层黑」。
   const env = harness({ collapsedAttr: "true", variant: "rc2", detailsAttr: null, rightbarAttr: "true" });
-  env.third.appendChild(env.doc.createElement("div"));   // 官方右栏里确实有内容（插件注册的 tab 面板）
+  env.third.appendChild(env.doc.createElement("div"));
   run(env, js);
-  assert.equal(env.html.classList.contains("dsh-ma-details-open"), false, "前提：默认不显示右栏");
   const menu = env.body.children.find((c) => c._cls.has("dsh-ma-menu"));
   assert.ok(menu, "应有悬浮菜单");
-  const btn = menu.querySelector('[data-role="right-pane"]');
-  assert.ok(btn, "菜单里必须有「打开右侧栏」按钮（用户唯一的明路）");
-  btn.dispatchEvent(new Ev("click", {}));
-  assert.equal(env.html.classList.contains("dsh-ma-details-open"), true,
-    "点「打开右侧栏」后，即便官方说收起（第三方插件不会让官方展开），也必须把有内容的右栏滑进来");
-  assert.equal(menu.hidden, true, "点完应关闭菜单（让用户看见滑入的面板）");
+  assert.equal(menu.querySelector('[data-role="right-pane"]'), null,
+    "★ 菜单里不该再有「打开右侧栏」按钮 —— 官方右栏自己的 tab / 会话头按钮就能开");
+  assert.equal(env.html.classList.contains("dsh-ma-details-open"), false,
+    "★ 适配层不得替官方决定右栏显隐");
+  assert.equal(env.html.classList.contains("dsh-ma-scrim-on"), false, "★ 更不得为它开遮罩");
 });
 
-test("打开右侧栏：右栏里没有任何内容时不得滑出一个空白面板（2026-09-19 白框事故的回归）", () => {
+test("★ 2026-09-19 白框事故的**结构性**回归锁：适配层任何情况下都不滑出第三列", () => {
   const { js } = injected();
-  const env = run(harness({ collapsedAttr: "true", variant: "rc2", detailsAttr: null, rightbarAttr: "true" }), js);
-  const menu = env.body.children.find((c) => c._cls.has("dsh-ma-menu"));
-  menu.querySelector('[data-role="right-pane"]').dispatchEvent(new Ev("click", {}));
-  assert.equal(env.html.classList.contains("dsh-ma-details-open"), false,
-    "官方右栏里什么都没有 → 宁可什么都不发生，也不弹一个空白白面板（那正是白框事故）");
+  // 当年白框的三种触发现场各来一遍，断言"我们什么都不做" ⇒ 白框在结构上不可能再出现
+  for (const opts of [
+    { collapsedAttr: "true", variant: "rc2", detailsAttr: null, rightbarAttr: "true" },   // 官方说收起 + 右栏有内容
+    { collapsedAttr: "true", variant: "rc2", detailsAttr: null, rightbarAttr: null },     // 官方属性说不清 + 有内容
+    { collapsedAttr: "true", detailsAttr: "false" }                                      // 官方说第三列展开（左抽屉仍收起）
+  ]) {
+    const env = harness(opts);
+    env.third.appendChild(env.doc.createElement("div"));
+    run(env, js);
+    env.doc.dispatchEvent(new Ev("resize", {}));
+    assert.equal(env.html.classList.contains("dsh-ma-details-open"), false,
+      "适配层不得滑出第三列（白框的结构性杜绝）: " + JSON.stringify(opts));
+    assert.equal(env.html.classList.contains("dsh-ma-scrim-on"), false,
+      "也不得为它开遮罩: " + JSON.stringify(opts));
+  }
 });
 
 test("打开右侧栏：绝不允许「载入即滑出白框」——必须由用户动作解锁", () => {

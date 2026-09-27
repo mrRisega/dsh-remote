@@ -149,19 +149,37 @@ const STYLE = `
   html.dsh-ma-official-collapsed:not(.dsh-ma-user-wants-open) div.pI_x6G_sidebarCol:not(.dsh-ma-details),
   html.dsh-ma-official-collapsed:not(.dsh-ma-user-wants-open) div.dsh-ma-sidebar:not(.dsh-ma-details) { transform: translateX(-103%) !important; }
 
-  div.pI_x6G_detailsCol, div.pI_x6G_rightbarCol, div.dsh-ma-details, div.dsh-ma-rightbar {
-    position: fixed; right: 0; top: 0; bottom: 0; margin: 0;
-    width: min(92vw, 400px); max-width: 96vw;
-    z-index: 300; overflow: hidden;
-    border-left: .5px solid var(--dsw-alias-border-l3, rgba(127,127,127,.25));
-    box-shadow: 0 10px 44px rgba(0,0,0,.26);
-    transform: translateX(103%);
-    transition: transform .22s var(--ds-ease-in-out, ease);
-  }
-  html.dsh-ma-details-open div.pI_x6G_detailsCol,
-  html.dsh-ma-details-open div.pI_x6G_rightbarCol,
-  html.dsh-ma-details-open div.dsh-ma-details,
-  html.dsh-ma-details-open div.dsh-ma-rightbar { transform: none; }
+/*
+   ══════════════════════════════════════════════════════════════════════════════
+   🚫 这里**故意什么都不写** —— 第三列（官方右栏）的显示/隐藏完全交还给官方。
+   ══════════════════════════════════════════════════════════════════════════════
+   历史（2026-09-27 根治，业主拍板 B 方案）：
+   0.6.13 起我们把这列改造成自绘浮层 —— position:fixed; right:0; width:min(92vw,400px);
+   transform:translateX(103%)，再用 html.dsh-ma-details-open … { transform:none } 滑进来。
+   因为"自绘浮层会白框压屏"（2026-09-19 事故），又加了一道很严的闸门（必须"用户 8 秒内
+   在正文里点过"才允许滑入）；而 better-sidebar 这类插件只翻**它自己**的 store、官方
+   cols.rightbar 永远是 0 → 闸门永远不开 → 于是又在悬浮菜单里补了颗「打开右侧栏」按钮。
+   
+   🔴 为什么这条路是错的（真机症状：点开之后整屏一层黑遮罩、看不到右栏内容）：
+   官方右栏在窄屏**本来就是全屏浮层**，由官方自己做：
+   · .P3OORG_panel[data-sidebar-right-panel=fullscreen]{ z-index:40; position:fixed; inset:0 }
+   （见 @deepseek-ai/dsh-client-ui-sidebar-right）
+   · 官方 ctx.layout.openRightbar(track, fullscreen) —— 窄屏打开时还会顺手收掉左栏
+   （viewportWidth < 1024 → narrowExpanded = false）。
+   而 CSS 里**只要祖先有 transform，就会给 position:fixed 的后代创建新的包含块** ——
+   我们那行 translateX(103%) 于是把官方那个 inset:0 的全屏面板**一起推到屏幕外**；
+   与此同时我们的闸门又把 dsh-ma-scrim-on（rgba(0,0,0,.32) 全屏遮罩）打开
+   ⇒ 用户看到的正是"整屏变黑、什么也没有"。
+   **官方本来就做对了，是我们把它挡住的。**
+   
+   现在的契约（护栏用例 mobile-adapter-guards 守着）：
+   ① 适配层**不得**给第三列设 position / transform / width / z-index / 背景；
+   ② 不得用类名（如 dsh-ma-details-open）驱动第三列的显隐；
+   ③ 不得为第三列开遮罩；
+   ④ 不再需要「打开右侧栏」按钮 —— 官方右栏自己的 tab / 会话头按钮就会调 openRightbar。
+   宽屏时官方把它当普通 grid 列（computeColumns），窄屏时当全屏浮层 —— 两种都不需要我们插手。
+   我们只保留 (.dsh-ma-details) 这个**标记**用于"别把第三列误认成左抽屉"（见上面的 :not 守卫）。
+*/
 
   /* --- 展开遮罩(在浮层下、在官方弹层下) --- */
   div.dsh-ma-scrim {
@@ -1004,34 +1022,11 @@ const SCRIPT = `(() => {
 
     /* 悬浮按钮/菜单：任何宽度都要有（电脑端访问镜像页同样需要「返回设备列表」的出口），
        与手机端布局改造分开守门；失败也不影响布局适配。 */
-    /* —— 「打开右侧栏」的接线（落点见 buildRemoteMenu 里的按钮注释）——
-       buildRemoteMenu 在**任何宽度**都会建（电脑端也要有返回设备列表的出口），而驱动第三列滑入的
-       状态机（detailsSticky / centerTouchedAt / sync）只在 boot() 的窄屏段里存在 ——
-       两者作用域不同、执行顺序也不保证（fab 先建）。所以用**一个模块级回调**做唯一接口：
-       菜单按钮只调 maRightPaneRequest()，状态机自己决定怎么开，两边永不互相引用私有变量。 */
-    let maOpenRightPane = null;   // 由 boot() 的窄屏段注入；null = 还没建好或当前是宽屏
-    /** 官方第三列（右栏）的「展开」按钮探测 —— 只用官方 aria-label / 结构，不认第三方标记。
-        官方 0.1.5-rc.2：收起态下会话头有一颗 ExpandButton，展开后它就消失 ——
-        所以"找不到"是正常情况（宽屏本来就不需要），不是错误。 */
-    const maRightPaneExpandBtn = () => {
-      try {
-        const sels = [
-          '[aria-label="Expand right sidebar"]', '[aria-label="Open right sidebar"]',
-          '[aria-label="Expand right pane"]',
-          '[aria-label="展开右侧栏"]', '[aria-label="打开右侧栏"]', '[aria-label="展开右栏"]'
-        ];
-        for (let i = 0; i < sels.length; i++) {
-          const el = document.querySelector(sels[i]);
-          if (el) return el;
-        }
-      } catch (e) { /* 选择器异常/老浏览器：当作找不到 */ }
-      return null;
-    };
-    const maRightPaneRequest = () => {
-      if (typeof maOpenRightPane === "function") { try { maOpenRightPane(); return; } catch (e) { /* 落到下面兜底 */ } }
-      // 宽屏 / 状态机还没建好：至少替用户点一下官方那颗展开按钮（没有就什么都不做，绝不报错）
-      try { const b = maRightPaneExpandBtn(); if (b && b.click) b.click(); } catch (e2) { /* 忽略 */ }
-    };
+    /* ❌ 这里曾有 maOpenRightPane / maRightPaneExpandBtn / maRightPaneRequest 三件套 ——
+   它们是「从 FAB 手动打开官方右栏」的入口。2026-09-27 根治时整条删除：
+   官方右栏的 tab / 会话头按钮本来就会调 ctx.layout.openRightbar(track, fullscreen)，
+   窄屏还会自动收起左栏（viewportWidth < 1024 → narrowExpanded = false）。
+   我们插一脚只会把官方推到相反方向（这正是「点开变黑遮罩」那条链的起点）。 */
     let fabDone = false;
     const buildRemoteMenu = () => {
       /* ===== 统一「远程控制」悬浮按钮：字号 + 加密状态 + 返回设备列表 =====
@@ -1105,7 +1100,9 @@ const SCRIPT = `(() => {
         // 「打开右侧栏」（0.6.18）：手机端第三列是离屏浮层，滑入闸门要求"用户 8 秒内在正文点过"，
         // 而把按钮注册进官方右栏的第三方插件（如 dsh-better-sidebar）只翻它自己的 store，
         // 官方 cols.rightbar 永远是 0 → 面板永远不滑进来。这里给用户一条明路（详见下方 click 处理）。
-        '<button type="button" class="dsh-ma-menu-right" data-role="right-pane">📋 打开右侧栏</button>' +
+        // ❌ 这里曾有颗「📋 打开右侧栏」按钮（0.6.18-beta.1/2）。已删：
+        //    它是「我们自绘浮层 → 浮层会挡屏 → 加闸门 → 闸门挡住第三方插件 → 再补个手动入口」
+        //    这条错误链的最后一环。官方右栏自己就能开（窄屏还会自动收左栏），不需要这颗按钮。
         '<button type="button" class="dsh-ma-menu-back">← 返回设备列表</button>' +
         '<div class="dsh-ma-load-warn" data-role="load-warn" hidden>' +
           '<span class="ico">⚠</span>' +
@@ -1288,26 +1285,10 @@ const SCRIPT = `(() => {
       };
       renderRtt();
 
-      /* 「打开右侧栏」：手机端第三列（官方右栏）是**离屏浮层**，唯一滑入闸门在 sync() 里：
-            detailsAttrLive() && !detailsCollapsed() && (用户 8s 内在正文点过 || detailsSticky)
-         而 better-sidebar 这类"把按钮注册进官方右栏"的插件只翻它**自己**的 store，官方 cols.rightbar
-         永远是 0 → 面板永远不会滑进来（用户报的「右侧按钮区看不见」）。
-         这里给用户一条**明路**：把"我要看右侧栏"登记成和"在正文里点了一下"等价的意图（不受 8s 窗口
-         限制），并在官方确实有展开按钮时替用户点一下。
-         ⚠️ 探测只用**官方类名/aria-label/结构**，绝不依赖 better-sidebar 的私有标记
-            （data-rightbar-col / data-dsh-center-col）—— 那正是 0.6.15/0.6.16 反复踩的坑：
-             插件换版本或被卸载，标记就没了，适配层会跟着失灵。
-         ⚠️ 状态机在 boot() 的窄屏段里（buildRemoteMenu 宽窄都建、且可能更早执行），
-            所以通过模块级回调 maOpenRightPane 单向调用；拿不到回调（宽屏/还没建好）时
-            退化成"只点官方那颗展开按钮"。 */
-      const rightBtn = menu.querySelector('[data-role="right-pane"]');
-      if (rightBtn) {
-        rightBtn.addEventListener("click", (e) => {
-          e.stopPropagation(); e.preventDefault();
-          closeMenu();
-          maRightPaneRequest();
-        });
-      }
+      /* ❌ 这里曾有「打开右侧栏」这一段与 maRightPane* 三件套 —— 2026-09-27 根治时整条删除。
+         原因见 STYLE 段顶部：官方右栏在窄屏本来就是全屏浮层，我们把它劫持成自绘浮层
+         （祖先 transform 会给 fixed 后代创建包含块）才导致「点开变整屏黑遮罩」。
+         官方自己的 tab / 会话头按钮就会调 ctx.layout.openRightbar(track, fullscreen)。 */
 
       /* ---- 交互 ---- */
       /* 菜单跟随按钮：按钮在上半屏 → 菜单挂在它下方；按钮靠左 → 菜单左对齐（都不超出视口）。 */
@@ -1643,12 +1624,10 @@ const SCRIPT = `(() => {
       scrim.addEventListener("click", (e) => {
         e.stopPropagation();
         userWantsOpen = false;                    // 用户明确要关(遮罩的作用就是关抽屉)
-        centerTouchedAt = 0; detailsSticky = false; // 顺带收回"要看详情"的意图(下次在正文里点一下即可恢复)
-        rightPaneWanted = false;                    // 也收回「打开右侧栏」的显式请求
         const t = toggleOf();
         if (t) { t.click(); }
         /* 兜底 + 保险:无论官方 toggle 在不在,都确保"点空白处"能关掉/不再拦截 */
-        document.documentElement.classList.remove("dsh-ma-sidebar-open", "dsh-ma-details-open", "dsh-ma-scrim-on");
+        document.documentElement.classList.remove("dsh-ma-sidebar-open", "dsh-ma-scrim-on");
       });
 
       /* 顶部小鲸鱼/菜单按钮 */
@@ -1704,7 +1683,7 @@ const SCRIPT = `(() => {
         } catch (e2) { return false; }
       };
       const sidebarInView = () => isDrawer(sidebar || document.querySelector(".dsh-ma-sidebar"));
-      const detailsInView = () => isDrawer(details || document.querySelector(".dsh-ma-details, .dsh-ma-rightbar"));
+      // ❌ 已随 2026-09-27 根治删除：detailsInView（第三列不再由我们判显隐）。
       /**
        * 抽屉列是不是**空壳**：官方已经把内容收起来了，只剩一个宽度还在的固定柱。
        *
@@ -1730,19 +1709,8 @@ const SCRIPT = `(() => {
           return true;   // 子节点为空 → 空壳（官方折叠后内容被卸载的情况）
         } catch (e) { return false; }
       };
-      /* 第三列折叠态:官方 0.1.2-rc.1 是 data-details-collapsed,0.1.5-rc.2 起是 data-rightbar-collapsed;
-         两个都认;都不存在(未来再改名)时**不当作展开**(见下面 detailsAttrLive)。 */
-      const detailsCollapsed = () =>
-        truthyAttr(frame, "data-details-collapsed") || truthyAttr(frame, "data-rightbar-collapsed");
-      const detailsAttrKnown = () =>
-        frame.hasAttribute("data-details-collapsed") || frame.hasAttribute("data-rightbar-collapsed");
-      /* 官方这两个属性都是"折叠时才写,展开时**移除**"(实测 0.1.2-rc.1:展开态下属性消失)。
-         所以"属性不在"既可能是"展开",也可能是"官方改名了,我们根本不认识这个属性"——必须区分:
-           · 只要**见过**它出现过(detailsSeenCollapsed),就说明这个名字是活的 → 之后的"不在"= 展开;
-           · 从没见过 → 不认识 → 一律不认(绝不把未知结构当成"展开的详情列",这是白框事故的根因)。
-         data-rightbar-fullscreen 一并算作"这个名字是活的"的旁证(0.1.5 起第三列的另一种开合表达)。 */
-      const detailsAttrLive = () =>
-        detailsAttrKnown() || detailsSeenCollapsed || frame.hasAttribute("data-rightbar-fullscreen");
+      /* ❌ 已随 2026-09-27 根治删除：detailsCollapsed / detailsAttrKnown / detailsAttrLive 三件套 ——
+         它们的前提是「由我们决定第三列显隐」，而决定权已交还官方。 */
       /* 状态来源（按优先级）：
          ① 用户意图 userWantsOpen —— 点菜单按钮打开 / 点遮罩关闭，期间**不被几何判定推翻**；
          ② 官方 frame 的 data 属性 —— 用户没表达意图时（初始、官方自己切换）以它为准。
@@ -1757,36 +1725,15 @@ const SCRIPT = `(() => {
       let officialExpandedSeen = false;
       let lastOfficialCollapsed = null;
       let scrimTimer = 0, scrimWatchdog = 0;
-      /* ---- 详情列(第三列)在手机端的显示条件 ----------------------------------------
-         ⚠️ 为什么不能"官方属性说展开就滑进来"(2026-09-19 白框事故的根因之一):
-            详情列在手机端是**离屏浮层**,我们自己的 CSS 用 translateX(103%) 把它推到屏幕右侧外面,
-            到底显不显示**完全由 dsh-ma-details-open 决定**。所以几何永远无法充当"要不要打开"的依据
-            (它永远在屏外);反过来,旧实现用带缺陷的几何判定去决定是否滑入,就把
-            "官方在宽屏/上次会话遗留的展开态(attr 缺失或 =false)"读成"现在就该显示",
-            于是手机一载入就滑出一个**空的白色 Details 面板**盖住界面。
-         现在的规则(唯一一条,很保守):
-           官方说得清"此刻是展开的" **且** 用户在**主内容列**里点过至少一次 → 才滑入。
-           为什么要求"用户点过主内容列":官方表达展开的方式有两种 —— 属性被移除,或写成 =false
-           (实测 0.1.2-rc.1 是"收起才写属性";0.1.5 起第三列改名 rightbar,写法可能与旧版不同)。
-           "载入时官方就是展开的"多半是宽屏/上次会话留下的状态,手机端一进来就弹一个空白白面板
-           正是用户报的那个白框;而"用户在正文里点了一下"是**可靠且唯一的**用户意图信号
-           (点工具行必然落在主内容列里)。这样两种写法都能正确处理,也不需要猜官方的时序。
-           注:用户点过之后,官方若把属性收回(=收起),下面的 !detailsCollapsed() 立刻让它退出 ——
-           关掉详情面板也是即时的。 */
-      let detailsSeenCollapsed = false;  // 是否见过官方写出折叠态(证明这个属性名是活的)
-      /* 手机端显示详情列的**唯一**依据:用户在主内容列里的点击(见下面 click 委托)。
-         · centerTouchedAt:最近一次点击时间 —— 点工具行后官方通常在同一帧内把详情置为展开,
-           给一个几秒窗口足够覆盖"点击 → 官方改属性 → 我们收到通知"的时序;
-         · detailsSticky:一经用户动作显示过就粘住(官方没说收起之前不自己缩回去),
-           否则那些 700/1600/…/12000ms 的兜底 re-sync 会在窗口过期后把面板又收起来。 */
-      const CENTER_TOUCH_MS = 8000;
-      let centerTouchedAt = 0;
-      let detailsSticky = false;
-      /* 「打开右侧栏」的**显式**请求（0.6.18，来自悬浮菜单那颗按钮）。
-         与 centerTouchedAt/detailsSticky 的区别：那两个是"用户大概想看点细节"的弱信号，
-         这个是"我就是要看官方右栏"的强信号 —— 强信号才允许跳过"官方说未收起"这一条
-         （better-sidebar 这类只翻自己 store 的插件永远不会让官方 cols.rightbar 变正）。 */
-      let rightPaneWanted = false;
+      /* ❌ 这里曾有「详情列(第三列)在手机端的显示条件」整段判据（白框事故后打的四层闸门）。
+         2026-09-27 根治时删除：第三列的显隐**完全交还官方** —— 宽屏按 grid 列、窄屏全屏浮层。
+         我们不再有"要不要显示它"的决定权，也就不需要任何判据。 */
+
+      // ❌ 已随 2026-09-27 根治删除：detailsSeenCollapsed。
+      // ❌ 同一批删除：centerTouchedAt / detailsSticky 的说明（自绘浮层时代的启发式）。
+
+      /* ❌ 已随 2026-09-27 根治删除：CENTER_TOUCH_MS / centerTouchedAt / detailsSticky / rightPaneWanted ——
+         这套「用户 8 秒内在正文点过 / 从 FAB 明确要求」的启发式闸门，是为自绘浮层打的补丁。 */
       /**
        * 官方右栏里到底有没有"宿主注册的内容"？—— 有内容才值得滑进来。
        * 判据只用**官方结构 + 几何**，绝不认 better-sidebar 的私有标记
@@ -1795,19 +1742,7 @@ const SCRIPT = `(() => {
        * 为什么重要：官方右栏收起时**面板仍然挂载**（只是平移出 frame 右缘），所以"有子节点"
        * 就足以说明"这颗按钮后面真有东西可看"，而不是一片空白。
        */
-      const rightPaneHasContent = () => {
-        try {
-          const el = details || document.querySelector(".dsh-ma-details, .dsh-ma-rightbar");
-          if (!el) return false;
-          const kids = el.children;
-          if (!kids || typeof kids.length !== "number") return false;
-          if (kids.length === 0) return false;
-          /* 官方折叠时宽度会被压到 0；但我们自己在窄屏把它改成 fixed + translateX(103%)，
-             所以宽度不再是"官方有没有内容"的判据，只用来排除"被压成 0 宽的列"。 */
-          if (typeof el.clientWidth === "number" && el.clientWidth === 0) return false;
-          return true;
-        } catch (e2) { return false; }
-      };
+      // ❌ 已随 2026-09-27 根治删除：rightPaneHasContent（「右栏里有没有内容」也交给官方判断）。
       /* scrim 的"到底有没有在拦"以浏览器算出来的 pointer-events 为准(class 只是我们的意图) */
       const scrimBlocks = () => {
         const html = document.documentElement;
@@ -1819,16 +1754,19 @@ const SCRIPT = `(() => {
         } catch (e2) { /* 忽略 */ }
         return true; // 认不出实际样式 → 以 class 为准(保守:当成在拦)
       };
+      /* 遮罩的「视口里确实有一层可交互抽屉」判据 —— 现在**只认左抽屉**。
+         第三列（官方右栏）不再是我们的浮层，也就绝不应该让我们的遮罩下闸。 */
       const anyDrawerInView = () =>
-        (sidebarInView() && !isShellColumn(sidebar || document.querySelector(".dsh-ma-sidebar"))) || detailsInView();
+        (sidebarInView() && !isShellColumn(sidebar || document.querySelector(".dsh-ma-sidebar")));
       /* 遮罩闸门：**只有此刻真的看得见抽屉**才允许拦截点击。
          抽屉是滑入动画（.22s），所以同步判定必然"还看不见" —— 那一瞬间不下闸即可，
          真正的下闸交给下一帧与动画结束后的复核（applyScrim），既不误拦也不影响手感。
          另外 CSS 侧已收口成"只认 dsh-ma-scrim-on 一个闸"，不会再出现"某个 class 常亮 → 整屏被拦"。 */
       const scrimShouldBeOn = () => {
+        // 只认**左抽屉**：第三列（官方右栏）交还官方之后，窄屏时官方自己做全屏浮层，
+        // 不需要（也不该）由我们再盖一层遮罩 —— 那正是「点开变整屏黑」的直接成因。
         const html = document.documentElement;
         if (html.classList.contains("dsh-ma-sidebar-open") && sidebarInView()) return true;
-        if (html.classList.contains("dsh-ma-details-open") && detailsInView()) return true;
         return false;
       };
       const applyScrim = () => {
@@ -1858,7 +1796,7 @@ const SCRIPT = `(() => {
             if (enforceScrimInvariant()) { /* 不变量被触发:已摘掉遮罩 */ }
             applyScrim();
             const html = document.documentElement;
-            if (!html.classList.contains("dsh-ma-scrim-on") && !html.classList.contains("dsh-ma-sidebar-open") && !html.classList.contains("dsh-ma-details-open")) {
+            if (!html.classList.contains("dsh-ma-scrim-on") && !html.classList.contains("dsh-ma-sidebar-open")) {
               clearInterval(scrimWatchdog); scrimWatchdog = 0;
             }
           }, 800);
@@ -1893,23 +1831,14 @@ const SCRIPT = `(() => {
            保持可见 + 点它可开可关（见其 click 处理），任何异常状态下都留一条出路。
            它的 z-index(320) 高于抽屉(310)/详情列(300)/遮罩(290) —— 判定怎么错都点得到。 */
         if (hamburger) hamburger.style.display = "";
-        /* 第三列(详情/rightbar)在手机端要不要滑进来（0.6.18 四层判据）:
-           ① 官方说得清（detailsAttrLive）+ 官方未收起 + 用户此刻想看 → 滑入（原判据）；
-           ② **用户从 FAB 明确要求**（rightPaneWanted）+ 右栏确实有内容 → 也滑入。为什么必须绕过
-              "官方未收起"：better-sidebar 这类把按钮注册进官方右栏的插件只翻它**自己**的 store，
-              官方 cols.rightbar 永远是 0 → 等它松口 = 面板永远打不开（用户报的「右侧按钮区看不见」）。
-             而"有没有内容"用官方结构/几何判，**绝不**认任何第三方私有标记；
-           ③ 官方属性改名了（detailsAttrLive 为假）但右栏里确实有内容 → 在用户已表达"要看"的前提下
-              也允许滑入（未来官方再改名的兜底；"载入即滑出白框"由 wantsRightPane 挡掉 —— 它要求
-              先有用户动作，那正是 2026-09-19 白框事故的根因）；
-           ④ 官方收起 → 立刻退出，并复位所有粘性意图（下次点正文 / 点 FAB 即可恢复）。 */
-        if (detailsCollapsed()) { detailsSeenCollapsed = true; detailsSticky = false; rightPaneWanted = false; }
-        const touchedRecently = centerTouchedAt !== 0 && (Date.now() - centerTouchedAt) <= CENTER_TOUCH_MS;
-        const wantsRightPane = touchedRecently || detailsSticky || rightPaneWanted;
-        const officialOpen = detailsAttrLive() && !detailsCollapsed();
-        const dOpen = wantsRightPane && (officialOpen || rightPaneHasContent());
-        if (dOpen) detailsSticky = true;
-        document.documentElement.classList.toggle("dsh-ma-details-open", dOpen);
+        /* ❌ 2026-09-27 根治：这里曾用四层判据决定"第三列（官方右栏）要不要滑进来"，
+           并 toggle dsh-ma-details-open。整段删除 —— 第三列的显隐**完全交还给官方**：
+             · 宽屏：官方按 grid 列摆（computeColumns）；
+             · 窄屏：官方把它做成全屏浮层（.P3OORG_panel[data-sidebar-right-panel=fullscreen]
+               { position:fixed; inset:0 }），并且 openRightbar() 时自动收起左栏。
+           我们插手的两个后果都已真机验证：① 祖先 transform 会给 fixed 后代创建包含块 →
+           官方全屏面板被推到屏幕外；② 我们再开遮罩 → 只剩"整屏一层黑"。
+           现在这里**刻意什么都不做**，护栏用例守着「不得出现 dsh-ma-details-open」。 */
         // 遮罩:同步先按当前几何下闸(抽屉已在视口内时无延迟),再在动画开始/结束后复核两次
         applyScrim();
         try {
@@ -1919,46 +1848,10 @@ const SCRIPT = `(() => {
         } catch (e2) { /* 忽略 */ }
         armScrimWatchdog();
       };
-      /* 「打开右侧栏」的真正实现（0.6.18；悬浮菜单那颗按钮通过模块级 maOpenRightPane 回调进来）——
-         状态机在这里，菜单那边看不到 detailsSticky/sync（两者作用域与创建时机都不同：
-         菜单宽窄都建、可能更早；状态机只在 boot() 的窄屏段）。
-         ① 登记"我就是要看官方右栏"的强意图（不受 8s 窗口限制）；
-         ② 官方若真有展开按钮就替用户点一下（探测失败是正常的：宽屏/已展开时它本来就不在）；
-         ③ sync() 立刻按意图生效；官方展开是异步的，动画结束（≈260ms）后再对齐一次。 */
-      maOpenRightPane = () => {
-        rightPaneWanted = true;
-        detailsSticky = true;                    // 双保险：即便官方 toggle 点不动，判据②也放行
-        centerTouchedAt = Date.now();
-        try {
-          const b = maRightPaneExpandBtn();
-          if (b && b.click && detailsCollapsed()) b.click();
-        } catch (eR) { /* 探测/点击失败不影响下面的 sync */ }
-        sync();
-        try { setTimeout(() => { try { sync(); } catch (eS) { /* 忽略 */ } }, 260); } catch (eS2) { /* 忽略 */ }
-      };
-      /* 用户在主内容列里点一下 → 视为"他要看详情"(手机端显示详情列的唯一开关)。
-         为什么必须由用户动作来解锁:官方表达"详情展开"的方式有两种 —— 属性被移除,或写成 =false,
-         而"载入时官方就是展开的"多半是宽屏/上次会话留下的状态;手机端一进来就滑出一个空白白面板
-         正是用户报的那个白框。点了正文之后才显示,两种写法都能正确处理,也不用去猜官方时序;
-         用户点空白(遮罩)即收回这个意图(见 scrim 的 click 处理)。
-         只认主内容列(.dsh-ma-center),不认抽屉/菜单/适配层自己的 UI —— 不会误触发。 */
-      try {
-        document.addEventListener("click", (e) => {
-          try {
-            if (!NARROW()) return;
-            const t = e.target;
-            if (!t || !t.closest) return;
-            if (t.closest(".dsh-ma-sidebar, .dsh-ma-scrim, .dsh-ma-hamburger, .dsh-ma-fab, .dsh-ma-menu")) return;
-            if (!t.closest(".dsh-ma-center, .pI_x6G_centerCol")) return;
-            centerTouchedAt = Date.now();
-            /* 只有"官方此刻就说详情是展开的"才需要立刻重算 —— 否则这一下点击改变不了任何显示,
-               白跑一次 sync()(它要读几次 getBoundingClientRect)。官方稍后把详情置为展开时,
-               frame 属性观察器会再触发一次 sync,那时 centerTouchedAt 已经记下了用户意图。 */
-            if (detailsCollapsed()) return;
-            sync();
-          } catch (e2) { /* 忽略 */ }
-        }, true);
-      } catch (e2) { /* 忽略 */ }
+      /* ❌ 「打开右侧栏」的实现已整条删除（2026-09-27 根治，原因见 STYLE 段顶部的长注释）。 */
+      /* ❌ 「在正文里点一下才允许详情列滑入」的 click 委托已删除（2026-09-27 根治）。
+         那道启发式闸门存在的唯一理由，是我们把官方右栏改成了自绘浮层、怕它白框压屏；
+         现在右栏完全交还给官方（官方自己 openRightbar / fullscreen），闸门没有存在意义了）。 */
       try {
         /* 观察 frame 的**全部属性**,再在回调里按名字筛(2026-09-19 手机实测后的加固):
            官方 0.1.5-rc.2 起表达抽屉开合的属性改过名(details→rightbar),将来还可能再改;

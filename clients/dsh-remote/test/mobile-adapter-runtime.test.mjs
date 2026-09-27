@@ -481,13 +481,16 @@ test("悬浮菜单：预览行已彻底删除（DOM 里不得再有 .dsh-ma-menu
   assert.match(menu.innerHTML, /只影响这台设备的远程页面/, "字号说明文案应保留");
 });
 
-test("悬浮菜单：新增「网络延迟」一行与「打开右侧栏」按钮（只读文案 + 显式出口）", () => {
+test("悬浮菜单：有「网络延迟」一行（只读文案）；**没有**「打开右侧栏」按钮", () => {
   const env = runAdapter(harness({ width: 390 }));
   const menu = findMenu(env);
   assert.ok(menu.querySelector(".dsh-ma-menu-net"), "菜单里应有网络延迟块");
   assert.match(menu.innerHTML, /网络延迟/, "应有「网络延迟」小标题");
   assert.ok(menu.querySelector('[data-role="net"]'), "延迟块要带 data-role=net（供渲染函数更新）");
-  assert.ok(menu.querySelector('[data-role="right-pane"]'), "菜单里应有「打开右侧栏」按钮");
+  // ❌ 2026-09-27 根治：那颗按钮已删 —— 官方右栏自己的 tab / 会话头按钮就会调 ctx.layout.openRightbar，
+  //    我们再造一个手动入口只会把官方推到相反方向（真机症状：点开变整屏黑遮罩）。
+  assert.equal(menu.querySelector('[data-role="right-pane"]'), null,
+    "菜单里不该再有「打开右侧栏」按钮（官方右栏自己能开）");
 });
 
 test("网络延迟：只在**已有**的 fetch 包装里采样，成功样本显示成角标（绝不主动测速）", async () => {

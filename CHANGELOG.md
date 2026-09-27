@@ -3,6 +3,61 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.18-beta.3] - 2026-09-27
+
+> 接 beta.2。**这一版把手机端右栏彻底还给官方**（业主拍板的「根治」）——
+> 删掉了我们自己那套「把官方右栏改造成自绘浮层」的做法。
+
+### 🔴 症状：点开右栏 → 整屏一层黑遮罩，看不到内容
+
+**根因**：官方右栏在**窄屏本来就是全屏浮层**，由官方自己实现：
+
+```css
+.P3OORG_panel[data-sidebar-right-panel=fullscreen]{ z-index:40; position:fixed; inset:0 }
+```
+
+而我们从 0.6.13 起把这列改造成自绘浮层，给它加了
+`position:fixed; transform:translateX(103%)`，再用 `dsh-ma-details-open` 滑进来。
+**CSS 里只要祖先有 `transform`，就会给 `position:fixed` 的后代创建新的包含块** ——
+我们那行 `translateX(103%)` 于是把官方那个 `inset:0` 的全屏面板**一起推到屏幕外**；
+与此同时我们的闸门又把全屏遮罩 `dsh-ma-scrim-on`（`rgba(0,0,0,.32)`）打开
+⇒ 你看到的就是「整屏变黑、什么都没有」。
+
+**官方本来就做对了，是我们把它挡住了。**
+
+### 改法：删，而不是加
+
+- **删掉**给第三列（右栏）写的全部 CSS（定位 / 位移 / 宽度 / 层级 / 描边 / 阴影）；
+- **删掉**驱动它显隐的整套状态机（`dsh-ma-details-open`、`detailsSticky`、`centerTouchedAt`、
+  `rightPaneWanted`、`detailsAttrLive`、`detailsCollapsed`、`rightPaneHasContent`）；
+- **删掉**「必须在正文里点过才允许滑入」那道启发式闸门（它存在的唯一理由就是"自绘浮层会挡屏"）；
+- **删掉**悬浮菜单里那颗「📋 打开右侧栏」按钮 —— 官方右栏自己的 tab / 会话头按钮
+  本来就会调 `ctx.layout.openRightbar(track, fullscreen)`，窄屏还会**自动收起左栏**
+  （`viewportWidth < 1024 → narrowExpanded = false`）。我们插一脚只会把官方推到相反方向。
+- **遮罩收口到只认左抽屉**：右栏（尤其官方窄屏全屏浮层）不需要我们盖遮罩。
+
+> 净效果：`mobile-adapter.mjs` **少了 107 行**，而功能是**多**的——右栏回到官方手里，
+  文件变动 / 任务状态这些页签按官方的方式打开。
+
+### 为什么这样做更稳
+
+这套「猜官方 DOM + 自绘浮层」的做法已经连续出过三次事故（2026-09-19 白框压屏、
+抽屉白柱、这次的透明面板 + 黑遮罩）。**删掉劫持之后，这三类事故在结构上不可能再发生**：
+我们不再拥有"第三列要不要显示"的决定权，也就没有判定链可以出错。
+
+### 测试
+
+`mobile-adapter-guards` 新增/改写 5 条，锁住新契约：
+① 第三列显隐**完全交还官方**——官方怎么翻转属性，适配层都不得出现 `dsh-ma-details-open`、不得开遮罩；
+② 生效 CSS 里**不得**出现 `detailsCol` / `rightbarCol` / `dsh-ma-details-open` / `translateX(103%)`；
+③ 遮罩**只跟左抽屉走**：第三列在视口里也绝不让遮罩下闸；
+④ 2026-09-19 白框事故的**结构性**回归锁（三种历史现场各跑一遍，断言我们什么都不做）；
+⑤ **源码契约**：去注释后的代码里不得再出现 `detailsSticky` / `centerTouchedAt` /
+   `rightPaneWanted` / `rightPaneHasContent` / `detailsAttrLive` / `detailsCollapsed` /
+   `maRightPane*` 等任何"驱动第三列"的符号。
+取消/改写：原「FAB 菜单那颗按钮必须能把它滑进来」与「悬浮菜单需有『打开右侧栏』按钮」两条（功能已删）。
+
+全量：router 48 / plugin 380 / bridge 433。
 ## [0.6.18-beta.2] - 2026-09-27
 
 > 接 beta.1。**这一版修的是「远程页面根本用不了」的根因**（诊断报告 P0-1，已有生产日志实锤）。
