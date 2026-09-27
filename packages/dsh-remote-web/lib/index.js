@@ -5710,6 +5710,31 @@ async function sendWeChatProxy(relayDir, res, routePath, init) {
 //   DSH_REMOTE_TRUSTED_HOSTS=a.com,b（放在 dsh web 前面的反向代理需要它）。
 // ============================================================
 const LOOPBACK_HOST_RE = /^(127\.0\.0\.1|localhost|\[::1\]|::1)(:\d+)?$/i;
+/**
+ * 私网 / 链路本地 / mDNS 的 authority。
+ *
+ * 为什么必须放行：本插件**自己**会把 dsh web 绑到 `0.0.0.0`（见 `cordis.patch.yml` 里那段
+ * `remote-web-ui lan-bind block`）——「局域网直连」是产品功能（同一 Wi-Fi 下的平板/手机直连），
+ * 只认 loopback 会把它整个挡死。真机验收时就是这么发现的。
+ *
+ * 放行它们**不等于**放开安全边界：
+ *   · DNS rebinding 仍被挡：攻击者页面把 evil.com 指到本机时，请求头里的 Host 是 **evil.com**
+ *     （浏览器按 URL 里的主机名发 Host，不看它解析到哪个 IP）→ 仍然命中 bad-host；
+ *   · CSRF 仍被挡：跨站请求的 Origin 与 Host 必然不同源 → 命中 origin-mismatch（下面 ②）；
+ *   · 唯一多让出来的是「Host 恰好是私网 IP 字面量」的请求，而它只可能来自**同源页面**
+ *     （也就是本机自己服务的那个页面），不构成新的攻击面。
+ */
+const PRIVATE_HOST_RE = new RegExp(
+  "^(?:" + [
+    "10\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}",
+    "192\\.168\\.\\d{1,3}\\.\\d{1,3}",
+    "172\\.(?:1[6-9]|2\\d|3[01])\\.\\d{1,3}\\.\\d{1,3}",
+    "169\\.254\\.\\d{1,3}\\.\\d{1,3}",
+    "[a-z0-9][a-z0-9-]*\\.local",
+    "\\[(?:fe80|fc|fd)[0-9a-f:]*\\]"
+  ].join("|") + ")(:\\d+)?$",
+  "i"
+);
 const LOCAL_GUARD_LOGGED = new Map(); // reason -> 上次告警时间（同一原因 60s 只报一次，避免刷日志）
 
 /** 只读地判断一个请求是否来自"本机同源页面"。返回 null=放行，否则返回拒绝原因。
@@ -5721,7 +5746,7 @@ export function localRequestBlocked(req) {
   const headers = (req && req.headers) || {};
   const host = String(headers.host || "").trim().toLowerCase();
   if (!host) return "missing-host";
-  if (!LOOPBACK_HOST_RE.test(host) && !extra.includes(host)) return "bad-host";
+  if (!LOOPBACK_HOST_RE.test(host) && !PRIVATE_HOST_RE.test(host) && !extra.includes(host)) return "bad-host";
   const origin = String(headers.origin || "").trim().toLowerCase();
   // Origin: null（file:// 或 sandbox iframe）不在这里判，交给下面的 sec-fetch-site
   if (origin && origin !== "null") {

@@ -31,11 +31,26 @@ test("守卫放行：手机隧道形态（Host=loopback、无 Origin、无 sec-f
   assert.equal(localRequestBlocked(req({ host: "127.0.0.1:3080", "sec-fetch-site": "same-origin" })), null);
 });
 
+test("守卫放行：局域网直连（插件自己 lan-bind 到 0.0.0.0，这是产品功能，不能一刀切挡掉）", () => {
+  // 2026-09-27 真机验收时发现：只认 loopback 会把「同一 Wi-Fi 下直连」整个挡死
+  for (const host of ["172.16.27.98:3080", "192.168.1.30:3080", "10.0.0.5:3080", "mac.local:3080"]) {
+    assert.equal(localRequestBlocked(req({ host })), null, `${host} 是私网/mDNS，应放行`);
+  }
+  // 但打这些地址的**跨站**请求仍必须拒（CSRF 与 Host 白名单是两条独立判据）
+  assert.equal(
+    localRequestBlocked(req({ host: "172.16.27.98:3080", origin: "http://evil.com" })),
+    "origin-mismatch",
+    "局域网地址上的跨站 POST 同样要挡"
+  );
+});
+
 test("DNS rebinding 必拒：Host 不是 loopback（即使 Origin 与该 Host 自洽）", () => {
   // rebinding 的形态：页面来源与目标都是 evil.com，Origin/Host 互相自洽 —— 只有 Host 白名单能挡
   assert.equal(localRequestBlocked(req({ host: "evil.com", origin: "http://evil.com" })), "bad-host");
   assert.equal(localRequestBlocked(req({ host: "evil.com:3080" })), "bad-host");
   assert.equal(localRequestBlocked(req({ host: "127.0.0.1.evil.com" })), "bad-host");
+  assert.equal(localRequestBlocked(req({ host: "172.16.27.98.evil.com" })), "bad-host", "私网前缀伪装也要拒");
+  assert.equal(localRequestBlocked(req({ host: "8.8.8.8:3080" })), "bad-host", "公网 IP 字面量不在白名单");
   assert.equal(localRequestBlocked(req({})), "missing-host");
 });
 

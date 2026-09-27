@@ -3,6 +3,24 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.18-beta.5] - 2026-09-27
+
+> 接 beta.4。**真机验收时发现并修掉一个自己造的兼容问题**。
+
+### 🟡 修：跨站守卫误伤「局域网直连」
+
+beta.4 加的跨站守卫只认 loopback Host，而本插件**自己**会把 dsh web 绑到 `0.0.0.0`
+（`cordis.patch.yml` 里的 `remote-web-ui lan-bind block`）——「同一 Wi-Fi 下直连」是产品功能，
+只认 loopback 会把它整个挡死（面板里所有 `/dsh-remote/*` 请求会 403）。
+
+现在白名单扩到 **loopback + 私网/链路本地 IP + `*.local`**。这不影响安全边界：
+
+- **DNS rebinding 仍被挡**：攻击者页面把 `evil.com` 指到本机时，请求头里的 Host 是 `evil.com`
+  （浏览器按 URL 里的主机名发 Host，不看它解析到哪个 IP）→ 仍是 `bad-host`；
+- **CSRF 仍被挡**：跨站请求的 Origin 与 Host 必然不同源 → `origin-mismatch`
+  （新增用例专门锁「打局域网 IP 的跨站 POST 也必须拒」）；
+- 唯一多让出来的是「Host 恰好是私网 IP 字面量」的请求，而它只可能来自本机自己服务的同源页面。
+
 ## [0.6.18-beta.4] - 2026-09-27
 
 > 接 beta.3。**这是安全修复版**（2026-09-27 全项目安全审计的首批修复），
