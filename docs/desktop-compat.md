@@ -291,3 +291,59 @@ const NODE_BIN = preferredNode()            // ← 探 /opt/homebrew/opt/node@20
 - profile 模板与 `desktop` profile 拒绝逻辑：`@deepseek-ai/dsh-app-boot`、`@deepseek-ai/dsh`(apps/cli)
 - 插件版本门禁：`@deepseek-ai/dsh-plugin-manager`
 - 官网：https://www.deepseek.com/harness/ ｜ 文档：https://deepseek-harness.github.io/deepseek-harness/
+
+---
+
+## 6. 【2026-10-08 实测补充】mobile-adapter 的 DOM 契约在 0.2 上**未破坏**
+
+### 6.1 方法（含一次被自己证伪的错误方法，务必照这个来）
+
+`mobile-adapter.mjs` 靠**官方混淆类名**（`.pI_x6G_frame` 这类）与 `data-*` 布局状态属性定位元素。
+这些名字来自官方构建，**换版本可能变**；一旦变了，适配层会**静默失效** —— 页面照常打开，
+只是手机端布局全坏，**只有真机才看得出来**。
+
+| 方法 | 结果 | 判定 |
+|---|---|---|
+| ❌ HTTP 抓首屏 HTML + 其引用的资源再搜锚点 | 0.2"缺 11/12"、0.1.5 对照也"缺 12/12" | **假阴性，已证伪**：锚点在懒加载 chunk / 别的包里，首屏抓不到 |
+| ✅ **直接 grep 框架树里的构建产物** | 见 6.3 | 可信 |
+
+**教训**：任何"锚点消失"的结论，必须先在**当前线上版本**上跑同一命令做对照 ——
+线上也缺同样几项，就说明是历史遗留而非本次升级引入。
+
+### 6.2 工具
+
+```bash
+# 线上树（对照基准）
+node scripts/check-ui-anchors.mjs /opt/homebrew/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai
+# 新版树（如 0.2）
+node scripts/check-ui-anchors.mjs ~/.npm/_npx/<hash>/node_modules/@deepseek-ai
+```
+锚点清单**从 `mobile-adapter.mjs` 自动抽取**（含过滤规则），不另抄一份，避免清单漂移。
+每次 DSH 升级都应各跑一次并比对两列。
+
+### 6.3 结果（0.1.5-rc.2 线上 vs 0.2.0-rc.2）
+
+| | 线上 0.1.5 | 新 0.2.0 |
+|---|---|---|
+| 官方类名 | **14 / 14** | **14 / 14** |
+| `data-*` 属性 | 9 / 12 | **9 / 12（缺的完全相同）** |
+
+缺失的 3 个：`data-details-collapsed`、`data-sidebar-open`、`data-rtt`。
+其中 `data-rtt` 是**适配层自己设在自有 FAB 上**的（抽取器的无害误报）；
+另外两个在 **0.1.5 上就已经缺失**，属历史遗留，与 0.2 无关。
+
+**结论：0.2 相对线上 0.1.5 零新增破坏，mobile-adapter 不需要为 0.2 改动。**
+D 阶段该项目的风险由"未知"降为"已核销"；真机仍需做视觉确认，但已无契约层面的隐患。
+
+### 6.4 本轮一并核销的其它桌面端项
+
+| D 阶段项 | 结论与证据 |
+|---|---|
+| 插件在 0.2 能激活 | ✅ 影子加载 + **官方桌面端 CLI `plugin --profile desktop add`** 真装成功，登记进 `dsh.profile.bundles`，**安装期兼容门未拦** |
+| 端口能被问出来 | ✅ 0.2 随机端口被自动探到（`upstreamSource = dsh web 实际监听端口`） |
+| Cookie 代持生效 | ✅ 启动令牌 → `dsh-auth-*` cookie，随后 `/dsh-remote/*` 全部 200 |
+| 桌面端宿主形态 | ✅ **用官方 Electron 二进制 + DMG 自带 0.2.0-rc.2 runtime 实跑 Host**：`desktopHost=true`、`restartSupported=false`；重启接口返回 `desktop-managed` 且不杀 Host |
+| Electron 子进程路线 | ✅ 官方 CLI shim 自身即 `ELECTRON_RUN_AS_NODE=1 exec <Electron>`，与本插件实现同源 |
+| 自带 node 布局 | ✅ 实测 `primary-runtime/dependencies/node/bin/node`（Node v24.21.0）；`DSH_DESKTOP_NODE_EXECUTABLE` 为应用自报路径 |
+| 未核销 | 真机视觉确认（需手机）、Windows 真机（需 Windows 机器） |
+
