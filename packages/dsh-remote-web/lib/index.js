@@ -372,13 +372,38 @@ const SELF_NODE_ENV = IS_ELECTRON_HOST ? { ELECTRON_RUN_AS_NODE: "1" } : {};
  */
 function desktopRuntimeNodeCandidates() {
   const exe = isWindows() ? "node.exe" : "node";
+  const out = [];
+  // ① 稳定落点：装在**用户目录**，桌面端升级/重装都不动它。
+  //    ⚠️ 真实布局是 `dependencies/node/bin/<exe>`（2026-10-07 拆官方 0.2.0-rc.2 DMG 实测：
+  //    `…/Resources/runtime/primary-runtime/dependencies/node/bin/node` → Node v24.21.0）。
+  //    其余几个是兼容不同版本的兜底；resolveExecutable() 会过滤掉不存在的路径，多列无害。
   const roots = [
     process.env.DSH_DESKTOP_RUNTIME_DIR || "",
     join(homedir(), ".dsh", "dsh-runtimes", "dsh-primary-runtime"),
-    join(homedir(), ".dsh", "dsh-runtimes", "dsh-primary-runtime", "runtime"),
+    join(homedir(), ".dsh", "dsh-runtimes", "primary-runtime"),
   ].filter(Boolean);
-  const out = [];
-  for (const root of roots) out.push(join(root, "bin", exe), join(root, "node", "bin", exe), join(root, "runtime", "bin", exe));
+  for (const root of roots) {
+    out.push(
+      join(root, "dependencies", "node", "bin", exe),
+      join(root, "bin", exe),
+      join(root, "node", "bin", exe),
+      join(root, "runtime", "bin", exe),
+    );
+  }
+  // ② 应用自己把自带 node 的路径交给子进程（其 `runtime/bin/node` shim 就是靠这个变量）——
+  //    平台无关，且是"应用自己说的"，比我们猜路径可靠。
+  if (process.env.DSH_DESKTOP_NODE_EXECUTABLE) out.push(process.env.DSH_DESKTOP_NODE_EXECUTABLE);
+  // ③ 最后才是指向应用包内部的绝对路径：它是**真实存在的 node**，但会随桌面端更新换路径，
+  //    所以排在稳定落点之后（自启动服务登记它属于"聊胜于无"，好过登记 Electron 本体）。
+  if (isWindows()) {
+    const local = process.env.LOCALAPPDATA || "";
+    if (local) out.push(join(local, "Programs", "DeepSeek Harness", "resources", "runtime", "primary-runtime", "dependencies", "node", exe));
+  } else {
+    out.push(
+      "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/primary-runtime/dependencies/node/bin/node",
+      "/Applications/DSH Desktop.app/Contents/Resources/runtime/primary-runtime/dependencies/node/bin/node",
+    );
+  }
   return out;
 }
 

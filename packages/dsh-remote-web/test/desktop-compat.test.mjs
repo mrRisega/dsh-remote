@@ -172,3 +172,42 @@ test("安装器：desktop profile 未初始化时给桌面端专属引导（不�
   //（apps/cli 的 rejectElectronProfile）—— 照抄 Web 版那句会让用户白折腾。
   assert.ok(!/未找到 dsh web profile/.test(fn), "不得再把桌面端统一报成 'dsh web profile'");
 });
+
+// ─────────────── ⑤ 桌面端自带 Node：跨平台候选（Windows 用 node.exe）───────────────
+
+test("桌面端自带 Node 的候选：跨平台 + 命中官方真实布局 + 稳定落点优先", () => {
+  for (const [name, src] of [["lib/index.js", INDEX_SRC], ["dsh-setup.mjs", SETUP_SRC]]) {
+    assert.match(src, /function desktopRuntimeNodeCandidates\(\)/, `${name}: 必须有候选构造器`);
+    // 真实布局（2026-10-07 拆官方 0.2.0-rc.2 DMG 实测）：
+    //   …/Resources/runtime/primary-runtime/dependencies/node/bin/node  （Node v24.21.0）
+    assert.match(src, /"dependencies", "node", "bin"/,
+      `${name}: 必须命中官方真实布局 dependencies/node/bin（猜错路径等于没这个候选）`);
+    assert.match(src, /DSH_DESKTOP_NODE_EXECUTABLE/,
+      `${name}: 必须采信应用自报的 node 路径（平台无关，比猜路径可靠）`);
+    assert.match(src, /\.\.\.desktopRuntimeNodeCandidates\(\)/,
+      `${name}: 必须真的并入解释器候选（不是死代码）`);
+  }
+
+  // 行为断言：注入平台与 HOME，验证真实产出（而不是只查字符串）
+  const start = SETUP_SRC.indexOf("function desktopRuntimeNodeCandidates()");
+  const end = SETUP_SRC.indexOf("function preferredNode()");
+  assert.ok(start > 0 && end > start, "切片锚点失效：候选构造器结构变了");
+  const src = SETUP_SRC.slice(start, end);
+  const make = new Function("process", "os", "path", `${src}\nreturn desktopRuntimeNodeCandidates;`);
+  const home = path.join(path.sep, "Users", "tester");
+  const win = make({ platform: "win32", env: {} }, { homedir: () => home }, path)();
+  const mac = make({ platform: "darwin", env: {} }, { homedir: () => home }, path)();
+
+  assert.ok(win.length > 0 && win.every((p) => p.endsWith("node.exe")),
+    `Windows 候选必须都是 node.exe（否则永远解析不到解释器），实际 ${JSON.stringify(win)}`);
+  assert.ok(mac.length > 0 && mac.every((p) => p.endsWith("node")),
+    `POSIX 候选必须都是 node，实际 ${JSON.stringify(mac)}`);
+  // 稳定落点优先：首条必须落在用户目录，且命中官方真实布局
+  assert.ok(mac[0].startsWith(home),
+    `首条候选必须在用户目录（要活过桌面端更新），实际 ${mac[0]}`);
+  assert.ok(mac[0].endsWith(path.join("dependencies", "node", "bin", "node")),
+    `首条候选必须是官方真实布局 dependencies/node/bin/node，实际 ${mac[0]}`);
+  // 会随桌面端更新失效的 .app 路径只能当后手
+  assert.ok(!mac[0].startsWith("/Applications"),
+    "不得把 .app 内部路径排在稳定落点之前（桌面端一升级自启动就失效）");
+});
