@@ -94,6 +94,29 @@ test("桌面端：真实 node 存在时服务定义必须优先登记它（.app 
 
 // ─────────────── ③ 重启语义：桌面端必须拒绝，且如实说明 ───────────────
 
+test("桌面端：restartHarness 在 Electron 宿主下**行为级**拒绝（不靠源码字符串）", async () => {
+  // 为什么需要行为级：源码锚点（下面那条）只能证明"代码里写了"，证明不了"跑起来真的是这个结果"。
+  // 注入 IS_ELECTRON_HOST=true、skipsSystemOps=false（模拟**生产**：
+  // 桌面端下 DSH_RELAY_SKIP_SERVICE 不会设置，故必须走到 Electron 守卫而不是被测试隔离短路）。
+  const start = INDEX_SRC.indexOf("async function restartHarness(");
+  const end = INDEX_SRC.indexOf("async function relayFetch(");
+  assert.ok(start > 0 && end > start, "切片锚点失效：restartHarness 结构变了");
+  const src = INDEX_SRC.slice(start, end);
+  // 只注入守卫之前会被求值的两个依赖；函数体其余部分不会被走到（守卫提前 return），
+  // 故其引用的模块级标识符无需注入（new Function 只在**执行**时才解析标识符）。
+  const make = new Function("IS_ELECTRON_HOST", "skipsSystemOps", `${src}\nreturn restartHarness;`);
+  const restartHarness = make(true, () => false);
+  const r = await restartHarness("/tmp/does-not-matter");
+  assert.equal(r.ok, false, "桌面端重启必须如实返回失败，不得假装成功");
+  assert.equal(r.status, "desktop-managed", "面板据该状态改文案，不能是通用错误");
+  assert.equal(r.mode, "desktop");
+  assert.match(r.detail, /退出并重新打开/, "必须告诉用户正确做法");
+  // 对照组：非 Electron 宿主**不得**走这条分支（否则 Web 版重启会被误禁）
+  const restartWeb = make(false, () => true); // skipsSystemOps=true 模拟测试隔离，避免真的重启
+  const rw = await restartWeb("/tmp/does-not-matter");
+  assert.notEqual(rw.status, "desktop-managed", "Web 版绝不能返回桌面端状态");
+});
+
 test("桌面端：restartHarness 必须拒绝重启 Host，并返回可识别的 desktop-managed 状态", () => {
   // 切片终点用 restartHarness **之后**的下一个顶层函数（buildRestartHelperSource 在它之前，不能用）
   const fn = INDEX_SRC.slice(INDEX_SRC.indexOf("async function restartHarness("),
