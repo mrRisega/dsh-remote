@@ -345,5 +345,47 @@ D 阶段该项目的风险由"未知"降为"已核销"；真机仍需做视觉�
 | 桌面端宿主形态 | ✅ **用官方 Electron 二进制 + DMG 自带 0.2.0-rc.2 runtime 实跑 Host**：`desktopHost=true`、`restartSupported=false`；重启接口返回 `desktop-managed` 且不杀 Host |
 | Electron 子进程路线 | ✅ 官方 CLI shim 自身即 `ELECTRON_RUN_AS_NODE=1 exec <Electron>`，与本插件实现同源 |
 | 自带 node 布局 | ✅ 实测 `primary-runtime/dependencies/node/bin/node`（Node v24.21.0）；`DSH_DESKTOP_NODE_EXECUTABLE` 为应用自报路径 |
-| 未核销 | 真机视觉确认（需手机）、Windows 真机（需 Windows 机器） |
+| 未核销 | ~~真机视觉确认（需手机）~~ **已于 §7 用无头 Chromium 核销**；Windows 真机（需 Windows 机器） |
+
+---
+
+## 7. 【2026-10-08 实测】移动端**视觉**回归：0.2 与线上 0.1.5 逐项一致
+
+§6 只证明了**锚点在**；锚点在 ≠ 布局对（适配层 CSS 含几何假设）。本节补上真实渲染验证。
+
+### 7.1 方法（不需要手机）
+
+用**系统自带 Chrome + CDP**（不装任何依赖：gstack 缺 bun）：
+
+1. 启动目标版本宿主（隔离 `DSH_HOME`）；
+2. 无头 Chrome，`Emulation.setDeviceMetricsOverride` = **390×844 / mobile / DPR3** + iPhone UA；
+3. **复用适配层自己的 `injectMobileAdapter()`** 取出 `STYLE`/`SCRIPT`，用
+   `Page.addScriptToEvaluateOnNewDocument` 在**文档起点**注入
+   （⚠️ 必须等 `document.head` 出现再 append：实测文档起点时 head 为 null，
+   直接 appendChild 会抛 `TypeError` 且**静默不注入**）；
+4. 关掉首启引导（内测声明 → API key 引导），再测量 + 截图；
+5. **两个版本各跑一遍做对照**。
+
+### 7.2 结果
+
+| 指标 | 线上 0.1.5-rc.2 | 新 0.2.0-rc.2 |
+|---|---|---|
+| `gridTemplateColumns`（三列轨宽） | **`0px 390px 0px`** | **`0px 390px 0px`** |
+| 横向溢出 `scrollWidth - innerWidth` | **0** | **0** |
+| `body.overflow-x` | hidden | hidden |
+| 适配层 UI（`.dsh-ma-menu` / `.dsh-ma-fab` / `.dsh-ma-sidebar`） | 全部存在 | **全部存在** |
+| 注入错误 | 无 | 无 |
+| 首启引导链 | 继续 → 稍后配置 | 继续 → 稍后配置 |
+
+**几何逐项相同** ⇒ 适配层的核心变换（强制 `0 / 1fr / 0`、侧栏离屏化、输入区满宽、
+禁横向滚动）在 0.2 上**行为一致**。
+
+截图（390×844）目视确认：0.2 下左侧汉堡菜单、右侧手机按钮、满宽输入框、工作区/模式行
+换行均正常；**0.2 新增的「预览版」标签未被适配层破坏**；无白屏 / 无挤压 / 无横向溢出。
+
+**结论：移动端在 0.2 上视觉与几何均无回归，`mobile-adapter` 无需改动。**
+D 阶段"真机视觉确认"一项由"需要手机"改为**已用无头 Chromium 核销**（真机仍建议跑一次作为最终确认）。
+
+复现：`/tmp/ma-visual.mjs`（脚本思路见 §7.1；两版各跑一次，比对 §7.2 表格）。
+
 
