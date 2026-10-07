@@ -3,7 +3,7 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
-## [0.7.0] - 2026-10-07
+## [0.7.0-beta.1] - 2026-10-07
 
 本轮主线：**支持 DeepSeek Harness 桌面端**（v0.2 预览版）。同一份插件，Web 版与桌面端都能用。
 
