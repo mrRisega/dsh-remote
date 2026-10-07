@@ -31,6 +31,7 @@ import {
   probeDshWeb,
   resolveUpstreamHint,
   DESKTOP_DEFAULT_PORT,
+  DESKTOP_PORT_SCAN,
   FALLBACK_UPSTREAM,
   UPSTREAM_FILE
 } from "../upstream-discovery.mjs";
@@ -52,14 +53,26 @@ const close = (x) => new Promise((r) => x.srv.close(r));
 
 const writeHint = (url) => writeFileSync(path.join(DIR, UPSTREAM_FILE), url + "\n");
 /**
- * 把 3080 封掉的 fetch 包装。
- * 为什么需要:开发机上真实存在一个 dsh web 监听 3080,候选扫描会命中它 ——
- * 那是**宿主**而不是测试夹具,断言就变成了"看运气"。封掉它,测试才只依赖自己起的假服务。
+ * 把**宿主真实占用的端口**整段封掉的 fetch 包装。
+ *
+ * 为什么需要:候选扫描会命中开发机上真实存在的宿主,而那是**宿主**不是测试夹具,
+ * 断言就变成"看运气"。最初这里只封了 `3080`(Web 版 dsh web);但装了 **DeepSeek Harness
+ * 桌面端**的机器上,Desktop Host 常年监听 `43120` 起的一段端口,而这段端口正是
+ * `candidatePorts()` 的静态候选 —— 于是两条用例在**代码没改**的情况下变红
+ * (2026-10-07 实测:桌面端在 43120 上跑着,`什么都找不到 → 回退 3080` 得到 43120)。
+ * 因此这里按"生产代码认定的已知宿主端口集合"整体封掉,测试才只依赖自己起的假服务。
  */
 const realFetch = globalThis.fetch;
+const AMBIENT_HOST_PORTS = new Set([
+  3080, // Web 版 dsh web 的历史默认端口
+  ...Array.from({ length: DESKTOP_PORT_SCAN }, (_, i) => DESKTOP_DEFAULT_PORT + i), // 桌面端 Host 候选区间
+]);
 const blockedFetch = (input, init) => {
   const url = String(typeof input === "string" ? input : (input && input.url) || "");
-  if (/:3080(\/|$)/.test(url)) return Promise.reject(new Error("blocked: host 3080"));
+  const m = /:(\d+)(?:\/|$)/.exec(url);
+  if (m && AMBIENT_HOST_PORTS.has(Number(m[1]))) {
+    return Promise.reject(new Error(`blocked: ambient host port ${m[1]}`));
+  }
   return realFetch(input, init);
 };
 

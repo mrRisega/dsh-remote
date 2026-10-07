@@ -173,6 +173,12 @@ function printHelp() {
   dsh-remote doctor       一条命令自检「为什么连不上」（只读；含上游/进程/微信/日志尾部）
   dsh-remote --help       显示本用法（等同 dsh-remote help）
 
+目标 profile（默认 Web 版）:
+  dsh-remote --profile desktop    装进 DeepSeek Harness **桌面端**的插件目录
+                                  （~/.dsh/profiles/desktop；装前请先完全退出桌面应用）
+  桌面端也可以在应用内「插件」页直接安装 dsh-remote-web —— 那是官方路径，无需退出。
+  ⚠️ 桌面端与 Web 版共享 ~/.dsh（会话/设置/凭据），但**插件互相隔离**，两边要各自安装。
+
 自建模式（可选）:
   dsh-remote setup --server wss://你的域名:端口 --key 访问密钥
 
@@ -239,19 +245,83 @@ function resolveExecutable(p) {
   } catch { return null; }
 }
 
+/**
+ * 宿主是否跑在 **Electron 的 Node 模式**下（DeepSeek Harness 桌面端的 Host 就是）。
+ *
+ * 桌面端 `process.execPath` 是 **Electron 应用二进制**而不是 node：不带
+ * `ELECTRON_RUN_AS_NODE=1` 直接拿它跑脚本，得到的不是「跑脚本的 node」，而是
+ * **又启动一个桌面端应用实例**。自启动服务是系统在应用退出后拉起的，踩到这里
+ * 的表现是「服务登记成功、进程秒退、bridge 永远起不来」，与 0.6.15 那次端口事故
+ * 一样难排查 —— 所以必须在**写服务定义时**就把变量带上。
+ */
+const IS_ELECTRON_HOST = Boolean(process.versions && process.versions.electron);
+
+/**
+ * DeepSeek Harness **桌面端自带 Node** 的稳定落点候选。
+ *
+ * 为什么需要：桌面端主打的正是**机器上没有系统 node** 的用户；而自启动服务要活过
+ * 桌面端的退出、甚至升级/重装（`.app` 路径会变、可能被换掉）。桌面端把自带运行时装在
+ * **用户目录** `~/.dsh/dsh-runtimes/…`，它不随应用包更新而移动 —— 所以只要它存在，
+ * 就该优先于任何指向 `.app` 内部的路径。
+ *
+ * 目录布局随桌面端版本演进（可能多套一层 runtime/node），故按多个候选探测；
+ * `resolveExecutable()` 会过滤掉不存在的路径，多列无害。
+ * @returns {string[]} 候选可执行文件绝对路径（可能都不存在）。
+ */
+function desktopRuntimeNodeCandidates() {
+  const exe = process.platform === "win32" ? "node.exe" : "node";
+  const roots = [
+    process.env.DSH_DESKTOP_RUNTIME_DIR || "",
+    path.join(os.homedir(), ".dsh", "dsh-runtimes", "dsh-primary-runtime"),
+    path.join(os.homedir(), ".dsh", "dsh-runtimes", "dsh-primary-runtime", "runtime"),
+  ].filter(Boolean);
+  const out = [];
+  for (const root of roots) out.push(path.join(root, "bin", exe), path.join(root, "node", "bin", exe), path.join(root, "runtime", "bin", exe));
+  return out;
+}
+
 function preferredNode() {
+  // 先归一化"自己的可执行文件"，用来判断最终选中的解释器是否就是 Electron 本体。
+  const selfReal = resolveExecutable(process.execPath) || process.execPath;
   const candidates = [
     process.env.DSH_SETUP_NODE20 || "",
     process.env.DSH_SETUP_NODE || "",
+    // 桌面端（Electron 宿主）：**真实 node 优先**。服务要活过桌面应用的退出与更新
+    //（.app 路径会变、可能被换掉），登记一个真实 node 才稳；找不到才回落 Electron 自身，
+    // 那时由 SERVICE_NODE_ENV 补上 ELECTRON_RUN_AS_NODE=1 把它变成 node。
+    ...(IS_ELECTRON_HOST
+      ? [
+          // 桌面端自带 Node 的**稳定**落点：装在用户目录（~/.dsh/dsh-runtimes/…），
+          // 桌面端升级/重装都不动它 —— 比 .app 内部路径更该登记进自启动服务。
+          ...desktopRuntimeNodeCandidates(),
+          "/opt/homebrew/opt/node@20/bin/node", "/usr/local/opt/node@20/bin/node", "/opt/homebrew/bin/node", "/usr/local/bin/node",
+        ]
+      : []),
     process.execPath
   ].filter(Boolean);
   for (const p of candidates) {
     const real = resolveExecutable(p);
-    if (real) return real;
+    if (real) return { bin: real, electron: IS_ELECTRON_HOST && real === selfReal };
   }
-  return process.execPath;
+  return { bin: process.execPath, electron: IS_ELECTRON_HOST };
 }
-const NODE_BIN = preferredNode();
+const INTERPRETER = preferredNode();
+const NODE_BIN = INTERPRETER.bin;
+/** 解释器是 Electron 二进制时必须注入的变量（真实 node 时为空对象，行为与本改动前一致）。 */
+const SERVICE_NODE_ENV = INTERPRETER.electron ? { ELECTRON_RUN_AS_NODE: "1" } : {};
+/** plist `EnvironmentVariables` 里追加的条目（真实 node 时为空串 → 模板逐字节不变）。 */
+const SERVICE_NODE_ENV_PLIST = Object.entries(SERVICE_NODE_ENV)
+  .map(([k, v]) => `<key>${k}</key><string>${v}</string>`).join("");
+/** systemd unit 里追加的 `Environment=` 行（真实 node 时为空串 → 模板逐字节不变）。 */
+const SERVICE_NODE_ENV_UNIT = Object.entries(SERVICE_NODE_ENV)
+  .map(([k, v]) => `Environment=${k}=${v}\n`).join("");
+/**
+ * 供**子进程 spawn** 用的环境（继承当前环境 + 解释器变量）。
+ * 本文件里凡是用 NODE_BIN 拉起子进程的地方都要带上它。
+ */
+function nodeEnv(extra) {
+  return { ...process.env, ...SERVICE_NODE_ENV, ...(extra || {}) };
+}
 
 /**
  * 自启动服务里注入的 PATH。
@@ -516,10 +586,17 @@ function writeWinHiddenLauncher(node, setup) {
   const vbsPath = winHiddenLauncherPath();
   const commandLine = `"${node}" "${setup}" run`; // 真正要执行的命令行
   const literal = commandLine.replace(/"/g, '""'); // 嵌进 VBS 字符串字面量后
+  // 解释器是 Electron（桌面端宿主且机器上没有真实 node）时，必须先设 ELECTRON_RUN_AS_NODE=1：
+  // 否则 wscript 拉起的不是 bridge 守护，而是**又开一个桌面端应用**。
+  // VBScript 侧的写法是往进程环境里塞，再 Run（不能像 shell 那样内联前缀）。
+  const envLines = Object.entries(SERVICE_NODE_ENV).map(([k, v]) => `sh.Environment("PROCESS")("${k}") = "${v}"`);
+  const runLines = envLines.length > 0
+    ? [`Set sh = CreateObject("WScript.Shell")`, ...envLines, `sh.Run "${literal}", 0, False`]
+    : [`CreateObject("WScript.Shell").Run "${literal}", 0, False`];
   const src = [
     "' dsh-remote 自动生成（勿手改，重装会覆盖）",
     "' 隐藏启动 bridge 守护：窗口样式 0 = 不显示窗口；False = 不等待，node 成为独立进程。",
-    `CreateObject("WScript.Shell").Run "${literal}", 0, False`,
+    ...runLines,
     "",
   ].join("\r\n");
   fs.mkdirSync(CONFIG_DIR, { recursive: true });
@@ -532,6 +609,12 @@ function writeWindowsTask() {
   const setup = runtimeSetupPath();
   // 首选 wscript 包装（无黑窗）；写不了 .vbs 就退回直接启动（有窗，但保底能自启）
   let direct = `"${node}" "${setup}" run`;
+  // 解释器是 Electron 时，直接启动这条路没有 .vbs 可以设环境变量，只能借 cmd 的 `set`
+  // （schtasks 的 /TR 只接受一条命令行，不能内联 env）。
+  if (Object.keys(SERVICE_NODE_ENV).length > 0) {
+    const sets = Object.entries(SERVICE_NODE_ENV).map(([k, v]) => `set ${k}=${v}`).join(" && ");
+    direct = `cmd.exe /c ${sets} && "${node}" "${setup}" run`;
+  }
   let tr = direct;
   let hidden = false;
   try {
@@ -599,7 +682,7 @@ function writeAutostartFile() {
   <key>LimitLoadToSessionType</key><array><string>Aqua</string><string>Background</string></array>
   <key>StandardOutPath</key><string>${path.join(CONFIG_DIR, ".dsh-bridge.log")}</string>
   <key>StandardErrorPath</key><string>${path.join(CONFIG_DIR, ".dsh-bridge.log")}</string>
-  <key>EnvironmentVariables</key><dict><key>PATH</key><string>${SERVICE_PATH}</string><key>DSH_BRIDGE_INSTALL_SOURCE</key><string>${INSTALL_SOURCE}</string><key>DSH_BRIDGE_INSTALL_VERSION</key><string>${INSTALL_VERSION}</string></dict>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>${SERVICE_PATH}</string>${SERVICE_NODE_ENV_PLIST}<key>DSH_BRIDGE_INSTALL_SOURCE</key><string>${INSTALL_SOURCE}</string><key>DSH_BRIDGE_INSTALL_VERSION</key><string>${INSTALL_VERSION}</string></dict>
 </dict></plist>`;
     // ~/Library/LaunchAgents 在全新账户/精简系统上可能不存在,必须先建目录,
     // 否则 writeFileSync 抛 ENOENT 直接把安装流程打断(用户反馈里也踩过类似的路径问题)。
@@ -615,7 +698,7 @@ function writeAutostartFile() {
   if (process.platform === "linux") {
     const dir = path.join(os.homedir(), ".config/systemd/user");
     fs.mkdirSync(dir, { recursive: true });
-    const unit = `[Unit]\nDescription=dsh-remote bridge (auto-starts with dsh web)\n\n[Service]\nExecStart=${runCmd}\nRestart=on-failure\nRestartSec=5\nEnvironment=PATH=${SERVICE_PATH}\nEnvironment=DSH_BRIDGE_INSTALL_SOURCE=${INSTALL_SOURCE}\nEnvironment=DSH_BRIDGE_INSTALL_VERSION=${INSTALL_VERSION}\n\n[Install]\nWantedBy=default.target\n`;
+    const unit = `[Unit]\nDescription=dsh-remote bridge (auto-starts with dsh web)\n\n[Service]\nExecStart=${runCmd}\nRestart=on-failure\nRestartSec=5\nEnvironment=PATH=${SERVICE_PATH}\n${SERVICE_NODE_ENV_UNIT}Environment=DSH_BRIDGE_INSTALL_SOURCE=${INSTALL_SOURCE}\nEnvironment=DSH_BRIDGE_INSTALL_VERSION=${INSTALL_VERSION}\n\n[Install]\nWantedBy=default.target\n`;
     const unitPath = autostartFilePath();
     fs.writeFileSync(unitPath, unit);
     return unitPath; // 路径在最终汇总里统一展示
@@ -673,7 +756,7 @@ function spawnDetachedBridge() {
     const child = spawn(NODE_BIN, [runtimeSetupPath(), "run"], {
       detached: true,
       stdio: ["ignore", out, out],
-      env: process.env,
+      env: nodeEnv(),
       // Windows 上 detached 即 DETACHED_PROCESS：子进程**不继承父控制台**，
       // 控制台程序（node.exe）会因此拿到一个**全新的可见窗口**。
       // 必须显式 windowsHide 才会带上 CREATE_NO_WINDOW（POSIX 上该选项被忽略）。
@@ -894,14 +977,63 @@ async function isDshWebUp(timeoutMs = 1200) {
   return upstreamReachable(after, timeoutMs);
 }
 
+/** 已知的 DSH profile 名（`--profile web` / `--profile desktop` 这种写法要能用）。 */
+const KNOWN_PROFILE_NAMES = ["web", "desktop"];
+/** profile 名 → 目录（与 dsh 自己的 `$DSH_HOME/profiles/<name>` 口径一致）。 */
+function profileDirOfName(name) {
+  return path.join(os.homedir(), ".dsh", "profiles", name);
+}
+/** 目标目录是否就是**桌面端**保留的 profile（由 Electron 应用独占管理）。 */
+function isDesktopProfileDir(dir) {
+  return path.resolve(dir) === path.resolve(profileDirOfName("desktop"));
+}
+
 /**
- * 解析 dsh web profile 目录（安装与插件管理共用同一口径）。
+ * 解析目标 profile 目录（安装与插件管理共用同一口径）。
+ *
+ * 三种写法都支持：
+ *   · `--profile web` / `--profile desktop` → `~/.dsh/profiles/<name>`
+ *     （新增：DeepSeek Harness 桌面端的 profile 就叫 `desktop`）
+ *   · `--profile <任意路径>`                → 原样当目录用（老行为，保持不变）
+ *   · `DSH_PROFILE_DIR` 环境变量            → 与 `--profile` 同口径
+ * 缺省仍是 Web 版 profile，行为与改动前完全一致。
  */
 function resolveProfileDir(argv = []) {
   const i = argv.indexOf("--profile");
-  return i > -1 && argv[i + 1]
-    ? argv[i + 1]
-    : process.env.DSH_PROFILE_DIR || path.join(os.homedir(), ".dsh", "profiles", "web");
+  const explicit = i > -1 && argv[i + 1] ? argv[i + 1] : process.env.DSH_PROFILE_DIR;
+  if (!explicit) return profileDirOfName("web");
+  if (KNOWN_PROFILE_NAMES.includes(explicit)) return profileDirOfName(explicit);
+  return explicit;
+}
+
+/**
+ * 从任意 argv 里挑出 profile 选择参数。
+ *
+ * 为什么需要：安装主流程 `setup()` 的 argv 里可能带 `--profile desktop`，但它内部调用
+ * `pluginCmd()` 时原本传的是空数组 —— 于是"指定 desktop profile"会被静默忽略、
+ * 插件仍然装进 Web 版 profile（桌面端用户装了却看不到面板，且极难自查）。
+ */
+function profileArgvOf(argv = []) {
+  const i = argv.indexOf("--profile");
+  return i > -1 && argv[i + 1] ? ["--profile", argv[i + 1]] : [];
+}
+
+/**
+ * 目标 profile 是桌面端时给出的前置提醒（安装前调用）。
+ *
+ * 桌面端的 `profiles/desktop` 由 Electron 应用**独占**：应用运行时它会持有 profile 写锁，
+ * 且运行中的进程不会重新装载我们刚写进去的插件。所以要么完全退出应用再装，要么
+ * 直接在应用内的「插件」页安装（那是官方路径，无需退出）。
+ * 这里只做提醒，不阻断 —— 用户可能正是在"应用已退出"的状态下跑安装器。
+ */
+function warnIfDesktopProfile(dir) {
+  if (!isDesktopProfileDir(dir)) return;
+  console.log("");
+  console.log("ℹ️ 目标 profile 是 DeepSeek Harness **桌面端**的保留 profile（~/.dsh/profiles/desktop）。");
+  console.log("   · 请先**完全退出** DeepSeek Harness 应用再安装（应用独占该 profile，运行中写入不会被装载）；");
+  console.log("   · 装完后重新打开应用即可。更省事的做法是在应用内「插件」页直接安装 dsh-remote-web；");
+  console.log("   · 桌面端与 Web 版共用 ~/.dsh 下的会话/设置/凭据，但**插件互相隔离**，两边需要各自安装。");
+  console.log("");
 }
 
 /**
@@ -1032,7 +1164,7 @@ logLine("已重新拉起 dsh web：pid=" + String(child.pid));
   try {
     fs.mkdirSync(CONFIG_DIR, { recursive: true });
     fs.writeFileSync(helper, src);
-    const child = spawn(NODE_BIN, [helper], { detached: true, stdio: "ignore", cwd: os.homedir(), windowsHide: true });
+    const child = spawn(NODE_BIN, [helper], { detached: true, stdio: "ignore", cwd: os.homedir(), windowsHide: true, env: nodeEnv() });
     child.on("error", () => { /* 有 error 监听：绝不能把宿主/安装器打挂 */ });
     child.unref();
     return { ok: true, how: "Windows 重启助手（原命令行自拉起）" };
@@ -1357,7 +1489,7 @@ async function runBridge() {
       // 只有它能让我们在停 bridge 之前请它跑完退出钩子（notifystop）—— 见 stopChildGracefully。
       bridgeProc = spawn(NODE_BIN,
         [path.join(THIS_DIR, "clients/dsh-remote/dsh-bridge.mjs")],
-        { env: childEnv, stdio: ["inherit", "inherit", "inherit", "ipc"] });
+        { env: nodeEnv(childEnv), stdio: ["inherit", "inherit", "inherit", "ipc"] });
       bridgeProc.on("exit", () => {
         removePidFile(BRIDGE_PID_FILE);
         console.log("[dsh-remote] bridge 退出，等待重启...");
@@ -1480,7 +1612,10 @@ async function setup(argv) {
   let pluginResult = null;
   if (!noPlugin) {
     try {
-      pluginResult = await pluginCmd([]);
+      // ⚠️ 必须把 `--profile` **透传下去**：否则 `--profile desktop`（桌面端）会被静默忽略，
+      // 插件装进 Web 版 profile，而用户面对的是桌面端 —— 面板永远不出现。
+      warnIfDesktopProfile(resolveProfileDir(argv));
+      pluginResult = await pluginCmd(profileArgvOf(argv));
     } catch (e) {
       console.warn(`⚠️ 插件安装未完成：${e.message}`);
     }
@@ -2178,7 +2313,7 @@ function probePluginResolve(profileDir) {
     "}));",
   ].join("\n");
   try {
-    const r = spawnSync(process.execPath, ["-e", script], { encoding: "utf8", timeout: 30_000, windowsHide: true });
+    const r = spawnSync(process.execPath, ["-e", script], { encoding: "utf8", timeout: 30_000, windowsHide: true, env: nodeEnv() });
     if (r.error) return { ok: false, reason: `无法启动解析探测进程：${r.error.message}` };
     if (r.status !== 0) {
       const line = String(r.stderr || "").split("\n").find((l) => /MODULE_NOT_FOUND|ERR_|Error/.test(l)) || "解析失败";
@@ -2452,8 +2587,19 @@ async function pluginCmd(argv) {
   const pluginDir = path.join(THIS_DIR, "packages", PLUGIN_ID);
 
   if (!fs.existsSync(pkgFile) || !fs.existsSync(patchFile)) {
-    console.error(`❌ 未找到 dsh web profile（${profileDir}）。`);
-    console.error("   请先安装 DeepSeek Harness（npx @deepseek-ai/dsh web）并初始化默认 profile。");
+    console.error(`❌ 未找到 profile（${profileDir}）。`);
+    if (isDesktopProfileDir(profileDir)) {
+      // 桌面端 profile 由 Electron 应用**自己初始化**：npm 版 `dsh` 明确拒绝管理它
+      // （apps/cli 的 rejectElectronProfile），所以 Web 版那句 "npx @deepseek-ai/dsh web"
+      // 在桌面端**不成立**，照抄只会让用户白折腾。这里必须给桌面端专属的三步。
+      console.error("   桌面端 profile 由 DeepSeek Harness 应用自己创建，不能像 Web 版那样用 npx 造出来：");
+      console.error("   ① 先启动一次 DeepSeek Harness 应用，让它初始化该 profile；");
+      console.error("   ② 完全退出应用（应用独占该 profile，运行中安装不会被装载）；");
+      console.error("   ③ 再执行本次安装：dsh-remote --profile desktop");
+      console.error("   更省事的官方路径：直接在应用内「插件」页安装 dsh-remote-web。");
+    } else {
+      console.error("   请先安装 DeepSeek Harness（npx @deepseek-ai/dsh web）并初始化默认 profile。");
+    }
     process.exit(1);
   }
   if (!fs.existsSync(pluginDir)) {

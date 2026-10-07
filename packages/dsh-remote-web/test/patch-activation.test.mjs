@@ -178,7 +178,12 @@ test("回归护栏：plugin 子命令必须把激活结果 return 给 setup（�
   const call = src.match(/return convergePluginActivation\(profileDir[^\n]*/);
   assert.ok(call, "pluginCmd 必须 return convergePluginActivation(...) 的结果");
   // setup() 必须真的消费这个结果
-  assert.match(src, /pluginResult = await pluginCmd\(\[\]\)/, "setup 应保存 pluginCmd 的返回值");
+  // ⚠️ 2026-10-07 起参数从 `[]` 改为 `profileArgvOf(argv)`：桌面端要支持
+  //    `--profile desktop`，而 setup() 原本**不把 --profile 透传给 pluginCmd**，
+  //    导致"指定 desktop profile"被静默忽略、插件装进 web profile，
+  //    桌面端用户装完看不到面板且极难自查。这里是那次修复的护栏。
+  assert.match(src, /pluginResult = await pluginCmd\(profileArgvOf\(argv\)\)/, "setup 应保存 pluginCmd 的返回值");
+  assert.match(src, /function profileArgvOf\(/, "必须有 profileArgvOf 把 --profile 挑出来");
   assert.match(src, /pluginResult\.hotPatch/, "应据 hotPatch 判断是否走热挂载形态");
 });
 

@@ -529,9 +529,10 @@ test("win32：登录任务经 wscript+VBS 隐藏启动（旧版会弹黑色空�
       SETUP_SRC.indexOf("function winHiddenLauncherPath()"),
       SETUP_SRC.indexOf("function writeWindowsTask()"),
     );
-    const make = new Function("CONFIG_DIR", "fs", "path",
+    // SERVICE_NODE_ENV 是模块级常量：切片只含函数体，必须显式注入（真实 node 时为空对象）。
+    const make = new Function("CONFIG_DIR", "fs", "path", "SERVICE_NODE_ENV",
       `${src}\nreturn { winHiddenLauncherPath, writeWinHiddenLauncher };`);
-    const { winHiddenLauncherPath, writeWinHiddenLauncher } = make(dir, nodeFs, path);
+    const { winHiddenLauncherPath, writeWinHiddenLauncher } = make(dir, nodeFs, path, {});
 
     // 用「空格 + 中文 + 括号」的路径：Windows 上最常见的翻车形状
     const node = "C:\\Program Files\\nodejs\\node.exe";
@@ -554,6 +555,36 @@ test("win32：登录任务经 wscript+VBS 隐藏启动（旧版会弹黑色空�
     assert.equal(value, `"${node}" "${setup}" run`, "VBS 字面量转义必须可往返（内嵌引号写成两个）");
     assert.ok(value.includes("My App (x64)"), "含空格/括号的路径必须完整保留");
     assert.ok(value.includes("张三"), "中文路径必须完整保留");
+    assert.ok(!/ELECTRON_RUN_AS_NODE/.test(vbs), "真实 node 时不得注入 Electron 变量（避免污染环境）");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("win32：桌面端（Electron 解释器）自启动必须先设 ELECTRON_RUN_AS_NODE=1", async () => {
+  // 现场价值：DeepSeek Harness 桌面端宿主里 process.execPath 是 Electron 应用二进制。
+  // 不设这个变量，自启动拉起的不是 bridge 守护，而是**又开一个桌面端应用** ——
+  // 表现为「服务登记成功、进程秒退、bridge 永远起不来」，与 0.6.15 端口事故一样难排查。
+  const dir = await mkdtemp(path.join(os.tmpdir(), "dsh-win-electron-"));
+  try {
+    const src = SETUP_SRC.slice(
+      SETUP_SRC.indexOf("function winHiddenLauncherPath()"),
+      SETUP_SRC.indexOf("function writeWindowsTask()"),
+    );
+    const make = new Function("CONFIG_DIR", "fs", "path", "SERVICE_NODE_ENV",
+      `${src}\nreturn { writeWinHiddenLauncher };`);
+    const { writeWinHiddenLauncher } = make(dir, nodeFs, path, { ELECTRON_RUN_AS_NODE: "1" });
+
+    const node = "C:\\Program Files\\DeepSeek Harness\\DeepSeek Harness.exe";
+    const setup = path.join(dir, "dsh-setup.mjs");
+    const vbs = readFileSync(writeWinHiddenLauncher(node, setup), "utf8");
+    assert.match(vbs, /Environment\("PROCESS"\)\("ELECTRON_RUN_AS_NODE"\)\s*=\s*"1"/,
+      "必须先往进程环境写入 ELECTRON_RUN_AS_NODE=1，再 Run");
+    assert.ok(vbs.indexOf("ELECTRON_RUN_AS_NODE") < vbs.indexOf(".Run "),
+      "设置环境变量必须发生在 Run **之前**（否则白设）");
+    // 注入变量不得破坏原有的隐藏启动语义
+    const line = vbs.replace(/\r\n/g, "\n").split("\n").find((l) => l.includes(".Run "));
+    assert.ok(/,\s*0,\s*False\s*$/.test(line), `Run 仍必须是 (cmd, 0, False)，实际：${line}`);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

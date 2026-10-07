@@ -327,20 +327,88 @@ function resolveExecutable(p) {
 }
 
 /** 优先 node@20（node-datachannel 兼容性），回退当前 node。 */
-function preferredNode() {
+/**
+ * 宿主是否跑在 **Electron 的 Node 模式**下（DeepSeek Harness 桌面端的 Host 就是）。
+ *
+ * 桌面端 `process.execPath` 是 **Electron 应用二进制**，不是 node：
+ * 直接 `spawn(process.execPath, [script])` 得到的不是「跑脚本的 node」，
+ * 而是**再启动一个 Electron 应用实例**（还会撞桌面端的单实例锁）。
+ * 必须补 `ELECTRON_RUN_AS_NODE=1`（官方桌面端自己也正是这么做的：
+ * 其内置 CLI 就是 `ELECTRON_RUN_AS_NODE=1 exec <Electron> --expose-internals <cli.js>`）。
+ */
+const IS_ELECTRON_HOST = Boolean(process.versions && process.versions.electron);
+
+/**
+ * 本插件派生的**辅助脚本**（watcher 拉起、在线更新、doctor、运行环境清理、重启助手）
+ * 一律用**当前进程自己的可执行文件**跑 —— 保持既有行为不变（宿主是哪个 node 就用哪个，
+ * 不引入"另找一个 node 可能版本不同"的风险）。
+ * 但桌面端宿主是 Electron：必须补 `ELECTRON_RUN_AS_NODE=1`，否则不是"跑脚本"而是**又开一个桌面端应用**。
+ * 非 Electron 宿主下为空对象，行为与改动前完全一致。
+ */
+const SELF_NODE_ENV = IS_ELECTRON_HOST ? { ELECTRON_RUN_AS_NODE: "1" } : {};
+
+/**
+ * 解析**自启动服务**里应当登记的解释器。
+ *
+ * 这里与 `SELF_NODE_ENV` 是两件事，不能混：服务由系统在**本应用退出之后**拉起，
+ * 所以它登记的解释器必须活过桌面端的退出、甚至更新（.app 路径会变、可能被换掉）。
+ * 因此**真实 node 优先**；只有找不到真实 node 时才回落宿主自身，
+ * 此时若宿主是 Electron，服务定义里也必须带 `ELECTRON_RUN_AS_NODE=1`。
+ *
+ * @returns {{bin:string, electron:boolean}} bin 是可执行文件绝对路径；electron=true 表示
+ *          该文件是 Electron 二进制，服务定义必须补 `ELECTRON_RUN_AS_NODE=1`。
+ */
+/**
+ * DeepSeek Harness **桌面端自带 Node** 的稳定落点候选。
+ *
+ * 为什么需要：桌面端主打的正是**机器上没有系统 node** 的用户；而自启动服务要活过
+ * 桌面端的退出、甚至升级/重装（`.app` 路径会变、可能被换掉）。桌面端把自带运行时装在
+ * **用户目录** `~/.dsh/dsh-runtimes/…`，它不随应用包更新而移动 —— 所以只要它存在，
+ * 就该优先于任何指向 `.app` 内部的路径。
+ *
+ * 目录布局随桌面端版本演进（可能多套一层 runtime/node），故按多个候选探测；
+ * `resolveExecutable()` 会过滤掉不存在的路径，多列无害。
+ * @returns {string[]} 候选可执行文件绝对路径（可能都不存在）。
+ */
+function desktopRuntimeNodeCandidates() {
+  const exe = isWindows() ? "node.exe" : "node";
+  const roots = [
+    process.env.DSH_DESKTOP_RUNTIME_DIR || "",
+    join(homedir(), ".dsh", "dsh-runtimes", "dsh-primary-runtime"),
+    join(homedir(), ".dsh", "dsh-runtimes", "dsh-primary-runtime", "runtime"),
+  ].filter(Boolean);
+  const out = [];
+  for (const root of roots) out.push(join(root, "bin", exe), join(root, "node", "bin", exe), join(root, "runtime", "bin", exe));
+  return out;
+}
+
+function resolveServiceInterpreter() {
   const candidates = [
     "/opt/homebrew/opt/node@20/bin/node",
     "/usr/local/opt/node@20/bin/node",
+    ...desktopRuntimeNodeCandidates(),
     process.env.DSH_SETUP_NODE20 || "",
   ].filter(Boolean);
   for (const p of candidates) {
     const real = resolveExecutable(p);
-    if (real) return real;
+    if (real) return { bin: real, electron: false };
   }
-  return resolveExecutable(process.execPath) || process.execPath;
+  return { bin: resolveExecutable(process.execPath) || process.execPath, electron: IS_ELECTRON_HOST };
 }
 
-const NODE_BIN = preferredNode();
+const SERVICE_INTERPRETER = resolveServiceInterpreter();
+const NODE_BIN = SERVICE_INTERPRETER.bin;
+/**
+ * 服务定义里（plist 的 EnvironmentVariables / systemd 的 Environment=）必须注入的变量。
+ * 形如 `{ELECTRON_RUN_AS_NODE:"1"}` 或 `{}`。
+ */
+const SERVICE_NODE_ENV = SERVICE_INTERPRETER.electron ? { ELECTRON_RUN_AS_NODE: "1" } : {};
+/** plist `EnvironmentVariables` 里要追加的解释器变量（真实 node 时为空串 → 模板不变）。 */
+const SERVICE_NODE_ENV_PLIST = Object.entries(SERVICE_NODE_ENV)
+  .map(([k, v]) => `<key>${k}</key><string>${v}</string>`).join("");
+/** systemd unit 里要追加的 `Environment=` 行（真实 node 时为空串 → 模板不变）。 */
+const SERVICE_NODE_ENV_UNIT = Object.entries(SERVICE_NODE_ENV)
+  .map(([k, v]) => `Environment=${k}=${v}\n`).join("");
 
 /**
  * 解析 npx 的调用方式。DeepSeek App 拉起 dsh web 时 PATH 只有 /usr/bin:/bin:/usr/sbin:/sbin
@@ -397,6 +465,10 @@ function npxInvocation() {
 
 /** 子进程环境：把 node 目录补进 PATH（npx 及其 shebang 需要），可附加额外变量。 */
 function spawnEnv(extra) {
+  // ⚠️ 这里刻意用 **process.execPath**，不是 NODE_BIN：PATH 首位的用途是让 npx 的
+  // `#!/usr/bin/env node` 解析到**正在跑本插件的那个 node**（与 npxInvocation 同口径）。
+  // NODE_BIN 回答的是另一个问题——"自启动服务里该登记哪个解释器"（真实 node 优先）。
+  // 两者语义不同，混用会悄悄改掉 web 版上 npx 用哪个 node。
   const nodeDir = dirname(process.execPath);
   const base = process.env.PATH || "";
   // PATH 分隔符必须按平台取（Windows 是 ";"，POSIX 是 ":"）：写死 ":" 会把整条 PATH
@@ -406,7 +478,10 @@ function spawnEnv(extra) {
   // 而 bridge 要用 ioreg 之类系统命令（缺了它 → 机器指纹静默退化，见 SERVICE_PATH 注释）。
   const posixDirs = isWindows() ? [] : ["/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"];
   const PATH = [nodeDir, base, ...posixDirs].filter(Boolean).join(delimiter);
-  return { ...process.env, PATH, ...(extra || {}) };
+  // ⚠️ SELF_NODE_ENV 展开在 extra **之前**（= 保持既有展开顺序，extra 依旧最后说了算）。
+  // 它只含 ELECTRON_RUN_AS_NODE 一个键，而没有任何调用方会去设置这个键，故不存在被误覆盖的场景。
+  // ⚠️ 也不要无条件设置（真实 node 下设了会污染子进程环境、并让 node 版本探测类工具困惑）。
+  return { ...process.env, ...SELF_NODE_ENV, PATH, ...(extra || {}) };
 }
 
 /**
@@ -902,7 +977,7 @@ ExecStart=${NODE_BIN} ${setup} run
 Restart=on-failure
 RestartSec=5
 Environment=PATH=${SERVICE_PATH}
-Environment=DSH_BRIDGE_UPSTREAM=${upstreamUrl()}
+${SERVICE_NODE_ENV_UNIT}Environment=DSH_BRIDGE_UPSTREAM=${upstreamUrl()}
 Environment=DSH_BRIDGE_INSTALL_SOURCE=${installSourceOf(relayDir)}
 Environment=DSH_BRIDGE_INSTALL_VERSION=${PLUGIN_VERSION}
 
@@ -1483,7 +1558,7 @@ function writeAutostartFile(relayDir) {
   <key>LimitLoadToSessionType</key><array><string>Aqua</string><string>Background</string></array>
   <key>StandardOutPath</key><string>${join(relayDir, ".dsh-bridge.log")}</string>
   <key>StandardErrorPath</key><string>${join(relayDir, ".dsh-bridge.log")}</string>
-  <key>EnvironmentVariables</key><dict><key>PATH</key><string>${SERVICE_PATH}</string><key>DSH_BRIDGE_INSTALL_SOURCE</key><string>${installSourceOf(relayDir)}</string><key>DSH_BRIDGE_INSTALL_VERSION</key><string>${PLUGIN_VERSION}</string></dict>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>${SERVICE_PATH}</string>${SERVICE_NODE_ENV_PLIST}<key>DSH_BRIDGE_INSTALL_SOURCE</key><string>${installSourceOf(relayDir)}</string><key>DSH_BRIDGE_INSTALL_VERSION</key><string>${PLUGIN_VERSION}</string></dict>
 </dict></plist>`;
   mkdirSync(dirname(plistPath), { recursive: true });
   writeFileSync(plistPath, plist, { mode: 0o644 });
@@ -2127,6 +2202,22 @@ logLine("已重新拉起 dsh web：pid=" + String(child.pid));
  */
 async function restartHarness(relayDir, opts = {}) {
   if (skipsSystemOps()) return { ok: false, status: "skipped", detail: "测试隔离（DSH_RELAY_SKIP_SERVICE=1）：跳过真实重启" };
+  // 桌面端（Electron 宿主）：**绝不重启 Host**。
+  //   · Host 是桌面应用（Electron）的子进程，把它杀掉会触发桌面端的**原生致命恢复弹窗**，
+  //     用户的观感是"应用崩了"，远差于"没重启"；
+  //   · 而且桌面端重启用处很小：插件由共享插件管理器安装、激活走 profile 的 patch HMR
+  //     （存盘后约 1 秒重新 compose），日常更新刷新页面即可生效；
+  //   · 真要重启，正确动作是**退出并重开桌面应用**，那由用户/操作系统负责，不该由插件代劳。
+  // 因此这里如实返回"做不到 + 该怎么做"，而不是假装成功或把宿主打死。
+  if (IS_ELECTRON_HOST) {
+    return {
+      ok: false,
+      status: "desktop-managed",
+      mode: "desktop",
+      detail: "当前运行在 DeepSeek Harness 桌面端：Host 由桌面应用托管，插件不能单独重启它（强行退出会让应用弹致命错误）。"
+        + "插件更新一般刷新页面即可生效；确实需要重启时，请退出并重新打开 DeepSeek Harness —— 后台服务与手机端连接不受影响。",
+    };
+  }
   const cmd = selfCommand();
   let mode = "relaunch";
   let target = "";
@@ -3777,6 +3868,9 @@ function spawnRuntimeCleanupDetached(relayDir, protectedPath) {
     writeFileSync(helperPath, buildRuntimeCleanupHelper(relayDir, protectedPath));
     const { child, error } = safeSpawn(process.execPath, [helperPath], {
       detached: true, cwd: homedir(), stdio: "ignore", windowsHide: true,
+      // ⚠️ 必须带 spawnEnv：桌面端宿主下 process.execPath 是 Electron 二进制，
+      // 不补 ELECTRON_RUN_AS_NODE=1 的话这里不是"跑清理脚本"，而是**又开一个桌面端应用**。
+      env: spawnEnv({}),
       onError: (e) => console.warn(`[dsh-remote-web] 运行时清理子进程启动失败: ${e.message}`),
     });
     if (error || !child) {
@@ -4340,6 +4434,11 @@ async function composeConnect(relayDir, opts = {}) {
     watcherRestarts: wedge.restarts,
     upstreamUrl: upstreamUrl(),
     upstreamSource: upstreamSourceLabel(),
+    // 宿主形态：桌面端（Electron）与 Web 版（node）在若干动作上语义不同 ——
+    // 最典型的是「重启 DeepSeek harness」在桌面端做不到也不该做（Host 由 Electron 托管，
+    // 强行退出会弹原生致命错误）。面板据此改文案/去掉无意义的按钮，而不是等用户点了才失败。
+    desktopHost: IS_ELECTRON_HOST,
+    restartSupported: !IS_ELECTRON_HOST,
     upstreamReachable: upstream ? upstream.ok : null,
     upstreamError: upstream && !upstream.ok ? upstream.error : "",
     rateLimitedUntil,

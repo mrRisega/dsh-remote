@@ -20,6 +20,12 @@ import { apply } from "../lib/index.js";
 // ⚠️ 必须用 fileURLToPath：Windows 上 `new URL(...).pathname` 得到的是 "/D:/a/..."（带前导斜杠），
 // path.join 之后会拼成 "D:\\D:\\a\\..." → ENOENT。CI 的 Windows 专项就死在这条上。
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+/**
+ * 版本号**从真实 manifest 派生**，不要写死。
+ * 写死会在每次发版时把这条无关用例弄红（2026-10-07 发 0.7.0 时实测踩到：断言里钉着 `/0\.6\./`），
+ * 而"按版本分桶"要的恰恰是**跟着真实版本走**。
+ */
+const PLUGIN_VERSION = JSON.parse(readFileSync(path.join(HERE, "..", "package.json"), "utf8")).version;
 const readOrEmpty = async (p) => { try { return await readFile(p, "utf8"); } catch { return ""; } };
 
 /** 假反馈服务：只收 /api/feedback 与 /api/feedback/:id/replies（与企业端契约同构）。 */
@@ -124,7 +130,7 @@ test("预览：把「将要发送的每一个字」摊开，且不含手机号�
     const b = await getJson(`${base}/dsh-remote/diag/bundle`);
     assert.equal(b.ok, true);
     assert.match(b.title, /\[诊断\]/);
-    assert.match(b.title, /0\.6\./, "标题要带插件版本，便于后台按版本分桶");
+    assert.ok(b.title.includes(PLUGIN_VERSION), `标题要带插件版本（${PLUGIN_VERSION}），便于后台按版本分桶`);
     const all = b.summary + "\n" + b.parts.join("\n");
     for (const need of ["【阶段】", "【bridge】", "【上游】", "【配置目录】", env.relayDir]) {
       assert.ok(all.includes(need), `预览必须包含 ${need}（这些正是 2026-09-23 那次反馈里缺失的证据）`);

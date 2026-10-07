@@ -2626,6 +2626,11 @@ window.__ModuleLoader__.load({
       // 是否需要重启 DeepSeek harness（首次安装/在线更新后置顶提醒 + 底部常驻按钮）
       var restartInfo = (st && st.restart) || {};
       var restartPending = !!restartInfo.pending;
+      // 宿主形态（node 半下发）：桌面端（Electron）Host 由桌面应用托管，重启这个动作
+      // 在那边**做不到也不该做**（强行退出会弹原生致命错误）。面板据此：
+      //   ① 不自动倒计时重启；② 保留提醒但改文案，引导"退出并重开桌面应用"。
+      // 旧版 host 的响应里没有该字段 → false，行为与改动前完全一致。
+      var desktopHost = !!(st && st.desktopHost);
       // kind === "refresh" = 插件文件在运行中被改写(装完/更新完),只需刷新页面;
       // 其余情况(极为罕见)才提重启 dsh web。
       var isRefreshOnly = restartPending && restartInfo.kind === "refresh";
@@ -3400,8 +3405,16 @@ window.__ModuleLoader__.load({
             waitHarnessBack(0, false);
           })
           .catch(function (e) {
-            setMsg("err", "重启失败: " + e.message + " —— 请手动重启 DeepSeek harness（退出 dsh web 后重新启动）。");
             setBusy("");
+            // 桌面端（Electron 宿主）：Host 由桌面应用托管，重启被**有意拒绝** —— 这不是故障，
+            // 是"这个动作在这里不该做"。用中性提示告知正确做法，不要写成"重启失败"吓用户。
+            var b = e && e.body;
+            if (b && b.status === "desktop-managed") {
+              setSt(b);
+              setMsg("warn", "ℹ️ " + (b.error || "桌面端不能单独重启 Host") );
+              return;
+            }
+            setMsg("err", "重启失败: " + e.message + " —— 请手动重启 DeepSeek harness（退出后重新启动）。");
           });
       };
 
@@ -4737,7 +4750,9 @@ window.__ModuleLoader__.load({
       // ⚠️ isRestartHard(在线更新完成,kind="restart")同理**不**自动重启:这一种现在会在每次
       // 在线更新成功后出现,若照旧 15 秒自动重启,等于"更新完必定打断用户正在做的事"。
       useEffect(function () {
-        if (!restartPending || isRefreshOnly || isRestartHard || busy !== "" || restartCancelled) { setRestartCountdown(null); return undefined; }
+        // ⚠️ desktopHost 时**不自动重启**：桌面端重启 Host 由 Electron 托管，插件无权也不该做
+        // （见 node 半 restartHarness 的说明）。此时只保留文案提醒，动作交给用户「退出并重开应用」。
+        if (!restartPending || isRefreshOnly || isRestartHard || desktopHost || busy !== "" || restartCancelled) { setRestartCountdown(null); return undefined; }
         var at = restartInfo.at || 0;
         if (autoRestartCancelled(at)) { setRestartCountdown(null); return undefined; }
         var left = Math.round(AUTO_RESTART_DELAY_MS / 1000);
@@ -4751,7 +4766,7 @@ window.__ModuleLoader__.load({
           restartHarness(); // 已有实现:重启 + 轮询等它回来 + 自动刷新页面
         }, 1000);
         return function () { clearInterval(iv); };
-      }, [restartPending, isRefreshOnly, isRestartHard, restartInfo.at, busy, restartCancelled]);
+      }, [restartPending, isRefreshOnly, isRestartHard, desktopHost, restartInfo.at, busy, restartCancelled]);
 
       // ── 📣 公告（0.6.18）：本组件的 hook 全部追加在**最后一个既有 hook 之后** ──────
       // 🔒 hook 序号铁律（见本组件顶部 2029-2036 的注释）：本组件大量 useState/useCallback/useEffect
@@ -4894,9 +4909,22 @@ window.__ModuleLoader__.load({
           ));
         }
         if (restartPending) {
+          // 桌面端：刷新类照旧（刷新页面即可）；需要重启 Host 的那一类**不给「立即重启」按钮** ——
+          // 桌面端 Host 由 Electron 托管，插件点了也做不到，给个点不动的按钮只会让人以为是 bug。
+          // 改成如实引导：退出并重开 DeepSeek Harness。
+          // ⚠️ 非桌面端必须保持**原有判据 isRestartHard**：改成 isRefreshOnly 会让"历史遗留 kind"
+          // 的文案从"刷新页面即可生效"变成"重启 dsh web 后生效" —— 属于发布版用户可见的文案变更，
+          // 不该混在桌面端适配里顺手做掉。桌面端才走新文案。
+          var restartRowText = desktopHost
+            ? (isRefreshOnly
+              ? "🔄 插件已更新：刷新页面即可生效"
+              : "🔄 插件已更新：退出并重新打开 DeepSeek Harness 后生效")
+            : (isRestartHard
+              ? "🔄 插件已更新：重启 dsh web 后生效"
+              : "🔄 插件已更新：刷新页面即可生效");
           rows.push(h("div", { className: "dru-access-tip-row", key: "restart" },
-            h("span", null, isRestartHard ? "🔄 插件已更新：重启 dsh web 后生效" : "🔄 插件已更新：刷新页面即可生效"),
-            h("button", {
+            h("span", null, restartRowText),
+            (isRefreshOnly || !desktopHost) ? h("button", {
               type: "button",
               className: "dru-linkbtn",
               disabled: busy !== "",
@@ -4904,7 +4932,7 @@ window.__ModuleLoader__.load({
                 if (isRefreshOnly) { try { location.reload(); } catch (e) { /* 忽略 */ } }
                 else restartHarness();
               }
-            }, isRefreshOnly ? "刷新页面" : "立即重启")
+            }, isRefreshOnly ? "刷新页面" : "立即重启") : null
           ));
         }
         rows.push(h("div", { className: "dru-access-tip-row", key: "hint" },
@@ -4945,15 +4973,23 @@ window.__ModuleLoader__.load({
                   h("div", { className: "dru-restart-alert-title" },
                     // 插件已改为 patch 热加载:装插件/在线更新都不再需要重启 harness,
                     // 唯一要用户动一下的情形是"插件文件在运行中被改写"→ 刷新页面即可。
-                    isRestartHard ? "插件已更新，重启 dsh web 后生效"
+                    // 桌面端：需要换 Host 进程的那一类改为引导「退出并重开应用」（插件无权重启 Host）。
+                    isRestartHard
+                      ? (desktopHost ? "插件已更新，退出并重新打开 DeepSeek Harness 后生效"
+                        : "插件已更新，重启 dsh web 后生效")
                       : isRefreshOnly ? "插件已更新，刷新页面即可生效"
-                        : "需要重启 dsh web 才能载入新插件"),
+                        : (desktopHost ? "需要重新打开 DeepSeek Harness 才能载入新插件"
+                          : "需要重启 dsh web 才能载入新插件")),
                   h("div", { className: "dru-restart-alert-sub" },
                     isRestartHard
-                      ? "新版本已经装到这台电脑上，但当前运行的 dsh web 还是旧代码（新的后台路由与面板要等它重新载入）。手机端连接与已登录状态都不受影响；重启期间页面会短暂断开，然后自动恢复。"
+                      ? (desktopHost
+                        ? "新版本已经装到这台电脑上，但当前运行的 DeepSeek Harness 还是旧代码（新的后台路由与面板要等它重新载入）。桌面端的运行环境由应用本身托管，插件不能单独重启它 —— 请退出并重新打开 DeepSeek Harness 应用。手机端连接与已登录状态都不受影响。"
+                        : "新版本已经装到这台电脑上，但当前运行的 dsh web 还是旧代码（新的后台路由与面板要等它重新载入）。手机端连接与已登录状态都不受影响；重启期间页面会短暂断开，然后自动恢复。")
                       : isRefreshOnly
                         ? "刚装好/刚更新的插件已在磁盘上，浏览器里的面板还是旧版本。刷新一下这个页面即可（手机端连接与已登录状态都不受影响）。"
-                        : "当前运行中的 dsh web 里还没有载入这个插件。先刷新页面；如果刷新后仍然看不到面板，再重启一次 dsh web。"),
+                        : (desktopHost
+                          ? "当前运行中的 DeepSeek Harness 里还没有载入这个插件。先刷新页面；如果刷新后仍然看不到面板，请退出并重新打开 DeepSeek Harness 应用。"
+                          : "当前运行中的 dsh web 里还没有载入这个插件。先刷新页面；如果刷新后仍然看不到面板，再重启一次 dsh web。")),
                   // 【自动化】待重启时自动倒计时重启(用户零操作);倒计时期间可一键取消
                   restartCountdown !== null && restartCountdown > 0
                     ? h("div", { className: "dru-restart-auto", role: "status" },
@@ -4974,7 +5010,9 @@ window.__ModuleLoader__.load({
                           onClick: function () { try { location.reload(); } catch (e) { /* 忽略 */ } }
                         }, "刷新页面")
                       : null,
-                    h("button", {
+                    // 桌面端且非"刷新即可"时**不摆重启按钮**：Host 由 Electron 托管，点了必然失败
+                    // （node 半会拒绝并说明原因）。缺省为 null 是 h() 认可的"什么都不渲染"。
+                    (desktopHost && !isRefreshOnly) ? null : h("button", {
                       type: "button",
                       className: "dru-btn " + (isRefreshOnly ? "dru-btn-ghost" : "dru-btn-primary"),
                       disabled: busy !== "",
@@ -5004,14 +5042,20 @@ window.__ModuleLoader__.load({
             : renderHome()
         ),
         // 常驻入口最底部：「重启 DeepSeek harness」按钮始终可达（首次安装/更新/排查都用它）
+        // 桌面端：Host 由 Electron 托管，重启这个动作不存在 → 不摆一个点了必然失败的按钮，
+        // 改为如实说明「退出并重开桌面应用」。后台服务与手机端连接在两种形态下都不受影响。
         h("div", { className: "dru-restart-foot" },
-          h("div", { className: "dru-hint" }, "重启 dsh web：仅在「刷新页面后仍看不到面板」时才需要。日常安装/更新插件已自动热加载，装完刷新页面即可；重启只影响 dsh web 本身，不影响后台服务与手机端连接。"),
-          h("button", {
-            type: "button",
-            className: "dru-btn " + (restartPending ? "dru-btn-primary" : "dru-btn-ghost"),
-            disabled: busy !== "",
-            onClick: function () { restartHarness(); }
-          }, busy === "restart" ? "重启中…" : "🔄 重启 dsh web")
+          h("div", { className: "dru-hint" }, desktopHost
+            ? "重启 DeepSeek Harness：桌面端由应用本身托管运行环境，请直接退出并重新打开应用（无需其他操作）。日常安装/更新插件已自动热加载，装完刷新页面即可；重启不影响后台服务与手机端连接。"
+            : "重启 dsh web：仅在「刷新页面后仍看不到面板」时才需要。日常安装/更新插件已自动热加载，装完刷新页面即可；重启只影响 dsh web 本身，不影响后台服务与手机端连接。"),
+          desktopHost
+            ? null
+            : h("button", {
+              type: "button",
+              className: "dru-btn " + (restartPending ? "dru-btn-primary" : "dru-btn-ghost"),
+              disabled: busy !== "",
+              onClick: function () { restartHarness(); }
+            }, busy === "restart" ? "重启中…" : "🔄 重启 dsh web")
         ),
         renderCommunityModal(),
         // 📣 公告详情弹窗（与交流群弹窗同一层：都挂在面板根上，点遮罩即收起）
