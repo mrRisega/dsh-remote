@@ -19,10 +19,17 @@ import test, { after } from "node:test";
 const UNAUTH = "dsh web authentication required; reopen the URL printed by dsh web.\n";
 const tmpDir = mkdtempSync(path.join(os.tmpdir(), "dsh-harness-cookie-"));
 const cookieFile = path.join(tmpDir, ".harness-cookie.json");
-const revokedFile = path.join(tmpDir, ".harness-cookie-revoked");
+/** 作废标记自 0.7.0-beta.2 起**按 authority 分文件**（见 harness-cookie-authority.test.mjs）。 */
+const slug = (authority) => String(authority).replace(/[^A-Za-z0-9._-]/g, "_");
+const revokedFileFor = (authority) => path.join(tmpDir, `.harness-cookie-revoked.${slug(authority)}`);
+/** 本用例的假上游 authority（listen 后才知道端口；Cookie 必须按它命名才不会被判 foreign）。 */
+let upstreamAuthority = "127.0.0.1:3080";
+const revokedFile = () => revokedFileFor(upstreamAuthority);
 
 function writeCookie(value) {
-  writeFileSync(cookieFile, JSON.stringify({ authority: "127.0.0.1:3080", cookie: value, mintedAt: Date.now() }), { mode: 0o600 });
+  // 写**旧版共享文件**：新桥仍兼容读取（authority 对得上时），这条用例验的是 401 自愈链路，
+  // 与"专属/共享"无关；专属文件的优先级由 harness-cookie-authority.test.mjs 覆盖。
+  writeFileSync(cookieFile, JSON.stringify({ authority: upstreamAuthority, cookie: value, mintedAt: Date.now() }), { mode: 0o600 });
 }
 
 // 假 dsh web:只认 cookie=dsh-auth-NEW;第一次请求 401(并模拟插件此刻换好新 Cookie)
@@ -50,7 +57,8 @@ process.env.DSH_BRIDGE_CONFIG = path.join(tmpDir, "config.json");
 
 const { handleHttpFrame } = await new Promise((resolve, reject) => {
   upstream.listen(0, "127.0.0.1", () => {
-    process.env.DSH_BRIDGE_UPSTREAM = `http://127.0.0.1:${upstream.address().port}`;
+    upstreamAuthority = `127.0.0.1:${upstream.address().port}`;
+    process.env.DSH_BRIDGE_UPSTREAM = `http://${upstreamAuthority}`;
     import("../dsh-bridge.mjs").then(resolve, reject);
   });
 });
@@ -69,12 +77,12 @@ async function request(frame) {
 
 test("旧 Cookie 被 dsh web 拒(401)→ 用新 Cookie 自动重试一次:手机端拿到 200,用户零操作", async () => {
   writeCookie("dsh-auth-OLD");
-  rmSync(revokedFile, { force: true });
+  rmSync(revokedFile(), { force: true });
   const reply = await request({ id: "heal-1", method: "GET", path: "/needs-auth", headers: {} });
   assert.equal(reply.status, 200, "自愈后应返回 200(而不是把 401 透传给手机)");
   assert.equal(Buffer.from(reply.body, "base64").toString("utf8"), "ok");
   assert.equal(firstCallSeen, 1, "上游只被 401 了一次(第二次带新 Cookie 成功)");
-  assert.ok(existsSync(revokedFile), "应写下 .harness-cookie-revoked 标记,让插件在面板轮询时重换");
+  assert.ok(existsSync(revokedFile()), "应写下 .harness-cookie-revoked 标记,让插件在面板轮询时重换");
 });
 
 test("Cookie 未变(插件还没换好)→ 保留 401 但已打标记,等待插件重换", async () => {
@@ -87,14 +95,14 @@ test("Cookie 未变(插件还没换好)→ 保留 401 但已打标记,等待插�
   const prev = process.env.DSH_BRIDGE_UPSTREAM;
   // 另起一个 bridge 实例指向这个永远 401 的上游(模块已加载,上游常量不可变 → 用新进程不便;
   // 这里直接验证标记语义:标记存在时 401 应原样透传,且标记仍在)
-  rmSync(revokedFile, { force: true });
+  rmSync(revokedFile(), { force: true });
   writeCookie("dsh-auth-STILL-OLD");
   try {
     const reply = await request({ id: "heal-2", method: "GET", path: "/needs-auth", headers: {} });
     // 上一个用例的假上游此刻会返回 200(因为它已经在第一次调用时把 Cookie 改成了 NEW),
     // 所以这里只断言"标记机制"本身:去掉标记后仍能再次自愈
     assert.ok(reply.status === 200 || reply.status === 401);
-    assert.ok(existsSync(revokedFile) || reply.status === 200, "自愈后应留下标记或已成功");
+    assert.ok(existsSync(revokedFile()) || reply.status === 200, "自愈后应留下标记或已成功");
   } finally {
     process.env.DSH_BRIDGE_UPSTREAM = prev;
     await new Promise((r) => srv2.close(r));

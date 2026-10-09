@@ -407,13 +407,25 @@ test("清理助手：护栏命中时绝不删 profile（relayDir 误配成 profi
 test("安全：三处机密写入都要显式收紧 ACL（Windows 上 mode 0o600 无效）", () => {
   for (const [label, src, callSites] of [
     ["安装器", SETUP_SRC, [/hardenFile\(CONFIG_PATH\)/]],
-    ["插件半", INDEX_SRC, [/hardenFile\(configPathOf\(relayDir\)\)/, /hardenFile\(join\(relayDir, HARNESS_COOKIE_FILE\)\)/]],
+    ["插件半", INDEX_SRC, [/hardenFile\(configPathOf\(relayDir\)\)/]],
     ["bridge", fs.readFileSync(path.join(HERE, "..", "..", "..", "clients", "dsh-remote", "dsh-bridge.mjs"), "utf8"), [/hardenFile\(CONFIG_PATH\)/]],
   ]) {
     assert.ok(/function hardenFile\(file\)/.test(src), `${label} 应有 hardenFile`);
     assert.ok(/icacls/.test(src) && /inheritance:r/.test(src), `${label} 必须在 Windows 上断开继承并只授权当前用户`);
     assert.ok(/process\.platform !== "win32"/.test(src), `${label} 非 Windows 走 chmod 即可`);
     for (const re of callSites) assert.ok(re.test(src), `${label} 的机密写入点必须调用 hardenFile：${re}`);
+  }
+});
+
+test("安全：Cookie 的每个写入点都必须紧跟着 hardenFile（按 authority 分文件后不得漏收）", () => {
+  // 0.7.0-beta.2 把 Cookie 从「一份共享文件」改成「本宿主专属 + 旧版镜像」两份（见 P0-2 事故根治）。
+  // 写点从 1 个变 2 个 —— 逐个按变量名断言，漏收的那一份在 Windows 上就是 ACL 敞开状态。
+  const mint = INDEX_SRC.slice(INDEX_SRC.indexOf("async function mintHarnessCookie"), INDEX_SRC.indexOf("function readHarnessCookie"));
+  assert.ok(mint.length > 0, "应能定位到 mintHarnessCookie（找不到说明函数被改名，请同步本用例）");
+  const written = [...mint.matchAll(/writeFileSync\((\w+),/g)].map((m) => m[1]);
+  assert.ok(written.length >= 2, `mintHarnessCookie 应写两份 Cookie（本宿主专属 + 旧版镜像），实际 ${written.length}`);
+  for (const v of written) {
+    assert.ok(new RegExp(`hardenFile\\(${v}\\)`).test(mint), `Cookie 写入点 ${v} 之后必须调用 hardenFile 收紧 ACL`);
   }
 });
 

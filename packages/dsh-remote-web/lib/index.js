@@ -741,6 +741,34 @@ function applySaaSMode(cfg) {
  */
 const HARNESS_COOKIE_FILE = ".harness-cookie.json";
 /**
+ * Cookie 按 **authority 分文件**(0.7.0-beta.2 起,2026-10-09 事故根治)。
+ *
+ * 【事故】`~/.dsh-remote/` 只有一份 `.harness-cookie.json`,而 Web 端(3080)与桌面端(每次启动
+ *   随机端口)是**两个宿主进程**,各自的插件都往里写"自己 authority 的 Cookie" → 互相覆盖。
+ *   桥撞 401 后重读磁盘,拿到的是另一个宿主刚写的 Cookie → 重试 → 还是 401 → 再读 → 又被
+ *   覆盖回去……**乒乓,永不自愈**,手机端持续白页(现象与"自愈坏了"一模一样,极易误判)。
+ * 【根治】每个宿主只写自己 authority 的文件:`.harness-cookie.<authority>.json`
+ *   (`:` → `_`,如 `.harness-cookie.127.0.0.1_19387.json`),互不覆盖。旧版共享文件继续**写**
+ *   一份镜像(旧桥还能用),但新桥只认当前上游 authority 的那一份,foreign 一律跳过。
+ *   命名规则与桥半 `clients/dsh-remote/dsh-bridge.mjs` 同名,漂移由
+ *   `clients/dsh-remote/test/harness-cookie-authority.test.mjs` 的跨文件不变量锁住。
+ */
+function authoritySlug(authority) {
+  return String(authority).replace(/[^A-Za-z0-9._-]/g, "_");
+}
+/** 本宿主专属 Cookie 文件名(与桥半同规则)。 */
+function harnessCookieFileFor(authority) {
+  return `${HARNESS_COOKIE_FILE.slice(0, -".json".length)}.${authoritySlug(authority)}.json`;
+}
+/** 本宿主专属「作废」标记名(与桥半同规则)。 */
+function harnessCookieRevokedFileFor(authority) {
+  return `${HARNESS_COOKIE_REVOKED_FILE}.${authoritySlug(authority)}`;
+}
+/** 由本进程 webServer 端口推出 authority(与 bridge 的 Host 口径一致)。 */
+function harnessAuthorityOfPort(port) {
+  return port ? `127.0.0.1:${port}` : "";
+}
+/**
  * 手机端 401「dsh web authentication required; reopen the URL printed by dsh web」的根因就在这里：
  * 该 Cookie 由本插件在进程内经 ?token= 换取后交给 bridge 代持，**dsh web 每次重启都会换签名密钥**，
  * 旧 Cookie 立即失效。旧实现只在启动后重试 20 次(约 60s)就放弃、之后 6 小时才刷新一次 ——
@@ -786,22 +814,47 @@ async function mintHarnessCookie(ctx, relayDir) {
     if (UNINSTALLED_DIRS.has(relayDir)) return false;
     const out = { authority: `127.0.0.1:${port}`, cookie, mintedAt: Date.now() };
     mkdirSync(dirname(configPathOf(relayDir)), { recursive: true });
-    writeFileSync(join(relayDir, HARNESS_COOKIE_FILE), JSON.stringify(out, null, 2), { mode: 0o600 });
-    hardenFile(join(relayDir, HARNESS_COOKIE_FILE)); // 会话 Cookie ≈ dsh web 的完整访问权，同样要收紧
+    // ① 本宿主专属文件(权威,两个宿主互不覆盖 —— 事故根治点)
+    const ownPath = join(relayDir, harnessCookieFileFor(out.authority));
+    writeFileSync(ownPath, JSON.stringify(out, null, 2), { mode: 0o600 });
+    hardenFile(ownPath); // 会话 Cookie ≈ dsh web 的完整访问权，同样要收紧
+    // ② 旧版共享文件镜像:只为还跑着旧桥(<0.7.0-beta.2)的机器保留 —— 新桥优先读 ①,
+    //    且对 authority 不符的镜像**直接跳过**,所以这里写镜像不会再引发乒乓。
+    const legacyPath = join(relayDir, HARNESS_COOKIE_FILE);
+    writeFileSync(legacyPath, JSON.stringify(out, null, 2), { mode: 0o600 });
+    hardenFile(legacyPath);
     return true;
   } catch {
     return false;
   }
 }
 
-/** 读取当前 Cookie 文件状态:{cookie, authority, mintedAt} 或 null。 */
-function readHarnessCookie(relayDir) {
-  try {
-    const j = JSON.parse(readFileSync(join(relayDir, HARNESS_COOKIE_FILE), "utf8"));
-    return j && typeof j.cookie === "string" && j.cookie ? j : null;
-  } catch {
-    return null;
+/**
+ * 读取当前 authority 可用的 Cookie 文件状态:{cookie, authority, mintedAt} 或 null。
+ *   ① 本宿主专属文件优先;
+ *   ② 旧版共享文件仅在 authority 对得上、或旧插件没写 authority 字段(兼容)时采用;
+ *   ③ 声明了别的 authority → 明确不用(那属于另一个宿主,用了必然 401)。
+ * @param {string} relayDir 配置目录
+ * @param {string} [authority] 本进程 authority(`127.0.0.1:<port>`);缺省只做兼容读取
+ */
+function readHarnessCookie(relayDir, authority) {
+  const read = (file) => {
+    try {
+      const j = JSON.parse(readFileSync(join(relayDir, file), "utf8"));
+      return j && typeof j.cookie === "string" && j.cookie ? j : null;
+    } catch {
+      return null;
+    }
+  };
+  if (authority) {
+    const own = read(harnessCookieFileFor(authority));
+    if (own) return own;
   }
+  const legacy = read(HARNESS_COOKIE_FILE);
+  if (!legacy) return null;
+  const claimed = typeof legacy.authority === "string" ? legacy.authority : "";
+  if (claimed === "" || !authority || claimed === authority) return legacy;
+  return null; // foreign authority:另一个宿主的 Cookie,本宿主用不了
 }
 
 let harnessMintInflight = false;
@@ -819,9 +872,22 @@ let harnessMintLastAt = 0;
  */
 async function ensureHarnessCookie(ctx, relayDir, opts) {
   const force = !!(opts && opts.force);
-  const revoked = existsSync(join(relayDir, HARNESS_COOKIE_REVOKED_FILE));
+  const authority = harnessAuthorityOfPort(ctx.webServer?.port);
+  const ownRevokedPath = authority ? join(relayDir, harnessCookieRevokedFileFor(authority)) : "";
+  const legacyRevokedPath = join(relayDir, HARNESS_COOKIE_REVOKED_FILE);
+  const cur = readHarnessCookie(relayDir, authority);
+  // 作废标记两个来源:
+  //   ① 本宿主专属标记(新桥 0.7.0-beta.2+ 写)—— 精确,不会被人家的 401 催着重换;
+  //   ② 旧版共享标记(旧桥写)—— 仅当它**晚于**我们手上这份 Cookie 时才认:说明是它被拒了。
+  //      否则(比如另一个宿主刚被拒、标记比我们的 Cookie 还旧)不理会,避免两个宿主互相催。
+  let revoked = ownRevokedPath !== "" && existsSync(ownRevokedPath);
+  if (!revoked && existsSync(legacyRevokedPath)) {
+    try {
+      const revokedAt = Number(readFileSync(legacyRevokedPath, "utf8").trim()) || 0;
+      revoked = !cur || revokedAt > Number(cur.mintedAt || 0);
+    } catch { /* 标记读不到就当没有 */ }
+  }
   if (!force && !revoked) {
-    const cur = readHarnessCookie(relayDir);
     if (cur && Date.now() - Number(cur.mintedAt || 0) < HARNESS_COOKIE_STALE_MS) return true;
   }
   if (harnessMintInflight) return false;              // 去重:同一时刻只换一次
@@ -831,7 +897,11 @@ async function ensureHarnessCookie(ctx, relayDir, opts) {
   try {
     const ok = await mintHarnessCookie(ctx, relayDir);
     if (ok || revoked) {
-      try { rmSync(join(relayDir, HARNESS_COOKIE_REVOKED_FILE), { force: true }); } catch { /* ignore */ }
+      // 清标记:① 本宿主专属标记(精确);② 旧版共享标记(旧桥写的,清了不影响新桥)。
+      // 代价:多宿主机器上可能清掉"另一个宿主"的旧标记 —— 那只让对方的**快速**自愈退化成
+      // 30 分钟周期刷新,不会造成错误状态,故不做更细的归属判定(复杂度不值)。
+      if (ownRevokedPath) { try { rmSync(ownRevokedPath, { force: true }); } catch { /* ignore */ } }
+      try { rmSync(legacyRevokedPath, { force: true }); } catch { /* ignore */ }
     }
     if (!ok && revoked) console.warn("[dsh-remote-web] 浏览器会话 Cookie 已被 dsh web 作废,重取失败,下次查状态再试");
     return ok;

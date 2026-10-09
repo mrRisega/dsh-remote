@@ -340,7 +340,7 @@ export class WeChatRuntime {
   /**
    * @param {{
    *   relayDir: string,
-   *   upstream?: string,              // dsh web 地址,默认 http://127.0.0.1:3080
+   *   upstream?: string|(() => string), // dsh web 地址,默认 http://127.0.0.1:3080;函数=每次重连重新求值
    *   cookieOf?: () => string,        // 读 .harness-cookie.json 的回调(bridge 已有该逻辑)
    *   secret?: string,                // 控制面密钥(bridge_secret);空则控制面拒绝所有请求
    *   logger?: any,
@@ -356,6 +356,16 @@ export class WeChatRuntime {
     if (!opts.relayDir) throw new Error("WeChatRuntime: 缺少 relayDir");
     this.relayDir = opts.relayDir;
     this.upstream = String(opts.upstream || "http://127.0.0.1:3080").replace(/\/+$/, "");
+    /**
+     * 上游地址的**取值器**：恰好是字符串时是常量函数。
+     *
+     * 为什么不让它是个固化字符串：宿主端口会变（`dsh web --port 0`、DSH Desktop 每次启动随机端口），
+     * 而事件订阅器是**长连接** —— 固化字符串的后果是端口一变就永久重连到旧端口。
+     * 【2026-10-09 真机实证】bridge 启动时宿主还是 3080，随后换成 19387；隧道转发侧
+     * （每次都读最新 UPSTREAM）一切正常，唯独微信事件通道死循环刷
+     * `connect ECONNREFUSED 127.0.0.1:3080` —— 手机能开页面，但**任务完成没有任何推送**。
+     */
+    this.upstreamOf = typeof opts.upstream === "function" ? opts.upstream : () => this.upstream;
     this.cookieOf = typeof opts.cookieOf === "function" ? opts.cookieOf : () => "";
     this.secret = String(opts.secret || "");
     this.clock = opts.clock || Date.now;
@@ -1597,7 +1607,8 @@ export class WeChatRuntime {
     // 而且完全静默。现在无论订阅器是新建还是注入,都保证挂上处理器(WeakSet 去重,可重复调用)。
     if (!this.subscriber) {
       this.subscriber = createEventSubscriber({
-        upstream: this.upstream,
+        // 传**取值器**而不是当次的值：见构造函数里 upstreamOf 的说明（端口变了要能跟上）。
+        upstream: () => this.upstreamOf(),
         cookie: () => this.cookieOf(),
         follow: true,
         log: (level, message, meta) => {

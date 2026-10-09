@@ -320,20 +320,99 @@ const HARNESS_COOKIE_FILE = ".harness-cookie.json";
 const HARNESS_UNAUTHORIZED_TEXT = "dsh web authentication required";
 /** 撞到 401 时写的「作废」标记:插件在面板轮询时看到它就会立刻重换 Cookie(见 node 半 ensureHarnessCookie)。 */
 const HARNESS_COOKIE_REVOKED_FILE = ".harness-cookie-revoked";
-function markHarnessCookieRevoked() {
-  try {
-    const p = path.join(path.dirname(CONFIG_PATH), HARNESS_COOKIE_REVOKED_FILE);
-    fs.writeFileSync(p, String(Date.now()), { mode: 0o600 });
-  } catch { /* 忽略:标记只为加速自愈 */ }
+
+/**
+ * Cookie 按 **authority 分文件**(0.7.0-beta.2 起,2026-10-09 事故根治)。
+ *
+ * 【事故】`~/.dsh-remote/` 只有一份 `.harness-cookie.json`,而 Web 端(3080)与桌面端(每次启动
+ *   随机端口)是**两个宿主、两个进程**,各自的插件都会往里写"自己 authority 的 Cookie" →
+ *   互相覆盖。桥撞 401 后重读磁盘,拿到的是**另一个宿主刚写的** Cookie(与失败的不是同一个)
+ *   → 重试 → 还是 401 → 再读 → 又被覆盖回去……**乒乓,永不自愈**。手机端持续白页。
+ * 【根治】每个宿主只写自己 authority 的文件:`.harness-cookie.<authority>.json`
+ *   (`:` 换成 `_`,如 `.harness-cookie.127.0.0.1_19387.json`),互不覆盖;桥只认
+ *   **当前上游 authority** 的那一份。旧版共享文件继续兼容读取,但**foreign authority 一律不用**
+ *   —— 那正是乒乓的来源。命名规则与插件半 `packages/dsh-remote-web/lib/index.js` 同名,
+ *   漂移由 `test/harness-cookie-authority.test.mjs` 的跨文件不变量锁住。
+ */
+function authoritySlug(authority) {
+  return String(authority).replace(/[^A-Za-z0-9._-]/g, "_");
 }
-function harnessCookieOf() {
+/** 本宿主专属 Cookie 文件名(与插件半同规则)。 */
+function harnessCookieFileFor(authority) {
+  return `${HARNESS_COOKIE_FILE.slice(0, -".json".length)}.${authoritySlug(authority)}.json`;
+}
+/** 本宿主专属「作废」标记名(与插件半同规则)。 */
+function harnessCookieRevokedFileFor(authority) {
+  return `${HARNESS_COOKIE_REVOKED_FILE}.${authoritySlug(authority)}`;
+}
+/** 当前上游的 authority(`127.0.0.1:<port>`);取不到返回空串。 */
+function upstreamAuthorityOf(upstream) {
   try {
-    const p = path.join(path.dirname(CONFIG_PATH), HARNESS_COOKIE_FILE);
-    const j = JSON.parse(fs.readFileSync(p, "utf8"));
-    return j && typeof j.cookie === "string" && j.cookie ? j.cookie : "";
+    return new URL(String(upstream || UPSTREAM)).host || "";
   } catch {
     return "";
   }
+}
+/** 已就"哪个 foreign authority 在抢"告警过的集合(每对只吵一次,不刷屏)。 */
+const foreignCookieWarned = new Set();
+function warnForeignCookieOnce(claimed, authority) {
+  const key = `${claimed}->${authority}`;
+  if (foreignCookieWarned.has(key)) return;
+  foreignCookieWarned.add(key);
+  console.warn(
+    `[bridge] 检测到另一宿主的会话 Cookie(${claimed}),而当前上游是 ${authority} —— ` +
+    `一台机器只能服务一个宿主,已跳过该 Cookie(不再乒乓重试)。` +
+    `若手机端仍 401,请确认 .dsh-upstream 指向正在运行的那个宿主,并让该宿主的插件重发 Cookie。`
+  );
+}
+function readCookieDoc(dir, file) {
+  try {
+    const j = JSON.parse(fs.readFileSync(path.join(dir, file), "utf8"));
+    return j && typeof j.cookie === "string" && j.cookie ? j : null;
+  } catch {
+    return null;
+  }
+}
+/**
+ * 当前上游该用的浏览器会话 Cookie(空串 = 没有可用的)。
+ *
+ * 取值顺序(2026-10-09 起):
+ *   ① 本宿主专属文件 `.harness-cookie.<authority>.json` —— 新插件写的,权威;
+ *   ② 旧版共享 `.harness-cookie.json` —— 仅当它声明的 `authority` 与当前上游一致,
+ *      或旧插件根本没写 authority 字段(向后兼容)时才用;
+ *   ③ 声明了**别的** authority → 明确不用,并告警一次(这就是乒乓的源头)。
+ */
+function harnessCookieOf() {
+  const dir = path.dirname(CONFIG_PATH);
+  const authority = upstreamAuthorityOf();
+  if (authority) {
+    const own = readCookieDoc(dir, harnessCookieFileFor(authority));
+    if (own) return own.cookie;
+  }
+  const legacy = readCookieDoc(dir, HARNESS_COOKIE_FILE);
+  if (!legacy) return "";
+  const claimed = typeof legacy.authority === "string" ? legacy.authority : "";
+  if (claimed === "" || authority === "" || claimed === authority) return legacy.cookie;
+  warnForeignCookieOnce(claimed, authority);
+  return "";
+}
+/** 本宿主 Cookie 是否处于「已作废、等插件重换」状态(诊断用,不参与取值)。 */
+function harnessCookieRevokedFor(authority) {
+  try {
+    return fs.existsSync(path.join(path.dirname(CONFIG_PATH), harnessCookieRevokedFileFor(authority)));
+  } catch {
+    return false;
+  }
+}
+function markHarnessCookieRevoked() {
+  const dir = path.dirname(CONFIG_PATH);
+  const authority = upstreamAuthorityOf();
+  // 只写**本宿主**的标记:两个宿主各写各的,插件侧才不会被人家的 401 反复催着重换。
+  // (旧版共享标记 `.harness-cookie-revoked` 不再写:它是"两个写者抢一份文件"的同款隐患。)
+  if (!authority) return;
+  try {
+    fs.writeFileSync(path.join(dir, harnessCookieRevokedFileFor(authority)), String(Date.now()), { mode: 0o600 });
+  } catch { /* 忽略:标记只为加速自愈 */ }
 }
 
 /**
@@ -1568,6 +1647,18 @@ function wechatAppUrl() {
 }
 
 let wechatRuntime = null;
+
+/**
+ * 微信事件通道要连的上游（**每次重连都会调一次**）。
+ *
+ * 行为：先顺手触发一次上游重发现（内部有 15s 冷却 + 单飞，反复调用不会打爆 lsof/探测），
+ * 再返回**当下**的 UPSTREAM。这样宿主换端口时通道能自己跟上，而不必重启 bridge。
+ */
+function currentUpstreamForChannel() {
+  void refreshUpstream("微信事件通道重连");
+  return UPSTREAM;
+}
+
 function startWeChat() {
   if (WECHAT_DISABLED) {
     console.log("[bridge] 微信通道已禁用(DSH_WECHAT=0)");
@@ -1578,10 +1669,15 @@ function startWeChat() {
     const cfg = loadLocalConfig();
     wechatRuntime = createWeChatRuntime({
       relayDir,
-      // 上游地址在 runTunnel() 开头已完成动态发现（见 refreshUpstream），所以这里拿到的是真实端口。
-      // ⚠️ 这是**取值**而非引用：运行中若上游端口又变了（自愈重发现），微信通道要等 bridge 重启才跟上；
-      //    隧道转发那一侧不受影响（它每次都读最新的 UPSTREAM）。
-      upstream: UPSTREAM,
+      // 传**取值器**而不是当次的值（0.7.0-beta.2 修复）。
+      //
+      // 【2026-10-09 真机事故】这里以前传的是 `UPSTREAM` 这个**当次快照**：bridge 起来时宿主还在
+      //   3080，随后宿主换了端口（Desktop 每次启动随机），隧道转发侧因为每次读最新 UPSTREAM 而
+      //   一切正常，**唯独微信事件通道抱着 3080 死循环重连** —— 现象极具迷惑性：手机能开页面、
+      //   bridge-status 显示 online，但任务跑完**一条推送都没有**，日志里只有刷屏的
+      //   `connect ECONNREFUSED 127.0.0.1:3080`。
+      // 现在取值器每次重连都会重新求值，并在打到死端口时主动触发一次上游重发现。
+      upstream: () => currentUpstreamForChannel(),
       cookieOf: harnessCookieOf,
       secret: process.env.DSH_BRIDGE_SECRET || (typeof cfg.bridge_secret === "string" ? cfg.bridge_secret : ""),
       // 免费/付费分层:档位来自账号的生效套餐,App 链接是免费用户越界时的转化入口。

@@ -457,6 +457,17 @@ class EventSubscriber extends EventEmitter {
    */
   #cursors = new Map();
 
+  /**
+   * 上一次**连接尝试**用的上游 URL（不是"成功"的那一次）。
+   *
+   * 为什么记"尝试"而不是"成功"：上游端口从 A 换到 B 时，第一轮打 B 必然是失败的
+   * （B 还没起来），若只在成功后才更新，就会每轮都判成"目标变了"而重置退避 ——
+   * 退避彻底失效、变成猛敲 B。记"上次尝试过的目标"才能做到**同一个目标只重置一次**。
+   */
+  #lastConnectUrl = null;
+  /** 上一次成功求值到的上游（getter 抛错/返回空时的回退，保证不会去打空地址）。 */
+  #lastGoodUpstream = null;
+
   #seq = 0;
   #lastFrameAt = 0;
   #authStatus = null;
@@ -465,11 +476,19 @@ class EventSubscriber extends EventEmitter {
 
   constructor(options = {}) {
     super();
-    if (typeof options.upstream !== "string" || options.upstream.trim() === "") {
+    const upstreamGiven = typeof options.upstream === "function"
+      ? true
+      : typeof options.upstream === "string" && options.upstream.trim() !== "";
+    if (!upstreamGiven) {
       throw new TypeError("dsh-events: options.upstream is required (e.g. http://127.0.0.1:3080)");
     }
+    // upstream 允许是**函数**（每次连接时求值）：宿主端口会变（`dsh web --port 0`、
+    // DSH Desktop 每次启动随机端口），写死字符串的话端口一变，本订阅器就会永久打旧端口。
+    const upstreamGetter = typeof options.upstream === "function"
+      ? options.upstream
+      : () => options.upstream;
     this.#opts = {
-      upstream: options.upstream.replace(/\/+$/, ""),
+      upstreamGetter,
       cookie: options.cookie ?? "",
       muxPath: options.muxPath ?? MUX_PATH,
       /** HTTP 路由（默认 `/api/$events/result`）。 */
@@ -631,8 +650,27 @@ class EventSubscriber extends EventEmitter {
     }
   }
 
-  #muxUrl() {
-    const url = new URL(this.#opts.upstream);
+  /**
+   * 当前上游地址（**每次调用都重新求值**，见构造函数里 upstream 可为函数的说明）。
+   *
+   * 求值失败（函数抛错 / 返回空 / 不是合法 URL）时回退到上一次成功用过的地址，
+   * 保证"取不到新地址"永远不会变成"打一个空 URL"。真的没得回退时返回空串，
+   * 由 `#connect()` 如实报错，而不是静默重连到垃圾地址。
+   */
+  #upstream() {
+    let raw;
+    try {
+      raw = this.#opts.upstreamGetter();
+    } catch (error) {
+      this.#log("warn", "upstream getter threw", { error: String(error) });
+      return this.#lastGoodUpstream ?? "";
+    }
+    const value = typeof raw === "string" ? raw.replace(/\/+$/, "") : "";
+    return value || this.#lastGoodUpstream || "";
+  }
+
+  #muxUrl(upstream) {
+    const url = new URL(upstream);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     url.pathname = this.#opts.muxPath;
     url.search = "";
@@ -643,16 +681,35 @@ class EventSubscriber extends EventEmitter {
   #connect() {
     if (this.#closed) return;
     this.#state = "connecting";
+    const upstream = this.#upstream();
+    if (upstream === "") {
+      this.#state = "auth-failed";
+      this.#emitAuthError(0, "upstream 不可用（取不到宿主地址）", "ws");
+      return;
+    }
+    // 目标变了 = 宿主换了端口（Desktop 每次启动随机 / `dsh web` 重启到新端口）。
+    // 把退避重置，否则旧目标上累积的长退避会让"换了端口反而更慢连上"（最长要等满 maxMs）。
+    if (upstream !== this.#lastConnectUrl) {
+      if (this.#lastConnectUrl !== null) {
+        this.#log("info", `上游切换 ${this.#lastConnectUrl} → ${upstream}，重连退避已重置`, {
+          from: this.#lastConnectUrl,
+          to: upstream,
+        });
+      }
+      this.#lastConnectUrl = upstream;
+      this.#attempt = 0;
+    }
+    this.#lastGoodUpstream = upstream;
     let url;
     try {
-      url = this.#muxUrl();
+      url = this.#muxUrl(upstream);
     } catch (error) {
       this.#state = "auth-failed";
       this.#emitAuthError(0, `upstream 不是合法 URL: ${String(error)}`, "ws");
       return;
     }
     // Host 显式写成上游 authority（loopback 围栏），Cookie 复用 bridge 已持有的浏览器会话。
-    const headers = { Host: new URL(this.#opts.upstream).host };
+    const headers = { Host: new URL(upstream).host };
     const cookie = this.#cookieValue();
     if (cookie !== "") headers.Cookie = cookie;
 
@@ -1411,7 +1468,8 @@ class EventSubscriber extends EventEmitter {
   async #rpc(method, args, eventId) {
     const rpcId = randomUUID();
     const envelope = { type: "client-request", rpcId, method, payload: { args } };
-    const url = `${this.#opts.upstream}${API_CHANNEL}/${method}`;
+    // 回执/RPC 也走**当前**上游（端口变了就跟着走），不是一个启动时固化的字符串。
+    const url = `${this.#upstream()}${API_CHANNEL}/${method}`;
 
     const timeoutMs = Number(this.#opts.rpcTimeoutMs);
     const budgeted = Number.isFinite(timeoutMs) && timeoutMs > 0;
@@ -1984,7 +2042,7 @@ export function classifyTurnEnd(sessionId, event, at) {
 /**
  * 创建一个订阅器。
  * @param {{
- *   upstream: string,
+ *   upstream: string|(() => string),  // 函数 = 每次连接/每次 RPC 重新求值（宿主端口会变）
  *   cookie?: string|(() => string),
  *   muxPath?: string,
  *   resultPath?: string,

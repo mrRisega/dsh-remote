@@ -35,17 +35,27 @@ const SETUP_SRC = readFileSync(path.join(HERE, "..", "..", "..", "dsh-setup.mjs"
 /**
  * 以给定的宿主形态构造一个真实的 spawnEnv 并调用它。
  * 切片只含 spawnEnv 函数体，故它引用的模块级常量/工具必须显式注入。
+ *
+ * ⚠️ 必须注入 **process 桩**（2026-10-09）：`spawnEnv` 的第一件事是 `...process.env`，
+ *   而这个套件**是在 DSH 宿主里跑的** —— 从桌面端应用内跑 `npm run test:plugin` 时，
+ *   环境里天然带着 `ELECTRON_RUN_AS_NODE=1`（那正是"宿主是 Electron"的标志）。
+ *   于是"Web 版绝不得注入这个变量"那条断言会读到**宿主自己的**变量而必红 ——
+ *   可被测代码其实一个字节都没往 env 里加。注入干净环境后，这条用例检验的才是插件的行为
+ *   （而不是"运行测试的这台机器是不是桌面端"）。
+ *
  * @param {object} selfNodeEnv 该宿主形态下 SELF_NODE_ENV 的值
  * @param {object} [extra] 调用方业务变量
+ * @param {object} [sourceEnv] 宿主进程环境（默认干净：只含 PATH）
  */
-function makeSpawnEnv(selfNodeEnv, extra) {
+function makeSpawnEnv(selfNodeEnv, extra, sourceEnv) {
   const start = INDEX_SRC.indexOf("function spawnEnv(extra)");
   const end = INDEX_SRC.indexOf("function safeSpawn(");
   assert.ok(start > 0 && end > start, "切片锚点失效：spawnEnv / safeSpawn 结构变了");
   const src = INDEX_SRC.slice(start, end);
-  const make = new Function("SELF_NODE_ENV", "isWindows", "delimiter", "dirname",
+  const make = new Function("SELF_NODE_ENV", "isWindows", "delimiter", "dirname", "process", "path",
     `${src}\nreturn spawnEnv;`);
-  return make(selfNodeEnv, () => false, path.delimiter, path.dirname)(extra);
+  const processStub = { env: sourceEnv ?? { PATH: "/usr/bin:/bin" }, execPath: "/usr/bin/node" };
+  return make(selfNodeEnv, () => false, path.posix.delimiter, path.posix.dirname, processStub, path.posix)(extra);
 }
 
 test("桌面端：Electron 宿主下 spawnEnv 必须注入 ELECTRON_RUN_AS_NODE=1", () => {
@@ -58,6 +68,19 @@ test("Web 版（真实 node）：绝不得注入 ELECTRON_RUN_AS_NODE（不能�
   const env = makeSpawnEnv({});
   assert.ok(!("ELECTRON_RUN_AS_NODE" in env),
     "非 Electron 宿主下注入该变量会污染子进程环境、并让 node 版本探测类工具困惑");
+});
+
+test("Web 版：宿主环境**已经带着** ELECTRON_RUN_AS_NODE 时，最终 env 与宿主逐键一致（插件没加料）", () => {
+  // 这条是上面那条的补充（2026-10-09）：上面那条断言"结果里没有这个键"，在 Electron 宿主里
+  // 跑测试时**天然不成立**（键来自宿主 process.env）。真正的判据是"插件有没有往 env 里加料"，
+  // 故这里显式把宿主环境造成带这个变量，验证：最终 env **逐键等于宿主环境 + PATH 调整**，
+  // 一个多余的键都没有（`{}` 展开是恒等）。这样这条用例在任何宿主里都恒真且有意义。
+  const hostEnv = { PATH: "/usr/bin:/bin", ELECTRON_RUN_AS_NODE: "1", HOME: "/Users/tester" };
+  const env = makeSpawnEnv({}, undefined, hostEnv);
+  const expectedPath = ["/usr/bin", "/usr/bin:/bin", "/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"].join(":");
+  assert.deepEqual(env, { ...hostEnv, PATH: expectedPath },
+    "除 PATH 外不得新增/删除/改动任何键（否则就是插件在污染子进程环境）");
+  assert.equal(env.ELECTRON_RUN_AS_NODE, "1", "宿主自己的值原样透传，不算插件注入");
 });
 
 test("spawnEnv：NODE_INTERPRETER 变量不得挤掉调用方的业务变量，PATH 仍按平台分隔符拼接", () => {
@@ -153,15 +176,25 @@ test("桌面端：面板文案改为引导'退出并重开应用'，且不影响
 
 // ─────────────── ④ 安装：--profile desktop 必须真的生效 ───────────────
 
-/** 用安装器切片构造真实的 resolveProfileDir（注入 os / path，伪造 HOME）。 */
+/**
+ * 用安装器切片构造真实的 resolveProfileDir（注入 os / path / process，伪造 HOME 与空环境）。
+ *
+ * ⚠️ 必须注入 **process 桩**（2026-10-09）：`resolveProfileDir` 的第二来源是
+ *   `process.env.DSH_PROFILE_DIR`，而这个测试套件**是在 DSH 宿主里跑的** ——
+ *   从桌面端应用内跑 `npm run test:plugin` 时，环境里天然带着
+ *   `DSH_PROFILE_DIR=/Users/<me>/.dsh/profiles/desktop`，于是"缺省仍是 Web 版"那条断言
+ *   会读到真实 HOME 下的 desktop，**在任何装了桌面端的机器上必红**（假红，且指向错误结论）。
+ *   注空环境 = 这条用例从此只验证被测逻辑，不受宿主环境影响。
+ */
 function makeResolveProfileDir(home) {
   const start = SETUP_SRC.indexOf("const KNOWN_PROFILE_NAMES");
   const end = SETUP_SRC.indexOf("function warnIfDesktopProfile");
   assert.ok(start > 0 && end > start, "切片锚点失效：profile 解析函数结构变了");
   const src = SETUP_SRC.slice(start, end);
   const osStub = { homedir: () => home };
-  const make = new Function("os", "path", `${src}\nreturn { resolveProfileDir, profileArgvOf, isDesktopProfileDir, profileDirOfName };`);
-  return make(osStub, path);
+  const processStub = { env: {} };
+  const make = new Function("os", "path", "process", `${src}\nreturn { resolveProfileDir, profileArgvOf, isDesktopProfileDir, profileDirOfName };`);
+  return make(osStub, path, processStub);
 }
 
 test("安装器：--profile desktop 解析到桌面端 profile 目录，不再是相对路径/被忽略", () => {

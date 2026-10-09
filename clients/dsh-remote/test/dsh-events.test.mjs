@@ -2085,3 +2085,91 @@ test("★ 一次 follow 失败不该把这条会话**永久**钉死：下一轮 
     await api.close();
   }
 });
+
+// ============================================================
+// 上游是**函数**：宿主换端口要能自己跟上（2026-10-09 真机事故回归）
+// ============================================================
+
+/**
+ * 【事故原貌】bridge 起来时宿主在 3080，随后宿主换端口（DSH Desktop 每次启动都是随机端口）。
+ * 隧道转发侧每次都读最新 UPSTREAM，所以一切正常；**唯独事件订阅器抱着启动那一刻的字符串**，
+ * 于是永久 `connect ECONNREFUSED 127.0.0.1:3080` —— 手机能开页面、面板显示 online，
+ * 但任务跑完**一条微信推送都没有**。迷惑性极强，最后靠 bridge 日志里刷屏的那一行才定位。
+ *
+ * 修法：`upstream` 允许传函数，每次连接/RPC 重新求值。这条用例就是那件事的锁。
+ */
+test("★ 事故锁：upstream 传函数时，宿主换端口后订阅器必须自己跟过去（不得永久打旧端口）", async () => {
+  const a = await startFakeDsh();
+  const b = await startFakeDsh();
+  let current = a.base;
+  const logs = [];
+  const sub = createEventSubscriber({
+    upstream: () => current,
+    cookie: () => a.cookie,
+    followSettleMs: 20,
+    reconnect: { minMs: 15, maxMs: 40, factor: 1, jitter: 0 },
+    log: (level, message) => logs.push(`${level}:${message}`),
+  });
+  try {
+    const first = await start(sub);
+    assert.ok(first.clientId, "先连上 A（模拟宿主最初的端口）");
+
+    // 宿主换端口：A 下线、B 上线，取值器开始返回 B。
+    await a.close();
+    current = b.base;
+
+    const second = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("换端口后没能自行连上 B（会永久打旧端口）")), 3_000);
+      timer.unref?.();
+      sub.on("ready", (info) => {
+        clearTimeout(timer);
+        resolve(info);
+      });
+    });
+    assert.ok(second.clientId, "必须自己连上 B 并拿到新的 clientId");
+    // clientId 是**每个服务端各自从 client-1 开始编号**的，不能拿它证明"换了连接"；
+    // 真正的证据是：B（新端口）确实收到了这条 mux 连接。
+    assert.equal(b.state.connections.length, 1, "新上游 B 必须真的收到了连接");
+    assert.ok(
+      logs.some((l) => l.includes("上游切换") && l.includes(b.base)),
+      `切换上游时必须留下可排查的日志（实际：${JSON.stringify(logs)}）`,
+    );
+  } finally {
+    sub.close();
+    await a.close().catch(() => {});
+    await b.close();
+  }
+});
+
+test("upstream 传函数但取值器抛错/返回空：绝不退化成打空地址（回退上一次可用地址）", async () => {
+  const a = await startFakeDsh();
+  let mode = "ok";
+  const logs = [];
+  const sub = createEventSubscriber({
+    upstream: () => {
+      if (mode === "throw") throw new Error("取值器炸了");
+      if (mode === "empty") return "";
+      return a.base;
+    },
+    cookie: () => a.cookie,
+    followSettleMs: 20,
+    reconnect: { minMs: 15, maxMs: 40, factor: 1, jitter: 0 },
+    log: (level, message) => logs.push(`${level}:${message}`),
+  });
+  try {
+    await start(sub);
+    mode = "empty";
+    // 断掉当前连接以触发一次退避重连：必须仍然打到 A（回退上次可用地址），而不是某个空 URL。
+    const before = a.state.connections.length;
+    a.currentConn().ws.terminate();
+    await waitFor(() => a.state.connections.length > before, { label: "退避重连（回退上次可用地址）" });
+    mode = "throw";
+    const before2 = a.state.connections.length;
+    a.currentConn().ws.terminate();
+    await waitFor(() => a.state.connections.length > before2, { label: "取值器抛错后仍能重连" });
+    assert.ok(!logs.some((l) => l.includes("upstream 不可用")), "有可回退的地址时不该报『upstream 不可用』");
+  } finally {
+    sub.close();
+    await a.close();
+  }
+});
