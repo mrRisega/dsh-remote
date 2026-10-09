@@ -9,6 +9,10 @@
 //       ① 官方「设置」→「远程访问」栏目（settings.section，位于「Agent 预设」下方，官方扩展点）；
 //       ② 左侧官方「设置」按钮旁注入独立「📱 远程访问」快捷按钮（id=dru-nav-remote，非 clone，
 //          插在其前方、同布局不覆盖官方按钮；点击直达该栏目，首次带引导红点）
+//          ⚠️ 只认**语义锚点**（`button[aria-haspopup="dialog"]`，且必须在设置弹层之外）：
+//             0.2 桌面端的设置面板本身就是 role="dialog" 的弹层，它的栏目也叫「通用设置」，
+//             旧代码用「文本包含『设置』」去找锚点 → 按钮被塞进设置面板栏目列表最上面（业主反馈的
+//             「植入错了地方」）。现在找不到锚点就**不注入**，绝不将就一个错误的落点。
 //   - 栏目内联渲染配置面板（浅色高对比 UI，遵循主流登录体验）
 //     · 登录态：已登录显示账号 + 退出登录；未登录显示 登录/注册 tabs
 //     · 🔒 修改密码（账号卡）：已登录账号经 图形验证码+短信验证码 重置（/dsh-remote/password/reset 代理）；
@@ -792,35 +796,87 @@ window.__ModuleLoader__.load({
         return !!el.closest('[role="navigation"], nav, [class*="sidebar" i], [class*="sidenav" i], [class*="appnav" i], [class*="navRail" i]');
       } catch (e) { return false; }
     }
-    function pickNavByToken(token) {
+    /**
+     * 是否位于「设置」弹层内部。
+     *
+     * 🔴 这一条是 2026-10-09 桌面端事故的根治点。官方设置面板本身就是一个
+     * `role="dialog" aria-modal="true"` 的弹层（0.2 实测，见 ui-settings-general 的 SettingsRoot），
+     * 它的左侧栏目同样长得像「导航」（`nav` + `navCell`），于是会被 navCellLike 命中。
+     * 旧代码用「文本包含『设置』」去找侧栏那颗齿轮按钮 —— 而弹层里的第一项叫
+     * **「通用设置」**，`indexOf("设置") !== -1` 直接命中，注入按钮就被塞进了
+     * 设置面板的栏目列表最上面（用户反馈的「植入错了地方」）。
+     */
+    function navInDialog(el) {
+      try { return !!el.closest('[role="dialog"], [aria-modal="true"]'); } catch (e) { return false; }
+    }
+    /**
+     * 官方「设置」触发器（侧栏那颗齿轮按钮）—— **只认语义锚点**。
+     *
+     * 两个版本（Web 0.1.x / 桌面端 0.2）的触发器都是同一个形状（各自实测源码一致）：
+     *   `<button aria-label="设置" aria-haspopup="dialog" aria-expanded=…>`，外层 `…triggerRow`。
+     * `aria-haspopup="dialog"` 是**语言无关**的语义标记，比匹配文案稳（换语言/换文案都不失效）。
+     * 找不到就**不注入** —— 宁可不显示快捷入口，也绝不把按钮塞到别人家的面板里。
+     */
+    function pickSettingsTrigger() {
+      try {
+        var cands = document.querySelectorAll('button[aria-haspopup="dialog"], [aria-haspopup="dialog"]');
+        for (var i = 0; i < cands.length; i++) {
+          var el = cands[i];
+          if (!el || el.id === NAV_ENTRY_ID) continue;   // 排除注入按钮自身
+          if (navInDialog(el)) continue;                 // 弹层里的（含面板内的关闭/栏目）一律不要
+          if (!navCellLike(el)) continue;
+          if (NAV_BAD_RE.test(String(el.className || ""))) continue;
+          return el;
+        }
+      } catch (e) { /* 忽略 */ }
+      // 兜底：严格等值匹配（**不做子串匹配**，否则又会命中「通用设置」）；且必须在弹层外
+      return pickNavByToken("设置", { exactOnly: true, insideDialog: false });
+    }
+    /**
+     * 按文案/aria-label 找导航项。
+     * @param {string} token 目标文案（如「远程访问」「设置」）
+     * @param {{exactOnly?:boolean, insideDialog?:boolean}} [opts]
+     *   exactOnly=true 只接受完全相等；insideDialog 限定是否必须在设置弹层内。
+     *   无论哪种模式：**精确相等优先于子串**（老代码只要子串命中就返回，误伤面很大）。
+     */
+    function pickNavByToken(token, opts) {
+      var exactOnly = !!(opts && opts.exactOnly);
+      var insideDialog = opts ? opts.insideDialog : undefined;
       try {
         var els = document.querySelectorAll("button, [role='tab'], [role='menuitem'], [role='button'], a, [aria-label]");
+        var loose = null;
         for (var i = 0; i < els.length; i++) {
           var el = els[i];
           if (!el || el.id === NAV_ENTRY_ID) continue; // 排除注入按钮自身(防递归)
           if (!navCellLike(el)) continue;
           if (NAV_BAD_RE.test(String(el.className || ""))) continue;
+          var inDlg = navInDialog(el);
+          if (insideDialog === true && !inDlg) continue;
+          if (insideDialog === false && inDlg) continue;
           var t = navCleanText(el);
-          if (t && !/\r|\n/.test(t) && t.length <= NAV_TEXT_MAX &&
-              (t === token || t.indexOf(token) === 0 || t.indexOf(token) !== -1)) return el;
           var at = navAttrOf(el);
-          if (at && (at === token || at.indexOf(token) === 0)) return el;
+          var textOK = !!(t && !/\r|\n/.test(t) && t.length <= NAV_TEXT_MAX);
+          if ((textOK && t === token) || (at && at === token)) return el;              // 精确命中：立即返回
+          if (!loose && ((textOK && t.indexOf(token) !== -1) || (at && at.indexOf(token) === 0))) loose = el;
         }
+        return exactOnly ? null : loose;
       } catch (e) { /* 忽略 */ }
       return null;
     }
     /** 打开「远程访问」设置栏目：栏目已渲染直接点；否则先点官方「设置」再 ≤3s 轮询补点。 */
     function openRemoteSettings() {
       try {
-        var cell = pickNavByToken("远程访问");
+        // 栏目项在设置弹层内 → 这里**允许**弹层内匹配（insideDialog: true）；
+        // 精确相等优先，避免命中「通用设置」这类含「设置」的邻居。
+        var cell = pickNavByToken("远程访问", { insideDialog: true });
         if (cell) { cell.click(); return; }
-        var st = pickNavByToken("设置");
+        var st = pickSettingsTrigger();   // 侧栏那颗齿轮（语义锚点，绝不落进弹层）
         if (!st) return;
         st.click();
         var tries = 0;
         var iv = setInterval(function () {
           tries++;
-          var c2 = pickNavByToken("远程访问");
+          var c2 = pickNavByToken("远程访问", { insideDialog: true });
           if (c2) { clearInterval(iv); c2.click(); }
           else if (tries >= NAV_POLL_MAX) clearInterval(iv);
         }, 150);
@@ -830,6 +886,9 @@ window.__ModuleLoader__.load({
     function mountNavEntry(host) {
       try {
         if (document.getElementById(NAV_ENTRY_ID)) return;
+        // 最后一道防线：无论调用方怎么找的，**绝不**把入口塞进设置弹层内部
+        // （2026-10-09 桌面端事故：按钮出现在设置面板栏目列表最上面）。
+        if (navInDialog(host)) return;
         var wrap = host && host.parentNode;
         if (!wrap || !wrap.insertBefore || !wrap.contains) return;
         var btn = document.createElement("button");
@@ -871,7 +930,7 @@ window.__ModuleLoader__.load({
       var iv = setInterval(function () {
         try {
           if (document.getElementById(NAV_ENTRY_ID)) return; // 已注入
-          var host = pickNavByToken("设置");
+          var host = pickSettingsTrigger();   // 只认 aria-haspopup="dialog" 的官方「设置」触发器
           if (host) mountNavEntry(host);
         } catch (e) { /* 忽略 */ }
       }, 2000);
