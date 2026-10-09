@@ -362,9 +362,13 @@ const SERVICE_PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/
  * 插件市场那条路径由插件半自愈补装：插件 spawn 本安装器时显式传入
  * DSH_BRIDGE_INSTALL_SOURCE=plugin_market，这里原样透传（外部注入 > 硬编码默认）。
  * install_version：优先取外部注入（插件/在线更新器），否则取本包 package.json 版本。
+ * harness_version：**只能由外部注入** —— 宿主（DeepSeek Harness）版本要从宿主进程的 argv /
+ *   安装目录推出来，而安装器是独立进程，推不出来。插件会在宿主进程内问出来再传进来；
+ *   用户直接跑 `npx @mrrisega/dsh-remote` 时没有这个值 → 留空（= 未上报，绝不猜一个错的）。
  */
 const INSTALL_SOURCE = String(process.env.DSH_BRIDGE_INSTALL_SOURCE || "").trim() || "npx";
 const INSTALL_VERSION = String(process.env.DSH_BRIDGE_INSTALL_VERSION || "").trim() || pkgVersion();
+const HARNESS_VERSION = String(process.env.DSH_BRIDGE_HARNESS_VERSION || "").trim();
 
 /**
  * 把文件权限收紧到「只有本人可读写」。
@@ -708,7 +712,7 @@ function writeAutostartFile() {
   <key>LimitLoadToSessionType</key><array><string>Aqua</string><string>Background</string></array>
   <key>StandardOutPath</key><string>${path.join(CONFIG_DIR, ".dsh-bridge.log")}</string>
   <key>StandardErrorPath</key><string>${path.join(CONFIG_DIR, ".dsh-bridge.log")}</string>
-  <key>EnvironmentVariables</key><dict><key>PATH</key><string>${SERVICE_PATH}</string>${SERVICE_NODE_ENV_PLIST}<key>DSH_BRIDGE_INSTALL_SOURCE</key><string>${INSTALL_SOURCE}</string><key>DSH_BRIDGE_INSTALL_VERSION</key><string>${INSTALL_VERSION}</string></dict>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>${SERVICE_PATH}</string>${SERVICE_NODE_ENV_PLIST}<key>DSH_BRIDGE_INSTALL_SOURCE</key><string>${INSTALL_SOURCE}</string><key>DSH_BRIDGE_INSTALL_VERSION</key><string>${INSTALL_VERSION}</string><key>DSH_BRIDGE_HARNESS_VERSION</key><string>${HARNESS_VERSION}</string></dict>
 </dict></plist>`;
     // ~/Library/LaunchAgents 在全新账户/精简系统上可能不存在,必须先建目录,
     // 否则 writeFileSync 抛 ENOENT 直接把安装流程打断(用户反馈里也踩过类似的路径问题)。
@@ -724,7 +728,7 @@ function writeAutostartFile() {
   if (process.platform === "linux") {
     const dir = path.join(os.homedir(), ".config/systemd/user");
     fs.mkdirSync(dir, { recursive: true });
-    const unit = `[Unit]\nDescription=dsh-remote bridge (auto-starts with dsh web)\n\n[Service]\nExecStart=${runCmd}\nRestart=on-failure\nRestartSec=5\nEnvironment=PATH=${SERVICE_PATH}\n${SERVICE_NODE_ENV_UNIT}Environment=DSH_BRIDGE_INSTALL_SOURCE=${INSTALL_SOURCE}\nEnvironment=DSH_BRIDGE_INSTALL_VERSION=${INSTALL_VERSION}\n\n[Install]\nWantedBy=default.target\n`;
+    const unit = `[Unit]\nDescription=dsh-remote bridge (auto-starts with dsh web)\n\n[Service]\nExecStart=${runCmd}\nRestart=on-failure\nRestartSec=5\nEnvironment=PATH=${SERVICE_PATH}\n${SERVICE_NODE_ENV_UNIT}Environment=DSH_BRIDGE_INSTALL_SOURCE=${INSTALL_SOURCE}\nEnvironment=DSH_BRIDGE_INSTALL_VERSION=${INSTALL_VERSION}\nEnvironment=DSH_BRIDGE_HARNESS_VERSION=${HARNESS_VERSION}\n\n[Install]\nWantedBy=default.target\n`;
     const unitPath = autostartFilePath();
     fs.writeFileSync(unitPath, unit);
     return unitPath; // 路径在最终汇总里统一展示
@@ -1505,6 +1509,8 @@ async function runBridge() {
         // 安装口径透传给 bridge（bridge 把它随设备登记请求一起上报给账号 API）
         DSH_BRIDGE_INSTALL_SOURCE: INSTALL_SOURCE,
         DSH_BRIDGE_INSTALL_VERSION: INSTALL_VERSION,
+        // 宿主版本：外部注入（插件在宿主进程内问出来的），安装器只是搬运工；没有就是空串
+        DSH_BRIDGE_HARNESS_VERSION: HARNESS_VERSION,
         ...(saas ? { DSH_BRIDGE_PHONE: (cfg.phone || cfg.email || ""), DSH_BRIDGE_PASSWORD: cfg.password, DSH_BRIDGE_API: apiUrl, DSH_BRIDGE_SECRET: cfg.bridge_secret || "" } : {}),
         ...(local ? { DSH_BRIDGE_LOCAL_KEY: cfg.local_key } : {})
       };

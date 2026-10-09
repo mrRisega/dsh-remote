@@ -254,8 +254,25 @@ function resolveInstallVersion() {
     return JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8")).version || "";
   } catch { return ""; }
 }
+/**
+ * 宿主（DeepSeek Harness）版本：**由插件注入**，bridge 自己算不出来。
+ *
+ * 为什么必须是注入：宿主版本要从"宿主进程的 argv / 安装目录"推出来，而 bridge 是插件
+ * **另外拉起的独立进程**（脱离宿主，见 dsh-setup.mjs 的守护），它的 argv 与宿主毫无关系。
+ * 插件跑在宿主进程内，能拿到真实版本（见 packages/dsh-remote-web/lib/index.js 的
+ * harnessVersion()），所以由它经 DSH_BRIDGE_HARNESS_VERSION 传下来。
+ *
+ * 与 INSTALL_VERSION 的区别（曾经把这两个数混为一谈，导致版本问题答不出来）：
+ *   install_version = **本插件**的版本（用户装的 dsh-remote-web 是哪个版本）
+ *   harness_version = **宿主**的版本（用户跑的 DeepSeek Harness 是哪个版本）
+ * 只知其一都定位不了"是不是宿主升级导致的兼容性故障"。
+ */
+function resolveHarnessVersion() {
+  return String(process.env.DSH_BRIDGE_HARNESS_VERSION || "").trim();
+}
 const INSTALL_SOURCE = resolveInstallSource();
 const INSTALL_VERSION = resolveInstallVersion();
+const HARNESS_VERSION = resolveHarnessVersion();
 
 // ---------- 稳定设备身份(.dsh-config.json) ----------
 
@@ -1399,6 +1416,9 @@ async function registerDeviceInAccount(token) {
         //   install_source: npx(安装器注入) | plugin_market(插件拉起/自愈,默认) | unknown(白名单外)
         install_source: INSTALL_SOURCE,
         install_version: INSTALL_VERSION,
+        // v15 宿主版本(由插件注入;老插件不注入 → 空串 = 未上报)。服务端 devices.harness_version。
+        // 与 install_version 是两个不同的数:前者是"插件版本",这个是"DeepSeek Harness 版本"。
+        harness_version: HARNESS_VERSION,
         host_os: process.platform,
         host_arch: process.arch
       })

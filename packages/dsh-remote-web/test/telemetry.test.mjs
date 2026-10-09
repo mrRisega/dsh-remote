@@ -414,6 +414,44 @@ const m = await import(${JSON.stringify(INDEX_URL)});
 console.log(JSON.stringify(m.__telemetryInternals.eventOf("plugin_loaded")));
 `;
 
+test("★ 宿主版本（桌面端 0.2 真机形态）：argv[1] 是开关时，仍能从 argv 里的宿主根取到版本", async () => {
+  // 真机实测（DeepSeek Harness 0.2，Electron）宿主进程 argv：
+  //   [0] …/MacOS/DeepSeek Harness
+  //   [1] --expose-internals                                  ← 开关，不是路径
+  //   [2] …/app.asar/dsh/node_modules/@deepseek-ai/dsh-desktop-host/lib/index.js
+  //   [3] …/app.asar/dsh                                      ← 宿主根（含 node_modules/@deepseek-ai/dsh）
+  // 旧实现只看 argv[1] → 桌面端**必然**取不到版本（这正是生产反馈里答不出宿主版本的原因）。
+  const root = await mkdtemp(path.join(os.tmpdir(), "dsh-harness-desktop-"));
+  try {
+    const hostRoot = path.join(root, "app.asar", "dsh");
+    await fakeHarness(path.join(hostRoot, "node_modules", "@deepseek-ai", "dsh"), { version: "0.2.0-rc.2" });
+    assert.equal(TELEMETRY.harnessVersionFromRoot(hostRoot), "0.2.0-rc.2", "宿主根里应能读到 @deepseek-ai/dsh 的版本");
+
+    const argv = [
+      "/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness",
+      "--expose-internals",
+      path.join(hostRoot, "node_modules", "@deepseek-ai", "dsh-desktop-host", "lib", "index.js"),
+      hostRoot,
+      path.join(root, "profiles", "desktop"),
+    ];
+    assert.equal(TELEMETRY.harnessVersionFromArgv(argv), "0.2.0-rc.2", "★桌面端 argv 必须能解析出宿主版本");
+
+    // 开关/相对路径绝不能被当成路径去 realpath（否则抛错或被当成"未知"掩盖真实问题）
+    assert.equal(TELEMETRY.harnessVersionFromArgv(["--expose-internals", "-x"]), "", "全是开关 → 空串");
+    assert.equal(TELEMETRY.harnessVersionFromArgv(["relative/path", ""]), "", "非绝对路径 → 空串");
+    assert.equal(TELEMETRY.harnessVersionFromArgv([]), "", "空 argv → 空串");
+    assert.equal(TELEMETRY.harnessVersionFromArgv(undefined), "", "undefined → 空串（绝不抛）");
+    // 不是 DSH 的宿主根（有 package.json 但名字不对）→ 空串，绝不猜
+    const otherRoot = path.join(root, "other-root");
+    await fakeHarness(path.join(otherRoot, "node_modules", "@deepseek-ai", "dsh"), { name: "not-dsh", version: "1.0.0" });
+    assert.equal(TELEMETRY.harnessVersionFromRoot(otherRoot), "", "名字不是 @deepseek-ai/dsh → 空串");
+    // Web 版形态仍然照旧可用（argv[1] 是 DSH 主模块）
+    const webEntry = await fakeHarness(path.join(root, "web", "node_modules", "@deepseek-ai", "dsh"), { version: "0.1.5-rc.2" });
+    assert.equal(TELEMETRY.harnessVersionFromArgv([webEntry]), "0.1.5-rc.2", "Web 版（argv[1]=主模块）路径不得被改坏");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+
 test("宿主版本：运行时从主模块解析（argv[1] → 上一级 package.json）；未知一律空串且不抛", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "dsh-harness-"));
   try {

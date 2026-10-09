@@ -21,7 +21,7 @@
 //
 // 不依赖任何第三方包：只使用 node 内置模块与 cordis 注入的 webServer 服务。
 import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync, accessSync, chmodSync, openSync, closeSync, readSync, fstatSync, rmSync, renameSync, statSync, copyFileSync, cpSync, constants as fsConstants } from "node:fs";
-import { join, dirname, sep, delimiter } from "node:path";
+import { join, dirname, sep, delimiter, isAbsolute } from "node:path";
 import { execSync, spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
@@ -1075,6 +1075,7 @@ Environment=PATH=${SERVICE_PATH}
 ${SERVICE_NODE_ENV_UNIT}Environment=DSH_BRIDGE_UPSTREAM=${upstreamUrl()}
 Environment=DSH_BRIDGE_INSTALL_SOURCE=${installSourceOf(relayDir)}
 Environment=DSH_BRIDGE_INSTALL_VERSION=${PLUGIN_VERSION}
+Environment=DSH_BRIDGE_HARNESS_VERSION=${harnessVersion()}
 
 [Install]
 WantedBy=default.target
@@ -1557,7 +1558,8 @@ function ensureRuntime(relayDir) {
       windowsHide: true,
       // DSH_BRIDGE_INSTALL_SOURCE：本机运行环境是插件自愈补的 → 安装器原样透传到 plist/bridge env，
       // 于是设备行上的 install_source 如实记成 plugin_market（而不是安装器默认的 npx）。
-      env: spawnEnv({ npm_config_registry: "https://registry.npmjs.org", DSH_BRIDGE_INSTALL_SOURCE: "plugin_market" }),
+      // DSH_BRIDGE_HARNESS_VERSION 同理：安装器会把它写进 plist；不给的话，桥重启后就丢了宿主版本。
+      env: spawnEnv({ npm_config_registry: "https://registry.npmjs.org", DSH_BRIDGE_INSTALL_SOURCE: "plugin_market", DSH_BRIDGE_HARNESS_VERSION: harnessVersion() }),
       stdio: ["ignore", openSync(log, "a"), openSync(log, "a")],
       onError: (e) => failSpawn(e, npx.kind),
     });
@@ -1653,7 +1655,7 @@ function writeAutostartFile(relayDir) {
   <key>LimitLoadToSessionType</key><array><string>Aqua</string><string>Background</string></array>
   <key>StandardOutPath</key><string>${join(relayDir, ".dsh-bridge.log")}</string>
   <key>StandardErrorPath</key><string>${join(relayDir, ".dsh-bridge.log")}</string>
-  <key>EnvironmentVariables</key><dict><key>PATH</key><string>${SERVICE_PATH}</string>${SERVICE_NODE_ENV_PLIST}<key>DSH_BRIDGE_INSTALL_SOURCE</key><string>${installSourceOf(relayDir)}</string><key>DSH_BRIDGE_INSTALL_VERSION</key><string>${PLUGIN_VERSION}</string></dict>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>${SERVICE_PATH}</string>${SERVICE_NODE_ENV_PLIST}<key>DSH_BRIDGE_INSTALL_SOURCE</key><string>${installSourceOf(relayDir)}</string><key>DSH_BRIDGE_INSTALL_VERSION</key><string>${PLUGIN_VERSION}</string><key>DSH_BRIDGE_HARNESS_VERSION</key><string>${harnessVersion()}</string></dict>
 </dict></plist>`;
   mkdirSync(dirname(plistPath), { recursive: true });
   writeFileSync(plistPath, plist, { mode: 0o644 });
@@ -1763,6 +1765,8 @@ function startBridgeDetached(relayDir, fallbackReason = "") {
     env: spawnEnv({
       DSH_BRIDGE_INSTALL_SOURCE: installSourceOf(relayDir),
       DSH_BRIDGE_INSTALL_VERSION: PLUGIN_VERSION,
+      // 宿主版本：bridge 自己推不出来（它是另一个进程），只能由插件在宿主进程内问出来再注入。
+      DSH_BRIDGE_HARNESS_VERSION: harnessVersion(),
       // 上游端口**必须**透传：watcher 用它判断「dsh web 在线吗」，bridge 用它做转发目标。
       // 不传的话两边都回落到写死的 3080 —— dsh web 不在默认端口时 bridge 永远不启动（0.6.12 修）。
       DSH_BRIDGE_UPSTREAM: upstreamUrl(),
@@ -3112,6 +3116,12 @@ async function proxyFeedback(relayDir, req, res, pathname) {
   const headers = {
     "x-dsh-device": cfg.device_id || "",
     "x-dsh-client": `dsh-remote-web/${PLUGIN_VERSION}`,
+    // 真实 UA 必须**转发**：以前不转发，上游 fetch 就用 undici 默认 UA（`node`），
+    // 后台「机型」列对每条真实反馈都显示同一个没用值（生产实测 fb_* 全是 user_agent=node），
+    // 于是「Windows 还是 Linux 出的问题」只能靠翻安装日志考古。同时补一个结构化平台字段
+    // （x-dsh-platform），比让后台解析 UA 可靠得多。
+    "user-agent": String(req.headers["user-agent"] || `dsh-remote-web/${PLUGIN_VERSION}`),
+    "x-dsh-platform": process.platform,
   };
   if (cfg.phone) headers["x-dsh-phone"] = String(cfg.phone);
   const auth = req.headers.authorization;
@@ -3527,7 +3537,14 @@ function spawnUpdater(relayDir, extraEnv, onError, spec = UPDATE_SPEC) {
     windowsHide: true, // Windows：不弹控制台窗口（POSIX 上该选项被忽略）
     // PATH 补 node 目录：App 最小 PATH 下也能跑 npx；同时保持本机既有的安装来源口径
     // （在线更新会重跑安装器并重写 plist，若不带来源就会把 plugin_market 误记成 npx）。
-    env: spawnEnv({ DSH_BRIDGE_INSTALL_SOURCE: installSourceOf(relayDir), ...(extraEnv || {}) }),
+    env: spawnEnv({
+      DSH_BRIDGE_INSTALL_SOURCE: installSourceOf(relayDir),
+      // 安装器会把这些环境变量原样写进 plist/systemd 单元，所以宿主版本也要一起给它 ——
+      // 否则安装器重启桥之后，新写的自启动项里就没有 harness 版本了。
+      DSH_BRIDGE_INSTALL_VERSION: PLUGIN_VERSION,
+      DSH_BRIDGE_HARNESS_VERSION: harnessVersion(),
+      ...(extraEnv || {}),
+    }),
     stdio: ["ignore", openSync(log, "a"), openSync(log, "a")],
     onError,
   });
@@ -3607,6 +3624,7 @@ async function runOnlineUpdate(relayDir) {
         env: spawnEnv({
           DSH_BRIDGE_INSTALL_SOURCE: installSourceOf(relayDir),
           DSH_BRIDGE_INSTALL_VERSION: PLUGIN_VERSION,
+          DSH_BRIDGE_HARNESS_VERSION: harnessVersion(),
           npm_config_registry: "https://registry.npmjs.org",
         }),
         stdio: ["ignore", out, out],
@@ -4613,6 +4631,8 @@ function buildConnectDiagnostics(relayDir, conn, log) {
   const rows = [
     "dsh-remote 连接诊断",
     `插件版本: ${PLUGIN_VERSION}`,
+    // 宿主版本：生产反馈里最缺的就是这个数 —— 只报插件版本时，「是不是 DSH 升级导致的兼容故障」答不出来
+    `宿主版本: ${harnessVersion() || "未知"}`,
     `配置目录: ${relayDir}`,
     `连接阶段: ${conn.phase}（${conn.text}）`,
     `设备 ID: ${conn.deviceId || "（未生成）"}`,
@@ -4678,7 +4698,7 @@ async function buildDiagReport(relayDir, opts = {}) {
   const conn = await composeConnect(relayDir, { manual });
   const cfg = loadConfig(relayDir);
   const head = redactForDiagnostics([
-    `【插件】v${PLUGIN_VERSION}　运行时 ${runtimeVersionOf(relayDir) || "未知"}　${osPlatform()}/${process.arch}　node ${String(process.versions.node).split(".")[0]}`,
+    `【插件】v${PLUGIN_VERSION}　运行时 ${runtimeVersionOf(relayDir) || "未知"}　宿主 ${harnessVersion() || "未知"}　${osPlatform()}/${process.arch}　node ${String(process.versions.node).split(".")[0]}`,
     `【阶段】${conn.phase}（${conn.text}）`,
     `【设备】ID=${conn.deviceId || "（未生成）"}　运行环境=${conn.runtimeReady ? "就绪" : `缺失${conn.runtimeMissing && conn.runtimeMissing.length ? `（缺 ${conn.runtimeMissing.slice(0, 3).join("、")}）` : ""}`}`,
     `【bridge】${conn.bridgeRunning ? `在运行 pid=${conn.bridgePids.join(",")}` : "未运行"}　守护=${conn.watcherRunning ? `在运行 pid=${conn.watcherPids.join(",")}${conn.watcherAgeMs ? `（${Math.round(conn.watcherAgeMs / 1000)}s）` : ""}` : "未运行"}${conn.watcherWedged ? " ⚠️活着但拉不起 bridge" : ""}${conn.watcherRestarts ? ` 已自动重启 ${conn.watcherRestarts} 次` : ""}`,
@@ -4714,6 +4734,10 @@ async function submitFeedback(relayDir, payload) {
     "content-type": "application/json",
     "x-dsh-device": cfg.device_id || "",
     "x-dsh-client": `dsh-remote-web/${PLUGIN_VERSION}`,
+    // 与 proxyFeedback 同一口径：结构化平台字段 + 真实 UA（此处没有浏览器请求可转发，
+    // 就如实写本机平台，绝不冒充浏览器 UA）。
+    "user-agent": `dsh-remote-web/${PLUGIN_VERSION} (${process.platform}; ${process.arch})`,
+    "x-dsh-platform": process.platform,
   };
   if (cfg.phone) headers["x-dsh-phone"] = String(cfg.phone);
   const t = await feedbackAuthToken(relayDir).catch(() => "");
@@ -5180,9 +5204,51 @@ function harnessVersionFromEntry(entry) {
   }
 }
 
+/**
+ * 由**宿主根目录**解析版本：`<root>/node_modules/@deepseek-ai/dsh/package.json`。
+ *
+ * 【为什么还要这一条（2026-10-09 真机）】桌面端（DeepSeek Harness 0.2，Electron）的宿主进程 argv 是：
+ *   [0] …/MacOS/DeepSeek Harness
+ *   [1] --expose-internals                                  ← **是开关，不是路径**
+ *   [2] …/app.asar/dsh/node_modules/@deepseek-ai/dsh-desktop-host/lib/index.js
+ *   [3] …/app.asar/dsh                                      ← **宿主根目录**
+ * 于是「取 argv[1] 的上一级 package.json」在桌面端**必然拿不到**（argv[1] 是 `--expose-internals`），
+ * 这就是桌面用户全部上报 harness 版本为空的原因。好在 argv[3] 就是宿主根，其
+ * `node_modules/@deepseek-ai/dsh/package.json` 正是宿主版本（实测 0.2.0-rc.2）。
+ * 桌面端是 Electron，`readFileSync` 能透明读 asar 内的路径，所以这条在真实宿主里可读。
+ */
+function harnessVersionFromRoot(root) {
+  try {
+    const manifest = JSON.parse(readFileSync(join(String(root), "node_modules", HARNESS_PACKAGE_NAME, "package.json"), "utf8"));
+    if (!manifest || manifest.name !== HARNESS_PACKAGE_NAME) return "";
+    return telemetryToken(manifest.version);
+  } catch {
+    return "";   // 不是宿主根 / 读不到 → 交给下一条候选，绝不抛
+  }
+}
+
+/**
+ * 从整条 argv 里找出宿主版本（**顺序试探，先命中先返回**）。三条来源都不联网、不起子进程：
+ *   ① 目录形态：某参数本身就是宿主根（桌面端 argv[3]）；
+ *   ② 文件形态：某参数是 DSH 主模块（Web 版 argv[1]），取它上一级的 package.json；
+ * 开关（`-` 开头）与非绝对路径一律跳过 —— 绝不把 `--expose-internals` 当路径去 realpath。
+ */
+function harnessVersionFromArgv(argv) {
+  const list = Array.isArray(argv) ? argv : [];
+  for (const raw of list) {
+    const p = String(raw ?? "");
+    if (p === "" || p.startsWith("-") || !isAbsolute(p)) continue;
+    const viaRoot = harnessVersionFromRoot(p);
+    if (viaRoot) return viaRoot;
+    const viaEntry = harnessVersionFromEntry(p);
+    if (viaEntry) return viaEntry;
+  }
+  return "";
+}
+
 /** 本进程运行所在的宿主版本（未知 = ""）。每次调用现读：事件量很小，且绝不该缓存出过期结论。 */
 function harnessVersion() {
-  return harnessVersionFromEntry(process.argv[1]);
+  return harnessVersionFromArgv(process.argv);
 }
 
 /**
@@ -5556,6 +5622,8 @@ export const __telemetryInternals = {
   // 必须能被用例逐条锁住（含未知/非法值的降级行为）。
   harnessVersion: () => harnessVersion(),
   harnessVersionFromEntry: (entry) => harnessVersionFromEntry(entry),
+  harnessVersionFromRoot: (root) => harnessVersionFromRoot(root),
+  harnessVersionFromArgv: (argv) => harnessVersionFromArgv(argv),
   harnessToken: (v) => telemetryToken(v),
   updateTag: UPDATE_TAG,
   eventNames: [...TELEMETRY_EVENT_NAMES],
@@ -5582,7 +5650,7 @@ export const __telemetryInternals = {
  * 安装信息上报（插件侧通道）：登录后把本机安装信息发给企业端，供「已登录用户升级插件后刷新版本号」
  * 之类的口径统计。无账号凭据不上报；失败静默（绝不阻塞面板、不弹错误）。
  * 契约：POST <api_url>/api/install-report，头 `authorization: Bearer <device-login JWT>`，
- * body { device_id?, install_source, install_version, host_os, host_arch }，成功 200 {ok:true}；
+ * body { device_id?, install_source, install_version, harness_version, host_os, host_arch }，成功 200 {ok:true}；
  * 404/400 一律忽略（老服务端没有该接口时不能报错）。
  */
 const INSTALL_REPORT_FILE = ".dsh-install-report.json";
@@ -5617,6 +5685,9 @@ async function reportInstallOnce(relayDir, cfgOverride, opts = {}) {
     ...(cfg.device_id ? { device_id: String(cfg.device_id) } : {}),
     install_source: source,
     install_version: version,
+    // 宿主（DeepSeek Harness）版本：与 install_version（插件版本）是两个数，
+    // 只报插件版本时「是不是 DSH 升级导致的故障」答不出来（2026-10 生产反馈的普遍缺口）。
+    harness_version: harnessVersion(),
     host_os: process.platform,
     host_arch: process.arch,
   };
