@@ -535,6 +535,47 @@ test("网络延迟分档：500ms 以内=顺畅、1000ms 以内=正常（远程�
   }
 });
 
+test("★ 亚毫秒样本（本机/回环自测）也必须出数 —— 不得永远停在「测速中…」", async () => {
+  // 业主 2026-10-09 实测反馈：「小悬浮窗一直提示『测速中，等待下一次网络请求后开始测速』」。
+  // 根因：旧实现是 `if (r < 1) return;`（注释写"亚毫秒=同帧缓存命中"），但**本机/回环**访问
+  //   （桌面端自测、在同一台机器上打开镜像页）一次真实往返往往就是 < 1ms —— 于是**每一个**样本
+  //   都被丢掉，界面永远停在空态。面板侧 chip 从来没这个毛病（`v <= 0` + `Math.max(1, …)`），
+  //   这条用例把两侧口径钉在一起。
+  const env = harness({ width: 390, fetchImpl: async () => ({ status: 200, ok: true }) }); // 零延迟 = 亚毫秒
+  runAdapter(env);
+  const rtt = findFab(env).querySelector('[data-role="rtt"]');
+  assert.equal(rtt.hidden, true, "前提：还没有样本");
+  await env.win.fetch("/api/session/list");
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(rtt.hidden, false, "★亚毫秒的真实往返必须记成样本（否则本机自测永远是「测速中…」）");
+  assert.equal(String(rtt.textContent), "1ms", "展示层夹到 1ms —— 0ms 是谎话");
+  const net = findMenu(env).querySelector(".dsh-ma-menu-net");
+  assert.ok(!/测速中/.test(String(net.textContent)),
+    `菜单行不得再显示空态，实际：${net.textContent}`);
+});
+
+test("★ 悬浮窗被官方 SPA 重渲染重建后，已积累的样本仍要显示（样本不跟着某一代闭包走）", async () => {
+  // fetch 包装只装一次（window.__dshMaSessionWatch 一次性闸门），而悬浮窗可能被重建。
+  // 若样本数组长在 buildRemoteMenu 的闭包里，包装会一直喂"上一代"（节点已不在文档里），
+  // 新界面读自己那份空数组 → 又是永远「测速中…」。样本挂在 window 上才不会这样。
+  const env = harness({
+    width: 390,
+    fetchImpl: async () => { await new Promise((r) => setTimeout(r, 5)); return { status: 200, ok: true }; },
+  });
+  runAdapter(env);
+  await env.win.fetch("/api/session/list");
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(findFab(env).querySelector('[data-role="rtt"]').hidden, false, "前提：第一代已有样本");
+
+  // 模拟 SPA 重渲染：官方把 body 子树整片换掉（我们的悬浮窗跟着消失），适配层再建一代。
+  env.body.children = [];
+  runAdapter(env);
+  const fab2 = findFab(env);
+  assert.ok(fab2, "重建后应有新的悬浮按钮");
+  assert.equal(fab2.querySelector('[data-role="rtt"]').hidden, false,
+    "★重建后的悬浮窗必须立刻显示已积累的样本（旧实现读自己那份空数组 → 永远「测速中…」）");
+});
+
 test("网络延迟：无样本 / 失败请求绝不显示 0ms（显示「测速中…」是唯一正确的空态）", async () => {
   const env = harness({
     width: 390,

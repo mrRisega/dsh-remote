@@ -1244,7 +1244,12 @@ const SCRIPT = `(() => {
          旧的 120/300 分档是照"网页首屏"的体感定的，会把大量正常可用的移动网络误报成"较慢"，
          反而让用户以为哪里坏了。 */
       const RTT_KEEP = 8, RTT_MAX_MS = 20000;
-      const rttSamples = [];
+      /* 🔴 样本数组挂在 window 上，**不在 buildRemoteMenu 的闭包里**（2026-10-09 加固）。
+         为什么：fetch 包装只装一次（window.__dshMaSessionWatch 一次性闸门），而菜单/悬浮按钮
+         在官方 SPA 重渲染时可能被**重建**。若样本数组长在 buildRemoteMenu 里，包装就会一直喂给
+         "上一代"渲染器（那个节点已经不在文档里），新界面读自己的空数组 → **永远停在「测速中…」**。
+         挂在 window 上则任何一代渲染器都读同一份样本。 */
+      const rttSamples = (window.__dshMaRttSamples || (window.__dshMaRttSamples = []));
       const rttEl = fab.querySelector('[data-role="rtt"]');
       const netEl = menu.querySelector('[data-role="net"]');
       const rttValue = () => {
@@ -1262,11 +1267,13 @@ const SCRIPT = `(() => {
         try {
           const ms = rttValue();
           const g = ms === null ? "" : rttGrade(ms);
+          // 0ms 是句谎话（不足 1ms 的真实往返会被四舍五入成 0）→ 展示层夹到 ≥1ms。
+          const shown = ms === null ? null : Math.max(1, Math.round(ms));
           if (rttEl) {
-            if (ms === null) { rttEl.hidden = true; rttEl.textContent = ""; rttEl.removeAttribute("data-rtt"); }
+            if (shown === null) { rttEl.hidden = true; rttEl.textContent = ""; rttEl.removeAttribute("data-rtt"); }
             else {
               rttEl.hidden = false;
-              rttEl.textContent = ms + "ms";
+              rttEl.textContent = shown + "ms";
               rttEl.setAttribute("data-rtt", g);
             }
           }
@@ -1274,17 +1281,22 @@ const SCRIPT = `(() => {
             netEl.setAttribute("data-rtt", g || "");
             const ico = netEl.querySelector(".ico");
             const txt = netEl.querySelector(".txt");
-            if (ico) ico.textContent = ms === null ? "📶" : (g === "bad" ? "📵" : "📶");
-            if (txt) txt.textContent = ms === null ? "测速中…（等一次网络请求后显示）" : (ms + " ms · " + rttLabel(g));
+            if (ico) ico.textContent = shown === null ? "📶" : (g === "bad" ? "📵" : "📶");
+            if (txt) txt.textContent = shown === null ? "测速中…（等一次网络请求后显示）" : (shown + " ms · " + rttLabel(g));
           }
-          try { fab.title = ms === null ? FAB_TITLE_BASE : ("远程控制：网络延迟 " + ms + "ms（" + rttLabel(g) + "） / 字号 / 加密状态 / 返回设备列表（可拖动）"); } catch (e) { /* 忽略 */ }
+          try { fab.title = shown === null ? FAB_TITLE_BASE : ("远程控制：网络延迟 " + shown + "ms（" + rttLabel(g) + "） / 字号 / 加密状态 / 返回设备列表（可拖动）"); } catch (e) { /* 忽略 */ }
         } catch (e) { /* 延迟显示失败绝不影响主功能 */ }
       };
       /** 记一个成功样本（由 fetch 包装在**响应到达**时调用；失败/超时不调用）。 */
       const noteRtt = (ms) => {
         if (typeof ms !== "number" || !isFinite(ms)) return;
         const r = Math.round(ms);
-        if (r < 1 || r > RTT_MAX_MS) return;      // 亚毫秒=同帧缓存命中；>20s=卡住/超时 → 都不是"网络延迟"
+        /* 🔴 旧写法是 if (r < 1 || ...) return; ，注释说"亚毫秒=同帧缓存命中"。这个假设是**错的**：
+           本机/回环访问（桌面端自测、在同一台机器上打开镜像页）一次真实往返往往就是 < 1ms，
+           于是**每一个**样本都被丢掉，界面永远停在「测速中…（等一次网络请求后显示）」——
+           业主 2026-10-09 实测反馈的正是这个现象。只拒绝负数与超时；0 → 展示层夹到 1ms。
+           （面板侧 chip 从一开始就是 v <= 0 + Math.max(1, round)，两边口径由此对齐。） */
+        if (r < 0 || r > RTT_MAX_MS) return;
         rttSamples.push(r);
         while (rttSamples.length > RTT_KEEP) rttSamples.shift();
         renderRtt();
