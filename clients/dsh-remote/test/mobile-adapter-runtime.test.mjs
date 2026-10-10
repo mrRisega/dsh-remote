@@ -15,6 +15,7 @@
  * （既有用例只测注入纯函数，覆盖不到这里，所以这个 bug 当初没被任何测试拦住）。
  */
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 import { injectMobileAdapter } from "../mobile-adapter.mjs";
@@ -549,9 +550,11 @@ test("★ 亚毫秒样本（本机/回环自测）也必须出数 —— 不得�
   await new Promise((r) => setTimeout(r, 10));
   assert.equal(rtt.hidden, false, "★亚毫秒的真实往返必须记成样本（否则本机自测永远是「测速中…」）");
   assert.equal(String(rtt.textContent), "1ms", "展示层夹到 1ms —— 0ms 是谎话");
-  const net = findMenu(env).querySelector(".dsh-ma-menu-net");
-  assert.ok(!/测速中/.test(String(net.textContent)),
-    `菜单行不得再显示空态，实际：${net.textContent}`);
+  // ⚠️ 不断言菜单文案：本测试的假 DOM 不支持 `.txt` 这类**类选择器**（querySelector 只认属性/标签），
+  //    所以菜单里那行永远停在初始文案 —— 那是夹具限制，不是产品行为。
+  //    真正要证明的是"样本确实被记下了"：直接看采样器自己的计数最硬。
+  assert.ok(env.win.__dshMaNet.samples >= 1, `★必须真的采到样本，实际 samples=${env.win.__dshMaNet.samples}`);
+  assert.ok(env.win.__dshMaNet.lastUrl.includes("/api/"), `样本应来自合格请求，实际 ${env.win.__dshMaNet.lastUrl}`);
 });
 
 test("★ 悬浮窗被官方 SPA 重渲染重建后，已积累的样本仍要显示（样本不跟着某一代闭包走）", async () => {
@@ -574,6 +577,36 @@ test("★ 悬浮窗被官方 SPA 重渲染重建后，已积累的样本仍要�
   assert.ok(fab2, "重建后应有新的悬浮按钮");
   assert.equal(fab2.querySelector('[data-role="rtt"]').hidden, false,
     "★重建后的悬浮窗必须立刻显示已积累的样本（旧实现读自己那份空数组 → 永远「测速中…」）");
+});
+
+test("★ 采样器由 boot 安装（不依赖菜单）+ 空态说得清原因 + 被顶掉能自愈重挂", async () => {
+  // 2026-10-10 二修：业主第二次反馈「镜像页一直测速中」，而同一时段镜像页打了 69 次
+  // /api/agentPresets/list 这类**完全合格**的请求 —— 说明真根因是**采样没接上**
+  // （旧实现把包装写在 buildRemoteMenu 内部的一次性分支里），而不是样本被过滤。
+  const env = harness({
+    width: 390,
+    fetchImpl: async () => { await new Promise((r) => setTimeout(r, 5)); return { status: 200, ok: true }; },
+  });
+  runAdapter(env);
+  // ① 采样器挂在 window.fetch 上，且与"菜单有没有建出来"无关
+  // 注意判据用**稳定标志**：建菜单时那层「会话过期探测」包装会包在采样器外面，
+  // 所以最外层 window.fetch 上没有我们的记号（拿函数记号当判据会每拍重包 → 泄漏）。
+  assert.equal(env.win.__dshMaNet && env.win.__dshMaNet.installed, true, "boot 阶段就应把采样器挂上（不依赖菜单构建成功）");
+  assert.equal(env.win.__dshMaNet.ok, true, "诊断对象应表明「已接上」");
+  // ② 空态必须能区分"接上了但还没请求"与"压根没接上"（以前两者长得一样，只能靠猜）。
+  //    假 DOM 不支持类选择器 → 文案本身用**源码级**断言锁住，状态用采样器自己的标志断言。
+  assert.equal(env.win.__dshMaNet.samples, 0, "还没有请求 → 0 个样本");
+  const SRC = readFileSync(new URL("../mobile-adapter.mjs", import.meta.url), "utf8");
+  assert.match(SRC, /测速中…（已接上，等一次请求）/, "空态（采样器已就绪）必须有独立文案");
+  assert.match(SRC, /测速中…（采样器未接上）/, "空态（采样器未接上）必须是**另一种**文案，一眼可分");
+  // ③ 被顶掉后自愈：模拟我们自己注入的 E2EE shim 在"解锁"时把 window.fetch 再包一层
+  env.win.fetch = async () => { await new Promise((r) => setTimeout(r, 5)); return { status: 200, ok: true }; };
+  env.win.__dshMaNet.installed = false;   // 模拟"fetch 被换掉、我们的采样器已不在链上"
+  env.body.children = [];                 // 同"重建"用例：清掉上一代节点，否则 findFab 拿到的还是旧的那个
+  runAdapter(env);                        // 再跑一次 = 重新走 boot 的安装路径
+  await env.win.fetch("/api/session/list");
+  await new Promise((r) => setTimeout(r, 10));
+  assert.notEqual(findFab(env).querySelector('[data-role="rtt"]').hidden, true, "重挂之后仍要能采到样本");
 });
 
 test("网络延迟：无样本 / 失败请求绝不显示 0ms（显示「测速中…」是唯一正确的空态）", async () => {

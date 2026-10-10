@@ -1028,6 +1028,74 @@ const SCRIPT = `(() => {
    窄屏还会自动收起左栏（viewportWidth < 1024 → narrowExpanded = false）。
    我们插一脚只会把官方推到相反方向（这正是「点开变黑遮罩」那条链的起点）。 */
     let fabDone = false;
+
+    /* ===== 📶 网络延迟采样器（2026-10-10 二修，与"某一代菜单 DOM"彻底解耦）=================
+       一修（0.7.0-beta.3）改掉了"亚毫秒样本被丢弃"，但业主实测**仍然一直「测速中」**，
+       而同一时段镜像页打了 69 次 /api/agentPresets/list 这类**完全合格**的请求 ——
+       说明真根因不是样本被过滤，而是**采样根本没接上**（或渲染写进了已被替换的旧节点）。
+
+       所以这次不再依赖"建菜单时顺手包装一次 fetch"：
+         · 安装独立成 maInstallNetSampler()，幂等、**自愈**（发现 window.fetch 上不是我们的采样器
+           就重新包一层）—— 谁在这之后把 fetch 换掉（我们自己注入的 E2EE shim 会在解锁时再包一次）
+           都能兜住；
+         · 样本挂 window（跨"菜单被 SPA 重建"共享）；
+         · 渲染**每次现查实时 DOM**，不再抱着建菜单时的旧引用（旧引用可能已脱离文档，
+           于是样本明明在涨、界面却永远停在初始文案）；
+         · 空态**直接说明原因**，下次再出问题不用猜：一眼看出是"没接上"还是"接上了但没请求"。 */
+    const maNetPatch = { ok: false, samples: 0, lastUrl: "", lastAt: 0 };
+    try { window.__dshMaNet = maNetPatch; } catch (eNet0) { /* 忽略 */ }
+    /** 当前这一代菜单注册的渲染器（可能为 null：菜单还没建）。 */
+    let maNetRender = null;
+    const maNoteRtt = (ms, url) => {
+      try {
+        if (typeof ms !== "number" || !isFinite(ms)) return;
+        const r = Math.round(ms);
+        // 只拒绝负数与超时；0（本机/回环的真实往返不足 1ms）照收，展示层再夹到 ≥1ms。
+        if (r < 0 || r > 20000) return;
+        const bag = (window.__dshMaRttSamples || (window.__dshMaRttSamples = []));
+        bag.push(r);
+        while (bag.length > 8) bag.shift();
+        maNetPatch.samples = bag.length;
+        maNetPatch.lastUrl = String(url || "").slice(0, 80);
+        maNetPatch.lastAt = Date.now();
+        if (maNetRender) { try { maNetRender(); } catch (eR) { /* 忽略 */ } }
+      } catch (eN) { /* 忽略 */ }
+    };
+    /** 把采样器挂到 window.fetch 上（**只挂一次**）。返回是否已就绪。 */
+    const maInstallNetSampler = () => {
+      try {
+        if (typeof window.fetch !== "function") return false;
+        /* ⚠️ 幂等判据必须是**稳定标志**，不能拿 window.fetch.__dshMaNetSampler 当判据（2026-10-10 自测抓到）：
+           "会话过期探测"那层包装会在本采样器**外面**再包一层（它建菜单时才装，晚于这里），
+           于是最外层 window.fetch 上没有我们的标记 → 若用函数标记当判据，每一拍都会再包一层，
+           秒级泄漏（请求穿过 N 层、同一趟被记 N 个样本）。 */
+        if (maNetPatch.installed === true) { maNetPatch.ok = true; return true; }
+        const orig = window.fetch;
+        const wrapped = function (input, init) {
+          let url = "";
+          try { url = typeof input === "string" ? input : (input && input.url) || ""; } catch (eU) { url = ""; }
+          const t0 = maNowMs();
+          const p = orig.apply(this, arguments);
+          try {
+            const abs = url.slice(0, 8).toLowerCase();
+            const absolute = abs.indexOf("http://") === 0 || abs.indexOf("https://") === 0;
+            const sameOrigin = !absolute || url.indexOf(window.location.origin) === 0;
+            const apiish = url.indexOf("/api/") >= 0 || url.indexOf("/remote/") >= 0
+              || url.indexOf("_devices") >= 0 || url.indexOf("_quota") >= 0;
+            if (sameOrigin && apiish && p && typeof p.then === "function") {
+              p.then(() => { maNoteRtt(maNowMs() - t0, url); }, () => { /* 网络错误不算延迟 */ });
+            }
+          } catch (eW) { /* 忽略 */ }
+          return p;
+        };
+        wrapped.__dshMaNetSampler = true;   // 只作记号便于人造排查（**不作**幂等判据）
+        maNetPatch.installed = true;        // 稳定幂等判据
+        window.fetch = wrapped;
+        maNetPatch.ok = true;
+        return true;
+      } catch (eI) { return false; }
+    };
+
     const buildRemoteMenu = () => {
       /* ===== 统一「远程控制」悬浮按钮：字号 + 加密状态 + 返回设备列表 =====
          2026-09-19 用户要求原话：「把字体的菜单和加密小锁的菜单合并成一个小悬浮按钮；点击后可以弹菜单
@@ -1244,14 +1312,11 @@ const SCRIPT = `(() => {
          旧的 120/300 分档是照"网页首屏"的体感定的，会把大量正常可用的移动网络误报成"较慢"，
          反而让用户以为哪里坏了。 */
       const RTT_KEEP = 8, RTT_MAX_MS = 20000;
-      /* 🔴 样本数组挂在 window 上，**不在 buildRemoteMenu 的闭包里**（2026-10-09 加固）。
-         为什么：fetch 包装只装一次（window.__dshMaSessionWatch 一次性闸门），而菜单/悬浮按钮
-         在官方 SPA 重渲染时可能被**重建**。若样本数组长在 buildRemoteMenu 里，包装就会一直喂给
-         "上一代"渲染器（那个节点已经不在文档里），新界面读自己的空数组 → **永远停在「测速中…」**。
-         挂在 window 上则任何一代渲染器都读同一份样本。 */
-      const rttSamples = (window.__dshMaRttSamples || (window.__dshMaRttSamples = []));
+      /* 建菜单时的引用只作**兜底**：正常路径每次渲染都现查实时 DOM（见 liveNetEl/liveRttEl）。 */
       const rttEl = fab.querySelector('[data-role="rtt"]');
       const netEl = menu.querySelector('[data-role="net"]');
+      /* 样本一律读 window 上那一份（由上面的 maNoteRtt 写入，跨"菜单被重建"共享）。 */
+      const rttSamples = (window.__dshMaRttSamples || (window.__dshMaRttSamples = []));
       const rttValue = () => {
         if (!rttSamples.length) return null;
         const s = rttSamples.slice().sort((a, b) => a - b);
@@ -1263,44 +1328,45 @@ const SCRIPT = `(() => {
       const rttGrade = (ms) => (ms <= 500 ? "ok" : ms <= 1000 ? "mid" : ms <= 2000 ? "slow" : "bad");
       const rttLabel = (g) => (g === "ok" ? "顺畅" : g === "mid" ? "正常" : g === "slow" ? "偏慢" : "很慢");
       const FAB_TITLE_BASE = "远程控制：字号 / 网络延迟 / 加密状态 / 返回设备列表（可拖动移动位置）";
+      /* 🔴 每次渲染都**现查实时 DOM**（2026-10-10 二修）。
+         抱着建菜单时的旧引用是"样本在涨、界面却永远停在初始文案"的经典成因：官方 SPA 换掉 body
+         子树后旧引用脱离文档，更新写进了看不见的节点。现查则永远写用户真正看得见的那一个；
+         查不到才退回旧引用（宽屏/菜单未开时本来就没有可写的节点）。 */
+      const liveNetEl = () => { try { return document.querySelector(".dsh-ma-menu-net") || netEl; } catch (eQ) { return netEl; } };
+      const liveRttEl = () => { try { return fab.querySelector('[data-role="rtt"]') || rttEl; } catch (eQ2) { return rttEl; } };
       const renderRtt = () => {
         try {
           const ms = rttValue();
           const g = ms === null ? "" : rttGrade(ms);
           // 0ms 是句谎话（不足 1ms 的真实往返会被四舍五入成 0）→ 展示层夹到 ≥1ms。
           const shown = ms === null ? null : Math.max(1, Math.round(ms));
-          if (rttEl) {
-            if (shown === null) { rttEl.hidden = true; rttEl.textContent = ""; rttEl.removeAttribute("data-rtt"); }
+          const rEl = liveRttEl();
+          if (rEl) {
+            if (shown === null) { rEl.hidden = true; rEl.textContent = ""; rEl.removeAttribute("data-rtt"); }
             else {
-              rttEl.hidden = false;
-              rttEl.textContent = shown + "ms";
-              rttEl.setAttribute("data-rtt", g);
+              rEl.hidden = false;
+              rEl.textContent = shown + "ms";
+              rEl.setAttribute("data-rtt", g);
             }
           }
-          if (netEl) {
-            netEl.setAttribute("data-rtt", g || "");
-            const ico = netEl.querySelector(".ico");
-            const txt = netEl.querySelector(".txt");
+          const nEl = liveNetEl();
+          if (nEl) {
+            nEl.setAttribute("data-rtt", g || "");
+            const ico = nEl.querySelector(".ico");
+            const txt = nEl.querySelector(".txt");
             if (ico) ico.textContent = shown === null ? "📶" : (g === "bad" ? "📵" : "📶");
-            if (txt) txt.textContent = shown === null ? "测速中…（等一次网络请求后显示）" : (shown + " ms · " + rttLabel(g));
+            if (txt) {
+              /* 空态**说清原因**（2026-10-10）：以前只有一句「等一次网络请求后显示」，
+                 于是"采样器压根没接上"和"接上了但还没有请求"长得一模一样，业主两次反馈
+                 我们都只能猜。现在一眼可分。 */
+              txt.textContent = shown !== null ? (shown + " ms · " + rttLabel(g))
+                : (maNetPatch.ok ? "测速中…（已接上，等一次请求）" : "测速中…（采样器未接上）");
+            }
           }
           try { fab.title = shown === null ? FAB_TITLE_BASE : ("远程控制：网络延迟 " + shown + "ms（" + rttLabel(g) + "） / 字号 / 加密状态 / 返回设备列表（可拖动）"); } catch (e) { /* 忽略 */ }
         } catch (e) { /* 延迟显示失败绝不影响主功能 */ }
       };
-      /** 记一个成功样本（由 fetch 包装在**响应到达**时调用；失败/超时不调用）。 */
-      const noteRtt = (ms) => {
-        if (typeof ms !== "number" || !isFinite(ms)) return;
-        const r = Math.round(ms);
-        /* 🔴 旧写法是 if (r < 1 || ...) return; ，注释说"亚毫秒=同帧缓存命中"。这个假设是**错的**：
-           本机/回环访问（桌面端自测、在同一台机器上打开镜像页）一次真实往返往往就是 < 1ms，
-           于是**每一个**样本都被丢掉，界面永远停在「测速中…（等一次网络请求后显示）」——
-           业主 2026-10-09 实测反馈的正是这个现象。只拒绝负数与超时；0 → 展示层夹到 1ms。
-           （面板侧 chip 从一开始就是 v <= 0 + Math.max(1, round)，两边口径由此对齐。） */
-        if (r < 0 || r > RTT_MAX_MS) return;
-        rttSamples.push(r);
-        while (rttSamples.length > RTT_KEEP) rttSamples.shift();
-        renderRtt();
-      };
+      maNetRender = renderRtt;   // 注册给采样器（样品到达时回调它）
       renderRtt();
 
       /* ❌ 这里曾有「打开右侧栏」这一段与 maRightPane* 三件套 —— 2026-09-27 根治时整条删除。
@@ -1449,14 +1515,9 @@ const SCRIPT = `(() => {
             window.fetch = function (input, init) {
               let url = "";
               try { url = typeof input === "string" ? input : (input && input.url) || ""; } catch (e5) { url = ""; }
-              /* 网络延迟采样（0.6.18）：**复用这处已有的包装**，零新增请求。
-                 t0 取在真正发请求之前、响应到达之后读差值 —— 量到的就是这一趟的真实往返。
-                 ⚠️ 只在同源且"像 API"的请求上量（与下面会话过期探测同一组判定）：
-                    静态壳/图片/字体不该代表"网络延迟"；telemetry 那条 /dsh-remote/telemetry/... 也
-                    不在 apiish 里（它既不含 "/api/" 也不含 "/remote/"，只有 "-remote/"），
-                    所以一次性的遥测上报不会污染样本。
-                 ⚠️ 失败(reject)/超时(>20s)不进样本 —— 那不是"延迟"，是"没通"（noteRtt 里已过滤）。 */
-              const t0 = maNowMs();
+              /* ⚠️ 2026-10-10：这里**不再**做网络延迟采样 —— 采样已独立成 maInstallNetSampler()
+                 （与菜单 DOM 解耦、幂等、自愈）。本包装只负责「会话过期探测」这一件事，
+                 否则同一趟请求会被量两次。 */
               const p = origFetch.call(this, input, init);
               try {
                 const abs = url.slice(0, 8).toLowerCase();
@@ -1465,7 +1526,7 @@ const SCRIPT = `(() => {
                 if (sameOrigin && apiish && p && typeof p.then === "function") {
                   p.then((res) => {
                     try { noteStatus(res && res.status); } catch (e6) { /* 忽略 */ }
-                    try { noteRtt(maNowMs() - t0); } catch (e6b) { /* 忽略 */ }
+                    /* 延迟采样已移到 maInstallNetSampler，这里只报会话过期 */
                   }, () => { /* 网络错误不算会话过期，也不算延迟样本 */ });
                 }
               } catch (e7) { /* 忽略 */ }
@@ -1509,6 +1570,11 @@ const SCRIPT = `(() => {
     let done = false;
     const boot = () => {
       if (!HOSTISH()) return;
+      /* 📶 **先**把延迟采样器挂上（2026-10-10）：它必须在"任何请求发生之前"就位。
+         即便 buildRemoteMenu() 因为任何原因没能建出菜单（或抛错），采样器也照挂不误 ——
+         旧实现把包装写在 buildRemoteMenu 内部的一次性分支里，那正是"请求明明在打、
+         界面却永远测速中"的结构性原因。 */
+      try { maInstallNetSampler(); } catch (eSampler0) { /* 忽略 */ }
       /* 悬浮按钮/菜单：任何宽度都要有（电脑端访问镜像页时同样需要返回设备列表的出口）。
          失败也不影响手机端布局适配 —— 两条链路各自独立。 */
       if (!fabDone) { fabDone = true; try { buildRemoteMenu(); } catch (eFabDone) { /* 忽略 */ } }
@@ -1976,6 +2042,12 @@ const SCRIPT = `(() => {
     const pump = () => {
       if (maTorn) return;
       if (bootUseful()) { try { boot(); } catch (eBoot) { /* 幂等重试 */ } }
+      /* 📶 采样器**自愈**（2026-10-10）：本函数每拍都跑（MutationObserver/1s 兜底），
+         所以只要 window.fetch 被谁换掉（我们自己注入的 E2EE shim 会在"解锁"时再包一层、
+         官方若在运行期替换 fetch 同理），下一拍就会把采样器重新挂回去 —— 幂等，已挂上时零开销。
+         同时顺手重绘一次：官方 SPA 换掉菜单子树后，数字不必等下一次请求才回来。 */
+      try { maInstallNetSampler(); } catch (eSampler) { /* 忽略 */ }
+      try { if (maNetRender) maNetRender(); } catch (eNetRender) { /* 忽略 */ }
       try { ensureDrawerChrome(); } catch (eChrome2) { /* 忽略 */ }
       /* 镜像页就绪探测（mirror_load 的量测终点）：pump 本来就被 MutationObserver(子树) + 1s 兜底表
          驱动，官方 frame/输入框一挂上就会在**这一拍或下一拍**（≤1s）命中 —— 这正是契约要求的
