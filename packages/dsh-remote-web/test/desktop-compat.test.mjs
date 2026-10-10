@@ -159,7 +159,10 @@ test("桌面端：状态接口必须下发宿主形态，面板才能自适应",
 });
 
 test("桌面端：面板不得自动倒计时重启，且不摆点了必然失败的重启按钮", () => {
-  assert.match(CLIENT_SRC, /var desktopHost = !!\(st && st\.desktopHost\)/, "面板必须读 desktopHost");
+  // ⚠️ 2026-10-11 修：node 半把这个字段下在 **connect** 里（`connect.desktopHost`），
+  // 只读顶层 `st.desktopHost` 会**永远 false** → 桌面端被当成 Web 版（照样摆重启按钮、走自动倒计时）。
+  assert.match(CLIENT_SRC, /var desktopHost = !!\(st && \(st\.desktopHost \|\| \(st\.connect && st\.connect\.desktopHost\)\)\)/,
+    "面板必须同时读顶层与 connect.desktopHost（只读顶层等于门禁失效）");
   assert.match(CLIENT_SRC, /isRestartHard \|\| desktopHost \|\| busy !== ""/,
     "自动倒计时重启必须在桌面端短路（Host 由 Electron 托管，不能替用户重启）");
   assert.match(CLIENT_SRC, /\(desktopHost && !isRefreshOnly\) \? null : h\("button"/,
