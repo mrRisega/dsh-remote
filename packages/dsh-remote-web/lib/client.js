@@ -522,9 +522,6 @@ window.__ModuleLoader__.load({
       ".dru-foot-entry:focus-visible{outline:2px solid var(--dru-focus);outline-offset:1px}",
       ".dru-foot-entry .ico{flex:none;width:18px;text-align:center;font-size:15px;line-height:1}",
       ".dru-foot-entry .lbl{overflow:hidden;text-overflow:ellipsis}",
-      // 账号菜单里的入口行（DOM 插入，见 accountMenuInjectTick）：与官方菜单项同样的整行观感
-      ".dru-menu-row{display:flex;align-items:center;gap:8px;width:100%;box-sizing:border-box;min-height:32px;padding:6px 10px;border:none;border-radius:6px;background:transparent;color:inherit;font:inherit;font-size:13px;text-align:left;cursor:pointer;white-space:nowrap;user-select:none}",
-      ".dru-menu-row:hover{background:var(--dru-hover)}",
       ".dru-nav-remote-dot{position:absolute;top:-2px;right:-2px;width:8px;height:8px;border-radius:50%;background:var(--dru-reddot);box-shadow:0 0 0 2px var(--dru-surface-2);pointer-events:none}",
       // 侧栏入口与官方按钮同高（30px）；用 ::after 把命中区补到 ≥44px，不破坏与原按钮的对齐
       ".dru-nav-remote::after{content:\"\";position:absolute;left:0;right:0;top:-7px;bottom:-7px}",
@@ -917,57 +914,32 @@ window.__ModuleLoader__.load({
      * 底部只有「远程访问」+ 账号（高昂），「设置」在**账号菜单**里。所以当侧栏候选全部落空时，
      * 必须能"打开账号菜单 → 点设置 → 再点我们的栏目"，否则入口点下去就是没反应。
      */
-    function accountMenuTrigger() {
+    /**
+     * 用**官方设置快捷键**（⌥⌘, / Alt+Meta+,）打开设置面板。
+     *
+     * 为什么用快捷键而不是"点账号菜单里的设置"（2026-10-11 业主反馈）：
+     *   桌面端侧栏没有设置齿轮，只能从账号菜单进 —— 但那会让**账号菜单先弹出来再关掉**，
+     *   业主的原话是「会触发一个小弹窗……有一瞬间会闪出一下，体验不好」。
+     *   实测（探针在桌面渲染器里验证）：向 document 派发一次
+     *   `keydown {key:",", metaKey:true, altKey:true}` 就能**直接**打开设置面板，没有任何中间弹层。
+     *   快捷键取自设置行自带的 `aria-keyshortcuts="Alt+Meta+,"`（宿主自己的约定）。
+     */
+    function openSettingsViaShortcut() {
       try {
-        var all = document.querySelectorAll('[aria-haspopup="menu"], button, [role="button"]');
-        var best = null;
-        for (var i = 0; i < all.length; i++) {
-          var el = all[i];
-          if (!el || el.id === NAV_ENTRY_ID) continue;
-          var aria = String((el.getAttribute && el.getAttribute("aria-label")) || "");
-          if (/账号菜单|Account menu/i.test(aria)) return el;            // 首选：明确的 aria 标签
-          var r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
-          var inSidebarFoot = r && r.left < 360 && r.top > 300;           // 侧栏底部区域
-          if (!best && inSidebarFoot && String(el.getAttribute && el.getAttribute("aria-haspopup") || "") === "menu") best = el;
-        }
-        return best;   // 兜底：侧栏底部里唯一带 aria-haspopup=menu 的（就是账号 chip）
-      } catch (e) { return null; }
-    }
-    /** 账号菜单打开后，点里面的「设置」。 */
-    function viaAccountMenu() {
-      try {
-        var trigger = accountMenuTrigger();
-        navTrace("menu:trigger=" + (trigger ? "found" : "none"));
-        if (!trigger) return;
-        try { trigger.click(); } catch (e) { return; }
+        navTrace("open:shortcut-dispatch");
+        var ev = new KeyboardEvent("keydown", {
+          key: ",", code: "Comma", metaKey: true, altKey: true, bubbles: true, cancelable: true
+        });
+        document.dispatchEvent(ev);
         var tries = 0;
         var iv = setInterval(function () {
           tries += 1;
-          var menus = document.querySelectorAll('[role="menu"], [role="dialog"], [role="listbox"]');
-          if (tries === 1) navTrace("menu:poll menus=" + menus.length);
-          for (var i = 0; i < menus.length; i++) {
-            var items = menus[i].querySelectorAll ? menus[i].querySelectorAll('button, [role="menuitem"]') : [];
-            for (var k = 0; k < items.length; k++) {
-              if (menuRowIsSettings(items[k])) {
-                navTrace("menu:settings-row-clicked");
-                clearInterval(iv);
-                try { items[k].click(); } catch (e2) { /* 忽略 */ }
-                var tries2 = 0;
-                var iv2 = setInterval(function () {          // 设置面板开了以后，再点我们的栏目
-                  tries2 += 1;
-                  var cell = pickNavByToken("远程访问", { insideDialog: true });
-                  if (cell) { navTrace("menu:section-clicked"); clearInterval(iv2); cell.click(); }
-                  else if (tries2 >= NAV_POLL_MAX) { navTrace("menu:section-timeout"); clearInterval(iv2); }
-                }, 150);
-                try { if (iv2 && typeof iv2.unref === "function") iv2.unref(); } catch (e3) { /* 忽略 */ }
-                return;
-              }
-            }
-          }
-          if (tries >= NAV_POLL_MAX) clearInterval(iv);
+          var cell = pickNavByToken("远程访问", { insideDialog: true });
+          if (cell) { navTrace("open:shortcut-section-clicked"); clearInterval(iv); cell.click(); return; }
+          if (tries >= NAV_POLL_MAX) { navTrace("open:shortcut-timeout"); clearInterval(iv); }
         }, 150);
-        try { if (iv && typeof iv.unref === "function") iv.unref(); } catch (e4) { /* 忽略 */ }
-      } catch (e) { /* 忽略 */ }
+        try { if (iv && typeof iv.unref === "function") iv.unref(); } catch (eV) { /* 忽略 */ }
+      } catch (e) { navTrace("open:shortcut-error:" + (e && e.message)); }
     }
 
     /**
@@ -984,10 +956,10 @@ window.__ModuleLoader__.load({
         if (cell) { navTrace("open:section-already-visible"); cell.click(); return; }
         var cands = settingsTriggerCandidates();
         navTrace("open:cands=" + cands.length);
-        if (!cands.length) { navTrace("open:no-cands→account-menu"); return viaAccountMenu(); }
+        if (!cands.length) { navTrace("open:no-sidebar-cands→shortcut"); return openSettingsViaShortcut(); }
         var idx = 0;
         var tryNext = function () {
-          if (idx >= cands.length) { navTrace("open:cands-exhausted→account-menu"); return viaAccountMenu(); }   // 侧栏里找不到触发器 → 走账号菜单
+          if (idx >= cands.length) { navTrace("open:sidebar-cands-exhausted→shortcut"); return openSettingsViaShortcut(); }   // 侧栏里找不到触发器 → 走账号菜单
           var el = cands[idx++];
           try { el.click(); } catch (eClick) { return tryNext(); }
           var tries = 0;
@@ -1069,57 +1041,6 @@ window.__ModuleLoader__.load({
          · 只用自己创建的 button（**不 cloneNode** —— 克隆会继承官方事件委托，历史事故）；
          · 整段 try/catch，任何异常都不影响面板本身。
        失败的可见后果只是"弹窗里没有这一项"，侧栏那个官方槽位入口仍然在。 */
-    var MENU_ENTRY_SIG = "data-dru-account-menu";
-    /**
-     * 这个菜单行是不是「设置」那一行？
-     *
-     * 🔴 2026-10-11 实测（探针拿到桌面渲染器真实 DOM）：账号菜单里那一项的文案是
-     *    **「设置 ⌘,」**（快捷键就写在行内）—— 我原先按 `textContent === "设置"` 全等匹配，
-     *    于是①插不进去、②点不动，表现就是业主说的"点了一点反应都没有"。
-     *    现在按"归一化后**以**设置/Settings 开头"判（也接受包含），并排除我们自己的行。
-     */
-    function menuRowIsSettings(el) {
-      try {
-        var t = String(el.textContent || "").replace(/\s+/g, "").trim();
-        if (!t) return false;
-        if (t.indexOf("远程访问") !== -1) return false;
-        return /^(设置|Settings)/i.test(t) || /(设置|Settings)$/i.test(t);
-      } catch (e) { return false; }
-    }
-    function accountMenuInjectTick() {
-      try {
-        var pops = document.querySelectorAll('[role="menu"], [role="dialog"], [role="listbox"]');
-        for (var i = 0; i < pops.length; i++) {
-          var pop = pops[i];
-          if (!pop || !pop.querySelectorAll) continue;
-          var txt = String(pop.textContent || "");
-          if (txt.indexOf("意见反馈") === -1 && txt.indexOf("Feedback") === -1) continue;  // 不是账号菜单
-          if (pop.querySelector("[" + MENU_ENTRY_SIG + "]")) return;                       // 已插入
-          var rows = pop.querySelectorAll("button, [role=\"menuitem\"], [role=\"button\"]");
-          var settingsRow = null;
-          for (var k = 0; k < rows.length; k++) {
-            if (menuRowIsSettings(rows[k])) { settingsRow = rows[k]; break; }
-          }
-          if (!settingsRow || !settingsRow.parentNode) return;
-          var btn = document.createElement("button");
-          btn.type = "button";
-          btn.className = "dru-menu-row";
-          btn.setAttribute(MENU_ENTRY_SIG, "1");
-          btn.setAttribute("data-dru-remote", "1");
-          btn.textContent = "📱 远程访问";
-          btn.onclick = function (ev) {
-            try { if (ev && ev.preventDefault) ev.preventDefault(); } catch (e0) { /* 忽略 */ }
-            try { if (ev && ev.stopPropagation) ev.stopPropagation(); } catch (e1) { /* 忽略 */ }
-            try { document.body.click(); } catch (e2) { /* 先关掉账号菜单，再开设置 */ }
-            setTimeout(function () { try { openRemoteSettings(); } catch (e3) { /* 忽略 */ } }, 120);
-          };
-          settingsRow.parentNode.insertBefore(btn, settingsRow);
-          navTrace("inject:inserted");
-          return;   // 一次只处理一个浮层
-        }
-      } catch (e) { /* 忽略：插入失败不影响任何既有功能 */ }
-    }
-
     function navEnsureStart() {
       if (window.__dshRemoteNavStarted) return;
       window.__dshRemoteNavStarted = true;
@@ -1127,11 +1048,6 @@ window.__ModuleLoader__.load({
       navTrace("adapter-ready");
       // ⚠️ 这里**不再**做 DOM 注入（见 RemoteNavEntry 的注释）：入口由官方槽位渲染。
       //    保留本函数只为实现"继续暴露 window.__dshRemoteNav"（老调用方与诊断仍在用）。
-      // 账号菜单里的入口（业主指定位置）：低频轮询，只在弹窗出现时插入一次，幂等且保守。
-      try {
-        var ivMenu = setInterval(accountMenuInjectTick, 1000);
-        if (ivMenu && typeof ivMenu.unref === "function") ivMenu.unref();
-      } catch (e) { /* 忽略 */ }
       try { if (typeof openRemoteSettings === "function") remoteNavOpen = openRemoteSettings; } catch (e) { /* 忽略 */ }
     }
 
