@@ -522,6 +522,9 @@ window.__ModuleLoader__.load({
       ".dru-foot-entry:focus-visible{outline:2px solid var(--dru-focus);outline-offset:1px}",
       ".dru-foot-entry .ico{flex:none;width:18px;text-align:center;font-size:15px;line-height:1}",
       ".dru-foot-entry .lbl{overflow:hidden;text-overflow:ellipsis}",
+      // 账号菜单里的入口行（DOM 插入，见 accountMenuInjectTick）：与官方菜单项同样的整行观感
+      ".dru-menu-row{display:flex;align-items:center;gap:8px;width:100%;box-sizing:border-box;min-height:32px;padding:6px 10px;border:none;border-radius:6px;background:transparent;color:inherit;font:inherit;font-size:13px;text-align:left;cursor:pointer;white-space:nowrap;user-select:none}",
+      ".dru-menu-row:hover{background:var(--dru-hover)}",
       ".dru-nav-remote-dot{position:absolute;top:-2px;right:-2px;width:8px;height:8px;border-radius:50%;background:var(--dru-reddot);box-shadow:0 0 0 2px var(--dru-surface-2);pointer-events:none}",
       // 侧栏入口与官方按钮同高（30px）；用 ::after 把命中区补到 ≥44px，不破坏与原按钮的对齐
       ".dru-nav-remote::after{content:\"\";position:absolute;left:0;right:0;top:-7px;bottom:-7px}",
@@ -969,12 +972,64 @@ window.__ModuleLoader__.load({
       ]);
     }
 
+    /* 📱 账号菜单里的入口（2026-10-11 业主指定位置：「放在设置那一行的上面，小弹窗里面」）。
+       ────────────────────────────────────────────────────────────────────────────
+       那个「小弹窗」= 桌面端自带的**账号菜单**（设置 / 意见反馈 / 登录 / 更多），由
+       `@deepseek-ai/dsh-client-ui-settings-account` 渲染（它只在桌面渲染器里注册，且有
+       `dshDesktop` 判断）。它**没有给插件留任何菜单槽位**（该包只注册 shell.overlay /
+       settings.models.sign-in / shell.quota-notice），所以放进它只能做 DOM 插入。
+       因此这里的写法刻意保守：
+         · 只在"确实是账号菜单"（含「意见反馈」这一独有文案）的浮层里动手，别的浮层一律不碰；
+         · 幂等（插过就跳过）；找不到「设置」那一行就**什么都不做**（绝不猜位置）；
+         · 只用自己创建的 button（**不 cloneNode** —— 克隆会继承官方事件委托，历史事故）；
+         · 整段 try/catch，任何异常都不影响面板本身。
+       失败的可见后果只是"弹窗里没有这一项"，侧栏那个官方槽位入口仍然在。 */
+    var MENU_ENTRY_SIG = "data-dru-account-menu";
+    function accountMenuInjectTick() {
+      try {
+        var pops = document.querySelectorAll('[role="menu"], [role="dialog"], [role="listbox"]');
+        for (var i = 0; i < pops.length; i++) {
+          var pop = pops[i];
+          if (!pop || !pop.querySelectorAll) continue;
+          var txt = String(pop.textContent || "");
+          if (txt.indexOf("意见反馈") === -1 && txt.indexOf("Feedback") === -1) continue;  // 不是账号菜单
+          if (pop.querySelector("[" + MENU_ENTRY_SIG + "]")) return;                       // 已插入
+          var rows = pop.querySelectorAll("button, [role=\"menuitem\"], [role=\"button\"]");
+          var settingsRow = null;
+          for (var k = 0; k < rows.length; k++) {
+            var t = String(rows[k].textContent || "").replace(/\s+/g, "").trim();
+            if (t === "设置" || t === "Settings") { settingsRow = rows[k]; break; }
+          }
+          if (!settingsRow || !settingsRow.parentNode) return;
+          var btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "dru-menu-row";
+          btn.setAttribute(MENU_ENTRY_SIG, "1");
+          btn.setAttribute("data-dru-remote", "1");
+          btn.textContent = "📱 远程访问";
+          btn.onclick = function (ev) {
+            try { if (ev && ev.preventDefault) ev.preventDefault(); } catch (e0) { /* 忽略 */ }
+            try { if (ev && ev.stopPropagation) ev.stopPropagation(); } catch (e1) { /* 忽略 */ }
+            try { document.body.click(); } catch (e2) { /* 先关掉账号菜单，再开设置 */ }
+            setTimeout(function () { try { openRemoteSettings(); } catch (e3) { /* 忽略 */ } }, 120);
+          };
+          settingsRow.parentNode.insertBefore(btn, settingsRow);
+          return;   // 一次只处理一个浮层
+        }
+      } catch (e) { /* 忽略：插入失败不影响任何既有功能 */ }
+    }
+
     function navEnsureStart() {
       if (window.__dshRemoteNavStarted) return;
       window.__dshRemoteNavStarted = true;
       try { window.__dshRemoteNav = { open: openRemoteSettings }; } catch (e) {}
       // ⚠️ 这里**不再**做 DOM 注入（见 RemoteNavEntry 的注释）：入口由官方槽位渲染。
       //    保留本函数只为实现"继续暴露 window.__dshRemoteNav"（老调用方与诊断仍在用）。
+      // 账号菜单里的入口（业主指定位置）：低频轮询，只在弹窗出现时插入一次，幂等且保守。
+      try {
+        var ivMenu = setInterval(accountMenuInjectTick, 1000);
+        if (ivMenu && typeof ivMenu.unref === "function") ivMenu.unref();
+      } catch (e) { /* 忽略 */ }
       try { if (typeof openRemoteSettings === "function") remoteNavOpen = openRemoteSettings; } catch (e) { /* 忽略 */ }
     }
 
