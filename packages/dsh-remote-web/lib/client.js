@@ -834,22 +834,34 @@ window.__ModuleLoader__.load({
      *   其中 **带 aria-keyshortcuts / 文案或 aria-label 含「设置」** 的优先（语言无关 + 精确）。
      */
     function settingsTriggerCandidates() {
-      var out = [];
+      var ranked = [];
       try {
+        /* 排名而不是「谁先扫到谁」（2026-10-11 业主实测「点入口弹出的是 token 用量小弹窗」）：
+             ① 官方设置槽位里的按钮 = 确定是设置触发器（sidebar.settings / settings.launcher）
+             ② 带快捷键或文案含「设置」的弹层触发器
+             ③ 其它弹层触发器（最后兜底）
+           并且**排除我们自己所在的底部槽**（sidebar.footer.action）—— token 用量、其它插件按钮
+           都在那一块，它们同样带 aria-haspopup=dialog，正是「点错弹窗」的来源。
+           只用 closest 判容器、不做后代选择器：任何 DOM 实现（含测试替身）都支持。 */
         var cands = document.querySelectorAll('button[aria-haspopup="dialog"], [aria-haspopup="dialog"]');
-        var rest = [];
         for (var i = 0; i < cands.length; i++) {
           var el = cands[i];
           if (!el || el.id === NAV_ENTRY_ID) continue;   // 排除我们自己的入口
           if (navInDialog(el)) continue;                 // 弹层内的（关闭键/栏目）一律不要
+          try { if (el.closest && el.closest('[data-slot="sidebar.footer.action"]')) continue; } catch (e0) { /* 忽略 */ }
           if (NAV_BAD_RE.test(String(el.className || ""))) continue;
+          var inSettingsSlot = false;
+          try {
+            inSettingsSlot = !!(el.closest && el.closest('[data-slot="sidebar.settings"], [data-slot="settings.launcher"]'));
+          } catch (e1) { inSettingsSlot = false; }
           var label = String(navAttrOf(el) || navCleanText(el) || "");
           var hasShortcut = !!(el.getAttribute && el.getAttribute("aria-keyshortcuts"));
-          if (hasShortcut || /设置|Settings/i.test(label)) out.push(el);
-          else rest.push(el);
+          var rank = inSettingsSlot ? 0 : ((hasShortcut || /设置|Settings/i.test(label)) ? 1 : 2);
+          ranked.push({ el: el, rank: rank, order: i });
         }
-        return out.concat(rest);   // 兜底也不能空着：实在认不出就逐个试（见 openRemoteSettings）
-      } catch (e) { return out; }
+        ranked.sort(function (a, b) { return (a.rank - b.rank) || (a.order - b.order); });
+        return ranked.map(function (x) { return x.el; });
+      } catch (e) { return ranked.map(function (x) { return x.el; }); }
     }
     /** 官方「设置」触发器（首选候选，保持旧名字给测试与调用方用）。 */
     function pickSettingsTrigger() {
@@ -2718,7 +2730,11 @@ window.__ModuleLoader__.load({
       // 在那边**做不到也不该做**（强行退出会弹原生致命错误）。面板据此：
       //   ① 不自动倒计时重启；② 保留提醒但改文案，引导"退出并重开桌面应用"。
       // 旧版 host 的响应里没有该字段 → false，行为与改动前完全一致。
-      var desktopHost = !!(st && st.desktopHost);
+      // 🔴 2026-10-11 修：node 半把该字段下在 **connect** 里（`connect.desktopHost`），
+      // 这里以前读顶层 `st.desktopHost` → **永远 false** → 桌面端被当成 Web 版：
+      // 面板照样摆「立即重启」按钮、照样走倒计时自动重启那条路（业主实测"装插件时窗口被突兀关掉"）。
+      // 兼容两种位置，桌面端的"不自动重启/只提示用户自己重启"这才真正生效。
+      var desktopHost = !!(st && (st.desktopHost || (st.connect && st.connect.desktopHost)));
       // kind === "refresh" = 插件文件在运行中被改写(装完/更新完),只需刷新页面;
       // 其余情况(极为罕见)才提重启 dsh web。
       var isRefreshOnly = restartPending && restartInfo.kind === "refresh";

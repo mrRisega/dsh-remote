@@ -100,7 +100,7 @@ function makeDocument(roots) {
   };
 }
 function loadNavHelpers(doc) {
-  const src = navHelpersSource() + "\nreturn { pickSettingsTrigger, pickNavByToken, navInDialog };";
+  const src = navHelpersSource() + "\nreturn { pickSettingsTrigger, settingsTriggerCandidates, pickNavByToken, navInDialog };";
   // eslint-disable-next-line no-new-func
   return new Function("document", "window", src)(doc, {});
 }
@@ -133,6 +133,30 @@ test("★ 事故锁：官方「设置」触发器只认语义锚点，且必须�
   const { doc, trigger } = desktopFixture();
   const { pickSettingsTrigger } = loadNavHelpers(doc);
   assert.equal(pickSettingsTrigger(), trigger, "必须命中侧栏那颗 aria-haspopup=dialog 的齿轮按钮");
+});
+
+test("★ 2026-10-11 业主实测：点入口弹出的是 token 用量弹窗 —— 官方设置槽位必须优先于底部槽邻居", () => {
+  // 现场：入口挂在 sidebar.footer.action，而同一底部区域的「token 本轮用量」按钮
+  // 也带 aria-haspopup="dialog"（甚至带快捷键）→ 旧实现"谁先扫到谁"就点中了它。
+  // 现在：① 官方设置槽位里的按钮排第一；② 底部槽（我们所在那块）里的候选直接排除。
+  const sidebar = new El("div", { cls: "sidebarRoot" });
+  const footSlot = new El("div", { attrs: { "data-slot": "sidebar.footer.action" } });
+  const tokenBtn = new El("button", { cls: "tokTrigger", attrs: { "aria-haspopup": "dialog", "aria-keyshortcuts": "Alt+Meta+T", "aria-label": "本轮用量" } });
+  const entry = new El("button", { id: "dru-nav-remote", cls: "dru-foot-entry", text: "📱 远程访问" });
+  footSlot.append(tokenBtn, entry);
+  const settingsArea = new El("div", { cls: "settingsArea" });
+  const settingsSlot = new El("div", { attrs: { "data-slot": "sidebar.settings" } });
+  const trigger = new El("button", { cls: "gearTrigger", attrs: { "aria-haspopup": "dialog", "aria-label": "设置" } });
+  settingsSlot.append(trigger);
+  settingsArea.append(settingsSlot);
+  sidebar.append(footSlot, settingsArea);
+
+  const doc = makeDocument([sidebar]);
+  const { pickSettingsTrigger, settingsTriggerCandidates } = loadNavHelpers(doc);
+  const cands = settingsTriggerCandidates();
+  assert.ok(!cands.includes(tokenBtn), "★ 底部槽里的 token 用量按钮必须被排除（点它会弹错窗）");
+  assert.ok(!cands.includes(entry), "我们自己的入口不能成为候选（否则点自己→再点自己）");
+  assert.equal(pickSettingsTrigger(), trigger, "★ 必须选中官方设置槽位里的齿轮，而不是 token 用量按钮");
 });
 
 test("★ 事故锁：弹层里的「通用设置」永远不能成为落点", () => {

@@ -6626,6 +6626,21 @@ function registerRoutes(ctx, relayDir) {
       handler: async (_req, res) => {
         // 首次安装/在线更新后重启 DeepSeek harness：插件本体与浏览器半在进程启动时装载，
         // 不重启则面板入口与 /dsh-remote/* 路由都不会出现。只重启承载本插件的进程。
+        //
+        // 🔴 2026-10-11 业主口径：**桌面端绝不代为重启**。
+        //   "自动重启会很突兀地把窗口给关掉，关没了……我们应该提示用户自己重启，不要由我们来重启。"
+        //   桌面端 Host 由 Electron 托管，重启 = 强杀承载窗口的进程（还会弹原生致命错误）。
+        //   这里做成**硬拒绝**（不只是前端藏按钮）：任何调用方都拿不到"被重启"的结果，
+        //   只会收到一句明确的"请手动重启"，前端据此展示提示。
+        if (IS_ELECTRON_HOST) {
+          sendJson(res, 200, {
+            ...(await composeStatus(relayDir)),
+            ok: false,
+            status: "manual-restart-required",
+            detail: "桌面端不代为重启：请手动退出并重新打开 DeepSeek Harness（自动重启会突兀地关掉窗口）",
+          });
+          return;
+        }
         const r = await restartHarness(relayDir);
         const payload = { ...(await composeStatus(relayDir)), ...r };
         if (!r.ok) payload.error = r.detail || r.status || "重启失败";
