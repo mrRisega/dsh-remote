@@ -57,7 +57,8 @@
     "_comment:test:bridge": "⚠️ 必须 --test-concurrency=1（与 test:plugin 对齐）：tunnel-auth 有一条「bridge 5 秒内必须重连」的硬期限，并行跑时新增用例抢 CPU 会把它撞破 → 偶发假红（实测单独跑 2/2 通过、并发跑偶发 0/2）。假红比慢更贵。",
     "test:bridge": "DSH_RELAY_DEFAULT_API=http://127.0.0.1:1 NODE_OPTIONS=\"--require $PWD/scripts/test-net-guard.cjs ${NODE_OPTIONS:-}\" node --test --test-concurrency=1 clients/dsh-remote/test/*.test.mjs",
     "check": "node --check scripts/check-profile-activation.mjs && node --check clients/dsh-remote/dsh-bridge.mjs && node --check clients/dsh-remote/wechat-channel.mjs && node --check clients/dsh-remote/wechat-runtime.mjs && node --check clients/dsh-remote/dsh-events.mjs && node --check clients/dsh-remote/e2ee-shim.mjs && node --check dsh-setup.mjs && node --check packages/dsh-remote-web/lib/index.js && node --check packages/dsh-remote-web/lib/client.js && node --check packages/relay-router/src/index.mjs && node --check packages/relay-router/src/logger.mjs && bash -n deploy/install-open.sh && grep -q 'command -v setsid' deploy/install-open.sh && grep -q 'command -v ss' deploy/install-open.sh",
-    "release:tarballs": "bash scripts/release-tarballs.sh"
+    "release:tarballs": "bash scripts/release-tarballs.sh",
+    "sync:local": "node scripts/sync-local.mjs"
   },
   "dependencies": {
     "ws": "^8.18.0"

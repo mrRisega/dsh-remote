@@ -2197,10 +2197,21 @@ function copyPluginIntoProfile(profileDir, pluginDir) {
     // 注意：插件源(npx 缓存 / npm 全局)本身就位于某个 node_modules 之下，
     // 过滤必须基于“相对插件目录”的路径片段，绝不能整条 src 路径包含判断，
     // 否则会把插件文件全过滤掉、拷出空目录(此前反复“插件入口缺失”的总根因)。
+    //
+    // 🔴 2026-10-10 修：**插件自带的 runtime/node_modules 不能被剔掉**。
+    //   旧规则是"任何一段叫 node_modules 就过滤"，这条原本只想剔掉插件自己的依赖目录
+    //   （那些由 profile 的包管理器管），却把 `runtime/node_modules/ws` 一起剔了 ——
+    //   而那份运行时正是"只有插件半"的机器**自愈补装时的来源**。剔掉它 = 自愈出来的运行环境
+    //   缺 ws（bridge 顶层 `import WebSocket from "ws"`）→ 一启动就崩，还"自检通过"。
+    //   现在：`runtime/` 之内一律保留；只过滤 runtime 之外的 node_modules。
     filter: (src) => {
       if (src === pluginDir) return true;
-      const rel = path.relative(pluginDir, src);
-      return !String(rel).split(path.sep).some((seg) => seg === "node_modules" || seg === ".git" || seg === ".DS_Store");
+      const rel = String(path.relative(pluginDir, src));
+      const segs = rel.split(path.sep);
+      if (segs.some((seg) => seg === ".git" || seg === ".DS_Store")) return false;
+      const inBundledRuntime = segs[0] === "runtime";
+      if (!inBundledRuntime && segs.some((seg) => seg === "node_modules")) return false;
+      return true;
     }
   };
 

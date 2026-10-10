@@ -995,6 +995,14 @@ function runtimeManifest(relayDir) {
  */
 function missingRuntimeFiles(relayDir) {
   if (!existsSync(join(relayDir, "dsh-setup.mjs"))) return ["dsh-setup.mjs"];
+  /* ⚠️ 已知盲区（2026-10-10 发现，**暂不做 gating**）：bridge 顶层 `import WebSocket from "ws"` 是裸依赖，
+     而 runtimeManifest 只跟**相对路径 import**，所以"运行环境里有没有 ws"从未进过这份自检。
+     试过把 `node_modules/ws` 加进必需清单，但真实语义是 **Node 会向上找 node_modules**
+     （~/.dsh-remote/node_modules/ws 与宿主/父级 node_modules 都可能提供它），
+     按"某个固定路径必须存在"判会误伤 —— 实测直接打挂 17 个连接流程用例，且真实机器上
+     ws 本来就解析得到（已验证）。所以这里保持"只判入口点名的相对文件"，
+     根治放在**源头**：安装器拷贝插件时必须保留 `runtime/node_modules`（已修 + 有用例），
+     以及 `npm run sync:local` 会把 ws 一并同步到 relayDir。 */
   return runtimeManifest(relayDir).filter((rel) => !existsSync(join(relayDir, rel)));
 }
 

@@ -156,3 +156,40 @@ test("★ 插件覆盖必须原子：staging → 必需文件自检 → rename �
     "🔴 不得再出现「先删 dest 再原地逐文件拷贝」——那正是这次事故的成因");
   assert.match(fn, /\.staging-\$\{process\.pid\}|\.staging-/, "被强杀留下的 staging 要能清理");
 });
+
+test("★ 插件拷贝必须保留**自带的 runtime/node_modules**（ws 是桥唯一的裸依赖）", () => {
+  // 2026-10-10 事故形态：过滤规则写的是"任何一段叫 node_modules 就剔除"，
+  // 本意只想去掉插件自己的依赖目录（那些由 profile 的包管理器管），
+  // 却把 `runtime/node_modules/ws` 一起剔了 —— 而这份运行时正是"只有插件半"的机器
+  // **自愈补装时的唯一来源**。剔掉它 → 自愈出来的运行环境缺 ws
+  // （bridge 顶层 `import WebSocket from "ws"`）→ 一启动就崩，而且自检还说"已就绪"。
+  const src = readFileSync(SETUP, "utf8");
+  const i = src.indexOf("const cpOpts = {");
+  assert.ok(i > 0, "应能定位 cpOpts");
+  const j = src.indexOf("};", i);
+  const objSrc = src.slice(i, j + 2);
+  const pluginDir = "/some/node_modules/dsh-remote-web";   // 源本身就在 node_modules 之下（历史坑）
+  const path = require$path();
+  // eslint-disable-next-line no-new-func
+  const make = new Function("path", "pluginDir", `${objSrc}\nreturn cpOpts;`);
+  const cpOpts = make(path, pluginDir);
+  const keep = (p) => cpOpts.filter(p) === true;
+
+  assert.equal(keep(pluginDir), true, "插件根目录本身必须保留");
+  assert.equal(keep(path.join(pluginDir, "lib", "index.js")), true, "普通文件必须保留");
+  // ① 自带运行时的 node_modules **必须保留**（本次修复的核心）
+  assert.equal(keep(path.join(pluginDir, "runtime", "node_modules")), true, "runtime/node_modules 必须保留");
+  assert.equal(keep(path.join(pluginDir, "runtime", "node_modules", "ws", "package.json")), true,
+    "★ runtime/node_modules/ws 必须被拷进 profile —— 否则自愈出来的运行环境起不来");
+  // ② runtime 之外的 node_modules 仍然要剔除（profile 的包管理器管那部分）
+  assert.equal(keep(path.join(pluginDir, "node_modules", "foo", "index.js")), false,
+    "runtime 之外的依赖目录仍应剔除（避免把解析器裁决权抢过来）");
+  // ③ 垃圾照旧剔除
+  assert.equal(keep(path.join(pluginDir, ".git", "config")), false, ".git 必须剔除");
+  assert.equal(keep(path.join(pluginDir, "lib", ".DS_Store")), false, ".DS_Store 必须剔除");
+});
+
+/** 只在本用例里用到的 path 注入（避免为一行断言引入模块级 require 语义）。 */
+function require$path() {
+  return { join: (...a) => a.join("/"), sep: "/", relative: (from, to) => to.startsWith(from + "/") ? to.slice(from.length + 1) : to };
+}
