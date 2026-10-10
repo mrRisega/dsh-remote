@@ -914,6 +914,95 @@ window.__ModuleLoader__.load({
      * 底部只有「远程访问」+ 账号（高昂），「设置」在**账号菜单**里。所以当侧栏候选全部落空时，
      * 必须能"打开账号菜单 → 点设置 → 再点我们的栏目"，否则入口点下去就是没反应。
      */
+    /** 设置面板是否已经打开（可见的 dialog 且含「通用设置」——它就是设置面板的标志）。 */
+    function settingsDialogOpen() {
+      try {
+        var ds = document.querySelectorAll('[role="dialog"], [aria-modal="true"]');
+        for (var i = 0; i < ds.length; i++) {
+          var el = ds[i];
+          if (!el.getBoundingClientRect || el.getBoundingClientRect().width === 0) continue;
+          var t = String(el.textContent || "");
+          if (t.indexOf("通用设置") !== -1 || t.indexOf("General") !== -1) return true;
+        }
+      } catch (e) { /* 忽略 */ }
+      return false;
+    }
+
+    /**
+     * 这一行是不是账号菜单里的「设置」？
+     * ⚠️ **只认"以设置/Settings 开头"** —— 绝不能加"以设置结尾"：账号菜单在桌面端真实文案是
+     * 「设置 ⌥ ⌘ ,」（带快捷键），而以"设置"结尾的还有「**通用设置**」，
+     * 那会让我们把设置面板当成账号菜单、把「通用设置」当成「设置」行（2026-10-11 两个远程访问的根因）。
+     */
+    function menuRowIsSettings(el) {
+      try {
+        var t = String(el.textContent || "").replace(/\s+/g, "").trim();
+        if (!t || t.indexOf("远程访问") !== -1) return false;
+        return /^(设置|Settings)/i.test(t);
+      } catch (e) { return false; }
+    }
+
+    /** 账号菜单的触发器：桌面端是左下角那颗"头像 chip"（aria-label="账号菜单"）。 */
+    function accountMenuTrigger() {
+      try {
+        var all = document.querySelectorAll('[aria-haspopup="menu"], button, [role="button"]');
+        var best = null;
+        for (var i = 0; i < all.length; i++) {
+          var el = all[i];
+          if (!el || el.id === NAV_ENTRY_ID) continue;
+          var aria = String((el.getAttribute && el.getAttribute("aria-label")) || "");
+          if (/账号菜单|Account menu/i.test(aria)) return el;
+          var r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+          if (!best && r && r.width > 0 && r.left < 360 && r.top > 300
+              && String((el.getAttribute && el.getAttribute("aria-haspopup")) || "") === "menu") best = el;
+        }
+        return best;
+      } catch (e) { return null; }
+    }
+
+    /**
+     * 兜底：从**账号菜单**进设置（桌面端的「设置」就在账号菜单里）。
+     * 这是唯一在真机上验证过能打开设置面板的路径 —— 但账号菜单会闪现一下，所以：
+     *   · 只在侧栏候选与快捷键都失败后才用（见 openRemoteSettings）；
+     *   · 轮询间隔压到 40ms，菜单可见时间≈一两帧，尽量不打扰。
+     */
+    function openSettingsViaAccountMenu() {
+      try {
+        var trigger = accountMenuTrigger();
+        navTrace("menu:trigger=" + (trigger ? "found" : "none"));
+        if (!trigger) return;
+        try { trigger.click(); } catch (e) { return; }
+        var tries = 0;
+        var iv = setInterval(function () {
+          tries += 1;
+          var menus = document.querySelectorAll('[role="menu"], [role="listbox"], [role="dialog"]');
+          for (var i = 0; i < menus.length; i++) {
+            var m = menus[i];
+            if (!m.getBoundingClientRect || m.getBoundingClientRect().width === 0) continue;
+            if (String(m.textContent || "").indexOf("通用设置") !== -1) continue;   // 那是设置面板，不是账号菜单
+            var items = m.querySelectorAll ? m.querySelectorAll('button, [role="menuitem"]') : [];
+            for (var k = 0; k < items.length; k++) {
+              if (!menuRowIsSettings(items[k])) continue;
+              navTrace("menu:settings-row-clicked");
+              clearInterval(iv);
+              try { items[k].click(); } catch (e2) { /* 忽略 */ }
+              var tries2 = 0;
+              var iv2 = setInterval(function () {
+                tries2 += 1;
+                var cell = pickNavByToken("远程访问", { insideDialog: true });
+                if (cell) { navTrace("menu:section-clicked"); clearInterval(iv2); cell.click(); }
+                else if (tries2 >= NAV_POLL_MAX) { navTrace("menu:section-timeout"); clearInterval(iv2); }
+              }, 120);
+              try { if (iv2 && typeof iv2.unref === "function") iv2.unref(); } catch (e3) { /* 忽略 */ }
+              return;
+            }
+          }
+          if (tries >= 30) { navTrace("menu:timeout"); clearInterval(iv); }   // 30×40ms≈1.2s
+        }, 40);
+        try { if (iv && typeof iv.unref === "function") iv.unref(); } catch (e4) { /* 忽略 */ }
+      } catch (e) { /* 忽略 */ }
+    }
+
     /**
      * 用**官方设置快捷键**（⌥⌘, / Alt+Meta+,）打开设置面板。
      *
@@ -936,8 +1025,12 @@ window.__ModuleLoader__.load({
           tries += 1;
           var cell = pickNavByToken("远程访问", { insideDialog: true });
           if (cell) { navTrace("open:shortcut-section-clicked"); clearInterval(iv); cell.click(); return; }
-          if (tries >= NAV_POLL_MAX) { navTrace("open:shortcut-timeout"); clearInterval(iv); }
-        }, 150);
+          if (tries >= 6) {                     // ~0.6s 还没开 → 桌面端快捷键可能是**原生菜单加速键**（合成事件打不动）
+            clearInterval(iv);
+            if (!settingsDialogOpen()) { navTrace("open:shortcut-no-effect→account-menu"); openSettingsViaAccountMenu(); }
+            else navTrace("open:shortcut-dialog-but-no-section");
+          }
+        }, 100);
         try { if (iv && typeof iv.unref === "function") iv.unref(); } catch (eV) { /* 忽略 */ }
       } catch (e) { navTrace("open:shortcut-error:" + (e && e.message)); }
     }

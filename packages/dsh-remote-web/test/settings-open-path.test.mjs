@@ -64,11 +64,34 @@ test("★ 设置面板打开后自动点中「远程访问」栏目", () => {
 });
 
 test("★ 不再往账号菜单里插任何东西（业主明确要求删掉）", () => {
-  for (const banned of ["dru-menu-row", "accountMenuInjectTick", "MENU_ENTRY_SIG", "viaAccountMenu"]) {
-    assert.ok(!SOURCE.includes(banned), `不得再出现 ${banned}（账号菜单注入已按业主要求删除）`);
+  for (const banned of ["dru-menu-row", "accountMenuInjectTick", "MENU_ENTRY_SIG"]) {
+    assert.ok(!SOURCE.includes(banned), `不得再往账号菜单里插条目：${banned}（已按业主要求删除）`);
   }
-  // 兜底也不许"点账号菜单"：那会闪出中间弹层（业主实测体验差）
-  assert.ok(!/aria-haspopup="menu"[\s\S]{0,200}click\(\)/.test(SOURCE), "不得再通过点账号菜单来打开设置");
+});
+
+test("★ 打开设置的顺序：侧栏候选 → 快捷键(验证) → 账号菜单(兜底)", () => {
+  // 桌面端的 ⌥⌘, 是**原生菜单加速键**，合成 DOM 事件打不动它（真机实测"点了没反应"）；
+  // 而"设置"只存在于账号菜单里 → 必须保留这条兜底，但只能在前面都失败后才走（它会闪一下）。
+  assert.match(SOURCE, /open:shortcut-no-effect→account-menu/, "快捷键无效时必须转投账号菜单兜底");
+  const shortcutAt = SOURCE.indexOf("function openSettingsViaShortcut()");
+  const menuAt = SOURCE.indexOf("function openSettingsViaAccountMenu()");
+  assert.ok(shortcutAt > 0 && menuAt > 0, "两条路径都要在");
+  // 菜单兜底里必须带上"不是设置面板"的排除（否则会把设置面板当成账号菜单）
+  assert.match(SOURCE, /indexOf\("通用设置"\) !== -1\) continue;/, "识别账号菜单时必须排除设置面板本身");
+});
+
+test("★ 「设置」行判据：认「设置 ⌥ ⌘ ,」，绝不认「通用设置」", () => {
+  const start = SOURCE.indexOf("function menuRowIsSettings(");
+  assert.ok(start > 0, "应有 menuRowIsSettings");
+  const end = SOURCE.indexOf("function accountMenuTrigger()", start);
+  const fn = new Function(`${SOURCE.slice(start, end)}; return menuRowIsSettings;`)();
+  const mk = (t) => ({ textContent: t });
+  assert.equal(fn(mk("设置 ⌥ ⌘ ,")), true, "真实文案带快捷键，必须认得");
+  assert.equal(fn(mk("设置")), true, "纯文案也要认得");
+  assert.equal(fn(mk("Settings")), true, "英文界面");
+  assert.equal(fn(mk("通用设置")), false, "★ 绝不能认「通用设置」——2026-10-11 两个『远程访问』就是它造成的");
+  assert.equal(fn(mk("📱 远程访问")), false, "不能认我们自己的入口");
+  assert.equal(fn(mk("意见反馈")), false);
 });
 
 test("★ 反复出现的坑：判据不得用「以设置结尾」（会命中「通用设置」）", () => {
