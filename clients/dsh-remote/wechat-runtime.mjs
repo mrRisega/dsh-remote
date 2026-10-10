@@ -199,10 +199,22 @@ const SPECIAL_EVENT_KINDS = Object.freeze([
 const NOTICE_FORMATTER_KINDS = Object.freeze(["quota", "membership"]);
 
 /**
- * 主动推送失败后的**待补发队列**上限（见 `#pushProactive`）。
- * 为什么是 20：够放下"一轮里所有该告诉用户的事"；再多下去，补发就变成刷屏了。
+ * 主动推送失败后的**待补发队列**上限（见 `#pushProactive`）：只留**最近几条**。
+ *
+ * 2026-10-09 业主口径：「积压超过一定时限后就丢弃掉最早的数据，只保留最近几条」。
+ * 从 20 收到 5 的理由：一轮里真正还值得看的就最近那么两三条；攒到 20 条的结果是
+ * 平台一恢复就**一次连打十几条** —— 实测正是这种突发批量触发 `ret=-2 prepare failed`
+ * 被限流，于是补发又失败、队列再涨，越积越多永远还不上（现场观察到的就是这个循环）。
  */
-const MAX_OUTBOX = 20;
+const MAX_OUTBOX = 5;
+/**
+ * 待补发条目的**保质期**：超过这个时长还没送达就丢弃（先丢最旧的）。
+ *
+ * 为什么必须有（同一条业主口径）：一条"任务跑完了"的通知迟到几小时就**毫无价值** ——
+ * 补发出去只会让用户以为刚刚才发生；而队列的价值在于"网络抖动期间的短暂失败"，
+ * 那是分钟级的。2 小时足够覆盖抖动与短时离线，又不会把半天前的旧事翻出来刷屏。
+ */
+const OUTBOX_TTL_MS = 2 * 60 * 60 * 1000;
 /** 补发时的正文前缀（迟到必须如实说，不能让用户以为刚刚才发生）。 */
 const OUTBOX_MARK = "（补发）";
 
@@ -337,6 +349,12 @@ function sendJson(res, status, body) {
 }
 
 export class WeChatRuntime {
+  /**
+   * 「预期内的订阅拒绝」已报过的 (code|sessionId) 集合 —— 见 fault 处理器。
+   * 只是防刷屏：每生成一个**子代理**会话都会被订阅层拒一次，不记集合就是每个子代理刷一行 warn。
+   */
+  #expectedFaultSeen = new Set();
+
   /**
    * @param {{
    *   relayDir: string,
@@ -508,7 +526,9 @@ export class WeChatRuntime {
       followed_sessions: this.subscriber && typeof this.subscriber.sessions === "function"
         ? this.subscriber.sessions()
         : [],
-      pending_outbox: Array.isArray(state.pending_outbox) ? state.pending_outbox.length : 0,
+      // 报**有效**条数（按保质期过滤后）：否则进程重启后，面板会一直显示那几条早已过期、
+      // 永远不会被补发的条目，看起来像"队列卡住了"。真正的清理由 #trimOutbox 落盘。
+      pending_outbox: this.#pruneOutbox(state.pending_outbox).kept.length,
       last_fault: state.last_fault || null,
       last_completed_session_id: state.last_completed_session_id || "",
       last_completed_at: Number(state.last_completed_at || 0),
@@ -1547,14 +1567,44 @@ export class WeChatRuntime {
     return list;
   }
 
+  /**
+   * 丢掉**过期**条目（返回保留的与丢掉的数量）。
+   * `at` 缺失/非法 = 更早的落盘格式（那时还没有 at 字段）→ 一律视为过期：
+   * 留着只会把"最近几条"挤掉，而它们必然比 TTL 更老。
+   */
+  #pruneOutbox(list) {
+    const now = this.clock();
+    const kept = [];
+    let dropped = 0;
+    for (const item of Array.isArray(list) ? list : []) {
+      const at = Number(item && item.at);
+      if (!Number.isFinite(at) || at <= 0 || now - at > OUTBOX_TTL_MS) { dropped += 1; continue; }
+      kept.push(item);
+    }
+    return { kept, dropped };
+  }
+
+  /** 丢弃过期的、并按上限只留最近几条；丢了就**如实记一行日志**（绝不静默丢）。 */
+  #trimOutbox(list) {
+    const { kept, dropped } = this.#pruneOutbox(list);
+    let overflow = 0;
+    while (kept.length > MAX_OUTBOX) { kept.shift(); overflow += 1; }
+    const lost = dropped + overflow;
+    if (lost > 0) {
+      const mins = Math.round(OUTBOX_TTL_MS / 60000);
+      const why = [dropped ? `${dropped} 条超 ${mins} 分钟未送达` : "", overflow ? `${overflow} 条超出最近 ${MAX_OUTBOX} 条上限` : ""]
+        .filter(Boolean).join("、");
+      this.logger.warn(`[wechat] 待补发队列丢弃 ${lost} 条（${why}），保留最近 ${kept.length} 条`);
+    }
+    return kept;
+  }
+
   #enqueueOutbox(text, kind = "") {
     const body = String(text || "");
     if (!body) return 0;
     const list = this.#outbox();
     list.push({ text: body, kind: String(kind || ""), at: this.clock() });
-    // 上限：丢最旧的（用户最需要的是"最近发生了什么"，而无限攒下去只会让补发像刷屏）
-    while (list.length > MAX_OUTBOX) list.shift();
-    return this.#writeOutbox(list).length;
+    return this.#writeOutbox(this.#trimOutbox(list)).length;
   }
 
   /**
@@ -1562,7 +1612,11 @@ export class WeChatRuntime {
    * @returns {Promise<number>} 这次补发成功的条数
    */
   async #flushOutbox(to) {
-    const list = this.#outbox();
+    // 补发前先按保质期清一遍：**过期的不发**（迟到几小时的"任务跑完了"只会误导用户），
+    // 也避免一次性连打十几条把平台打限流（那正是队列越积越多的成因）。
+    const raw = this.#outbox();
+    const list = this.#trimOutbox(raw);              // 只在真丢了东西时才落盘（避免每轮都写状态文件）
+    if (list.length !== raw.length) this.#writeOutbox(list);
     if (!list.length || !to) return 0;
     let sent = 0;
     const rest = [...list];
@@ -1645,10 +1699,20 @@ export class WeChatRuntime {
       const code = String((info && info.code) || "unknown");
       const message = String((info && info.message) || "").slice(0, 160);
       const sessionId = String((info && info.sessionId) || "");
-      this.logger.warn(`[wechat/events] 订阅异常 ${code}${sessionId ? ` session=${sessionId}` : ""}: ${message}`);
-      if (!(info && info.expected === true)) {
-        this.channel.writeState({ last_fault: { code, message, session_id: sessionId, at: this.clock() } });
+      // 预期内的拒绝（子代理会话必然被拒 `session/agent-busy` / 会话刚被删 `session/not-found`）
+      // **不是故障**：每生成一个子代理就会来一条，写成 warn 会把真正的故障淹掉
+      // （2026-10-09 现场：日志里成片 `订阅异常 session/agent-busy … require their durable parent address`）。
+      // 但也不能完全静默（2026-09-25 的教训：fault 以前没人接，全丢）→ 降为 info，且同一对只报一次。
+      if (info && info.expected === true) {
+        const key = `${code}|${sessionId}`;
+        if (this.#expectedFaultSeen.size < 200 && !this.#expectedFaultSeen.has(key)) {
+          this.#expectedFaultSeen.add(key);
+          this.logger.info(`[wechat/events] 订阅跳过(预期，不重试) ${code}${sessionId ? ` session=${sessionId}` : ""}: ${message}`);
+        }
+        return;
       }
+      this.logger.warn(`[wechat/events] 订阅异常 ${code}${sessionId ? ` session=${sessionId}` : ""}: ${message}`);
+      this.channel.writeState({ last_fault: { code, message, session_id: sessionId, at: this.clock() } });
     });
   }
 

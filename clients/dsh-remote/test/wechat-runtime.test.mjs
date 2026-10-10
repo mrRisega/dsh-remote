@@ -1983,6 +1983,77 @@ test("★ 事故锁：用户主动 /use 切走的会话不能被「最近完成�
   }
 });
 
+test("★ 待补发队列：过期的**不发**（丢弃最早的），且只保留最近几条", async () => {
+  // 业主 2026-10-09 口径：「积压超过一定时限后就丢弃掉最早的数据，只保留最近几条」。
+  // 两条理由：① 迟到几小时的"任务跑完了"只会误导用户；② 攒到十几条会在平台恢复时一次连打，
+  // 实测正是这种突发批量触发 `ret=-2 prepare failed` 被限流 → 补发又失败 → 队列再涨（死循环）。
+  const ilink = await fakeIlink();
+  try {
+    const sub = makeFakeSubscriber();
+    const { rt, relayDir } = await boundRuntime(ilink, { subscriber: sub });
+    const statePath = path.join(relayDir, ".wechat-state.json");
+    const stateOf = () => JSON.parse(fs.readFileSync(statePath, "utf8"));
+    const now = Date.now();
+    const H = 60 * 60 * 1000;
+
+    // 手工造一段积压：2 条很旧（>2h）+ 1 条刚失败（刚刚）
+    rt.channel.writeState({
+      pending_outbox: [
+        { text: "很久以前的完成通知A", kind: "stopped", at: now - 5 * H },
+        { text: "很久以前的完成通知B", kind: "stopped", at: now - 3 * H },
+        { text: "刚刚的完成通知C", kind: "stopped", at: now - 1000 },
+      ],
+    });
+    // ① 面板看到的是**有效**条数（过期的不该再显示成"待补发"）
+    assert.equal(rt.status().pending_outbox, 1, "status 必须按保质期报有效条数（否则重启后面板显示永远发不出去的旧条目）");
+
+    // ② 用户随便发一条 → 触发补发：只发那条没过期的
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "/status" } }] });
+    await waitFor(() => (stateOf().pending_outbox || []).length === 0);
+    const resent = allTexts(ilink.state).filter((t) => t.startsWith("（补发）"));
+    assert.equal(resent.length, 1, `★ 只应补发未过期的那一条，实际补发 ${resent.length} 条`);
+    assert.match(resent[0], /刚刚的完成通知C/, "补发的必须是没过期的那条");
+    assert.ok(!resent.some((t) => /很久以前的完成通知/.test(t)), "★ 过期条目绝不能发出去");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★ 待补发队列：超过上限只留最近几条（丢最早，且如实记日志）", async () => {
+  const ilink = await fakeIlink({ onSendMessage: (_s, reply) => reply({ ret: -2, errmsg: "prepare failed" }) });
+  try {
+    const infos = [];
+    const warns = [];
+    const sub = makeFakeSubscriber();
+    sub.sessionsFixture = [{ sessionId: "session-done", title: "跑完的活", running: false, cwd: "/p" }];
+    sub.summaryFixture = "做完了。";
+    const { rt, relayDir } = await boundRuntime(ilink, { subscriber: sub });
+    rt.logger = { info: (m) => infos.push(String(m)), warn: (m) => warns.push(String(m)), error() {}, debug() {}, addSecret() {} };
+    const statePath = path.join(relayDir, ".wechat-state.json");
+    const stateOf = () => JSON.parse(fs.readFileSync(statePath, "utf8"));
+
+    // 连推 9 条（每一条都发不出去 → 全部入队）。每条正文不同，才能断言"留下的是最近的"。
+    for (let i = 1; i <= 9; i += 1) {
+      sub.summaryFixture = `这是第${i}条结论。`;
+      await rt.notify({ kind: NODE_KINDS.TURN_END, sessionId: "session-done", reason: "completed", at: i });
+    }
+    const queued = stateOf().pending_outbox || [];
+    assert.equal(queued.length, 5, `★ 队列上限 = 最近 5 条，实际 ${queued.length}`);
+    const kept = queued.map((q) => String(q.text)).join("\n");
+    for (const i of [5, 6, 7, 8, 9]) {
+      assert.match(kept, new RegExp(`这是第${i}条结论`), `最近的第 ${i} 条必须保留`);
+    }
+    for (const i of [1, 2, 3, 4]) {
+      assert.ok(!kept.includes(`这是第${i}条结论`), `★ 最早的第 ${i} 条必须被丢弃（只留最近几条）`);
+    }
+    assert.ok(warns.some((m) => /待补发队列丢弃 \d+ 条/.test(m)),
+      `丢数据必须如实记日志（不得静默），实际:${JSON.stringify(warns)}`);
+  } finally {
+    await ilink.close();
+  }
+});
+
+
 test("★ 事故锁：订阅 fault 必须落到日志 + 状态（旧实现只 emit、没人接 → 全静默）", async () => {
   // 那次「一条推送都没有、日志里也没有任何报错」的根因就在这类静默里：
   // `#emitFault` 只 emit('fault')，而运行时没接这个事件 —— follow 失败/发现失败/流上限
@@ -1990,9 +2061,10 @@ test("★ 事故锁：订阅 fault 必须落到日志 + 状态（旧实现只 em
   const ilink = await fakeIlink();
   try {
     const warns = [];
+    const infos = [];
     const sub = makeFakeSubscriber();
     const { rt, relayDir } = await boundRuntime(ilink, { subscriber: sub });
-    rt.logger = { info() {}, warn: (m) => warns.push(String(m)), error() {}, debug() {}, addSecret() {} };
+    rt.logger = { info: (m) => infos.push(String(m)), warn: (m) => warns.push(String(m)), error() {}, debug() {}, addSecret() {} };
     await rt.startChannel(); // 真实接线：#startSubscriber() → 给注入的订阅器挂 handler
     try {
       sub.emit("fault", { code: "follow-limit", message: "follow 流已达上限 8", sessionId: "session-x", expected: false });
@@ -2002,9 +2074,23 @@ test("★ 事故锁：订阅 fault 必须落到日志 + 状态（旧实现只 em
       assert.equal(st.last_fault && st.last_fault.code, "follow-limit", "非预期的订阅异常要记进状态供面板显示");
 
       // 预期内的（子代理会话必然被拒 / 会话刚被删）只记日志，不该污染故障状态
+      const warnCountBefore = warns.length;
       sub.emit("fault", { code: "session/agent-busy", message: "busy", sessionId: "sub-1", expected: true });
       const st2 = JSON.parse(fs.readFileSync(path.join(relayDir, ".wechat-state.json"), "utf8"));
       assert.equal(st2.last_fault.code, "follow-limit", "expected 的异常不该覆盖真正的故障");
+      // ★2026-10-09：预期内的拒绝**不能写成 warn** —— 每生成一个子代理就会来一条，
+      // 成片的 `订阅异常 session/agent-busy …` 会把真正的故障淹掉（业主现场看到的就是这个）。
+      assert.equal(warns.length, warnCountBefore, `expected 的拒绝不得写 warn，实际:${JSON.stringify(warns)}`);
+      assert.ok(infos.some((m) => m.includes("订阅跳过(预期") && m.includes("session=sub-1")),
+        `expected 的拒绝要有一条 info 留痕（绝不静默），实际:${JSON.stringify(infos)}`);
+      // 同一对 (code, session) 反复来也只报一次：否则子代理一多照样刷屏
+      const infoCountBefore = infos.length;
+      sub.emit("fault", { code: "session/agent-busy", message: "busy", sessionId: "sub-1", expected: true });
+      sub.emit("fault", { code: "session/agent-busy", message: "busy", sessionId: "sub-1", expected: true });
+      assert.equal(infos.length, infoCountBefore, "同一 (code, session) 的预期拒绝只报一次（防刷屏）");
+      // 但**不同**会话仍各自留痕一次（可诊断，不被去重抹掉）
+      sub.emit("fault", { code: "session/agent-busy", message: "busy", sessionId: "sub-2", expected: true });
+      assert.equal(infos.length, infoCountBefore + 1, "不同子代理会话各留一条");
     } finally {
       await rt.stopChannel();
     }
