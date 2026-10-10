@@ -173,10 +173,13 @@ function printHelp() {
   dsh-remote doctor       一条命令自检「为什么连不上」（只读；含上游/进程/微信/日志尾部）
   dsh-remote --help       显示本用法（等同 dsh-remote help）
 
-目标 profile（默认 Web 版）:
-  dsh-remote --profile desktop    装进 DeepSeek Harness **桌面端**的插件目录
-                                  （~/.dsh/profiles/desktop；装前请先完全退出桌面应用）
-  桌面端也可以在应用内「插件」页直接安装 dsh-remote-web —— 那是官方路径，无需退出。
+目标 profile（默认：**本机 Web 版 + 桌面端一起装**）:
+  不带 --profile 时，会把插件装进本机**已有的** Web 版与桌面端 profile（谁在用就装给谁，
+  避免"命令跑完了、桌面端却没有面板"这类装错地方的坑）；机器上的实验/自动化 profile 不会被动。
+  dsh-remote --profile desktop    只装进 DeepSeek Harness **桌面端**
+                                  （~/.dsh/profiles/desktop）
+  dsh-remote --profile web        只装进 Web 版
+  桌面端也可以在应用内「插件」页直接安装 dsh-remote-web —— 那是官方路径，也最省事。
   ⚠️ 桌面端与 Web 版共享 ~/.dsh（会话/设置/凭据），但**插件互相隔离**，两边要各自安装。
 
 自建模式（可选）:
@@ -712,7 +715,7 @@ function writeAutostartFile() {
   <key>LimitLoadToSessionType</key><array><string>Aqua</string><string>Background</string></array>
   <key>StandardOutPath</key><string>${path.join(CONFIG_DIR, ".dsh-bridge.log")}</string>
   <key>StandardErrorPath</key><string>${path.join(CONFIG_DIR, ".dsh-bridge.log")}</string>
-  <key>EnvironmentVariables</key><dict><key>PATH</key><string>${SERVICE_PATH}</string>${SERVICE_NODE_ENV_PLIST}<key>DSH_BRIDGE_INSTALL_SOURCE</key><string>${INSTALL_SOURCE}</string><key>DSH_BRIDGE_INSTALL_VERSION</key><string>${INSTALL_VERSION}</string><key>DSH_BRIDGE_HARNESS_VERSION</key><string>${HARNESS_VERSION}</string></dict>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>${SERVICE_PATH}</string>${SERVICE_NODE_ENV_PLIST}${PINNED_UPSTREAM ? `<key>DSH_BRIDGE_UPSTREAM</key><string>${PINNED_UPSTREAM}</string>` : ""}<key>DSH_BRIDGE_INSTALL_SOURCE</key><string>${INSTALL_SOURCE}</string><key>DSH_BRIDGE_INSTALL_VERSION</key><string>${INSTALL_VERSION}</string><key>DSH_BRIDGE_HARNESS_VERSION</key><string>${HARNESS_VERSION}</string></dict>
 </dict></plist>`;
     // ~/Library/LaunchAgents 在全新账户/精简系统上可能不存在,必须先建目录,
     // 否则 writeFileSync 抛 ENOENT 直接把安装流程打断(用户反馈里也踩过类似的路径问题)。
@@ -761,18 +764,45 @@ function launchdState(target) {
 }
 
 /**
+ * 等 label **真的从 launchd 里摘干净**。
+ *
+ * 🔴 2026-10-11 实测的坑：`launchctl bootout` 是**异步**的 —— 紧接着 bootstrap 同一个 label 会
+ * 随机失败（`Bootstrap failed: 5: Input/output error`），表现为"安装时灵时不灵"：
+ * 手工在两条命令之间加个 sleep 就 100% 成功，安装器里没等就大约一半失败 →
+ * 失败后走 `spawnDetachedBridge()` 兜底 → 用户看到"⚠️ 未被系统托管 / 不会开机自启"。
+ * 所以 bootout 之后必须轮询到 `launchctl print` 真的查不到，再 bootstrap。
+ */
+function waitLaunchdGone(target, tries = 12, gapMs = 200) {
+  for (let i = 0; i < tries; i += 1) {
+    if (!sh(`launchctl print ${target}`).ok) return true;
+    sleepSync(gapMs);
+  }
+  return false;
+}
+
+/**
  * 轮询等待 job 起来。
  * launchd 派生是异步的：bootstrap 成功后立刻 print 必然看到 not running（旧实现因此误报"启动失败"）。
  * 明确"被挂起且没有派生"时提前放弃（等满也没用），否则给足 ~8 秒。
  */
-function waitLaunchdRunning(target, tries = 20, gapMs = 400) {
+function waitLaunchdRunning(target, tries = 25, gapMs = 400) {
   let st = launchdState(target);
   for (let i = 0; i < tries; i += 1) {
     st = launchdState(target);
     if (st.running) return st;
-    // 已登记、没在跑、又没被挂起（runs>0 说明派生过）→ 是启动后立刻退出，不必等满
+    /* 🔴 2026-10-11 修：刚 bootstrap/kickstart 后 launchd 会先进入**过渡态**
+       （`state = xpcproxy` / `spawn scheduled` / `pending`），此时 runs 还是 0。
+       旧判据"登记了却一次都没派生 → 判定被挂起"在 1.2 秒后就放弃，于是
+       `installAutostart()` 误报"launchd 无法托管本机 bridge"，转而拉起一个**脱离进程** ——
+       用户看到的是"安装没装好/不会开机自启"，而实际上 launchd 下一秒就把它拉起来了
+       （现场实测：state=xpcproxy，几秒后 state=running）。
+       现在：过渡态一律继续等；只有"确实派生过又退出"或"等满窗口都没起来"才算失败。 */
+    const transitional = /state\s*=\s*(xpcproxy|spawn scheduled|pending|running\s*\()/i.test(String(st.raw || ""));
+    if (transitional) { sleepSync(gapMs); continue; }
+    // 已派生过、现在没在跑、也没被挂起 → 是启动后立刻退出（真失败），不必等满
     if (st.exists && st.runs > 0 && !st.deferred) break;
-    if (i >= 2 && st.exists && !st.deferred && st.runs === 0) break; // 登记了却一次都没派生 → 被挂起
+    // 登记了却一次都没派生，且已经等了足够久（给足 4 秒让 launchd 调度）→ 判为被挂起
+    if (i >= 10 && st.exists && !st.deferred && st.runs === 0) break;
     sleepSync(gapMs);
   }
   return st;
@@ -850,7 +880,14 @@ function startBridgeDarwin(plistPath) {
       };
     }
     sh(`launchctl bootout ${target}`);
+    waitLaunchdGone(target);   // 关键：不等干净就 bootstrap → 随机 "5: Input/output error"
     let boot = sh(`launchctl bootstrap ${domain} ${q(plistPath)}`);
+    if (!boot.ok) {
+      // 摘除竞态可能还没结束：再等一拍重试一次（仍失败才走老写法兜底）
+      sleepSync(600);
+      waitLaunchdGone(target, 6, 200);
+      boot = sh(`launchctl bootstrap ${domain} ${q(plistPath)}`);
+    }
     if (!boot.ok) {
       // 老写法兜底（部分系统上 load -w 仍可用）
       sh(`launchctl unload ${q(plistPath)}`);
@@ -959,6 +996,33 @@ function restartBridgeService() {
  *   统一在 clients/dsh-remote/upstream-discovery.mjs，watcher 与 bridge 共用同一份实现。
  */
 const UPSTREAM_FILE = ".dsh-upstream";
+
+/**
+ * 本次安装要**钉住**的上游（null = 不钉，运行时按 env → .dsh-upstream → 探测 取值）。
+ * 见 desktopAppPort() 的注释：插件装进多个 profile 后，各宿主会互相覆盖 `.dsh-upstream`。
+ */
+let PINNED_UPSTREAM = String(process.env.DSH_BRIDGE_UPSTREAM || "").trim().replace(/\/+$/, "") || null;
+
+/**
+ * 探测桌面端（Electron 应用）当前监听的**回环端口**。
+ *
+ * 为什么需要（2026-10-11 实测事故）：插件同时装进 web 与 desktop 后，**每个宿主**都会在装载时
+ * 把自己 `ctx.webServer.port` 写进 `<relayDir>/.dsh-upstream` —— 谁最后写谁生效。于是桥的上游
+ * 会在两个应用之间来回跳：那次桥跑去连了 Web 版的 3080，而业主面对的是桌面端 19387，
+ * 表现就是"命令跑完了但没装上 / 手机连上看到的不是我在用的界面"。
+ * 装桌面端时把端口**钉进自启动配置**（环境变量优先级最高），两个宿主就抢不动了。
+ */
+function desktopAppPort() {
+  if (process.platform !== "darwin") return null;
+  try {
+    const r = sh("lsof -nP -iTCP -sTCP:LISTEN -a -c DeepSeek 2>/dev/null");
+    for (const line of String(r.stdout || "").split("\n")) {
+      const m = line.match(/(?:127\.0\.0\.1|\[::1\]):(\d+)\s/);
+      if (m) return Number(m[1]);
+    }
+  } catch { /* 拿不到就算了，退回运行时探测 */ }
+  return null;
+}
 /** 运行时动态发现到的上游（优于可能过期的端口文件；进程内缓存）。 */
 let discoveredUpstream = "";
 function upstreamUrl() {
@@ -1075,6 +1139,50 @@ function resolveProfileDir(argv = []) {
  * `pluginCmd()` 时原本传的是空数组 —— 于是"指定 desktop profile"会被静默忽略、
  * 插件仍然装进 Web 版 profile（桌面端用户装了却看不到面板，且极难自查）。
  */
+/**
+ * 探测本机**已存在**的 profile（可装载 = 同时有 package.json 与 cordis.patch.yml）。
+ * desktop 排在前面：业主主用的是桌面应用，多个 profile 一起装时它是"首选/权威"那个。
+ */
+function detectProfileDirs() {
+  const root = path.join(os.homedir(), ".dsh", "profiles");
+  let names = [];
+  try {
+    names = fs.readdirSync(root, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && !e.name.startsWith("."))
+      .map((e) => e.name)
+      .filter((n) => fs.existsSync(path.join(root, n, "package.json")) && fs.existsSync(path.join(root, n, "cordis.patch.yml")));
+  } catch { return []; }
+  names.sort((a, b) => (a === "desktop" ? -1 : b === "desktop" ? 1 : a.localeCompare(b)));
+  return names.map((n) => ({ name: n, dir: profileDirOfName(n) }));
+}
+
+/**
+ * 本次要操作的 profile 列表。
+ *
+ * 业主口径（2026-10-11）：「默认安装的时候也能同步安装给 desktop」。
+ * 以前不带 `--profile` 时**写死装 web** —— 桌面端用户执行官方那条 `npx @mrrisega/dsh-remote@beta`
+ * 之后，插件全进了 Web 版 profile，而用户面对的是桌面应用 → 面板永远不出现，且极难自查。
+ *
+ * · `--profile X` / `DSH_PROFILE_DIR` → 只动那一个（脚本化与既有用法不变）
+ * · 都不给 → **本机所有已存在的 profile**（desktop 优先）
+ * · 一个都没探测到 → 退回 web（保留"首次安装"的引导文案）
+ */
+function targetProfileDirs(argv = []) {
+  const i = argv.indexOf("--profile");
+  if (i > -1 && argv[i + 1]) return [{ name: argv[i + 1], dir: resolveProfileDir(argv) }];
+  if (process.env.DSH_PROFILE_DIR) return [{ name: "env", dir: process.env.DSH_PROFILE_DIR }];
+  const all = detectProfileDirs();
+  if (!all.length) return [{ name: "web", dir: profileDirOfName("web") }];
+  /* 默认装哪些？**不是"全部"** —— 机器上常有过实验/自动化用的 profile（headless、web02…），
+     往那些里面塞插件是越界。规则：
+       · 已知的面向用户的 profile（web / desktop）：**有就装**（这是业主的核心诉求：默认也要给 desktop）
+       · 其他 profile：**只有本来就已经装了插件**才继续管（升级不能悄悄漏掉它）
+       · 上面并集为空（例如只有 headless 一种）→ 退回"全部已存在"，避免什么都不装 */
+  const chosen = all.filter((p) => KNOWN_PROFILE_NAMES.includes(p.name)
+    || fs.existsSync(path.join(p.dir, PLUGIN_LOCAL_DIR)));
+  return chosen.length ? chosen : all;
+}
+
 function profileArgvOf(argv = []) {
   const i = argv.indexOf("--profile");
   return i > -1 && argv[i + 1] ? ["--profile", argv[i + 1]] : [];
@@ -1666,6 +1774,19 @@ async function setup(argv) {
 
   let svc = { path: null, status: { ok: true, status: "skipped", detail: "--no-autostart" } };
   if (!noAutostart) {
+    // ⚠️ 顺序要紧：**先**探测并钉住上游，**再**写自启动文件 ——
+    // 否则 plist 里不会带上 DSH_BRIDGE_UPSTREAM（实测踩到：打印说已钉住，plist 里却没有）。
+    try {
+      const pluginTargets = targetProfileDirs(argv);
+      if (!PINNED_UPSTREAM && pluginTargets.some((t) => t.name === "desktop")) {
+        const p = desktopAppPort();
+        if (p) {
+          PINNED_UPSTREAM = `http://127.0.0.1:${p}`;
+          try { fs.writeFileSync(path.join(CONFIG_DIR, UPSTREAM_FILE), PINNED_UPSTREAM + "\n"); } catch { /* 忽略 */ }
+          console.log(`ℹ 桌面端在 127.0.0.1:${p} 监听 → 桥的上游已钉到它（避免与 Web 版互抢）`);
+        }
+      }
+    } catch { /* 探测失败不阻断安装 */ }
     svc = installAutostart();
   } else {
     console.log("ℹ --no-autostart：跳过自启动服务安装（可用 `dsh-remote run` 手动运行 bridge）。");
@@ -1678,7 +1799,9 @@ async function setup(argv) {
     try {
       // ⚠️ 必须把 `--profile` **透传下去**：否则 `--profile desktop`（桌面端）会被静默忽略，
       // 插件装进 Web 版 profile，而用户面对的是桌面端 —— 面板永远不出现。
-      warnIfDesktopProfile(resolveProfileDir(argv));
+      // 未指定 --profile 时目标是本机全部 profile：桌面端提醒与后续判定都要按同一份列表来
+      const pluginTargets = targetProfileDirs(argv);
+      for (const t of pluginTargets) warnIfDesktopProfile(t.dir);
       pluginResult = await pluginCmd(profileArgvOf(argv));
     } catch (e) {
       console.warn(`⚠️ 插件安装未完成：${e.message}`);
@@ -1688,7 +1811,8 @@ async function setup(argv) {
   // 插件是**进程启动时**装载的：刚装进 profile 的插件，运行中的 dsh web 里并没有
   // （既没有 /dsh-remote/* 路由，也没有「设置 → 远程访问」面板项）。
   // 这里做一个确定性判断：进程启动时间早于插件落盘时间 → 必须重启 dsh web 才生效。
-  const pluginDir = path.join(resolveProfileDir(argv), PLUGIN_LOCAL_DIR);
+  const primaryProfileDir = targetProfileDirs(argv)[0].dir;   // desktop 优先 = 用户面对的那个宿主
+  const pluginDir = path.join(primaryProfileDir, PLUGIN_LOCAL_DIR);
   const pluginMtime = fs.existsSync(path.join(pluginDir, "lib", "index.js"))
     ? fs.statSync(path.join(pluginDir, "lib", "index.js")).mtimeMs
     : 0;
@@ -2656,13 +2780,32 @@ function convergePluginActivation(profileDir, pkgFile, patchFile, pluginDir, pat
 
 async function pluginCmd(argv) {
   const uninstall = hasFlag(argv, "--uninstall");
-  const profileDir = resolveProfileDir(argv);
+  const targets = targetProfileDirs(argv);
+  const multi = targets.length > 1;
+  if (multi) {
+    console.log(`ℹ 未指定 --profile：同步到本机**全部 ${targets.length} 个 profile**（${targets.map((t) => t.name).join(" → ")}）`);
+  }
+  let last = null;
+  let ok = 0;
+  for (const t of targets) {
+    if (multi) console.log(`\n── profile: ${t.name}（${t.dir}）`);
+    const r = await pluginApplyTo(t.dir, uninstall, multi);
+    if (r === "skip") continue;
+    ok += 1;
+    if (r !== undefined && r !== null) last = r;
+  }
+  if (ok === 0) process.exit(1);
+  return last;
+}
+
+/** 对**单个** profile 执行插件安装/卸载（原 pluginCmd 主体，逐字保留行为）。 */
+async function pluginApplyTo(profileDir, uninstall, multi) {
   const pkgFile = path.join(profileDir, "package.json");
   const patchFile = path.join(profileDir, "cordis.patch.yml");
   const pluginDir = path.join(THIS_DIR, "packages", PLUGIN_ID);
 
   if (!fs.existsSync(pkgFile) || !fs.existsSync(patchFile)) {
-    console.error(`❌ 未找到 profile（${profileDir}）。`);
+    console.error(`${multi ? "⚠️ 跳过（未找到 profile）" : "❌ 未找到 profile"}（${profileDir}）。`);
     if (isDesktopProfileDir(profileDir)) {
       // 桌面端 profile 由 Electron 应用**自己初始化**：npm 版 `dsh` 明确拒绝管理它
       // （apps/cli 的 rejectElectronProfile），所以 Web 版那句 "npx @deepseek-ai/dsh web"
@@ -2675,6 +2818,7 @@ async function pluginCmd(argv) {
     } else {
       console.error("   请先安装 DeepSeek Harness（npx @deepseek-ai/dsh web）并初始化默认 profile。");
     }
+    if (multi) return "skip";
     process.exit(1);
   }
   if (!fs.existsSync(pluginDir)) {

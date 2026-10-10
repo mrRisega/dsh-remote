@@ -193,3 +193,36 @@ test("★ 插件拷贝必须保留**自带的 runtime/node_modules**（ws 是桥
 function require$path() {
   return { join: (...a) => a.join("/"), sep: "/", relative: (from, to) => to.startsWith(from + "/") ? to.slice(from.length + 1) : to };
 }
+
+test("★ launchd bootout 后必须等 label 摘干净再 bootstrap（否则随机 5: Input/output error）", () => {
+  // 2026-10-11 实测：bootout 是**异步**的，紧接着 bootstrap 同一个 label 大约一半次数失败 →
+  // 失败后走 spawnDetachedBridge() 兜底 → 用户看到"⚠️ 未被系统托管 / 不会开机自启"。
+  // 手工在两条命令之间加 sleep 就 100% 成功 —— 所以这里必须有"等到摘干净"的轮询。
+  const src = readFileSync(SETUP, "utf8");
+  assert.match(src, /function waitLaunchdGone\(/, "必须有 waitLaunchdGone（等 label 从 launchd 摘干净）");
+  const start = src.indexOf("function startBridgeDarwin(");
+  const end = src.indexOf("function restartBridgeService(");
+  assert.ok(start > 0 && end > start, "应能定位 startBridgeDarwin");
+  const fn = src.slice(start, end);
+  const bootoutAt = fn.indexOf("launchctl bootout ${target}");
+  const waitAt = fn.indexOf("waitLaunchdGone(target)");
+  const bootAt = fn.indexOf("launchctl bootstrap ${domain}");
+  assert.ok(bootoutAt > 0 && waitAt > 0 && bootAt > 0, "bootout / waitLaunchdGone / bootstrap 三者都要在");
+  assert.ok(bootoutAt < waitAt && waitAt < bootAt,
+    "顺序必须是 bootout → waitLaunchdGone → bootstrap（差一步就会随机失败）");
+  // 失败重试：摘除竞态可能还没结束，要能再试一次，而不是直接掉进脱离进程兜底
+  assert.match(fn, /bootok|!boot\.ok[\s\S]{0,400}launchctl bootstrap/, "bootstrap 失败应重试一次再兜底");
+});
+
+test("★ 自启动配置里可以钉住上游（多 profile 时代，各宿主会互抢 .dsh-upstream）", () => {
+  const src = readFileSync(SETUP, "utf8");
+  assert.match(src, /function desktopAppPort\(/, "要有桌面端端口探测（lsof -c DeepSeek）");
+  assert.match(src, /PINNED_UPSTREAM/, "要有钉住上游的机制");
+  // plist 模板里必须把它写进 EnvironmentVariables（环境变量优先级高于 .dsh-upstream 文件）
+  assert.match(src, /DSH_BRIDGE_UPSTREAM<\/key><string>\$\{PINNED_UPSTREAM\}/,
+    "plist 里要写入 DSH_BRIDGE_UPSTREAM，否则两端宿主会互相覆盖上游");
+  // ⚠️ 顺序：必须在写自启动文件**之前**算出来，否则 plist 里带不上（实测踩到过）
+  const pinAt = src.indexOf("PINNED_UPSTREAM = `http://127.0.0.1:${p}`");
+  const svcAt = src.indexOf("svc = installAutostart()");
+  assert.ok(pinAt > 0 && svcAt > 0 && pinAt < svcAt, "钉定必须发生在 installAutostart() 之前");
+});

@@ -66,7 +66,11 @@ test("launchd 修复：不再只 print 一次就判定失败（异步派生必�
   const fn = src.slice(src.indexOf("function launchdState"), src.indexOf("function spawnDetachedBridge"));
   assert.ok(/for \(let i = 0; i < tries; i \+= 1\)/.test(fn), "应循环轮询而非单次检查");
   assert.ok(/sleepSync\(gapMs\)/.test(fn), "轮询之间要真正等待");
-  assert.ok(/tries = 20/.test(fn), "总等待时长应足够 launchd 完成异步派生");
+  // 断言"总等待窗口足够"而不是写死某个数字：2026-10-11 把窗口放宽到 25×400ms（过渡态更常见）
+  const win = fn.match(/waitLaunchdRunning\(target, tries = (\d+), gapMs = (\d+)\)/);
+  assert.ok(win, "waitLaunchdRunning 应有显式的 tries/gapMs 默认值");
+  assert.ok(Number(win[1]) * Number(win[2]) >= 8000,
+    `总等待窗口应 ≥8 秒（launchd 派生是异步的），实际 ${Number(win[1]) * Number(win[2])}ms`);
   // 必须能识别「登记了但从未派生」这一 macOS 26 特征，才能给出正确建议而不是干等
   assert.ok(/pended nondemand spawn/.test(fn) && /on-demand-only/.test(fn), "应识别 on-demand-only 挂起特征");
 });
