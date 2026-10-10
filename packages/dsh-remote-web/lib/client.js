@@ -937,25 +937,27 @@ window.__ModuleLoader__.load({
     function viaAccountMenu() {
       try {
         var trigger = accountMenuTrigger();
+        navTrace("menu:trigger=" + (trigger ? "found" : "none"));
         if (!trigger) return;
         try { trigger.click(); } catch (e) { return; }
         var tries = 0;
         var iv = setInterval(function () {
           tries += 1;
           var menus = document.querySelectorAll('[role="menu"], [role="dialog"], [role="listbox"]');
+          if (tries === 1) navTrace("menu:poll menus=" + menus.length);
           for (var i = 0; i < menus.length; i++) {
             var items = menus[i].querySelectorAll ? menus[i].querySelectorAll('button, [role="menuitem"]') : [];
             for (var k = 0; k < items.length; k++) {
-              var t = String(items[k].textContent || "").replace(/\s+/g, "").trim();
-              if (t === "设置" || t === "Settings") {
+              if (menuRowIsSettings(items[k])) {
+                navTrace("menu:settings-row-clicked");
                 clearInterval(iv);
                 try { items[k].click(); } catch (e2) { /* 忽略 */ }
                 var tries2 = 0;
                 var iv2 = setInterval(function () {          // 设置面板开了以后，再点我们的栏目
                   tries2 += 1;
                   var cell = pickNavByToken("远程访问", { insideDialog: true });
-                  if (cell) { clearInterval(iv2); cell.click(); }
-                  else if (tries2 >= NAV_POLL_MAX) clearInterval(iv2);
+                  if (cell) { navTrace("menu:section-clicked"); clearInterval(iv2); cell.click(); }
+                  else if (tries2 >= NAV_POLL_MAX) { navTrace("menu:section-timeout"); clearInterval(iv2); }
                 }, 150);
                 try { if (iv2 && typeof iv2.unref === "function") iv2.unref(); } catch (e3) { /* 忽略 */ }
                 return;
@@ -977,13 +979,15 @@ window.__ModuleLoader__.load({
      */
     function openRemoteSettings() {
       try {
+        navTrace("open:enter");
         var cell = pickNavByToken("远程访问", { insideDialog: true });
-        if (cell) { cell.click(); return; }
+        if (cell) { navTrace("open:section-already-visible"); cell.click(); return; }
         var cands = settingsTriggerCandidates();
-        if (!cands.length) return;
+        navTrace("open:cands=" + cands.length);
+        if (!cands.length) { navTrace("open:no-cands→account-menu"); return viaAccountMenu(); }
         var idx = 0;
         var tryNext = function () {
-          if (idx >= cands.length) { return viaAccountMenu(); }   // 侧栏里找不到触发器 → 走账号菜单
+          if (idx >= cands.length) { navTrace("open:cands-exhausted→account-menu"); return viaAccountMenu(); }   // 侧栏里找不到触发器 → 走账号菜单
           var el = cands[idx++];
           try { el.click(); } catch (eClick) { return tryNext(); }
           var tries = 0;
@@ -1003,6 +1007,21 @@ window.__ModuleLoader__.load({
      * 由下面的导航模块赋值 —— 让"入口在哪渲染"与"点了怎么打开"彻底解耦。
      */
     var remoteNavOpen = null;
+
+    /**
+     * 入口点击链路的**现场追踪**（有界 40 条，挂在 `window.__druNavTrace`）。
+     * 为什么值得常驻：这类"点了没反应"的问题跨了"侧栏候选 → 账号菜单 → 设置面板"三步，
+     * 光看界面分不清卡在哪一步（本次排查就是靠它定位到「设置 ⌥⌘,」文案不匹配）。
+     * 只写内存、不含隐私，出问题时让用户执行 `copy(window.__druNavTrace)` 即可。
+     */
+    function navTrace(step) {
+      try {
+        var w = window;
+        if (!w.__druNavTrace) w.__druNavTrace = [];
+        w.__druNavTrace.push(String(step));
+        if (w.__druNavTrace.length > 40) w.__druNavTrace.shift();
+      } catch (e) { /* 忽略 */ }
+    }
 
     /* 📱 侧栏底部的「远程访问」入口（2026-10-10 三修：改用**官方槽位**）。====================
        前两次都栽在"自己找 DOM 落点"上：
@@ -1051,6 +1070,22 @@ window.__ModuleLoader__.load({
          · 整段 try/catch，任何异常都不影响面板本身。
        失败的可见后果只是"弹窗里没有这一项"，侧栏那个官方槽位入口仍然在。 */
     var MENU_ENTRY_SIG = "data-dru-account-menu";
+    /**
+     * 这个菜单行是不是「设置」那一行？
+     *
+     * 🔴 2026-10-11 实测（探针拿到桌面渲染器真实 DOM）：账号菜单里那一项的文案是
+     *    **「设置 ⌘,」**（快捷键就写在行内）—— 我原先按 `textContent === "设置"` 全等匹配，
+     *    于是①插不进去、②点不动，表现就是业主说的"点了一点反应都没有"。
+     *    现在按"归一化后**以**设置/Settings 开头"判（也接受包含），并排除我们自己的行。
+     */
+    function menuRowIsSettings(el) {
+      try {
+        var t = String(el.textContent || "").replace(/\s+/g, "").trim();
+        if (!t) return false;
+        if (t.indexOf("远程访问") !== -1) return false;
+        return /^(设置|Settings)/i.test(t) || /(设置|Settings)$/i.test(t);
+      } catch (e) { return false; }
+    }
     function accountMenuInjectTick() {
       try {
         var pops = document.querySelectorAll('[role="menu"], [role="dialog"], [role="listbox"]');
@@ -1063,8 +1098,7 @@ window.__ModuleLoader__.load({
           var rows = pop.querySelectorAll("button, [role=\"menuitem\"], [role=\"button\"]");
           var settingsRow = null;
           for (var k = 0; k < rows.length; k++) {
-            var t = String(rows[k].textContent || "").replace(/\s+/g, "").trim();
-            if (t === "设置" || t === "Settings") { settingsRow = rows[k]; break; }
+            if (menuRowIsSettings(rows[k])) { settingsRow = rows[k]; break; }
           }
           if (!settingsRow || !settingsRow.parentNode) return;
           var btn = document.createElement("button");
@@ -1080,6 +1114,7 @@ window.__ModuleLoader__.load({
             setTimeout(function () { try { openRemoteSettings(); } catch (e3) { /* 忽略 */ } }, 120);
           };
           settingsRow.parentNode.insertBefore(btn, settingsRow);
+          navTrace("inject:inserted");
           return;   // 一次只处理一个浮层
         }
       } catch (e) { /* 忽略：插入失败不影响任何既有功能 */ }
@@ -1089,6 +1124,7 @@ window.__ModuleLoader__.load({
       if (window.__dshRemoteNavStarted) return;
       window.__dshRemoteNavStarted = true;
       try { window.__dshRemoteNav = { open: openRemoteSettings }; } catch (e) {}
+      navTrace("adapter-ready");
       // ⚠️ 这里**不再**做 DOM 注入（见 RemoteNavEntry 的注释）：入口由官方槽位渲染。
       //    保留本函数只为实现"继续暴露 window.__dshRemoteNav"（老调用方与诊断仍在用）。
       // 账号菜单里的入口（业主指定位置）：低频轮询，只在弹窗出现时插入一次，幂等且保守。
