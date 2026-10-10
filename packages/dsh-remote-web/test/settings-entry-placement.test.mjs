@@ -168,11 +168,17 @@ test("精确相等优先于子串：给了 exactOnly 时子串一律不算", () 
   assert.equal(pickNavByToken("设置", { exactOnly: true, insideDialog: false }), settings);
 });
 
-test("源码约束：注入路径不得再出现「按文案模糊找设置」的写法", () => {
-  assert.ok(!/pickNavByToken\(\s*"设置"\s*\)/.test(SOURCE),
-    "侧栏落点不得再用 pickNavByToken(\"设置\")（子串会命中「通用设置」→ 按钮进设置面板）");
-  assert.match(SOURCE, /aria-haspopup="dialog"/, "必须按 aria-haspopup=dialog 认官方设置触发器");
-  assert.match(SOURCE, /\[role="dialog"\], \[aria-modal="true"\]/, "必须有「在设置弹层内」的判据");
-  assert.match(SOURCE, /var host = pickSettingsTrigger\(\)/, "常驻注入必须走语义锚点");
-  assert.match(SOURCE, /if \(navInDialog\(host\)\) return;/, "mountNavEntry 必须有最后一道弹层防线");
+test("源码约束：入口不再自己找 DOM 落点，而是注册官方槽位（2026-10-10 三修后的事实）", () => {
+  // 一修/二修都是"自己找落点"，先后落错到设置面板顶部、以及"找不到锚点干脆不注入"。
+  // 三修起改用官方槽位 sidebar.footer.action —— 本用例把这条设计锁住，防止有人再退回 DOM 注入。
+  assert.match(SOURCE, /ctx\.slots\.inject\("sidebar\.footer\.action"/,
+    "侧栏入口必须注册进官方槽位 sidebar.footer.action");
+  assert.match(SOURCE, /id:\s*"dsh-remote-nav"/, "槽位条目 id 应为 dsh-remote-nav");
+  assert.ok(!/var host = pickSettingsTrigger\(\)/.test(SOURCE),
+    "不得再出现「每 2s 找锚点注入」的老写法（那正是两次落错位置的来源）");
+  assert.ok(!/if \(navInDialog\(host\)\) return;/.test(SOURCE),
+    "老的 DOM 注入兜底应已删除（入口改由槽位渲染）");
+  // 仍保留的：打开栏目的点击路径必须还能工作，且不会把「通用设置」当成设置触发器
+  assert.match(SOURCE, /aria-haspopup="dialog"/, "打开栏目时仍按 aria-haspopup=dialog 认官方设置触发器");
+  assert.match(SOURCE, /\[role="dialog"\], \[aria-modal="true"\]/, "必须保留「在设置弹层内」的判据");
 });

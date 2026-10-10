@@ -162,11 +162,22 @@ function loadPlugin(opts = {}) {
   };
 }
 
-test("入口迁移：注册 settings.section 栏目（id/order/label），移除侧边栏入口与浮动面板", () => {
+test("入口：settings.section 栏目（id/order/label）+ 侧栏底部官方槽 sidebar.footer.action", () => {
   const plugin = loadPlugin();
 
-  // 不再注入侧边栏入口槽
-  assert.equal(plugin.injects.has("sidebar.footer.action"), false, "侧边栏入口槽不应再注入");
+  // 2026-10-10 三修（业主口径「就要放侧栏底部那个位置」）：入口改注册进**官方列表槽**
+  // `sidebar.footer.action`（宿主为侧栏底部区域提供的扩展点；0.2 实测该槽当前为空）。
+  // 不再自己注入 DOM —— 前两次都是"自己找落点"找错的。
+  assert.ok(plugin.injects.has("sidebar.footer.action"), "应注入官方侧栏底部槽");
+  const disposeNav = plugin.injects.get("sidebar.footer.action")();
+  assert.equal(typeof disposeNav, "function", "register 应返回 disposer");
+  const navMeta = plugin.metas.get("dsh-remote-nav");
+  assert.ok(navMeta, "侧栏入口应以 id=dsh-remote-nav 注册");
+  assert.equal(navMeta.name, "sidebar.footer.action");
+  assert.equal(typeof navMeta.label, "function");
+  assert.ok(String(navMeta.label()).includes("远程访问"), `槽位 label 应为「远程访问」，实际 ${navMeta.label()}`);
+  // 按钮 id 必须仍复用 NAV_ENTRY_ID(=dru-nav-remote)：公告徽标/首次红点按 id 取节点的逻辑依赖它
+  assert.match(SOURCE, /id:\s*NAV_ENTRY_ID/, "入口按钮的 id 必须复用 NAV_ENTRY_ID(=dru-nav-remote)");
 
   // settings.section 官方扩展点：id=dsh-remote、order=30（> Agent 预设 20，位于其下方）、label=📱 远程访问
   assert.ok(plugin.injects.has("settings.section"), "应注入 settings.section 扩展点");
@@ -202,8 +213,9 @@ test("入口迁移：settings.section 里**只有一个**栏目（id=dsh-remote�
   // 搬进去之后仍然存在：面板 tab 条里的第三个 tab + 微信绿泡泡图标（行为断言见 wechat-bot-ui.test.mjs）
   assert.match(SOURCE, /"微信机器人通道"/, "微信机器人 tab 必须在面板里");
   assert.match(SOURCE, /dru-wx-ico/, "微信 tab 必须带绿泡泡图标 class");
-  // 槽注入次数仍是两次（settings.section + shell.overlay），没有偷偷加第三个 inject
-  assert.equal(plugin.injects.size, 2, `inject 的槽名应仍是 settings.section + shell.overlay，实际：${[...plugin.injects.keys()].join(",")}`);
+  // 槽注入次数：settings.section + shell.overlay + sidebar.footer.action（2026-10-10 加的侧栏入口）
+  assert.equal(plugin.injects.size, 3,
+    `inject 的槽名应是 settings.section + shell.overlay + sidebar.footer.action，实际：${[...plugin.injects.keys()].join(",")}`);
 });
 
 test("登录态账号区：无「切换账号」，有「退出登录」，头部/关于卡文案为「远程访问」", () => {
@@ -345,9 +357,11 @@ test("源码约束：侧栏注入「远程访问」按钮与官方「设置」�
   assert.match(SOURCE, /dsh-remote-seen-dot/);
 });
 
-test("源码约束：无侧边栏入口/浮动面板/切换账号；命名统一为「远程访问」；新增访问密钥/设备路由", () => {
-  // 只断言“代码形态”不存在（注释里允许出现说明文字）
-  assert.doesNotMatch(SOURCE, /slots\.inject\("sidebar\.footer\.action"/);
+test("源码约束：侧栏入口走官方槽位/无浮动面板/无切换账号；命名统一为「远程访问」", () => {
+  // 2026-10-10 三修：侧栏入口**改回**官方槽位（业主口径「就要放侧栏底部那个位置」），
+  // 所以这条从"不得出现 footer.action"翻转为"必须走官方槽位、不得自己注入 DOM"。
+  assert.match(SOURCE, /slots\.inject\("sidebar\.footer\.action"/);
+  assert.doesNotMatch(SOURCE, /insertBefore\(btn, host\)/, "不得再自己插 DOM 找落点");
   assert.doesNotMatch(SOURCE, /dru-backdrop\{/);
   assert.doesNotMatch(SOURCE, /切换账号/);
   assert.doesNotMatch(SOURCE, /dsh-remote-panel/);

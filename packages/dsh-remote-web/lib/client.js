@@ -469,7 +469,7 @@ window.__ModuleLoader__.load({
       ".dru-e2ee-line.ok{color:var(--dru-success)}",
       // ── 📣 公告（0.6.18）──────────────────────────────────────────────────────
       // 侧栏入口上的**未读数字徽标**：与首次引导红点（.dru-nav-remote-dot）同一落点。
-      // 两者同时出现会叠在一起，所以 JS 侧是"徽标优先"（有未读就不挂红点，见 mountNavEntry）。
+      // 两者同时出现会叠在一起，所以 JS 侧是"徽标优先"（有未读就不挂红点，见 RemoteNavEntry）。
       // 数字用白字蓝底（不是红底）：红点=「你还没点过我」，未读数=「有多少条内容」，
       // 语义不同就不该长一样；红色在这个面板里已经被"危险/未读公告本身"占用了。
       ".dru-nav-remote-badge{position:absolute;top:-7px;right:-7px;min-width:16px;height:16px;box-sizing:border-box;padding:0 4px;border-radius:999px;background:var(--dru-accent-fill);color:var(--dru-on-accent);font:700 10.5px/16px inherit;text-align:center;box-shadow:0 0 0 2px var(--dru-surface-2);pointer-events:none}",
@@ -515,6 +515,13 @@ window.__ModuleLoader__.load({
       // 独立 button(非 clone),插在官方「设置」按钮之前,同源同布局不覆盖官方热区。
       ".dru-nav-remote{display:inline-flex;align-items:center;gap:6px;height:30px;margin:0 0 2px;padding:0 10px;border:1px solid var(--dru-border-ctl);border-radius:8px;background:var(--dru-surface-2);color:var(--dru-accent);font:500 12.5px/1 inherit;cursor:pointer;white-space:nowrap;user-select:none}",
       ".dru-nav-remote:hover:not(:disabled){background:var(--dru-accent-tint-2);border-color:var(--dru-accent)}",
+      // 📱 侧栏底部入口（官方槽位 sidebar.footer.action 内，2026-10-10 三修）：
+      // 原生底部项是「整行、无边框、hover 浅底、14px 字」，之前那个自绘胶囊按钮与邻居格格不入。
+      ".dru-foot-entry{display:flex;align-items:center;gap:8px;width:100%;box-sizing:border-box;min-height:32px;padding:6px 10px;border:none;border-radius:8px;background:transparent;color:inherit;font:inherit;font-size:14px;text-align:left;cursor:pointer;position:relative;white-space:nowrap;user-select:none}",
+      ".dru-foot-entry:hover{background:var(--dru-hover)}",
+      ".dru-foot-entry:focus-visible{outline:2px solid var(--dru-focus);outline-offset:1px}",
+      ".dru-foot-entry .ico{flex:none;width:18px;text-align:center;font-size:15px;line-height:1}",
+      ".dru-foot-entry .lbl{overflow:hidden;text-overflow:ellipsis}",
       ".dru-nav-remote-dot{position:absolute;top:-2px;right:-2px;width:8px;height:8px;border-radius:50%;background:var(--dru-reddot);box-shadow:0 0 0 2px var(--dru-surface-2);pointer-events:none}",
       // 侧栏入口与官方按钮同高（30px）；用 ::after 把命中区补到 ≥44px，不破坏与原按钮的对齐
       ".dru-nav-remote::after{content:\"\";position:absolute;left:0;right:0;top:-7px;bottom:-7px}",
@@ -882,59 +889,53 @@ window.__ModuleLoader__.load({
         }, 150);
       } catch (e) { /* 忽略 */ }
     }
-    /** 注入侧栏按钮到官方「设置」按钮之前（独立 button；首次未见过引导红点）。 */
-    function mountNavEntry(host) {
-      try {
-        if (document.getElementById(NAV_ENTRY_ID)) return;
-        // 最后一道防线：无论调用方怎么找的，**绝不**把入口塞进设置弹层内部
-        // （2026-10-09 桌面端事故：按钮出现在设置面板栏目列表最上面）。
-        if (navInDialog(host)) return;
-        var wrap = host && host.parentNode;
-        if (!wrap || !wrap.insertBefore || !wrap.contains) return;
-        var btn = document.createElement("button");
-        btn.type = "button";
-        btn.id = NAV_ENTRY_ID;
-        btn.className = "dru-nav-remote";
-        btn.setAttribute("data-dru-remote", "1");
-        // 🎨 侧栏入口在面板之外，拿不到面板根上的令牌 → 自己也挂一份主题属性
-        btn.setAttribute("data-dru-theme", themeGet());
-        themeState.navEl = btn;
-        // 入口常驻，所以它自己就是主题观察器的一个订阅者：
-        // 用户切深色时（哪怕面板没开着）这里也要立刻跟上。
-        themeStartWatch();
-        btn.title = "打开「远程访问」设置(快捷入口)";
-        btn.style.position = "relative";
-        btn.textContent = "📱 远程访问";
-        btn.addEventListener("click", function (e) {
-          try { e.stopPropagation(); e.preventDefault(); } catch (err) {}
-          dotMarkSeen(); // 用过快捷入口=已了解入口位置 → 关闭首次红点(含官方栏目红点)
-          openRemoteSettings();
-        });
-        wrap.insertBefore(btn, host);
-        // 徽标优先于首次引导红点：两者落点相同（右上角），同时挂会叠在一起。
-        // 有未读公告时"有多少条内容"比"你还没点过我"更值得占那个位置；红点本来也只到用户点一次为止。
-        var badgeOn = !!(annState.ok && annState.bubble && annState.unread > 0);
-        if (!dotSeen() && !badgeOn) {
-          var d = document.createElement("span");
-          d.className = "dru-nav-remote-dot";
-          btn.appendChild(d);
+    /**
+     * 打开「远程访问」栏目的入口（供官方槽位里的按钮调用）。
+     * 由下面的导航模块赋值 —— 让"入口在哪渲染"与"点了怎么打开"彻底解耦。
+     */
+    var remoteNavOpen = null;
+
+    /* 📱 侧栏底部的「远程访问」入口（2026-10-10 三修：改用**官方槽位**）。====================
+       前两次都栽在"自己找 DOM 落点"上：
+         · 一修前：按文案包含「设置」找锚点 → 命中的是设置面板里的「通用设置」→ 按钮跑到设置面板顶部；
+         · 二修：改成只认 aria-haspopup="dialog" 且必须在弹层外 → 桌面端侧栏那颗齿轮不满足
+           navCellLike，于是**干脆不注入**（业主看到的就是"那个位置是空的"）。
+       而宿主本来就为这个位置提供了官方列表槽 `sidebar.footer.action`（0.1.x 与 0.2 都有；
+       0.2 实测该槽就在侧栏底部、且**当前是空的**）—— 位置、宽度、折叠态全由宿主负责。
+       所以这里不再注入任何 DOM，直接注册进槽位。id 仍保留 `dru-nav-remote`：
+       公告徽标 / 首次红点那套按 id 取节点的既有逻辑因此不用改。 */
+    function RemoteNavEntry(props) {
+      var wide = !(props && props.wide === false);
+      var seenArr = useState(false);
+      var clicked = seenArr[0];
+      var setClicked = seenArr[1];
+      var showDot = !clicked && !dotSeen();
+      return h("button", {
+        type: "button",
+        id: NAV_ENTRY_ID,
+        className: "dru-foot-entry",
+        title: "打开「远程访问」设置",
+        "data-dru-remote": "1",
+        onClick: function (e) {
+          try { e.preventDefault(); } catch (err) { /* 忽略 */ }
+          setClicked(true);
+          dotMarkSeen();                       // 用过入口 = 已了解位置 → 收起首次红点
+          if (remoteNavOpen) remoteNavOpen();
         }
-        annRenderNavBadge();
-      } catch (e) { /* 忽略 */ }
+      }, [
+        h("span", { className: "ico", key: "ico" }, "📱"),
+        wide ? h("span", { className: "lbl", key: "lbl" }, "远程访问") : null,
+        showDot ? h("span", { className: "dru-nav-remote-dot", key: "dot" }) : null
+      ]);
     }
-    /** 常驻确保：官方「设置」按钮出现后在它前面挂一次入口(去重；2s 心跳，成本极低)。 */
+
     function navEnsureStart() {
       if (window.__dshRemoteNavStarted) return;
       window.__dshRemoteNavStarted = true;
       try { window.__dshRemoteNav = { open: openRemoteSettings }; } catch (e) {}
-      var iv = setInterval(function () {
-        try {
-          if (document.getElementById(NAV_ENTRY_ID)) return; // 已注入
-          var host = pickSettingsTrigger();   // 只认 aria-haspopup="dialog" 的官方「设置」触发器
-          if (host) mountNavEntry(host);
-        } catch (e) { /* 忽略 */ }
-      }, 2000);
-      try { if (iv && typeof iv.unref === "function") iv.unref(); } catch (e) {} // node 测试环境不阻塞退出
+      // ⚠️ 这里**不再**做 DOM 注入（见 RemoteNavEntry 的注释）：入口由官方槽位渲染。
+      //    保留本函数只为实现"继续暴露 window.__dshRemoteNav"（老调用方与诊断仍在用）。
+      try { if (typeof openRemoteSettings === "function") remoteNavOpen = openRemoteSettings; } catch (e) { /* 忽略 */ }
     }
 
     // ══ 📣 公告（0.6.18）模块级状态 ═══════════════════════════════════════════
@@ -5732,6 +5733,22 @@ window.__ModuleLoader__.load({
       // 【0.6.11】本插件在这个槽里**只有一个栏目**（📱 远程访问）：🤖 微信机器人原先以 order 31
       // 注册成第二个栏目，业主口径「不要给它单独弄一个菜单，直接放到面板里面」→ 已改成面板里的
       // 第三个 tab（renderMainTabs / renderWeChat）。不要再往这个槽里加第二个 register。
+      /* 📱 侧栏底部的快捷入口 —— 官方列表槽 `sidebar.footer.action`（2026-10-10 三修）。
+         这个槽由 `@deepseek-ai/dsh-client-ui-sidebar` 声明，渲染在侧栏底部的 footerActions 里
+         （在「设置」那一行的上方、与「意见反馈/登录/更多」同属底部区域）。0.1.x 与 0.2 都有该槽，
+         0.2 实测此槽当前为空 —— 正合业主"就要放那个位置"的要求，而且不用我们再猜任何 DOM。
+         order 60：排在该槽内既有条目之后（宿主自己的条目不带 order，按注册序在前）。
+         老宿主若没有这个槽，`inject` 会静默不生效（不会抛）——面板内的 settings.section 入口仍在。 */
+      try {
+        ctx.slots.inject("sidebar.footer.action", function () {
+          return ctx.slots.register({
+            name: "sidebar.footer.action",
+            id: "dsh-remote-nav",
+            order: 60,
+            label: function () { return "远程访问"; }
+          }, RemoteNavEntry);
+        });
+      } catch (eFootSlot) { /* 老宿主没有这个槽：忽略，面板入口仍然可用 */ }
       ctx.slots.inject("settings.section", function () {
         var d1 = ctx.slots.register({
           name: "settings.section",
@@ -5767,7 +5784,7 @@ window.__ModuleLoader__.load({
       try {
         // 侧栏徽标的 DOM 订阅者（非 React）：store 一变就重画徽标。
         // 即便入口按钮此刻还没注入（官方「设置」按钮尚未出现），订阅本身也是零成本的 ——
-        // mountNavEntry 挂上按钮时会主动画一次。
+        // RemoteNavEntry 挂上按钮时会主动画一次。
         annSubscribe(annRenderNavBadge);
         annPullOnce();
       } catch (e) { /* 静默降级：不显示公告入口/徽标，页面照常 */ }
@@ -5777,7 +5794,7 @@ window.__ModuleLoader__.load({
       // 侧栏「远程访问」快捷入口（2026-09 恢复注入：与官方「设置」按钮共存不遮挡）
       navEnsureStart();
       // 🎨 主题：**不在这里**建 observer —— 观察器只在真有订阅者时才创建
-      // （面板/弹窗挂载 → themeSubscribe；侧栏入口挂上 → mountNavEntry）。
+      // （面板/弹窗挂载 → themeSubscribe；侧栏入口挂上 → RemoteNavEntry）。
       // 这样「没有任何东西需要跟随主题」时不会白留一个 MutationObserver，
       // 也避免与本插件已有的红点观察器互相干扰。
 
