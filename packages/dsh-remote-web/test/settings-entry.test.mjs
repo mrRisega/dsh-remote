@@ -347,7 +347,8 @@ test("源码约束：侧栏注入「远程访问」按钮与官方「设置」�
   assert.match(SOURCE, /data-dru-remote/);
   assert.match(SOURCE, /NAV_ENTRY_ID/);
   // 安全设计：绝不克隆官方按钮；候选限定 navCell/导航容器 + 短文本；排除自身；排除菜单语义
-  assert.doesNotMatch(SOURCE, /cloneNode/);
+  // 只禁止**调用**（注释里说明"为什么不克隆"是允许的；2026-10-11 因注释里出现该词误报过）
+  assert.doesNotMatch(SOURCE, /\.cloneNode\s*\(/);
   assert.match(SOURCE, /navCell/);
   assert.match(SOURCE, /NAV_TEXT_MAX/);
   assert.match(SOURCE, /el\.id === NAV_ENTRY_ID/);
