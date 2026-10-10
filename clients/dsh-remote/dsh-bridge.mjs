@@ -55,8 +55,8 @@
  *   - 帧体带信封标记(content-type: application/vnd.dsh.e2ee-v2 或 x-dsh-e2ee)= 已加密:
  *     HTTP 解封→转发上游→响应封回;WS 逐消息封/解。任何解封失败显式
  *     502 + x-dsh-e2ee-error / ws-close 1008,绝不静默降级。
- *   - 控制通道 /_e2ee/ctrl(device/channel 形态)不连上游,跑 §5.2 握手(hello/ack/探针);
- *     数据流 ws-open 携带 &e2ee=<sessId>&w=<8B hex>,探针通过前不转发任何数据。
+ *   - 控制通道 /_e2ee/ctrl(device/channel 形态)不连上游,跑 §5.2 握手(hello/ack/探测);
+ *     数据流 ws-open 携带 &e2ee=<sessId>&w=<8B hex>,探测通过前不转发任何数据。
  *
  * E2EE Phase-4(镜像页 shim,见 e2ee-shim.mjs / e2ee-shim-script.js):
  *   - doHttp 在 text/html 注入 mobile-adapter 之后、压缩/封包之前,对「e2ee.enabled ∧
@@ -237,7 +237,7 @@ function persistBridgeState(patch, opts = {}) {
   } catch { /* 非关键:面板侧还有日志/账号兜底判据 */ }
 }
 
-// ---------- 安装来源 / 版本(服务端设备行统计口径) ----------
+// ---------- 安装来源 / 版本(服务端设备行统计约定) ----------
 // DSH_BRIDGE_INSTALL_SOURCE 由一键安装器(dsh-setup.mjs)注入 = npx;未设置表示这台电脑走的是
 // 「插件市场装面板插件 + 插件自愈补装运行环境」那条路径 = plugin_market;白名单外一律 unknown。
 const INSTALL_SOURCE_VALUES = new Set(["npx", "plugin_market"]);
@@ -339,9 +339,9 @@ const HARNESS_UNAUTHORIZED_TEXT = "dsh web authentication required";
 const HARNESS_COOKIE_REVOKED_FILE = ".harness-cookie-revoked";
 
 /**
- * Cookie 按 **authority 分文件**(0.7.0-beta.2 起,2026-10-09 事故根治)。
+ * Cookie 按 **authority 分文件**(0.7.0-beta.2 起,2026-10-09 故障根治)。
  *
- * 【事故】`~/.dsh-remote/` 只有一份 `.harness-cookie.json`,而 Web 端(3080)与桌面端(每次启动
+ * 【故障】`~/.dsh-remote/` 只有一份 `.harness-cookie.json`,而 Web 端(3080)与桌面端(每次启动
  *   随机端口)是**两个宿主、两个进程**,各自的插件都会往里写"自己 authority 的 Cookie" →
  *   互相覆盖。桥撞 401 后重读磁盘,拿到的是**另一个宿主刚写的** Cookie(与失败的不是同一个)
  *   → 重试 → 还是 401 → 再读 → 又被覆盖回去……**乒乓,永不自愈**。手机端持续白页。
@@ -905,7 +905,7 @@ async function doHttp(method, path, reqHeaders, body, isB64) {
  * 【0.6.15】这里曾经是 `body: Buffer.from(JSON.stringify(respEnv)).toString("base64")`
  * + `bodyBase64: true` —— 也就是把整个信封 JSON 再 base64 一次。中继拿到它做的第一件事
  * 就是解回 UTF-8 再写给手机，所以这一层**纯属白花 33% 流量**，而且正好落在按流量计量的
- * bridge→中继 那条 WS 上（业主实测那条聚合包：12.69 MiB vs 直接发 UTF-8 的 9.5 MiB）。
+ * bridge→中继 那条 WS 上（用户实测那条聚合包：12.69 MiB vs 直接发 UTF-8 的 9.5 MiB）。
  * 中继对两种形态都支持（`frame.bodyBase64` 真假之分），所以直接发 UTF-8 明文即可。
  *
  * @param {string|number} id 帧 id
@@ -931,7 +931,7 @@ export function e2eeHttpResponseFrame(id, sessId, respEnv) {
  * 「镜像页交付了、但页面再也没回来」的看门狗（2026-09-25）。
  *
  * 【为什么需要】首屏提示层被整块删除后，页面上不再有任何东西能告诉用户"没加载完"
- * （那正是业主的要求：不许再有会盖住界面的层）。但**服务端能看见一个更硬的信号**：
+ * （那正是用户的要求：不许再有会盖住界面的层）。但**服务端能看见一个更硬的信号**：
  * 我们把镜像页 HTML 交付给手机后，官方前端一定会在几秒内发一串请求（模块、会话、mux…）。
  * 若 60 秒内一个都没有，那这个页面几乎必然没起来 —— 这时在**日志**里留一条带时间戳的结论，
  * 用户「复制诊断信息」或 `dsh-remote doctor` 时就能看到，不用再靠猜。
@@ -1109,7 +1109,7 @@ function sendCtrlError(send, id, code, extra = "") {
   sendCtrlMsg(send, id, { v: 2, type: "e2ee-error", code, ...(extra ? { message: extra } : {}) });
 }
 
-/** 控制通道 ws-open:不连上游,应答 ok 后按 §5.2 跑握手(hello/ack → 探针)。 */
+/** 控制通道 ws-open:不连上游,应答 ok 后按 §5.2 跑握手(hello/ack → 探测)。 */
 function openControlWs(send, id) {
   if (!e2ee.enabled) {
     console.log(`[bridge] e2ee ctrl 被拒(桥端未启用): id=${id}`);
@@ -1122,7 +1122,7 @@ function openControlWs(send, id) {
   console.log(`[bridge] e2ee ctrl 通道已开 (id=${id}),等待 hello`);
 }
 
-/** 控制通道消息:明文 hello / AEAD 探针信封(§5.2)。 */
+/** 控制通道消息:明文 hello / AEAD 探测信封(§5.2)。 */
 function handleCtrlMessage(send, id, rawText) {
   const conn = ctrlConns.get(id);
   if (!conn) return;
@@ -1145,9 +1145,9 @@ function handleCtrlMessage(send, id, rawText) {
     return;
   }
   if (obj.v === 2 && obj.k === "ctrl") {
-    // AEAD 探针(密文信封);失败 → bad_key 提示手机“密码/密钥不一致”,绝不静默
+    // AEAD 探测(密文信封);失败 → bad_key 提示手机“密码/密钥不一致”,绝不静默
     if (!conn.sessId) {
-      sendCtrlError(send, id, "unknown_session", "探针先于 hello");
+      sendCtrlError(send, id, "unknown_session", "探测先于 hello");
       return;
     }
     try {
@@ -1155,7 +1155,7 @@ function handleCtrlMessage(send, id, rawText) {
       sendCtrlMsg(send, id, reply);
     } catch (e) {
       const code = e2eeCodeOf(e);
-      // 探针解密失败对手机语义统一为 bad_key(§5.2;密码不一致/改密未更新)
+      // 探测解密失败对手机语义统一为 bad_key(§5.2;密码不一致/改密未更新)
       sendCtrlError(send, id, code === "auth_failed" || code === "bad_key" ? "bad_key" : code, e?.message || "");
     }
     return;
@@ -1183,7 +1183,7 @@ export async function handleWsOpen(dchOrSend, frame) {
       send({ id, type: "ws-open", ok: false, code: 1008, reason: "e2ee_session_locked:请先解锁完成握手(检查密码)" });
       return;
     }
-    // 探测前不转发任何数据(§4.6/§5.2:探针通过后数据流才可建);此时已验证 → 安全
+    // 探测前不转发任何数据(§4.6/§5.2:探测通过后数据流才可建);此时已验证 → 安全
   }
   if (wsSessions.has(id)) { try { wsSessions.get(id).ws.terminate(); } catch {} wsSessions.delete(id); }
   const safe = safePath(tagged ? tagged.upstreamPath : path);
@@ -1412,7 +1412,7 @@ async function registerDeviceInAccount(token) {
         device_name: os.hostname() || "dsh-bridge",
         pub_key: pubKey,
         machine_fp: MACHINE_FP, // v6 同机识别:服务端据此自动顶替旧设备(重装不再被设备数卡死)
-        // 安装口径(服务端存到设备行,用于区分「市场安装/自愈补装」与「安装器 npx」):
+        // 安装约定(服务端存到设备行,用于区分「市场安装/自愈补装」与「安装器 npx」):
         //   install_source: npx(安装器注入) | plugin_market(插件拉起/自愈,默认) | unknown(白名单外)
         install_source: INSTALL_SOURCE,
         install_version: INSTALL_VERSION,
@@ -1659,7 +1659,7 @@ async function resolveWechatTier() {
 
 /**
  * App 入口(免费用户越界时给的转化链接)。
- * 由账号 API 地址推导:去掉 `/relay-api` 再加 `/app/` —— 与插件半的 DEFAULT_APP_URL 同一口径
+ * 由账号 API 地址推导:去掉 `/relay-api` 再加 `/app/` —— 与插件半的 DEFAULT_APP_URL 同一约定
  * (https://host:port/relay-api → https://host:port/app/)。
  */
 function wechatAppUrl() {
@@ -1691,7 +1691,7 @@ function startWeChat() {
       relayDir,
       // 传**取值器**而不是当次的值（0.7.0-beta.2 修复）。
       //
-      // 【2026-10-09 真机事故】这里以前传的是 `UPSTREAM` 这个**当次快照**：bridge 起来时宿主还在
+      // 【2026-10-09 真机故障】这里以前传的是 `UPSTREAM` 这个**当次快照**：bridge 起来时宿主还在
       //   3080，随后宿主换了端口（Desktop 每次启动随机），隧道转发侧因为每次读最新 UPSTREAM 而
       //   一切正常，**唯独微信事件通道抱着 3080 死循环重连** —— 现象极具迷惑性：手机能开页面、
       //   bridge-status 显示 online，但任务跑完**一条推送都没有**，日志里只有刷屏的
@@ -1770,7 +1770,7 @@ async function runTunnel() {
 /**
  * 给 stdout/stderr 的每一行加 ISO 时间戳。
  *
- * 【2026-09-25 事故】bridge 日志**没有任何时间戳**，于是排查
+ * 【2026-09-25 故障】bridge 日志**没有任何时间戳**，于是排查
  * 「任务跑完没收到微信推送」时完全无法把日志和事件对上时间：
  * 不知道最后一条 `sendmessage 失败` 发生在用户的回话之前还是之后，
  * 最后只能靠"数行数 ÷ 每分钟行数"去估时间（估出来的结论还差点搞反方向）。

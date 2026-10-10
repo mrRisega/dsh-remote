@@ -60,7 +60,7 @@ non-negotiables, because each of them has already broken something in production
    line numbers, severity labels (P1/F2), incident write-ups, or "self-introduced regression"
    post-mortems. Keep one release section under a screen; fold a round's `-beta.N` previews into
    a single entry. Internal detail belongs in commit bodies of the closed-source repo or in
-   `../dsh-relay-internal/release-notes-internal/`. Full rules: **§8 of
+   仓库外的私有发布说明目录. Full rules: **§8 of
    [docs/release-and-market.md](docs/release-and-market.md)**.
 
 ## Architecture

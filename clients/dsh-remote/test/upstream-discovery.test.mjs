@@ -2,7 +2,7 @@
 /**
  * 上游（dsh web）地址发现契约测试。
  *
- * 背景（两起真实事故，见 upstream-discovery.mjs 顶部注释）：
+ * 背景（两起真实故障，见 upstream-discovery.mjs 顶部注释）：
  *   ① `dsh web --port 8090` / `--port 0`（系统分配端口）→ 写死 3080 的探测永远失败；
  *   ② **DSH Desktop**（Electron 壳 `dsh-plugin-desktop`）默认 43120、占用则 +1，插件 0.6.10
  *      实测「面板永久停在 starting、设备从未登记」——watcher 探 3080 探不到就永不派生 bridge。

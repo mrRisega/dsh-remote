@@ -1,7 +1,7 @@
 /**
  * Windows 兼容回归（0.6.7 新增）。
  *
- * 背景（真实事故，用户诊断报告 + 本地逐条复现）：
+ * 背景（真实故障，用户诊断报告 + 本地逐条复现）：
  *   dsh-remote-web 0.6.6 及更早的整套「服务状态 / 启停 / 重启」按 macOS/Linux 写死，
  *   在 Windows 上**运行期必死**——安装与网络都正常，坏的全是运行期：
  *     ① launchTarget() 无条件调 process.getuid()：Windows 没有这个 API（typeof !== "function"）
@@ -267,7 +267,7 @@ test("win32：重启 harness 生成 node 助手（不再 /bin/sh），且生成�
 });
 
 test("契约：插件里不存在「裸 spawn」——每个子进程都必须有 'error' 监听（否则打挂宿主）", () => {
-  // 事故原文：spawn("/bin/sh") 在 Windows ENOENT，而 ChildProcess 没有 'error' 监听
+  // 故障原文：spawn("/bin/sh") 在 Windows ENOENT，而 ChildProcess 没有 'error' 监听
   // → 未捕获异常把 dsh web 打挂，且代码已经先把「已调度重启」写进日志、返回成功。
   // 生成的 Windows 助手源码是模板字符串（它自己挂了 error 监听），先从「真实代码」里剔除
   const helperStart = INDEX_SRC.indexOf("function buildRestartHelperSource(");
@@ -425,7 +425,7 @@ test("win32：dsh-setup 注册任务计划程序登录任务（不再只说「�
 test("win32：彻底卸载会删掉任务计划条目（否则下次登录又被拉起来）", () => {
   const uninstall = INDEX_SRC.slice(INDEX_SRC.indexOf("function uninstallRuntime("), INDEX_SRC.indexOf("// ---------- DeepSeek harness 重启"));
   assert.ok(/schtasks", \["\/Delete", "\/TN", WIN_TASK_NAME, "\/F"\]/.test(uninstall), "卸载应删除 Windows 登录任务");
-  assert.ok(/servicePlatform: isDarwin\(\) \? "launchd"/.test(uninstall), "servicePlatform 应包含 Windows 口径");
+  assert.ok(/servicePlatform: isDarwin\(\) \? "launchd"/.test(uninstall), "servicePlatform 应包含 Windows 约定");
 });
 
 test("win32：dsh-setup 生成的「重启 dsh web」助手也是合法可执行的 JS", async () => {
@@ -465,7 +465,7 @@ test("前端：bridge-status 轮询失败不再静默（旧版让面板永久停
 });
 
 test("测试隔离：套件不得访问任何外部地址（生产限流会被测试污染）", () => {
-  // 事故（2026-09-19）：有用例在配置里写了假账号却没覆盖 api_url → 按默认地址请求**生产中继**，
+  // 故障（2026-09-19）：有用例在配置里写了假账号却没覆盖 api_url → 按默认地址请求**生产中继**，
   // 其中 /api/device-login 带假密码必然失败，而服务端登录限流按**出口 IP** 计（5 次/15 分钟）——
   // 结果不仅污染生产审计，还让**本机自己的 bridge 被连坐**（拿不到 JWT），
   // 真机表现成"切换账号后设备一直登记不上去"，排查方向被彻底带偏。
@@ -564,7 +564,7 @@ test("win32：登录任务经 wscript+VBS 隐藏启动（旧版会弹黑色空�
 test("win32：桌面端（Electron 解释器）自启动必须先设 ELECTRON_RUN_AS_NODE=1", async () => {
   // 现场价值：DeepSeek Harness 桌面端宿主里 process.execPath 是 Electron 应用二进制。
   // 不设这个变量，自启动拉起的不是 bridge 守护，而是**又开一个桌面端应用** ——
-  // 表现为「服务登记成功、进程秒退、bridge 永远起不来」，与 0.6.15 端口事故一样难排查。
+  // 表现为「服务登记成功、进程秒退、bridge 永远起不来」，与 0.6.15 端口故障一样难排查。
   const dir = await mkdtemp(path.join(os.tmpdir(), "dsh-win-electron-"));
   try {
     const src = SETUP_SRC.slice(

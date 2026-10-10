@@ -113,8 +113,8 @@ test("机器指纹：darwin/linux 两条老分支没有被改坏", () => {
   assert.equal(linux.fn(), "0123456789abcdef", "linux 仍读 /etc/machine-id（并去掉换行）");
 });
 
-test("★回归：子进程一律用绝对路径优先，不赌 PATH（launchd 的 PATH 不含 /usr/sbin 的真实事故）", () => {
-  // 事故（2026-09-22 真机日志）：bridge 由 launchd 拉起，plist 给的 PATH 是
+test("★回归：子进程一律用绝对路径优先，不赌 PATH（launchd 的 PATH 不含 /usr/sbin 的真实故障）", () => {
+  // 故障（2026-09-22 真机日志）：bridge 由 launchd 拉起，plist 给的 PATH 是
   // /usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin —— 没有 /usr/sbin，而 ioreg 在那里。
   // 日志里出现 `/bin/sh: ioreg: command not found`，指纹**静默**退化成 hostname 哈希：
   // 用户改一次主机名就被服务端当成新设备。这类"PATH 假设"必须用绝对路径堵死。

@@ -123,7 +123,7 @@ test("信封逐字段一致:http 请求 / http 响应 / w(文本·二进制)/ ct
     else assert.equal(Buffer.from(back.data).toString("utf8"), data);
   }
 
-  // ctrl 探针
+  // ctrl 探测
   const probePlain = JSON.stringify({ p: "dsh-e2ee-probe-v1", t: 1700000000000, c: 0 });
   const envCN = nodeS.seal({ kind: "ctrl", dir: "p2b", counter: 0, data: probePlain, nonce: NONCE_12() });
   const envCW = await wcS.seal({ kind: "ctrl", dir: "p2b", counter: 0, data: probePlain, nonceBytes: NONCE_12() });

@@ -4,7 +4,7 @@
  * 运行时语义(docs/e2ee-protocol.md §4/§5/§6/§9;字节约定对齐 clients/dsh-remote/
  * e2ee-client.mjs「规范化决定 1–6」与 native.html Phase-3 手机端):
  *   0. document-start:读一次性交接单(sessionStorage dsh-e2ee-handover)→ 立即删除,
- *      用内存重建「已与桥端探针互认」的会话(仅 SHK+saltH+sessId;MK/密码不下放)。
+ *      用内存重建「已与桥端探测互认」的会话(仅 SHK+saltH+sessId;MK/密码不下放)。
  *   1. 有会话 → patch window.fetch / window.WebSocket:命中 §4.5 策略表(/api 排除
  *      SSE、/sidebar、/git、/pet;channel 形态 /remote/{api|sidebar|git|pet}/* 与
  *      device 形态 /remote/<dev>/… 归一后同样判定)→ HTTP 封 v2 信封发送、响应信封
@@ -132,7 +132,7 @@
     return out;
   }
 
-  /** 一个解锁会话(由交接单重建;与桥端已探针互认的会话同 sessId)。密钥仅内存。 */
+  /** 一个解锁会话(由交接单重建;与桥端已探测互认的会话同 sessId)。密钥仅内存。 */
   function SeSession(o) {
     if (!o || typeof o.sessId !== "string" || !SE_SESS_RE.test(o.sessId)) throw seErr("bad_session", "e2ee: sessId 非法");
     if (!o.shk || o.shk.length !== SE_KEY_BYTES || !o.saltH || o.saltH.length !== SE_KEY_BYTES) throw seErr("bad_session", "e2ee: SHK/saltH 非法");
@@ -141,7 +141,7 @@
     this.saltH = o.saltH;
     this.profile = typeof o.profile === "string" ? o.profile : "";
     this.epoch = Number(o.epoch) || 0;
-    this.verified = true; // 交接单来源 = 已通过探针的解锁会话
+    this.verified = true; // 交接单来源 = 已通过探测的解锁会话
   }
   /** 子密钥(node keyFor / wc keyBytesFor 同构)。 */
   SeSession.prototype.keyBytesFor = function (opt) {
@@ -292,7 +292,7 @@
   /**
    * 把**根路径**的受保护请求改写成"设备作用域"形态：`/api/x` → `/remote/<deviceId>/api/x`。
    *
-   * 为什么必须（2026-09-26 线上事故，nginx access/error 日志为证）：
+   * 为什么必须（2026-09-26 线上故障，nginx access/error 日志为证）：
    *   官方客户端把 mux WS 的地址固定按 **`location.origin`** 拼成 `/api/remote.mux`
    *   （@deepseek-ai/dsh-api-gateway/lib/client.js:544 的 remoteStreamUrl()）—— 它**永远**不带设备前缀，
    *   于是中继只能靠 **`dsh_device` cookie** 来判"这是哪台设备"（relay-router/src/index.mjs:626-627
@@ -424,7 +424,7 @@
     if (typeof console !== "undefined" && console.warn) console.warn("[dsh-e2ee-shim]", message);
   }
 
-  /* ---- 会话失效自愈(2026-09-26 线上事故:unknown_session 502 + 刷新也好不了) -------------
+  /* ---- 会话失效自愈(2026-09-26 线上故障:unknown_session 502 + 刷新也好不了) -------------
      链路:手机镜像页 → 加密信封 → 中继透明转发 → 桥端 e2ee-client 查会话表 → 查不到就回
      **明文** 502 + `x-dsh-e2ee-error: unknown_session`(桥端会话表是进程内存 + 24h TTL + CAP=32 LRU,
      桥重启/被挤掉之后就没了)。而手机侧靠 **localStorage 持久交接单**长期复用同一个 sessId
@@ -604,7 +604,7 @@
     inner.onopen = function (ev) { self._state = 1; self._opened = true; seNoteWsOpened(); if (typeof self._onopen === "function") self._onopen(ev || { type: "open", target: self }); };
     inner.onerror = function (ev) {
       /* 握手上就失败(error 早于任何 open)→ 让用户知道"加密数据通道没建立"。
-         这是 2026-09-26 事故里最缺的一条信号:mux 被 404 掐掉时页面**一声不响**,
+         这是 2026-09-26 故障里最缺的一条信号:mux 被 404 掐掉时页面**一声不响**,
          用户只看到所有数据都停住。 */
       if (!self._opened) seNoteWsHandshakeFail(self._meta && self._meta.wsLabel, "error");
       if (typeof self._onerror === "function") self._onerror(ev || { type: "error", target: self });
@@ -715,7 +715,7 @@
         var base = ctx.origin || (typeof window !== "undefined" ? window.location.href : undefined);
         var uo = new URL(url, base);
         if (seSameWebContext(uo, ctx.origin)) {
-          /* ★ 设备作用域改写（2026-09-26 事故）：官方客户端把 mux WS 固定拼成**根路径**
+          /* ★ 设备作用域改写（2026-09-26 故障）：官方客户端把 mux WS 固定拼成**根路径**
              `/api/remote.mux`（dsh-api-gateway/lib/client.js:544 用 location.origin 拼），
              于是中继只能靠 `dsh_device` cookie 判设备；cookie 一过期/缺失就是 404（upgrade 被
              rejectUpgrade 掐掉，nginx 只看到 009）→ E2EE 会话永远建不起来 → 之后每个受保护请求
@@ -730,7 +730,7 @@
           /* ★ 关键：改写结果要**留住**。原来不改写分支 return 的是原始 url，等于把
              `/remote/<dev>/api/remote.mux` 又丢回根路径 —— 那正是 404 的来源。 */
           passUrl = so.href;
-          /* ⚠️ 必须同时要求"有会话"：URL 改写在无会话时也要做（这是 2026-09-26 事故的正题），
+          /* ⚠️ 必须同时要求"有会话"：URL 改写在无会话时也要做（这是 2026-09-26 故障的正题），
              但**加密**没有会话就做不了 —— 少了这个判断，未解锁的页面上任何
              `new WebSocket("/api/…")` 都会在 ctx.sess.sessId 上抛 TypeError，
              把整个页面打挂（比原来"不装补丁"还糟）。 */
@@ -948,7 +948,7 @@
           try { lsSess = seSessionOfHandover(lsRaw); } catch (e) { lsSess = null; }
           if (lsSess) {
             _install(lsSess);
-            /* ⚠️ 0.6.18 起这句文案不再无条件说"加密好好的"（2026-09-26 事故的教训）：
+            /* ⚠️ 0.6.18 起这句文案不再无条件说"加密好好的"（2026-09-26 故障的教训）：
                从 localStorage 恢复的会话**没法在本机验证**桥端是否还认它（桥端会话表是进程内存 +
                24h TTL + CAP=32 LRU，桥重启/被挤掉之后这张交接单就是死票）。真实校验只能等
                第一个受保护请求 —— 那一步由 seNoteE2eeError 兜底：一旦桥端回 unknown_session，

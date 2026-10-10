@@ -190,7 +190,7 @@ test("诊断面板必须显示目录选择器状态(这类'按钮没反应'才�
 });
 
 test("接线:apply 挂的是**延后**接线（schedulePickerPin），绝不在启动期直接切 Loader", () => {
-  // 🔴 2026-09-26 事故锁：旧实现是 apply() 里直接 `pinBrowseDirectoryPicker(ctx)`，
+  // 🔴 2026-09-26 回归锁：旧实现是 apply() 里直接 `pinBrowseDirectoryPicker(ctx)`，
   //    于是 dsh 还在装配插件图时就去 loader.remove/create → dsh-client-modules 反复 compose
   //    整张前端图（buildCombo/newlineCount/identitySectionMap 热点）→ dsh web 3 分钟不监听、
   //    表现为假死。DSH_REMOTE_NATIVE_PICKER=1 能立刻恢复，正是这条链的证据。

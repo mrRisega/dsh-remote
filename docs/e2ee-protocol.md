@@ -141,7 +141,7 @@
 - 校验时机（不变更语义，仅记录）：`POST /api/login`、`POST /api/device-login`、改密时的旧密码校验；恒定时间比较（现实现已如此）。
 - **不存明文、不存可逆材料**；verifier 不可逆出 MK（域分离 + 单向 KDF）。
 
-### 3.3 客户端主密钥 MK（两端口径必须一致）
+### 3.3 客户端主密钥 MK（两端约定必须一致）
 
 两端（bridge 的 node `crypto`、手机浏览器 **WebCrypto**）必须算出一致 MK。WebCrypto 无原生 scrypt，因此：
 
@@ -286,14 +286,14 @@ node 侧 `decodeHttpResponsePlain()`、镜像页 `seDecodeHttpRespPlain()` 都�
 
 1. **数据 WS 连接标识**：shim 打开发送方 URL 时附加 `&e2ee=<sessId>&w=<8B 随机hex>`（仅标识，router 透传；bridge `handleWsOpen` 解析并**剥离**后才向上游建连，避免污染上游路径）。
 2. **每条 WS 消息** = `k:"w"` 信封（§4.2，`t` 区分文本/二进制；上游二进制原样进 `t:1`）。bridge 对标记流：解密 → 原文（文本或二进制）`ws.send` 上游；上游消息 → 加密 → `ws-msg` 回手机。未标记流照旧透传（明文回退）。
-3. **流密钥** = HKDF(SHK, info 含 `wsLabel = 剥离后 path+query ‖ w`)，两端一致；bridge 端到端确认（§5.2 探针）后才把该流当加密流处理，**探针失败不向该流转发任何上游数据**。
+3. **流密钥** = HKDF(SHK, info 含 `wsLabel = 剥离后 path+query ‖ w`)，两端一致；bridge 端到端确认（§5.2 探测）后才把该流当加密流处理，**探测失败不向该流转发任何上游数据**。
 4. `ws-close` 语义不变；加密流中途 AEAD 失败 → 手机侧以 `1008` 关闭并提示重试/检查密码。
 
 **帧/信封分块**：信封 JSON 超过既有 `CHUNK_SIZE`(200KB) 时，沿用 `__chunk` 信封重装——两端现有代码不变。
 
 ### 4.7 对隧道传输的影响
 
-- 密文长度 ≈ 明文 + 28B（tag/nonce 摊销）；按字节统计的观测口径基本不变，只需注明“含 AEAD 开销”。
+- 密文长度 ≈ 明文 + 28B（tag/nonce 摊销）；按字节统计的观测约定基本不变，只需注明“含 AEAD 开销”。
 - bridge 现有响应 gzip（隧道省带宽）迁移到“压缩先于加密”，中继仍只见不可压缩密文——带宽收益在 phone↔bridge 的**解密后**由 shim 解压还原，逻辑等价。
 - `content-encoding` 等实体头进入信封密文，**外层不再携带**（shim 解密后重建），router/nginx 不会对密文误判 gzip。
 
@@ -306,7 +306,7 @@ node 侧 `decodeHttpResponsePlain()`、镜像页 `seDecodeHttpRespPlain()` 都�
 - 触发：登录态下（密码登录/短信登录/扫码 auth-key 均可）首次点选设备进入**被控 dsh web 隧道页**，或该页冷启动且无内存密钥。
 - 流程：
   1. 页面注入的 shim 检测：账号 e2ee 启用（`/api/e2ee-params`）**且**设备 bridge 声明能力（`/_devices` 携带 `caps:["e2ee-v2"]`，见 §6.2）→ **先尝试免输密码建立加密会话**：密码登录/注册（本页内存留有密码）→ 静默自动解锁；扫码/一次性链接/短信登录（无密码）→ 先走 §5.4 桌面授权引导。两者都不行才弹解锁层人工输入密码；服务端/设备不支持 → 直接明文并显示原因徽标。
-  2. 解锁 = 输入账号密码 → WebCrypto 派生 MK（§3.3，~200–400ms）→ 打开**控制 WS** `/remote/<deviceId>/_e2ee/ctrl`（channel 形态 `/_e2ee/ctrl` + 设备头亦可）→ §5.2 握手；§5.4 引导路径等价——手机已持有一次性派生 MK，走同一 §5.2 握手（双方 MK 一致仍由探针确认）。
+  2. 解锁 = 输入账号密码 → WebCrypto 派生 MK（§3.3，~200–400ms）→ 打开**控制 WS** `/remote/<deviceId>/_e2ee/ctrl`（channel 形态 `/_e2ee/ctrl` + 设备头亦可）→ §5.2 握手；§5.4 引导路径等价——手机已持有一次性派生 MK，走同一 §5.2 握手（双方 MK 一致仍由探测确认）。
   3. 成功后：`sessId`、SHK、子密钥与各流计数**只存本页面 JS 内存**（模块闭包/WeakMap），不写 sessionStorage/IndexedDB。
      - `[DECISION-2026-09-2 用户决策]` 持久化例外：为让「刷新后仍保持加密」，手机端在解锁/引导成功后把**派生 MK**（≈“记住本机密码”）写入 localStorage（与镜像页同源共用）——/app 刷新后点设备自动解锁；镜像页刷新且无交接单时，shim 会用该 MK + 同账号登录态自动重建加密会话。风险如实告知：localStorage 与同源页面脚本等价可读（≈“记住密码”的常规暴露面），退出登录即清除，用浏览器无痕可避免；SHK/会话密钥仍不落盘。
 - **刷新/重开页面/浏览器重启 → 内存会话清空**（与登录 cookie 存续无关）。默认开启「记住本机」后：/app 点设备自动解锁、镜像页自动恢复加密，**刷新不再回明文**；未记住/电脑端离线/已退出登录 → 回落密码输入或明文提示。退出登录会清除 localStorage 中的 MK。
@@ -325,11 +325,11 @@ node 侧 `decodeHttpResponsePlain()`、镜像页 `seDecodeHttpRespPlain()` 都�
 | 3 | 双方 | 计算 | `SHK=HKDF(MK, salt=sha256(a‖b), info="dsh-e2ee/v1/shk")` |
 | 4 | 手机→bridge | `e2ee-probe`（AEAD） | 密文 = `{"p":"dsh-e2ee-probe-v1","t":<ms>,"c":0}`，key 由 `SHK→ctrl-p2b` |
 | 5 | bridge→手机 | `e2ee-probe-ok`（AEAD） | 同上反向；成功即确认**双方 MK 一致** |
-| – | bridge→手机 | `e2ee-error`（明文） | `{code}`：`bad_key`(探针解密失败=密码不一致)/`no_cap`/`disabled`/`params`/`busy` |
+| – | bridge→手机 | `e2ee-error`（明文） | `{code}`：`bad_key`(探测解密失败=密码不一致)/`no_cap`/`disabled`/`params`/`busy` |
 
-- 桥端行为：bridge 不提前把控制 WS 的后续内容当用户数据；**探针通过前，任何数据 WS 不向上游转发**；探针失败则明文回复 `e2ee-error bad_key`（手机提示“电脑端保存的账号密码与本次输入不一致，请在电脑端面板重新登录该账号”）。
+- 桥端行为：bridge 不提前把控制 WS 的后续内容当用户数据；**探测通过前，任何数据 WS 不向上游转发**；探测失败则明文回复 `e2ee-error bad_key`（手机提示“电脑端保存的账号密码与本次输入不一致，请在电脑端面板重新登录该账号”）。
 - 每次控制握手都是**新随机数** → 新 SHK；旧 SHK 一旦过期/解锁结束即不可用。
-- 中继视角的离线猜测面：任何密文/探针都可被用于以 MK 派生成本离线猜密码（§8 风险 4），v1 不引入 PAKE（如实声明），仅在 §8.5 给升级路径。
+- 中继视角的离线猜测面：任何密文/探测都可被用于以 MK 派生成本离线猜密码（§8 风险 4），v1 不引入 PAKE（如实声明），仅在 §8.5 给升级路径。
 
 ### 5.3 密码修改 → 旧会话失效机制（复用既有基建）
 
@@ -394,7 +394,7 @@ node 侧 `decodeHttpResponsePlain()`、镜像页 `seDecodeHttpRespPlain()` 都�
 | 配置/启动 | E2EE 启用条件：账号模式（非 `DSH_BRIDGE_LOCAL_KEY`）且服务端 `e2ee.enabled`；启动时用 device-login JWT 拉 `e2ee-params` → 内存派生 MK（失败静默禁用该能力） |
 | 注册 | `tunnel-register` 携带 `caps:["e2ee-v2"]` |
 | 控制通道 | 识别 `/remote/<dev>/_e2ee/ctrl`（及 channel 形态）ws-open：**不连上游**，跑 §5.2 握手 |
-| 数据 WS | `handleWsOpen` 解析并剥离 `e2ee`/`w` 查询参数；标记流解密→上游、上游→加密；探针通过前不转发 |
+| 数据 WS | `handleWsOpen` 解析并剥离 `e2ee`/`w` 查询参数；标记流解密→上游、上游→加密；探测通过前不转发 |
 | HTTP | `handleHttpFrame` 检测 `content-type: application/vnd.dsh.e2ee-v2` → 解密还原请求；响应压缩先于加密；AEAD 失败返回明文 `502 + x-dsh-e2ee-error` |
 | HTML 注入 | 复用现有 text/html 注入管线（mobile-adapter 同机制）注入 **crypto shim 引导脚本**（先于官方 bundles 执行；含解锁 UI 与状态徽标）与“本机已保存密码用于自动登录/加密”提示 |
 | 日志 | 禁止记录密码/MK/明文正文（现状纪律延续） |
@@ -405,7 +405,7 @@ node 侧 `decodeHttpResponsePlain()`、镜像页 `seDecodeHttpRespPlain()` 都�
 |---|---|
 | 注册/登录页 | §2.3 信任文案；注册密码框规则不变（≥8） |
 | 设备选择页 | 按 `/_devices` 的 `caps` 显示设备“🔒 可加密”徽标；点选设备时若账号启用 E2EE 则**先经解锁页**再跳转（或跳转后由 shim 在隧道页内解锁，二选一，实现建议：隧道页内解锁，PWA 只提示） |
-| 隧道页 shim | fetch/XHR/WebSocket 传输 patch（document-start，早于官方模块）；§4.5 策略表决定包裹；信封加/解密、探针、计数/重放、状态徽标、解锁 UI、错误处理（§5.1） |
+| 隧道页 shim | fetch/XHR/WebSocket 传输 patch（document-start，早于官方模块）；§4.5 策略表决定包裹；信封加/解密、探测、计数/重放、状态徽标、解锁 UI、错误处理（§5.1） |
 | 插件浏览器半（Mac 面板） | “🔒 通道加密”卡片：显示本机 bridge 能力、账号 e2ee 状态、启停/重新登录入口；替换 §2.3 占位文案 |
 | 文案 | 登录/解锁/重置密码三类文案按 §2.3/§5.3 落地 |
 
@@ -464,10 +464,10 @@ node 侧 `decodeHttpResponsePlain()`、镜像页 `seDecodeHttpRespPlain()` 都�
 1. **元数据可见（如实告知）**：路径/方法/大小/时间/是否加密对中继可见（路由所需），存在流量分析面（§2.3）。v1 不加密静态壳与 SSE（§4.5）。
 2. **引导代码明文**：加密 shim 随被控 dsh web 的 HTML 壳下发；**主动作恶的中继**可改写该页移除 shim（降级攻击）。检出手段：AEAD 打开失败/徽标缺失提示用户；根治需“代码先于中继可信交付”（原生 App/内容签名），vNext。
 3. **密码强度直接决定安全性**：密钥=密码，弱密码可被离线猜测（猜测成本=§3.3 KDF 成本；服务端另有 scrypt verifier）。注册策略保留 ≥8 位，面板/登录页提示高强度密码；不承诺对弱密码的绝对保护。
-4. **离线猜测面**：任何捕获密文/探针都可做密码离线验证（代价=客户端 KDF 一次）。v1 采用 PBKDF2-600k（浏览器可算），与 verifier（scrypt）为两套成本面；升级路径=内存困难 profile / PAKE / OPAQUE（§8.5）。
+4. **离线猜测面**：任何捕获密文/探测都可做密码离线验证（代价=客户端 KDF 一次）。v1 采用 PBKDF2-600k（浏览器可算），与 verifier（scrypt）为两套成本面；升级路径=内存困难 profile / PAKE / OPAQUE（§8.5）。
 5. **本地存储安全**：会话密钥仅内存（页面/进程）；密码明文仅存 bridge 本机 0600 配置（现状）——本机被攻破=内容可解密（§3.5）；页面 XSS 可读内存密钥（与 dsh web 同风险面）。`[DECISION-2026-09-2]` 手机端“记住本机”会把**派生 MK** 写 localStorage（等同“记住密码”，XSS 可读 → 该账号全部内容可解密），用户已按产品决策知情接受；退出登录清除、无痕浏览可避免；日志仍绝不记录 MK/密码。若后期切换到 WebAuthn 封存（§8.5）可将 MK 落盘暴露降到最低。
 6. **登录服务器天然可见密码**（一次）：enterprise 必须在登录/改密时收到密码做 verifier 校验——这是既有登录协议，E2EE 只防“内容”不防“登录”本身；服务端可假冒任意会话（§2.1）。如需服务端不可见密码的登录，需引入 PAKE/OPAQUE（服务端只存 verifier 参与协议），列 vNext。
-7. **字节口径**：密文长度 = 明文 + AEAD 开销（影响可忽略），gzip 迁移到加密前（§4.7）。
+7. **字节约定**：密文长度 = 明文 + AEAD 开销（影响可忽略），gzip 迁移到加密前（§4.7）。
 8. **监管/合规一句话**：端到端加密与“服务端不存内容”意味着**依法协助调查无法提供用户内容**（与主流 E2EE 产品一致），请在服务条款/隐私政策明示；本设计不提供任何后门/主密钥托管，用户内容恢复责任在用户侧。
 9. **会话吊销的残余窗口**：改密 revoke 到手机下次校验之间 ≤1 次 JWT 生命周期；bridge 长连在 `bad_key`/401 前可能短暂存续（其内存 MK 随旧盐无法解密新流量，不扩大泄露）。
 

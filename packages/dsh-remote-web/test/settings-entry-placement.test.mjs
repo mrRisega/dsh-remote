@@ -1,9 +1,9 @@
-// dsh-remote-web 侧栏快捷入口「落点」回归（2026-10-09 桌面端事故）。
+// dsh-remote-web 侧栏快捷入口「落点」回归（2026-10-09 桌面端故障）。
 //
-// 【事故】桌面端（DSH 0.2）设置面板本身就是 `role="dialog" aria-modal="true"` 的弹层，
+// 【故障】桌面端（DSH 0.2）设置面板本身就是 `role="dialog" aria-modal="true"` 的弹层，
 //   它左侧栏目列表的第一项叫 **「通用设置」**。旧代码用「文本包含『设置』」（`indexOf !== -1`）
 //   去找侧栏那颗齿轮按钮 → **命中的是弹层里的「通用设置」**，于是我们的「📱 远程访问」
-//   快捷按钮被插进了设置面板栏目列表的最上面。业主截图反馈：「植入错了地方」。
+//   快捷按钮被插进了设置面板栏目列表的最上面。用户截图反馈：「植入错了地方」。
 //
 // 本用例把 client.js 里的导航注入辅助函数**原样切出来**，喂一个最小 DOM，逐条锁住：
 //   ① 官方「设置」触发器只按**语义锚点**（aria-haspopup="dialog"）识别，且必须在弹层之外；
@@ -129,13 +129,13 @@ function desktopFixture() {
 
 // ───────────────────────── 用例 ─────────────────────────
 
-test("★ 事故锁：官方「设置」触发器只认语义锚点，且必须落在**设置弹层之外**", () => {
+test("★ 回归锁：官方「设置」触发器只认语义锚点，且必须落在**设置弹层之外**", () => {
   const { doc, trigger } = desktopFixture();
   const { pickSettingsTrigger } = loadNavHelpers(doc);
   assert.equal(pickSettingsTrigger(), trigger, "必须命中侧栏那颗 aria-haspopup=dialog 的齿轮按钮");
 });
 
-test("★ 2026-10-11 业主实测：点入口弹出的是 token 用量弹窗 —— 官方设置槽位必须优先于底部槽邻居", () => {
+test("★ 2026-10-11 用户实测：点入口弹出的是 token 用量弹窗 —— 官方设置槽位必须优先于底部槽邻居", () => {
   // 现场：入口挂在 sidebar.footer.action，而同一底部区域的「token 本轮用量」按钮
   // 也带 aria-haspopup="dialog"（甚至带快捷键）→ 旧实现"谁先扫到谁"就点中了它。
   // 现在：① 官方设置槽位里的按钮排第一；② 底部槽（我们所在那块）里的候选直接排除。
@@ -159,7 +159,7 @@ test("★ 2026-10-11 业主实测：点入口弹出的是 token 用量弹窗 —
   assert.equal(pickSettingsTrigger(), trigger, "★ 必须选中官方设置槽位里的齿轮，而不是 token 用量按钮");
 });
 
-test("★ 事故锁：弹层里的「通用设置」永远不能成为落点", () => {
+test("★ 回归锁：弹层里的「通用设置」永远不能成为落点", () => {
   const { doc, general } = desktopFixture();
   const { pickSettingsTrigger, pickNavByToken } = loadNavHelpers(doc);
   assert.notEqual(pickSettingsTrigger(), general, "「通用设置」在弹层内，绝不能被当成侧栏设置按钮");

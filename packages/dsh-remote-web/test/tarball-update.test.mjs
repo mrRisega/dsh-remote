@@ -1,7 +1,7 @@
 /**
  * 零依赖 tarball 更新通道的回归测试（node:test，零框架）。
  *
- * 背景（真实事故，见 lib/tarball-update.js 顶部注释）：
+ * 背景（真实故障，见 lib/tarball-update.js 顶部注释）：
  *   Windows 上「一键更新」走的 `npx` 在 Node ≥20.12 起同步 EINVAL，0.6.6 及更早的升级通道
  *   本身是坏的 —— 79 台点过一键更新的 Windows 机器全部 update_failed，且产品内无出路。
  *   本文件就是给替代通道（HTTPS 取 tarball → 内置 zlib + 自解析 tar 落 staging）上锁：

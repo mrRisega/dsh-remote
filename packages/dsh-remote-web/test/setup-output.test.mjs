@@ -26,7 +26,7 @@ const SETUP = join(HERE, "..", "..", "..", "dsh-setup.mjs");
 const src = readFileSync(SETUP, "utf8");
 
 test("测试隔离：unset 系统操作开关的用例必须同时伪造 HOME（否则污染真实自启动）", () => {
-  // 事故复盘:harness-restart 用例 unset DSH_RELAY_SKIP_SERVICE 去走真实分支,
+  // 故障回顾:harness-restart 用例 unset DSH_RELAY_SKIP_SERVICE 去走真实分支,
   // 但没伪造 HOME → 插件写 plist 的路径是 join(homedir(), "Library/LaunchAgents/…"),
   // 于是把**指向测试临时目录**的 plist 覆盖到开发者真实的 ~/Library/LaunchAgents,
   // 临时目录随即被删 → 真实 bridge 自启动彻底失效(本机实测踩到,macOS 26 用户反馈排查时发现)。
@@ -105,13 +105,13 @@ test("安装输出:跳过/不支持自启动时不得自相矛盾地显示「运
 });
 
 test("安装输出:服务状态字符串仍是插件面板可解析的稳定契约", () => {
-  // 插件半按 running / 未运行 解析,不能因为排版调整改口径
-  assert.ok(/\? `✅ 运行中/.test(src), "running 口径保留(带 pid)");
-  assert.ok(/`未运行 \(\$\{st\.detail \|\| st\.status\}\)`/.test(src), "未运行口径保留(带原因)");
+  // 插件半按 running / 未运行 解析,不能因为排版调整改约定
+  assert.ok(/\? `✅ 运行中/.test(src), "running 约定保留(带 pid)");
+  assert.ok(/`未运行 \(\$\{st\.detail \|\| st\.status\}\)`/.test(src), "未运行约定保留(带原因)");
 });
 
 test("版本比较：预设版 < 同号正式版；beta.10 < beta.11（更新提示不能误判）", () => {
-  // 事故背景：面板原本用 `latest !== current` 判断"有没有新版本"，于是
+  // 故障背景：面板原本用 `latest !== current` 判断"有没有新版本"，于是
   // ① 0.6.4-beta.11 与 0.6.4-beta.10 无法比大小；② 正式版 0.6.4 发布后，
   // 装了 0.6.4-beta.11 的人反而被当成"落后"（其实预设版 semver 低于正式版）。
   const src = readFileSync(join(HERE, "..", "lib", "index.js"), "utf8");
@@ -135,8 +135,8 @@ test("版本比较：预设版 < 同号正式版；beta.10 < beta.11（更新提
   assert.match(src, /cmp === null \? Boolean\(latest && latest !== current\) : cmp > 0/);
 });
 
-test("★ 插件覆盖必须原子：staging → 必需文件自检 → rename 切换（2026-09-26「dsh 起不来」事故）", () => {
-  // 事故：旧实现 `rmSync(dest)` → `cpSync(pluginDir, dest)`，于是拷贝期间 dest 是"半个插件"：
+test("★ 插件覆盖必须原子：staging → 必需文件自检 → rename 切换（2026-09-26「dsh 起不来」故障）", () => {
+  // 故障：旧实现 `rmSync(dest)` → `cpSync(pluginDir, dest)`，于是拷贝期间 dest 是"半个插件"：
   //   dsh 恰在此刻启动 → package.json 已声明 bundle，但 cordis.patch.yml 还没拷到 →
   //   `failed to read overlay … cordis.patch.yml: ENOENT` → **整个 GUI 起不来**。
   //   时间证据：dsh 报错 23:46:03，cordis.patch.yml 写完 23:46:05（差 2 秒）。
@@ -153,12 +153,12 @@ test("★ 插件覆盖必须原子：staging → 必需文件自检 → rename �
   assert.match(fn, /renameSync\(backup, dest\)/, "切换失败必须把 backup 改回来（旧版仍可用）");
   // 反向锁：绝不允许回到"先 rm dest、再 cpSync 逐文件"的旧写法
   assert.ok(!/fs\.rmSync\(dest,\s*\{\s*recursive:\s*true,\s*force:\s*true\s*\}\);\s*\n\s*fs\.cpSync\(/.test(fn),
-    "🔴 不得再出现「先删 dest 再原地逐文件拷贝」——那正是这次事故的成因");
+    "🔴 不得再出现「先删 dest 再原地逐文件拷贝」——那正是这次故障的成因");
   assert.match(fn, /\.staging-\$\{process\.pid\}|\.staging-/, "被强杀留下的 staging 要能清理");
 });
 
 test("★ 插件拷贝必须保留**自带的 runtime/node_modules**（ws 是桥唯一的裸依赖）", () => {
-  // 2026-10-10 事故形态：过滤规则写的是"任何一段叫 node_modules 就剔除"，
+  // 2026-10-10 故障形态：过滤规则写的是"任何一段叫 node_modules 就剔除"，
   // 本意只想去掉插件自己的依赖目录（那些由 profile 的包管理器管），
   // 却把 `runtime/node_modules/ws` 一起剔了 —— 而这份运行时正是"只有插件半"的机器
   // **自愈补装时的唯一来源**。剔掉它 → 自愈出来的运行环境缺 ws
@@ -228,8 +228,8 @@ test("★ 自启动配置里可以钉住上游（多 profile 时代，各宿主�
 });
 
 test("★ 桌面应用在运行时，绝不改写它的 profile（否则应用会自己退出/重启）", () => {
-  // 2026-10-11 事故：在应用运行中改写 ~/.dsh/profiles/desktop/ 的插件文件 →
-  // 应用随即自己退出/重启（业主："怎么又触发了 dsh 的关闭"）。安装器文案早就写了"先完全退出应用"，
+  // 2026-10-11 故障：在应用运行中改写 ~/.dsh/profiles/desktop/ 的插件文件 →
+  // 应用随即自己退出/重启（用户："怎么又触发了 dsh 的关闭"）。安装器文案早就写了"先完全退出应用"，
   // 但必须由程序强制，不能靠人记得。
   const src = readFileSync(SETUP, "utf8");
   assert.match(src, /function dshDesktopAppRunning\(/, "要有「桌面应用是否在运行」的探测");

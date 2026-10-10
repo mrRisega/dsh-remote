@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * Cookie **按 authority 隔离**回归（2026-10-09 事故根治）。
+ * Cookie **按 authority 隔离**回归（2026-10-09 故障根治）。
  *
- * 【事故原貌】`~/.dsh-remote/` 只有一份 `.harness-cookie.json`，而 Web 端(3080)与桌面端
+ * 【故障原貌】`~/.dsh-remote/` 只有一份 `.harness-cookie.json`，而 Web 端(3080)与桌面端
  *   (每次启动随机端口)是**两个宿主进程**，各自的插件都往里写自己 authority 的 Cookie →
  *   互相覆盖。桥撞 401 后重读磁盘拿到的是**另一个宿主刚写的** Cookie（与失败的不是同一个）
  *   → 重试 → 还是 401 → 再读 → 又被覆盖回去……**乒乓，永不自愈**，手机端持续白页。
@@ -69,9 +69,9 @@ test("本宿主专属文件优先：`.harness-cookie.<authority>.json` 收到的
   assert.equal(r.cookie, "dsh-auth-OWN");
 });
 
-test("★ 事故锁：旧版共享文件里是**另一个宿主**的 Cookie → 一个字节都不许发出去", async () => {
+test("★ 回归锁：旧版共享文件里是**另一个宿主**的 Cookie → 一个字节都不许发出去", async () => {
   clearCookies();
-  // 这正是事故现场：共享文件被另一宿主(3080)覆盖过
+  // 这正是故障现场：共享文件被另一宿主(3080)覆盖过
   writeDoc(LEGACY, { authority: "127.0.0.1:3080", cookie: "dsh-auth-FOREIGN", mintedAt: Date.now() });
   const r = await ask();
   assert.equal(r.status, 200);

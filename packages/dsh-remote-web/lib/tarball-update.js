@@ -1,7 +1,7 @@
 /**
  * 零依赖更新通道：直接从 npm registry 取 tarball，用 Node 内置 zlib + 自解析 tar 落到 staging 目录。
  *
- * 为什么必须有这条通道（真实事故，生产遥测近 14 天）：
+ * 为什么必须有这条通道（真实故障，生产遥测近 14 天）：
  *   插件面板的「一键更新」过去一律走 `npx @mrrisega/dsh-remote@<tag>`。在 Windows 上，
  *   Node ≥20.12（CVE-2024-27980 的修复）起 `spawn("npx.cmd")` 不带 shell 会**同步抛 EINVAL**，
  *   0.6.6 及更早正是这么写的 —— 于是**升级通道本身坏掉**：427 台 Windows 里 157 台装机失败

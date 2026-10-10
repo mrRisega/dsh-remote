@@ -268,7 +268,7 @@ test("触发点：plugin_loaded → install_started → runtime_ready → bridge
 
     const { host, base } = await serve(routes);
     try {
-      // ③ 运行环境补齐（dsh-setup.mjs 落地）→ 面板轮询触达探针 → runtime_ready
+      // ③ 运行环境补齐（dsh-setup.mjs 落地）→ 面板轮询触达探测 → runtime_ready
       await writeFile(path.join(env.relayDir, "dsh-setup.mjs"), "// runtime stub");
       let r = await bridgeStatus(base);
       assert.equal(r.ok, true);
@@ -351,7 +351,7 @@ test("隐私审计：对抗性 extra 字段（手机号/hostname/machine_fp/路�
     // 直接往唯一的构造点灌脏数据：字段白名单 + 事件名校验必须把它们全部丢掉
     TELEMETRY.record(env.relayDir, "install_started", { device_id: "dev-telemetry", machine_fp: "fp-abc" });
     TELEMETRY.record(env.relayDir, "plugin_loaded", { hostname: "mac.local", username: "mac" });
-    TELEMETRY.record(env.relayDir, "panel_opened", { path: "/Users/mac/.dsh-remote", phone: "13800000000" });
+    TELEMETRY.record(env.relayDir, "panel_opened", { path: "/home/user/relay", phone: "13800000000" });
     TELEMETRY.record(env.relayDir, "update_started", { email: "a@b.c", token: "jwt", password: "pw" });
     TELEMETRY.record(env.relayDir, "harness_restart", { ip: "1.2.3.4" });
     // 白名单外的事件名：一条都不入队
@@ -554,7 +554,7 @@ test("冻结契约：既有事件名与既有字段一字不改（本次只新�
   assert.match(String(ev.node), /^\d+$/);
   assert.ok(!("fail_code" in ev), "fail_code 仍只出现在 *_failed 事件上");
   assert.equal(TELEMETRY.eventOf("user_login"), null, "白名单外事件名照旧不发");
-  // 通道与"一键更新"同源：面板看到的通道 = 上报的通道（两处口径必须是一处）
+  // 通道与"一键更新"同源：面板看到的通道 = 上报的通道（两处约定必须是一处）
   assert.equal(ev.channel, TELEMETRY.updateTag);
 });
 
@@ -845,7 +845,7 @@ test("面板可见性：关于卡片写明「匿名统计 + 关闭方式」，�
     "客户端上报的事件，不是服务端的实时存量",
     "bot_id",
   ]) {
-    assert.ok(doc.includes(line), "docs/telemetry.md 必须写明微信通道事件的口径边界：" + line);
+    assert.ok(doc.includes(line), "docs/telemetry.md 必须写明微信通道事件的约定边界：" + line);
   }
   for (const code of TELEMETRY.failCodes) assert.ok(doc.includes(code), "docs/telemetry.md 必须列出失败码：" + code);
 });

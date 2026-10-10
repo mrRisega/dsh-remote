@@ -254,7 +254,7 @@ function resolveExecutable(p) {
  * 桌面端 `process.execPath` 是 **Electron 应用二进制**而不是 node：不带
  * `ELECTRON_RUN_AS_NODE=1` 直接拿它跑脚本，得到的不是「跑脚本的 node」，而是
  * **又启动一个桌面端应用实例**。自启动服务是系统在应用退出后拉起的，踩到这里
- * 的表现是「服务登记成功、进程秒退、bridge 永远起不来」，与 0.6.15 那次端口事故
+ * 的表现是「服务登记成功、进程秒退、bridge 永远起不来」，与 0.6.15 那次端口故障
  * 一样难排查 —— 所以必须在**写服务定义时**就把变量带上。
  */
 const IS_ELECTRON_HOST = Boolean(process.versions && process.versions.electron);
@@ -359,7 +359,7 @@ function nodeEnv(extra) {
  */
 const SERVICE_PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
-// ---------- 安装口径（随 bridge 环境变量注入；服务端存到设备行，用于区分安装来源） ----------
+// ---------- 安装约定（随 bridge 环境变量注入；服务端存到设备行，用于区分安装来源） ----------
 /**
  * install_source：本文件即「一键安装器」→ 默认 npx（用户自己跑 `npx @mrrisega/dsh-remote` 的那条路径）。
  * 插件市场那条路径由插件半自愈补装：插件 spawn 本安装器时显式传入
@@ -526,7 +526,7 @@ function readPidFile(name) {
  *
  * 为什么必须查:pid 文件可能过期，而 pid 会被系统**回收给无关进程**。
  * 去重逻辑信任 `pidAlive()` 只会导致"我多退一次"（安全方向）；但监管者接管时要
- * **主动结束**那个 pid —— 盲杀一个被回收的无关进程是事故。所以动它之前先认一下命令行。
+ * **主动结束**那个 pid —— 盲杀一个被回收的无关进程是故障。所以动它之前先认一下命令行。
  */
 function looksLikeWatcher(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
@@ -838,7 +838,7 @@ function spawnDetachedBridge() {
  *   ③ 后台进程  ← 连 launchd 都托管不了时保证可用
  */
 /**
- * 🔴 标签占用保护（2026-10-10 事故）：`com.dshremote.bridge` 这个 launchd label 是**全局唯一**的，
+ * 🔴 标签占用保护（2026-10-10 故障）：`com.dshremote.bridge` 这个 launchd label 是**全局唯一**的，
  *   谁 bootstrap 谁就接管它。当天跑测试时，某个用例用**假 HOME + 真 launchctl** 把测试临时目录的
  *   plist 登记到了同一个 label 上 → **真桥被顶掉**、远程访问中断，而日志里看不出任何异常。
  *
@@ -984,7 +984,7 @@ function restartBridgeService() {
 /**
  * 上游 dsh web 地址（bridge 的转发目标 + watcher 的「dsh web 在线吗」判据**同一个来源**）。
  *
- * 【2026-09-23 用户实测事故】这里原本处处写死 `http://127.0.0.1:3080`：只要用户的 dsh web
+ * 【2026-09-23 用户实测故障】这里原本处处写死 `http://127.0.0.1:3080`：只要用户的 dsh web
  * 不在默认端口（`dsh web --port 8090`、profile 里配了 port、或 `--port 0` 让系统分配空闲端口），
  * watcher 的在线探测就**永远**失败 → bridge 永远不启动，而面板只会说「正在启动 Bridge…」。
  * 优先级：显式环境变量 > **运行时动态发现** > 插件半留下的端口文件 > DSH_WEB_URL > 默认 3080。
@@ -1006,9 +1006,9 @@ let PINNED_UPSTREAM = String(process.env.DSH_BRIDGE_UPSTREAM || "").trim().repla
 /**
  * 探测桌面端（Electron 应用）当前监听的**回环端口**。
  *
- * 为什么需要（2026-10-11 实测事故）：插件同时装进 web 与 desktop 后，**每个宿主**都会在装载时
+ * 为什么需要（2026-10-11 实测故障）：插件同时装进 web 与 desktop 后，**每个宿主**都会在装载时
  * 把自己 `ctx.webServer.port` 写进 `<relayDir>/.dsh-upstream` —— 谁最后写谁生效。于是桥的上游
- * 会在两个应用之间来回跳：那次桥跑去连了 Web 版的 3080，而业主面对的是桌面端 19387，
+ * 会在两个应用之间来回跳：那次桥跑去连了 Web 版的 3080，而用户面对的是桌面端 19387，
  * 表现就是"命令跑完了但没装上 / 手机连上看到的不是我在用的界面"。
  * 装桌面端时把端口**钉进自启动配置**（环境变量优先级最高），两个宿主就抢不动了。
  */
@@ -1105,7 +1105,7 @@ async function isDshWebUp(timeoutMs = 1200) {
 
 /** 已知的 DSH profile 名（`--profile web` / `--profile desktop` 这种写法要能用）。 */
 const KNOWN_PROFILE_NAMES = ["web", "desktop"];
-/** profile 名 → 目录（与 dsh 自己的 `$DSH_HOME/profiles/<name>` 口径一致）。 */
+/** profile 名 → 目录（与 dsh 自己的 `$DSH_HOME/profiles/<name>` 约定一致）。 */
 function profileDirOfName(name) {
   return path.join(os.homedir(), ".dsh", "profiles", name);
 }
@@ -1115,13 +1115,13 @@ function isDesktopProfileDir(dir) {
 }
 
 /**
- * 解析目标 profile 目录（安装与插件管理共用同一口径）。
+ * 解析目标 profile 目录（安装与插件管理共用同一约定）。
  *
  * 三种写法都支持：
  *   · `--profile web` / `--profile desktop` → `~/.dsh/profiles/<name>`
  *     （新增：DeepSeek Harness 桌面端的 profile 就叫 `desktop`）
  *   · `--profile <任意路径>`                → 原样当目录用（老行为，保持不变）
- *   · `DSH_PROFILE_DIR` 环境变量            → 与 `--profile` 同口径
+ *   · `DSH_PROFILE_DIR` 环境变量            → 与 `--profile` 同约定
  * 缺省仍是 Web 版 profile，行为与改动前完全一致。
  */
 function resolveProfileDir(argv = []) {
@@ -1142,8 +1142,8 @@ function resolveProfileDir(argv = []) {
 /**
  * DeepSeek Harness **桌面应用**是否正在运行。
  *
- * 🔴 2026-10-11 事故：我在应用运行中改写了 `~/.dsh/profiles/desktop/` 里的插件文件，
- *    应用随即**自己退出/重启**（业主："怎么又触发了 dsh 的关闭"）。安装器自己的提示早就写着
+ * 🔴 2026-10-11 故障：我在应用运行中改写了 `~/.dsh/profiles/desktop/` 里的插件文件，
+ *    应用随即**自己退出/重启**（用户："怎么又触发了 dsh 的关闭"）。安装器自己的提示早就写着
  *    「请先**完全退出** DeepSeek Harness 应用再安装（应用独占该 profile）」—— 这条必须由程序强制，
  *    不能靠"我记得"。
  * 检测方式：macOS 上桌面应用的进程名就是 `DeepSeek`（lsof/pgrep 实测），另加 App 包路径兜底。
@@ -1165,7 +1165,7 @@ function dshDesktopAppRunning() {
 
 /**
  * 探测本机**已存在**的 profile（可装载 = 同时有 package.json 与 cordis.patch.yml）。
- * desktop 排在前面：业主主用的是桌面应用，多个 profile 一起装时它是"首选/权威"那个。
+ * desktop 排在前面：用户主用的是桌面应用，多个 profile 一起装时它是"首选/权威"那个。
  */
 function detectProfileDirs() {
   const root = path.join(os.homedir(), ".dsh", "profiles");
@@ -1183,7 +1183,7 @@ function detectProfileDirs() {
 /**
  * 本次要操作的 profile 列表。
  *
- * 业主口径（2026-10-11）：「默认安装的时候也能同步安装给 desktop」。
+ * 用户约定（2026-10-11）：「默认安装的时候也能同步安装给 desktop」。
  * 以前不带 `--profile` 时**写死装 web** —— 桌面端用户执行官方那条 `npx @mrrisega/dsh-remote@beta`
  * 之后，插件全进了 Web 版 profile，而用户面对的是桌面应用 → 面板永远不出现，且极难自查。
  *
@@ -1199,7 +1199,7 @@ function targetProfileDirs(argv = []) {
   if (!all.length) return [{ name: "web", dir: profileDirOfName("web") }];
   /* 默认装哪些？**不是"全部"** —— 机器上常有过实验/自动化用的 profile（headless、web02…），
      往那些里面塞插件是越界。规则：
-       · 已知的面向用户的 profile（web / desktop）：**有就装**（这是业主的核心诉求：默认也要给 desktop）
+       · 已知的面向用户的 profile（web / desktop）：**有就装**（这是用户的核心诉求：默认也要给 desktop）
        · 其他 profile：**只有本来就已经装了插件**才继续管（升级不能悄悄漏掉它）
        · 上面并集为空（例如只有 headless 一种）→ 退回"全部已存在"，避免什么都不装 */
   const chosen = all.filter((p) => KNOWN_PROFILE_NAMES.includes(p.name)
@@ -1453,7 +1453,7 @@ function loginRateLimitUntil() {
 
 /* ── 守护启动锁：把"一堆守护同时被拉起"的惊群收敛成串行 ─────────────────────────────
  *
- * 🔴 2026-09-26 真机事故（dsh web 启动故障的连带伤害）：一次重启窗口里同时出现了
+ * 🔴 2026-09-26 真机故障（dsh web 启动故障的连带伤害）：一次重启窗口里同时出现了
  *    **6 个 `dsh-setup.mjs run` 守护 + 6 个 bridge**，全部用同一个 deviceId 去 router 注册，
  *    互相把对方顶掉 —— bridge 日志刷满
  *      `隧道断开(code=4000, replaced by new connection)` → `2s 后重连` → 再被顶掉，
@@ -1639,7 +1639,7 @@ async function runBridge() {
 
     // 账号/模式/设备身份变了 → 必须重启 bridge（它的凭据是启动时从环境变量固化的）。
     // 没有这一条时：面板切了账号、旧 bridge 却继续用旧账号跑，新账号的设备列表里看不到这台机器
-    //（2026-09-19 实测事故）。
+    //（2026-09-19 实测故障）。
     const fp = accountFingerprint(cfg);
     if (!childStopped(bridgeProc) && bridgeAccountFp && bridgeAccountFp !== fp) {
       console.log("[dsh-remote] 账号配置已变化 → 重启 bridge 让新账号生效...");
@@ -1670,7 +1670,7 @@ async function runBridge() {
         DSH_BRIDGE_TUNNEL_URL: cfg.tunnel_url,
         // 上游端口显式传给 bridge：它自己在旧版本里也回退到写死的 3080（见 dsh-bridge.mjs 的 UPSTREAM）。
         DSH_BRIDGE_UPSTREAM: upstreamUrl(),
-        // 安装口径透传给 bridge（bridge 把它随设备登记请求一起上报给账号 API）
+        // 安装约定透传给 bridge（bridge 把它随设备登记请求一起上报给账号 API）
         DSH_BRIDGE_INSTALL_SOURCE: INSTALL_SOURCE,
         DSH_BRIDGE_INSTALL_VERSION: INSTALL_VERSION,
         // 宿主版本：外部注入（插件在宿主进程内问出来的），安装器只是搬运工；没有就是空串
@@ -1903,7 +1903,7 @@ async function setup(argv) {
   }
 
   const pub = await fetchPublicConfig(cfg.api_url || DEFAULT_API);
-  // 服务状态字符串是给插件面板解析的稳定契约(running / 未运行),不要改口径。
+  // 服务状态字符串是给插件面板解析的稳定契约(running / 未运行),不要改约定。
   // 三分支:running / 未运行(有原因) / 未安装(跳过或平台不支持)——最后一种既不能显示"运行中",
   // 也不能显示"未运行(原因)",它压根没装(此前会打出自相矛盾的"(当前平台不支持) — ✅ 运行中")。
   const svcSkipped = st.status === "skipped" || st.status === "unsupported" || !svc.path;
@@ -1912,7 +1912,7 @@ async function setup(argv) {
   // Windows 没有 launchd，这条判断对它不成立（否则会把 win32 误报成"本机不支持崩溃自愈"）。
   const svcFragile = !IS_WIN && !svcSkipped && st.ok && st.selfHealing === false;
   const svcDegraded = st.status === "degraded-detached";
-  // Windows：自启动 = 任务计划程序里的登录任务。口径与 macOS/Linux 不同
+  // Windows：自启动 = 任务计划程序里的登录任务。约定与 macOS/Linux 不同
   // （"任务已注册" ≠ "进程此刻在跑"），所以单独给文案，避免复用"未被系统托管"这种会误导的措辞。
   const winTask = IS_WIN && winTaskOk();
   const svcState = IS_WIN
@@ -2110,7 +2110,7 @@ function compareVersionStrings(a, b) {
 }
 
 /**
- * 解析 patch 文本里的 insert 行 id（与 dshmarket 同口径的极简解析，不引 YAML 依赖）。
+ * 解析 patch 文本里的 insert 行 id（与 dshmarket 同约定的极简解析，不引 YAML 依赖）。
  * 用途有二：① 判断本插件是否已激活（幂等）；② **写完校验**——patch 文件形态非法时
  * dsh web 会直接启动失败，所以每次写入后必须重新解析确认结果仍是「一行一条的 insert 列表」。
  * @returns {{ids: string[], badLines: string[]}} badLines 非空 = 文件形态不合法
@@ -2219,7 +2219,7 @@ function ensurePatchActivation(patchFile, pluginLocalDir, pkgFile, opts = {}) {
   };
   // ★★ 稳定形态 = **只由 `dsh.profile.bundles` 激活**,我们**不再往 patch 里写激活行**。
   //
-  // 2026-09-22 实测事故:`duplicate loader entry id: dsh-remote-web` →
+  // 2026-09-22 实测故障:`duplicate loader entry id: dsh-remote-web` →
   //   `dsh: plugin tree failed to load` → **dsh web 启动即挂**(用真实启动复现)。
   // 根因是**两处激活同时存在**:
   //   (a) 插件自带的 bundle 在 `package.json` 的 `dsh.profile.bundles` 里;
@@ -2322,7 +2322,7 @@ function normalizePatchBase(patch) {
 /**
  * 插件目录里**必须存在且非空**的文件。缺任何一个都说明这次拷贝是"半个插件"。
  *
- * 🔴 为什么必须有这一步（2026-09-26 23:46 真实事故）：当时是"先 rmSync 整个 dest、再逐文件 cpSync"，
+ * 🔴 为什么必须有这一步（2026-09-26 23:46 真实故障）：当时是"先 rmSync 整个 dest、再逐文件 cpSync"，
  *    而 dsh 恰好在这个空窗里启动 → `package.json` 已经声明 bundle，但 `cordis.patch.yml` 还没拷到
  *    → dsh 读 overlay 直接 `ENOENT: no such file or directory` 退出，**整个 GUI 起不来**：
  *
@@ -2353,7 +2353,7 @@ function missingPluginFiles(dir) {
  * 源(本包 packages/${PLUGIN_ID})可能在 npx 临时缓存里,因此必须拷到 profile 内持久化,
  * include 用相对路径直接指向拷贝出的入口,不写依赖、不跑任何包管理器。
  *
- * 🔴 **原子覆盖（2026-09-26 事故后的硬要求）**：
+ * 🔴 **原子覆盖（2026-09-26 故障后的硬要求）**：
  *   1. 先整份拷到同级的 `.staging-<pid>`，**全程不碰 dest** —— dsh 任何时刻读到的
  *      要么是完整的旧版、要么是完整的新版；
  *   2. 拷完**校验**必需文件（见 `PLUGIN_REQUIRED_FILES`），不通过就丢弃 staging、抛错、
@@ -2406,7 +2406,7 @@ function copyPluginIntoProfile(profileDir, pluginDir) {
     throw new Error(`插件拷贝失败（已保留原目录不动）：${e && e.message ? e.message : e}`);
   }
 
-  // 2) 自检：必需文件一个都不能少（这一步就是 23:46 那次事故的闸门）
+  // 2) 自检：必需文件一个都不能少（这一步就是 23:46 那次故障的闸门）
   const missing = missingPluginFiles(stage);
   if (missing.length > 0) {
     try { fs.rmSync(stage, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -2639,7 +2639,7 @@ function activateLocalCopy(profileDir, pkgFile, patchFile, pluginDir, patch, pkg
     console.error(`❌ 插件入口缺失：${entryFile}（本包不完整？请用官方源重装：npx --registry=https://registry.npmjs.org @mrrisega/dsh-remote@latest）`);
     process.exit(1);
   }
-  // ⚠️ 顺序与"失败即中止"都是刻意的（0.6.7-beta.1 Windows 实测事故）：
+  // ⚠️ 顺序与"失败即中止"都是刻意的（0.6.7-beta.1 Windows 实测故障）：
   //   老代码把 ensurePluginLinked 的返回值丢掉、patch 照写、还打印「✅ 插件已就绪」，
   //   于是用户拿到的是**起不来的 dsh web**（cordis 按裸包名解析到空目录 → plugin tree failed to load，
   //   整个 dsh web 启动失败，而面板/插件市场都在那个进程里 → 用户没有任何自助修复入口）。
@@ -2814,7 +2814,7 @@ async function pluginCmd(argv) {
   let skippedRunning = 0;
   const force = hasFlag(argv, "--force");
   for (const t of targets) {
-    // ⚠️ 桌面应用在运行时**绝不改写它的 profile**：应用会因此退出/重启（2026-10-11 实测事故）
+    // ⚠️ 桌面应用在运行时**绝不改写它的 profile**：应用会因此退出/重启（2026-10-11 实测故障）
     if (t.name === "desktop" && !force && dshDesktopAppRunning()) {
       console.log(`⚠️ 跳过 desktop：DeepSeek Harness 应用正在运行。`);
       console.log(`   应用独占该 profile，运行中改写会让应用自己退出/重启。请任选其一：`);

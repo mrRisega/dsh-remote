@@ -1,7 +1,7 @@
 /**
  * 「连接卡住 → 一键修复提示词 + 结论报告」契约测试（node:test，零框架）。
  *
- * 背景（真实事故，2026-09-23，Windows 用户）：
+ * 背景（真实故障，2026-09-23，Windows 用户）：
  *   插件面板卡在「连接阶段: starting（正在启动 Bridge…）」，手机端看不到任何设备，反复修都没用。
  *   事后定位到三种机制（半装运行环境 / 守护活着没起作用 / bridge 起来就崩），它们在面板上长得一模一样，
  *   面板侧诊断分不开；只能由用户本机的 agent 在自己电脑上取证。
@@ -120,7 +120,7 @@ test("报告格式：REPORT_KEYS 六个字段齐全，REPORT_FORMAT 首行即固
   for (const key of ["症状", "机制判定", "关键证据", "已做的修复", "修复结果", "仍需人工处理"]) {
     assert.ok(REPORT_KEYS.includes(key), `REPORT_KEYS 应覆盖「${key}」`);
   }
-  assert.equal(REPORT_KEYS.length, 6, "REPORT_KEYS 就是这六项（多了会让解析口径漂移）");
+  assert.equal(REPORT_KEYS.length, 6, "REPORT_KEYS 就是这六项（多了会让解析约定漂移）");
   assert.equal(REPORT_FORMAT.split("\n")[0], REPORT_TITLE, "报告模板首行必须是固定标题");
   assert.equal(REPORT_TITLE, "=== dsh-remote 诊断结论 ===");
   // 六项在模板里都要有对应行，且顺序与 REPORT_KEYS 一致

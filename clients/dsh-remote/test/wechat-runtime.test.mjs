@@ -339,12 +339,12 @@ test("★ handleCommand 的字段是 replyText:回 /help 必须真的发出帮�
 test("★ 分层:免费档 = 通知+审批,付费档才给遥控;未知档位按最低档", () => {
   const { capabilitiesFor, WECHAT_CAPABILITY_TABLE, grantsCap, limitsFor } = rtmod;
   const free = capabilitiesFor("free");
-  // 免费档(业主口径):收得到通知、点得了审批、看得到状态、停得下任务 —— 但**遥控不了**。
+  // 免费档(用户约定):收得到通知、点得了审批、看得到状态、停得下任务 —— 但**遥控不了**。
   for (const cap of ["notify", "approve", "status", "stop"]) {
     assert.ok(free.includes(cap), `免费档必须有 ${cap}`);
   }
   for (const cap of ["assign", "sessions", "summary"]) {
-    assert.ok(!free.includes(cap), `免费档**不得**有 ${cap}(业主:那是付费能力)`);
+    assert.ok(!free.includes(cap), `免费档**不得**有 ${cap}(用户:那是付费能力)`);
   }
   // 付费档 = 免费档超集 + 遥控
   const pro = capabilitiesFor("pro");
@@ -355,7 +355,7 @@ test("★ 分层:免费档 = 通知+审批,付费档才给遥控;未知档位按
     assert.ok(grantsCap(pro, cap), `付费档必须有 ${cap}`);
   }
 
-  // ★★ 业主 2026-09-22 拍板的核心不变量:免费**能续接已有会话、不能开新会话**
+  // ★★ 用户 2026-09-22 拍板的核心不变量:免费**能续接已有会话、不能开新会话**
   assert.ok(grantsCap(free, "assign.continue"), "免费档必须能「继续已有会话」(回复即续接)");
   assert.ok(!grantsCap(free, "assign.new"), "★免费档**不得**能开新会话(那是会员能力的差异点)");
   assert.ok(!grantsCap(free, "sessions"), "免费档不得能切换会话");
@@ -368,7 +368,7 @@ test("★ 分层:免费档 = 通知+审批,付费档才给遥控;未知档位按
   assert.ok(!grantsCap(["assign"], "constructor"), "前缀规则不能被开头相同的无关词命中");
   assert.ok(!grantsCap(free, "steer") && !grantsCap(["whatever"], "assign.new"), "未知能力不授权");
 
-  // 额度(业主:「免费给每月 N 条消息额度,超出再引导升级」;付费档不限)
+  // 额度(用户:「免费给每月 N 条消息额度,超出再引导升级」;付费档不限)
   assert.ok(Number(limitsFor("free").messages_per_month) > 0, "免费档必须有每月消息额度");
   assert.equal(Number(limitsFor("pro").messages_per_month || 0), 0, "付费档不应限量(0 = 不限)");
   assert.equal(Number(limitsFor("pro_max").messages_per_month || 0), 0, "最高档同样不限量");
@@ -402,7 +402,7 @@ test("★ 分层:免费档被挡且回复里带 App 链接;付费档放行;未�
     const freeText = lastText(ilink.state);
     assert.match(freeText, /会员功能/, `要说清为什么被拒,实际:${freeText}`);
     assert.ok(freeText.includes(APP_URL),
-      `★回复必须带上可点击的 App 链接(业主:免费用户要去做别的,就给他访问 App 的链接),实际:${freeText}`);
+      `★回复必须带上可点击的 App 链接(用户:免费用户要去做别的,就给他访问 App 的链接),实际:${freeText}`);
     assert.match(freeText, /\/help/, "还要告诉他现在能做什么,而不是死路一条");
 
     // ② 付费档:同一句话必须放行
@@ -543,9 +543,9 @@ test("★ v2:有当前会话时纯文本进当前会话(不是每次开新的)",
   }
 });
 
-test("★ v2 安全边界(业主拍板放宽):看不到内容照给一键回执,只看得出破坏性才降级", async () => {
+test("★ v2 安全边界(用户拍板放宽):看不到内容照给一键回执,只看得出破坏性才降级", async () => {
   // 背景:DSH 的审批节点常常只下发 toolName、没有命令原文。原先「看不到内容也算破坏性」
-  // 会把绝大多数正常 Bash 审批都降级成"只能回电脑确认" —— 过严。业主明确:DSH 自身有
+  // 会把绝大多数正常 Bash 审批都降级成"只能回电脑确认" —— 过严。用户明确:DSH 自身有
   // 权限控制,安全边界可以松一点。所以现在**只看内容**。
   const ilink = await fakeIlink();
   try {
@@ -647,7 +647,7 @@ test("★ v2:完成推送带会话名称 + 结论,而不只是「任务已停止
 });
 
 test("★ 0.6.15：完成推送必须把「当前会话」切到刚跑完的那个（否则回话会发进上一次的会话）", async () => {
-  // 业主实测：B 任务跑完推了结论，他在微信里直接回一句"再改一下"，那条消息却发给了
+  // 用户实测：B 任务跑完推了结论，他在微信里直接回一句"再改一下"，那条消息却发给了
   // **上一次的当前会话 A** —— A 平白多了一条指令，B 永远收不到。
   const ilink = await fakeIlink();
   try {
@@ -819,7 +819,7 @@ test("★★ 日报发送失败时**不能**把当天标记为已发(否则当�
 });
 
 test("★ 日报:晚上发(不是早上)、内容是「今天干了啥」、带品牌露出", async () => {
-  // 业主:「每天早上发『今日干了啥事儿』,这肯定不太对劲。应该是晚上发,比如晚上 6 点,发『今天干了啥』」
+  // 用户:「每天早上发『今日干了啥事儿』,这肯定不太对劲。应该是晚上发,比如晚上 6 点,发『今天干了啥』」
   // 且一天只发一次(它兼作 24h 推送窗口的心跳,早晚各一次就太频繁了)。
   assert.equal(rtmod.DEFAULT_DIGEST_HOUR, 18, "日报时刻必须是晚上 18 点,不能是早上 9 点");
   const ilink = await fakeIlink();
@@ -847,7 +847,7 @@ test("★ 日报:晚上发(不是早上)、内容是「今天干了啥」、带�
 
 test("★★ 会员到期提醒:提前 2 天 / 1 天 / 到期当天各提醒一次,同一天不重复", async () => {
   // 这条**以前根本不存在**:notifyMembershipExpiring() 只有定义、全仓零调用方 ——
-  // 业主以为"提前两天发、提前一天也发",实际一次都没发过。这里锁住补上的触发点。
+  // 用户以为"提前两天发、提前一天也发",实际一次都没发过。这里锁住补上的触发点。
   const ilink = await fakeIlink();
   try {
     const DAY = 86_400_000;
@@ -888,7 +888,7 @@ test("★★ 会员到期提醒:提前 2 天 / 1 天 / 到期当天各提醒一�
   }
 });
 
-test("★★ A:免费档「能续接已有会话、不能开新会话」(业主拍板的分级)", async () => {
+test("★★ A:免费档「能续接已有会话、不能开新会话」(用户拍板的分级)", async () => {
   const ilink = await fakeIlink();
   try {
     // ① 免费 + **没有**当前会话 → 纯文本等于开新任务 → 必须被拒
@@ -906,7 +906,7 @@ test("★★ A:免费档「能续接已有会话、不能开新会话」(业主�
     b.rt.currentSessionTitle = "已有任务";
     await b.rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "继续修" } }] });
     const prompted = subB.calls.filter((c) => c.m === "promptSession");
-    assert.equal(prompted.length, 1, "★免费 + 有当前会话:必须能继续聊(业主要的就是这个)");
+    assert.equal(prompted.length, 1, "★免费 + 有当前会话:必须能继续聊(用户要的就是这个)");
     assert.equal(prompted[0].text, "继续修", "内容要原样下发");
 
     // ③ 免费仍不能开新会话、不能切换会话
@@ -993,7 +993,7 @@ test("★★ 权益包:服务端下发的 caps/limits 覆盖内置表(后台改�
 });
 
 test("★★ 多条待审批:回数字必须答**最早那条**(先进先出),答完把下一条顶到底部", async () => {
-  // 业主报的真 bug:「如果需要用户回应多条消息,而用户一开始只看到第一条审批消息,
+  // 用户报的真 bug:「如果需要用户回应多条消息,而用户一开始只看到第一条审批消息,
   //   回应一个数字之后,流程就结束了。后面的几条消息没有让用户继续回应,直接提示为『未回应』」
   // 成因:旧实现按**栈顶(最新)**匹配数字,而微信是**从上往下读**的、消息位置一发出去就固定
   //   → 用户看着第 1 条回「1」,系统答了最后一条,第 1 条永远没人回应,DSH 最终标它「未回应」。
@@ -1535,7 +1535,7 @@ test("★ 多审批 + 提醒混排:回执仍按 FIFO 走审批(提醒不参与�
 // 原先这条路径透传上游的静态 HELP_TEXT —— 那份清单把 /new、/ls、/use、/summary 与
 // "直接发一句话"一并列成"你能用的"。免费用户敲错一个字,拿到的就是这张**会员清单**,
 // 照着做再吃一次拒绝,于是"打错命令"被理解成"这功能坏了"。
-// 业主红线:话术与权限必须一致、不多承诺。
+// 用户红线:话术与权限必须一致、不多承诺。
 // ---------------------------------------------------------------------------
 
 test("★ 免费用户敲未知指令:要回显命令 + 给**分层**帮助,不得把会员指令列成『你能用的』", async () => {
@@ -1719,7 +1719,7 @@ test("★ /help 必须逐行分隔:付费档也不许退化成一坨(无换行/�
 });
 
 // ---------------------------------------------------------------------------
-// 日报**重复推送**的根治（2026-09-23 业主实测「每日简报推送了两次」）
+// 日报**重复推送**的根治（2026-09-23 用户实测「每日简报推送了两次」）
 //
 // 根因：`#maybeDigest` 是「读 state → 等网络发送 → 写 state」的**跨 await 读-改-写**。
 // 发送要等网络，这段窗口里第二个执行者会读到"今天还没发" → 两条都发出去。
@@ -1798,7 +1798,7 @@ test("★ 日报占位一天一个,换天时会清掉旧占位(不攒文件)", a
 });
 
 // ---------------------------------------------------------------------------
-// 出站必须回带 context_token（2026-09-23 业主实测「没收到微信通道」）
+// 出站必须回带 context_token（2026-09-23 用户实测「没收到微信通道」）
 //
 // 平台要求出站消息带回「这条会话的上下文令牌」，而它只出现在**入站消息**里
 // （官方实现：messaging/send.js 的 buildTextMessageReq → `msg.context_token`；
@@ -1831,7 +1831,7 @@ test("★ 没有 context_token 时**完全不带这个键**(而不是空串)", a
     await rt.handleInbound({ from_user_id: "user-1", item_list: [{ type: 1, text_item: { text: "/status" } }] });
     const last = ilink.state.sends.at(-1);
     assert.ok(!("context_token" in last.msg),
-      "★拿不到令牌时不得塞空串(与官方 `contextToken ?? undefined` 同口径)");
+      "★拿不到令牌时不得塞空串(与官方 `contextToken ?? undefined` 同约定)");
   } finally {
     await ilink.close();
   }
@@ -1887,14 +1887,14 @@ test("★ extractContextToken 防御式:形状不认识一律当没有,绝不猜
   assert.equal(extractContextToken({ contextToken: "CT-2" }), "CT-2", "兼容驼峰写法");
 });
 
-// ═════════════ 2026-09-25 事故：完成推送"消失" + 回话跑进另一个会话 ═════════════
+// ═════════════ 2026-09-25 故障：完成推送"消失" + 回话跑进另一个会话 ═════════════
 //
-// 现场（业主）：任务跑完一条微信都没收到；他在微信里回了一句，结果**发进了上一个会话**。
+// 现场（用户）：任务跑完一条微信都没收到；他在微信里回了一句，结果**发进了上一个会话**。
 // 日志证据：48 条 `sendmessage 失败:sendMessage: ret=-2 errmsg=prepare failed`
 //   —— 平台侧发送是**间歇性**失败的，而旧实现失败即丢弃：那条"任务跑完了"永远消失了。
 // 状态证据：`current_session_id` 停在几天前的旧会话上（因为切换只在推送成功后发生）。
 
-test("★ 事故锁：主动推送失败**不能消失** —— 入队，并在下一次入站时补发（带「补发」标记）", async () => {
+test("★ 回归锁：主动推送失败**不能消失** —— 入队，并在下一次入站时补发（带「补发」标记）", async () => {
   let failSends = true;
   const ilink = await fakeIlink({
     onSendMessage: (_state, reply) => (failSends
@@ -1926,7 +1926,7 @@ test("★ 事故锁：主动推送失败**不能消失** —— 入队，并在�
   }
 });
 
-test("★ 事故锁：静音（/quiet）也要记下「最近完成的任务」，回话不能跑进上一个会话", async () => {
+test("★ 回归锁：静音（/quiet）也要记下「最近完成的任务」，回话不能跑进上一个会话", async () => {
   const ilink = await fakeIlink();
   try {
     const sub = makeFakeSubscriber();
@@ -1958,7 +1958,7 @@ test("★ 事故锁：静音（/quiet）也要记下「最近完成的任务」�
   }
 });
 
-test("★ 事故锁：用户主动 /use 切走的会话不能被「最近完成」抢回去", async () => {
+test("★ 回归锁：用户主动 /use 切走的会话不能被「最近完成」抢回去", async () => {
   const ilink = await fakeIlink();
   try {
     const sub = makeFakeSubscriber();
@@ -1972,7 +1972,7 @@ test("★ 事故锁：用户主动 /use 切走的会话不能被「最近完成�
     assert.equal(rt.currentSessionId, "session-mine", "前置条件：/use 切到了 2 号");
     await rt.notify({ kind: NODE_KINDS.TURN_END, sessionId: "session-done", reason: "completed", at: 3 });
 
-    // 完成事件在处理时会把它自己设为回复目标（这是产品口径）；但用户**之后**再切回去要算数：
+    // 完成事件在处理时会把它自己设为回复目标（这是产品约定）；但用户**之后**再切回去要算数：
     await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "/use 2" } }] });
     await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "继续聊我的" } }] });
     const prompt = sub.calls.filter((c) => c.m === "promptSession").pop();
@@ -1984,7 +1984,7 @@ test("★ 事故锁：用户主动 /use 切走的会话不能被「最近完成�
 });
 
 test("★ 待补发队列：过期的**不发**（丢弃最早的），且只保留最近几条", async () => {
-  // 业主 2026-10-09 口径：「积压超过一定时限后就丢弃掉最早的数据，只保留最近几条」。
+  // 用户 2026-10-09 约定：「积压超过一定时限后就丢弃掉最早的数据，只保留最近几条」。
   // 两条理由：① 迟到几小时的"任务跑完了"只会误导用户；② 攒到十几条会在平台恢复时一次连打，
   // 实测正是这种突发批量触发 `ret=-2 prepare failed` 被限流 → 补发又失败 → 队列再涨（死循环）。
   const ilink = await fakeIlink();
@@ -2054,7 +2054,7 @@ test("★ 待补发队列：超过上限只留最近几条（丢最早，且如�
 });
 
 
-test("★ 事故锁：订阅 fault 必须落到日志 + 状态（旧实现只 emit、没人接 → 全静默）", async () => {
+test("★ 回归锁：订阅 fault 必须落到日志 + 状态（旧实现只 emit、没人接 → 全静默）", async () => {
   // 那次「一条推送都没有、日志里也没有任何报错」的根因就在这类静默里：
   // `#emitFault` 只 emit('fault')，而运行时没接这个事件 —— follow 失败/发现失败/流上限
   // 全都不留任何痕迹。现在必须：① 一条 warn 进 bridge 日志；② 非预期的记进状态文件。
@@ -2079,7 +2079,7 @@ test("★ 事故锁：订阅 fault 必须落到日志 + 状态（旧实现只 em
       const st2 = JSON.parse(fs.readFileSync(path.join(relayDir, ".wechat-state.json"), "utf8"));
       assert.equal(st2.last_fault.code, "follow-limit", "expected 的异常不该覆盖真正的故障");
       // ★2026-10-09：预期内的拒绝**不能写成 warn** —— 每生成一个子代理就会来一条，
-      // 成片的 `订阅异常 session/agent-busy …` 会把真正的故障淹掉（业主现场看到的就是这个）。
+      // 成片的 `订阅异常 session/agent-busy …` 会把真正的故障淹掉（用户现场看到的就是这个）。
       assert.equal(warns.length, warnCountBefore, `expected 的拒绝不得写 warn，实际:${JSON.stringify(warns)}`);
       assert.ok(infos.some((m) => m.includes("订阅跳过(预期") && m.includes("session=sub-1")),
         `expected 的拒绝要有一条 info 留痕（绝不静默），实际:${JSON.stringify(infos)}`);

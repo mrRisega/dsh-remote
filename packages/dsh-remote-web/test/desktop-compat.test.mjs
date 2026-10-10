@@ -3,7 +3,7 @@
  *
  * 背景：DeepSeek Harness 于 2026-09-29 发布桌面端 v0.2 预览（Electron 薄壳 + 完整 dsh Web Host，
  * Host 以 `--no-open --port 0` 启动，端口随机、每进程令牌鉴权）。dsh-remote 的两大难点
- * （随机端口、会话 Cookie）此前已因真实事故适配过，因此这次新增的适配**集中在三处**：
+ * （随机端口、会话 Cookie）此前已因真实故障适配过，因此这次新增的适配**集中在三处**：
  *
  *   ① **Electron 宿主下 process.execPath 不是 node**：它是 Electron 应用二进制。
  *      直接 `spawn(process.execPath, [script])` 得到的不是"跑脚本的 node"，而是**又开一个桌面端应用**
@@ -92,7 +92,7 @@ test("spawnEnv：NODE_INTERPRETER 变量不得挤掉调用方的业务变量，P
 // ─────────────── ② 服务定义：plist / systemd 必须带上解释器变量（跨文件同构）───────────────
 
 test("跨文件不变量：插件与安装器的 plist / systemd 模板都必须带解释器变量占位", () => {
-  // 为什么是"两份都要查"：历史上前述两份模板漂移过、并因此各造成一个真机事故
+  // 为什么是"两份都要查"：历史上前述两份模板漂移过、并因此各造成一个真机故障
   // （插件每次自愈都会重写 plist，谁写谁说了算 → 漂移等于把另一份正确的覆盖掉）。
   for (const [name, src] of [["lib/index.js", INDEX_SRC], ["dsh-setup.mjs", SETUP_SRC]]) {
     assert.match(src, /const SERVICE_NODE_ENV\b/, `${name}: 必须有 SERVICE_NODE_ENV`);
@@ -214,7 +214,7 @@ test("安装器：setup() 必须把 --profile 透传给插件挂载步骤", () =
   const { profileArgvOf } = makeResolveProfileDir("/Users/tester");
   assert.deepEqual(profileArgvOf(["--profile", "desktop"]), ["--profile", "desktop"]);
   assert.deepEqual(profileArgvOf([]), [], "未指定时不得凭空塞参数");
-  // 事故面：setup() 原本调 pluginCmd([]) → --profile desktop 被静默忽略、插件装进 web profile
+  // 故障面：setup() 原本调 pluginCmd([]) → --profile desktop 被静默忽略、插件装进 web profile
   assert.match(SETUP_SRC, /pluginCmd\(profileArgvOf\(argv\)\)/, "setup 必须透传 profile 选择");
   assert.ok(!/pluginCmd\(\[\]\)/.test(SETUP_SRC), "不得再有硬编码空参数（会把 --profile 吞掉）");
 });
@@ -227,7 +227,7 @@ test("安装器：desktop profile 未初始化时给桌面端专属引导（不�
   assert.match(fn, /isDesktopProfileDir\(profileDir\)/, "必须区分桌面端 profile");
   assert.match(fn, /启动一次 DeepSeek Harness 应用/, "必须给桌面端专属引导：profile 由应用自己创建");
   assert.match(fn, /完全退出应用/, "必须提醒完全退出（应用独占 profile，运行中安装不会被装载）");
-  // 事故面：桌面端 profile 由 Electron 应用初始化，npm 版 dsh 明确拒绝管理它
+  // 故障面：桌面端 profile 由 Electron 应用初始化，npm 版 dsh 明确拒绝管理它
   //（apps/cli 的 rejectElectronProfile）—— 照抄 Web 版那句会让用户白折腾。
   assert.ok(!/未找到 dsh web profile/.test(fn), "不得再把桌面端统一报成 'dsh web profile'");
 });

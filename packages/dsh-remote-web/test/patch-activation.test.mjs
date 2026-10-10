@@ -172,7 +172,7 @@ test("安全护栏：原子写回 —— 不留 .tmp 残留，且末尾换行规
 });
 
 test("回归护栏：plugin 子命令必须把激活结果 return 给 setup（否则热挂载验证被跳过）", () => {
-  // 事故复盘：convergePluginActivation 已经返回 {hotPatch}，但 pluginCmd 没把它 return 出去，
+  // 故障回顾：convergePluginActivation 已经返回 {hotPatch}，但 pluginCmd 没把它 return 出去，
   // 于是 setup() 拿不到激活形态 → 跳过热挂载验证 → 明明热挂载成功却仍报「需要重启」。
   const src = readFileSync(SETUP, "utf8");
   const call = src.match(/return convergePluginActivation\(profileDir[^\n]*/);
@@ -230,7 +230,7 @@ test("硬约束：写入 patch 行后 bundles 必须被清空（单一激活点�
 });
 
 test("回归护栏：热挂载探测必须比对**版本**，不能只看接口 200", () => {
-  // 事故复盘：profile 已更新到 0.6.4，运行中的插件仍是 beta.10，而旧探测只看
+  // 故障回顾：profile 已更新到 0.6.4，运行中的插件仍是 beta.10，而旧探测只看
   // `/dsh-remote/status` 是否 200（旧版本本来就有这个接口）→ 误报"热加载成功"，
   // 用户以为已生效、实际还在跑旧代码。
   const src = readFileSync(SETUP, "utf8");

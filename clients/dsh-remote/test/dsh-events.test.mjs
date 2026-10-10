@@ -147,7 +147,7 @@ function unaryArgsProblem(method, args) {
 }
 
 /**
- * 一元方法的默认应答（真值口径），让 happy-path 用例不必逐个配桩。
+ * 一元方法的默认应答（真值约定），让 happy-path 用例不必逐个配桩。
  * 需要精确控制的用例用 `api.setRpcFor()` 覆盖。
  */
 function defaultRpcFor(method, body) {
@@ -331,7 +331,7 @@ async function startFakeDsh(options = {}) {
         const stream = { streamId: msg.streamId, endpoint: msg.endpoint, payload: msg.payload, closed: false };
         // 镜像真 gateway 的 payload 校验（dsh-api-gateway/lib/index.js:929）：
         // 非 $events 的流必须恰好带一个 plain-object 的 args 字段 —— 本地假服务端若放松这条，
-        // 就会漏掉真实线上会拒的形状（这个坑正是靠真机探针发现的）。
+        // 就会漏掉真实线上会拒的形状（这个坑正是靠真机探测发现的）。
         if (!isPlainArgsPayload(msg.payload)) {
           api.fail(conn, msg.streamId, {
             code: "gateway/internal",
@@ -815,7 +815,7 @@ test("follow 的会话 id：原样为主、alternative 兜底一次；agent-busy
   assert.equal(toDurableSessionId("session-9b4f"), "session-9b4f");
 
   const faults = [];
-  // 真机口径：子代理会话的真实 id 是裸 uuid，`session-<uuid>` 不存在（实测）。
+  // 真机约定：子代理会话的真实 id 是裸 uuid，`session-<uuid>` 不存在（实测）。
   // 这个假服务端只认「原样 id」，对另一种形式回 session/not-found。
   const api = await startFakeDsh({
     onOpen(server, conn, stream) {
@@ -847,7 +847,7 @@ test("follow 的会话 id：原样为主、alternative 兜底一次；agent-busy
     sub.on("fault", (fault) => faults.push(fault));
     await start(sub);
 
-    // 事件里报裸 uuid（= 真机 api-session/status 的口径）→ 主形式必须**原样**，不加前缀
+    // 事件里报裸 uuid（= 真机 api-session/status 的约定）→ 主形式必须**原样**，不加前缀
     const reportedId = "9b4f9e73-8912-49ca-98ba-23da9c34ab47";
     globalThis.__acceptedId = `session-${reportedId}`; // 服务端只认带前缀的那种
     api.pushEmit("api-session/status", [reportedId, true]);
@@ -1997,17 +1997,17 @@ test("一元：本地校验（空 text / 缺 sessionId / 坏 mode…）直接类
   }
 });
 
-// ═══════════════════ 2026-09-25 事故：完成推送静默消失（业主实测）═══════════════════
+// ═══════════════════ 2026-09-25 故障：完成推送静默消失（用户实测）═══════════════════
 //
 // 现场：任务跑完了，微信**一条推送都没有**，bridge 日志里也**没有任何报错**。
-// 活体探针（以微信通道同款方式订阅本机 dsh web）显示：
+// 活体探测（以微信通道同款方式订阅本机 dsh web）显示：
 //   · 新起的订阅器 163ms 就发现并 follow 了正在跑的会话 —— 机制本身是好的；
 //   · 而当时在跑的 bridge 进程到 3080 只有 2 条 WS（mux + control）、**没有 follow 流**，
 //     可它明明有一个正在跑长任务的会话。
 // 根因就在下面这条：周期性发现被"当前一条 follow 都没有"这个条件**关掉了自己**——
 // 丢一次 status:true 边沿就永久失去发现能力，而 turn/end 只在 follow 流上才有。
 
-test("★ 事故锁：一条 follow 都没有时，周期性发现**仍然要跑**（丢一次边沿不能永久失聪）", async () => {
+test("★ 回归锁：一条 follow 都没有时，周期性发现**仍然要跑**（丢一次边沿不能永久失聪）", async () => {
   const api = await startFakeDsh({ listItems: [] }); // 连上时没有任何会话在跑
   const sub = createEventSubscriber({
     upstream: api.base,
@@ -2087,18 +2087,18 @@ test("★ 一次 follow 失败不该把这条会话**永久**钉死：下一轮 
 });
 
 // ============================================================
-// 上游是**函数**：宿主换端口要能自己跟上（2026-10-09 真机事故回归）
+// 上游是**函数**：宿主换端口要能自己跟上（2026-10-09 真机故障回归）
 // ============================================================
 
 /**
- * 【事故原貌】bridge 起来时宿主在 3080，随后宿主换端口（DSH Desktop 每次启动都是随机端口）。
+ * 【故障原貌】bridge 起来时宿主在 3080，随后宿主换端口（DSH Desktop 每次启动都是随机端口）。
  * 隧道转发侧每次都读最新 UPSTREAM，所以一切正常；**唯独事件订阅器抱着启动那一刻的字符串**，
  * 于是永久 `connect ECONNREFUSED 127.0.0.1:3080` —— 手机能开页面、面板显示 online，
  * 但任务跑完**一条微信推送都没有**。迷惑性极强，最后靠 bridge 日志里刷屏的那一行才定位。
  *
  * 修法：`upstream` 允许传函数，每次连接/RPC 重新求值。这条用例就是那件事的锁。
  */
-test("★ 事故锁：upstream 传函数时，宿主换端口后订阅器必须自己跟过去（不得永久打旧端口）", async () => {
+test("★ 回归锁：upstream 传函数时，宿主换端口后订阅器必须自己跟过去（不得永久打旧端口）", async () => {
   const a = await startFakeDsh();
   const b = await startFakeDsh();
   let current = a.base;

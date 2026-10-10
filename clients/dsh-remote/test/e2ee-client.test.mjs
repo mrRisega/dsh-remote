@@ -4,7 +4,7 @@
  *   - MK 派生向量与 enterprise 参考实现(e2ee.js deriveE2eeMasterKey)一致(固定口令/盐 → 固定 hex);
  *   - 信封加解密往返 / 篡改拒绝 / nonce 重放拒绝 / ws 计数重放拒绝;
  *   - 参数端点容错(非 200 / 无 e2ee / enabled=false → disabled 不回退抛错);
- *   - 桥端控制通道握手(hello→ack、探针好/坏密钥)、http 明文编解码、ws 标签解析。
+ *   - 桥端控制通道握手(hello→ack、探测好/坏密钥)、http 明文编解码、ws 标签解析。
  *
  * 用法: node --test test/e2ee-client.test.mjs
  */
@@ -216,7 +216,7 @@ function flipB64(b64) {
 }
 
 test("★ 0.6.15 二进制明文框架:正文不再 base64(省掉三层里的第一层),且旧 JSON 形态仍能解", () => {
-  // 业主实测"打开慢几分钟"的直接原因之一：同一条响应被 base64 编了三层(1.333³≈2.37×)。
+  // 用户实测"打开慢几分钟"的直接原因之一：同一条响应被 base64 编了三层(1.333³≈2.37×)。
   // 第一层就是"gzip 正文塞进 JSON 明文"。二进制框架把它去掉，且必须**两种形态都能解**
   // （老客户端只发旧形态，新客户端声明后收新形态）。
   const body = Buffer.from("首屏聚合包".repeat(500), "utf8");
@@ -323,7 +323,7 @@ test("信封标记头:封包/识别/解析一致;content-type 与 x-dsh-e2ee 双
   assert.equal(parseEnvelopeMarker({}), null);
 });
 
-// ---------- 桥端服务:握手 / 探针 / 开关 ----------
+// ---------- 桥端服务:握手 / 探测 / 开关 ----------
 
 test("E2eeService:disabled 状态 caps 为空;enabled 后 caps=['e2ee-v2']", () => {
   const off = new E2eeService({ enabled: false, reason: "server_disabled" });
@@ -345,7 +345,7 @@ test("E2eeService.introGrant:启用时一次性下发派生 MK(32B b64url);禁�
   assert.equal(g.epoch, 3);
   assert.equal(typeof g.mk, "string");
   assert.equal(Buffer.from(g.mk, "base64url").length, 32);
-  assert.equal(Buffer.from(g.mk, "base64url").toString("hex"), mk.toString("hex"), "引导下发的 MK 应与桥端派生 MK 一致(否则手机无法通过探针)");
+  assert.equal(Buffer.from(g.mk, "base64url").toString("hex"), mk.toString("hex"), "引导下发的 MK 应与桥端派生 MK 一致(否则手机无法通过探测)");
 });
 
 test("E2eeService.init:服务端 enabled=false/401/无密码/禁用开关 → 明文回退原因", async () => {
@@ -387,7 +387,7 @@ test("握手:hello→ack(b 随机 32B);salt/profile 不符拒绝;disabled 服务
   assert.throws(() => off.handleHello({ v: 2, type: "e2ee-hello", role: "phone", s: newSessId(), a: randomB64(32), salt: SALT_B64 }), (e) => e.code === "disabled");
 });
 
-test("探针:正确 MK 通过并置 verified;错误 MK → bad_key;未解锁会话被拒", () => {
+test("探测:正确 MK 通过并置 verified;错误 MK → bad_key;未解锁会话被拒", () => {
   const mk = deriveMasterKey("unit-password", SALT_B64);
   const svc = new E2eeService({ enabled: true, mk, salt: SALT_B64, profile: "pbkdf2-sha256-600k" });
   const sessId = newSessId();
@@ -398,7 +398,7 @@ test("探针:正确 MK 通过并置 verified;错误 MK → bad_key;未解锁会�
     return ack.b;
   })();
   const client = new E2eeSession({ sessId, ...deriveShk(mk, aB64, bB64), profile: "pbkdf2-sha256-600k" });
-  // 探针(明文 {p,t,c})
+  // 探测(明文 {p,t,c})
   const probe = client.seal({ kind: "ctrl", dir: "p2b", counter: 0, data: JSON.stringify({ p: "dsh-e2ee-probe-v1", t: Date.now(), c: 0 }) });
   const { reply, session } = svc.handleProbe(sessId, probe);
   assert.equal(reply.k, "ctrl");
@@ -407,7 +407,7 @@ test("探针:正确 MK 通过并置 verified;错误 MK → bad_key;未解锁会�
   // bridge 回 probe-ok → 手机可开
   const okPlain = client.open({ kind: "ctrl", dir: "b2p", env: reply, counter: reply.c });
   assert.equal(JSON.parse(okPlain.data.toString("utf8")).p, "dsh-e2ee-probe-ok");
-  // 重放同一探针 → 计数重放拒绝
+  // 重放同一探测 → 计数重放拒绝
   assert.throws(() => svc.handleProbe(sessId, probe), (e) => e.code === "replay" || e.code === "bad_counter");
   // 错误 MK(错误口令)的手机 → bad_key
   const wrongMk = deriveMasterKey("wrong-password", SALT_B64);

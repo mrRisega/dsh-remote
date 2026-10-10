@@ -243,7 +243,7 @@ test("退出登录：必须停 bridge 并作废设备身份（否则旧账号的
   }
 });
 
-// ─────────── ③ launchd 域名阶梯（事故的直接技术原因） ───────────
+// ─────────── ③ launchd 域名阶梯（故障的直接技术原因） ───────────
 
 test("launchd：作业在 user/<uid> 域时也必须被认成「运行中」（旧实现只看 gui/<uid>）", { skip: process.platform !== "darwin" }, async () => {
   const env = await makeEnv();
@@ -270,7 +270,7 @@ test("launchd：作业在 user/<uid> 域时也必须被认成「运行中」（�
   }
 });
 
-test("源码契约：启动/停止都要覆盖两个 launchd 域（只认 gui 就是本次事故）", () => {
+test("源码契约：启动/停止都要覆盖两个 launchd 域（只认 gui 就是本次故障）", () => {
   assert.ok(/function launchDomains\(\)/.test(INDEX_SRC), "应有统一的域阶梯");
   const startFn = INDEX_SRC.slice(INDEX_SRC.indexOf("function startBridge(relayDir)"), INDEX_SRC.indexOf("function scheduleRuntime("));
   assert.ok(/for \(const domain of launchDomains\(\)\)/.test(startFn), "启动必须遍历域阶梯（user 优先）");

@@ -310,7 +310,7 @@ test("开关与回退:enabled bridge 上报 caps + 状态文件;off/401 明文�
   assert.match(await r.text(), /⚠/);
 });
 
-test("E2EE 解锁握手(device 形态)+ channel 形态可开,探针通过后会话可用", async () => {
+test("E2EE 解锁握手(device 形态)+ channel 形态可开,探测通过后会话可用", async () => {
   const { mk, params } = await phonePrepare();
   const { ctrl, client, sessId } = await unlock(`${routerBase}/remote/${DEV_ON}/_e2ee/ctrl`, { mk, params });
   assert.equal(sessId.length, 32);
@@ -379,7 +379,7 @@ test("E2EE HTTP:信封请求解封→上游→封回往返一致;篡改密文 �
 });
 
 test("★ 0.6.15 三层 base64 降为两层:声明过的客户端收到二进制明文,协商头不转发上游", async () => {
-  // 业主实测（dev-1014f947f8ab，Ubuntu 上的 dsh + Windows 访问，首屏要等几分钟）：
+  // 用户实测（dev-1014f947f8ab，Ubuntu 上的 dsh + Windows 访问，首屏要等几分钟）：
   // 同一条响应被 base64 编了三层（1.333³≈2.37×）。第一层是"gzip 正文进 JSON"，
   // 现在由客户端声明 x-dsh-e2ee-want: bin 换成二进制框架；老客户端不声明 → 形态不变。
   const u = globalThis.__unlocked;
@@ -492,7 +492,7 @@ test("E2EE WS 数据流:&e2ee=&w= 标记 → 桥剥除标记连上游,逐消息�
 // (而非测试内复制)跑真实解锁 + HTTP 信封 + WS 数据流,验证手机端与桥端互通。
 // ============================================================
 
-/** 手机端(浏览器 WebCrypto)解锁:hello→ack→deriveShk→探针;密码错 → bad_key。 */
+/** 手机端(浏览器 WebCrypto)解锁:hello→ack→deriveShk→探测;密码错 → bad_key。 */
 function wcUnlock(ctrlWsUrl, { mkBytes, params }) {
   return new Promise((resolve, reject) => {
     const sessId = wc.wcNewSessId();
@@ -649,7 +649,7 @@ test("Phase-4 镜像页 shim:注入+交接单重建+HTTP 信封/WS 真实互通;
   const params = await fetchE2eeParams(apiBase, signJwt({ sub: "42", phone: "13811110001", plan: "free" }));
   assert.equal(params.enabled, true);
   const mk = new Uint8Array(deriveMasterKey(PASSWORD, params.salt, params.kdf));
-  // 手机端(浏览器 WebCrypto)解锁 → 已与桥端探针互认的会话
+  // 手机端(浏览器 WebCrypto)解锁 → 已与桥端探测互认的会话
   const { client, sessId } = await wcUnlock(`${routerBase}/remote/${DEV_ON}/_e2ee/ctrl`, { mkBytes: mk, params });
   assert.equal(sessId.length, 32);
 

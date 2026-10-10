@@ -64,14 +64,14 @@ import { createEventSubscriber, NODE_KINDS } from "./dsh-events.mjs";
  */
 
 /**
- * v2 能力表(运营钩子) —— 业主 2026-09-22 确认的分层:
+ * v2 能力表(运营钩子) —— 用户 2026-09-22 确认的分层:
  *
  *   · **免费档 = 只读 + 审批**:收得到任务通知(含完成小结、报错、额度、会员到期),
  *     点得了审批回执(选择下一步执行)。但**遥控不了**。
  *   · **付费档 = 免费档 + 遥控**:在微信里直接交代任务、切换会话(以及预留的中途纠偏/附件/多会话)。
  *
  * 免费用户尝试付费能力时,回复里带上 App 链接 —— 这既是解释,也是转化入口
- * (见 `#upsellText()`:业主口径是"如果免费用户要去做其他的东西,就在消息后面跟一个访问 App 的链接")。
+ * (见 `#upsellText()`:用户约定是"如果免费用户要去做其他的东西,就在消息后面跟一个访问 App 的链接")。
  *
  * ⚠️ `pro_max` **必须存在**:服务端的生效套餐取值就是 free / pro / pro_max(见企业端 auth.js 的
  *    PLAN_PRIORITY),而 `capabilitiesFor` 对**未知档位回退 free** —— 漏了 pro_max 就会把
@@ -80,7 +80,7 @@ import { createEventSubscriber, NODE_KINDS } from "./dsh-events.mjs";
  */
 const FREE_CAPABILITIES = Object.freeze([
   "notify", "approve", "status", "stop",
-  // ★ 业主 2026-09-22 拍板:「免费只能继续已有会话(回复即续接),不能开新会话、不能选用别的会话」。
+  // ★ 用户 2026-09-22 拍板:「免费只能继续已有会话(回复即续接),不能开新会话、不能选用别的会话」。
   //   所以 assign 被**拆成两半**:continue 免费、new 付费 —— 既让免费用户"能接着聊",
   //   又保住"开新任务 / 管会话"是会员能力(否则付费理由就没了)。
   "assign.continue"
@@ -116,7 +116,7 @@ export function grantsCap(caps, need) {
  * 各档位的**额外限制**(与能力表并列,同属"权益包")。
  *
  * `messages_per_month`:该档用户每月最多能给 agent 发多少条消息;**0 或缺省 = 不限**。
- * 业主 2026-09-22:「免费给每月 N 条消息额度,超出再引导升级(可配置,挂在权益包里)」。
+ * 用户 2026-09-22:「免费给每月 N 条消息额度,超出再引导升级(可配置,挂在权益包里)」。
  * ⚠️ 只有**派活**(发消息/开任务)计数;审批回执与指令**不计数** ——
  *    否则免费用户会为了省额度而不敢拍板,那等于把安全阀关掉。
  */
@@ -126,7 +126,7 @@ export const WECHAT_TIER_LIMITS = Object.freeze({
   pro_max: Object.freeze({ messages_per_month: 0 })
 });
 
-/** 某档位的限制。未知档位按最低档(free)处理 —— 与能力表同一口径。 */
+/** 某档位的限制。未知档位按最低档(free)处理 —— 与能力表同一约定。 */
 export function limitsFor(tier, table = WECHAT_TIER_LIMITS) {
   const key = Object.prototype.hasOwnProperty.call(table, String(tier || "")) ? String(tier) : "free";
   return table[key] || {};
@@ -201,7 +201,7 @@ const NOTICE_FORMATTER_KINDS = Object.freeze(["quota", "membership"]);
 /**
  * 主动推送失败后的**待补发队列**上限（见 `#pushProactive`）：只留**最近几条**。
  *
- * 2026-10-09 业主口径：「积压超过一定时限后就丢弃掉最早的数据，只保留最近几条」。
+ * 2026-10-09 用户约定：「积压超过一定时限后就丢弃掉最早的数据，只保留最近几条」。
  * 从 20 收到 5 的理由：一轮里真正还值得看的就最近那么两三条；攒到 20 条的结果是
  * 平台一恢复就**一次连打十几条** —— 实测正是这种突发批量触发 `ret=-2 prepare failed`
  * 被限流，于是补发又失败、队列再涨，越积越多永远还不上（现场观察到的就是这个循环）。
@@ -210,7 +210,7 @@ const MAX_OUTBOX = 5;
 /**
  * 待补发条目的**保质期**：超过这个时长还没送达就丢弃（先丢最旧的）。
  *
- * 为什么必须有（同一条业主口径）：一条"任务跑完了"的通知迟到几小时就**毫无价值** ——
+ * 为什么必须有（同一条用户约定）：一条"任务跑完了"的通知迟到几小时就**毫无价值** ——
  * 补发出去只会让用户以为刚刚才发生；而队列的价值在于"网络抖动期间的短暂失败"，
  * 那是分钟级的。2 小时足够覆盖抖动与短时离线，又不会把半天前的旧事翻出来刷屏。
  */
@@ -284,7 +284,7 @@ export const DEFAULT_BIND_TTL_MS = 5 * 60_000;
  * 每日简报时刻(本地小时)。
  *
  * ⚠️ 必须是**晚上**而不是早上:简报的内容是"**今天**干了啥"(已完成/出错/你拍板了几次),
- *    早上 9 点发的时候今天才刚开始,整篇都是空的 —— 业主原话「每天早上发『今日干了啥事儿』,
+ *    早上 9 点发的时候今天才刚开始,整篇都是空的 —— 用户原话「每天早上发『今日干了啥事儿』,
  *    这肯定不太对劲。应该是晚上发,比如晚上 6 点,发『今天干了啥』」。
  *    它同时兼作微信 24h 推送窗口的心跳,所以一天**只发一次**、不要早晚各一次。
  */
@@ -500,7 +500,7 @@ export class WeChatRuntime {
       cooldown_ms: cooldownMs,
       // 只数**待拍板**的(不含额度/会员到期这类提醒):面板上的数字要与用户真实要做的决定一致
       pending_replies: this.#decisionCount(),
-      // ★ 面板要把「你现在能用什么」如实展示出来(业主:话术与权限必须一致,不多承诺)。
+      // ★ 面板要把「你现在能用什么」如实展示出来(用户:话术与权限必须一致,不多承诺)。
       //   这里下发的是**通道实际在用**的那一份(服务端权益包优先,否则内置表按档位),
       //   所以面板不需要自己猜档位 → 展示与判定不可能不一致。
       plan: this.#tier(),
@@ -517,7 +517,7 @@ export class WeChatRuntime {
         : { active: false, failed: !!(this.bind && this.bind.done && !this.bind.result) },
       channel_running: !!this.channelTask,
       events_running: !!this.subscriber,
-      // ── 诊断字段（2026-09-25 事故加的）────────────────────────────────────
+      // ── 诊断字段（2026-09-25 故障加的）────────────────────────────────────
       // 那次「任务跑完一条微信都没收到，日志里也没有任何报错」暴露了三件必须能看见的事：
       //   ① 事件订阅到底 ready 了没、**正在 follow 哪些会话**（follow 集为空 = turn/end 收不到）；
       //   ② 有没有排进待补发队列的通知（推送失败不再等于消失）；
@@ -536,7 +536,7 @@ export class WeChatRuntime {
     };
   }
 
-  /** 通知文案里用的机器人自称与奖励口径(与产品口径同源)。 */
+  /** 通知文案里用的机器人自称与奖励约定(与产品约定同源)。 */
   #notifyOpts() {
     return { botName: "ClawBot" };
   }
@@ -749,7 +749,7 @@ export class WeChatRuntime {
   /**
    * 取"**最早**一条待答通知"。
    *
-   * ⚠️ 必须是**先进先出**,不能取最近一条。真机 bug(业主报的):
+   * ⚠️ 必须是**先进先出**,不能取最近一条。真机 bug(用户报的):
    *    「如果需要用户回应多条消息,而用户一开始只看到第一条审批消息,回应一个数字之后,
    *      流程就结束了,后面的几条消息没有让用户继续回应,直接提示为『未回应』」
    *    成因:旧实现按栈顶(最新那条)匹配数字,而**微信是从上往下读的**、消息一发出去位置就固定 ——
@@ -800,7 +800,7 @@ export class WeChatRuntime {
     const from = extractFromUserId(msg);
     const text = normalizeInput(extractInboundText(msg));
     // ★ 每条入站消息都带上 `context_token`,而**出站必须回带它**才发得出去
-    //   (不进它 → 真机 `ret=-2 errmsg=prepare failed`,业主「没收到微信通道」)。
+    //   (不进它 → 真机 `ret=-2 errmsg=prepare failed`,用户「没收到微信通道」)。
     //   放在 `if (!text) return` **之前**:图片/语音这类没有文本的消息同样会刷新上下文。
     //   记不住不影响主流程(最坏就是这一条发不出去,与以前一样)。
     try { this.channel.rememberContextToken(extractContextToken(msg), from); } catch { /* 忽略 */ }
@@ -832,7 +832,7 @@ export class WeChatRuntime {
       return;
     }
     if (cls.kind === "message") {
-      // 纯文本 = 派活。★ 分两种(业主 2026-09-22 拍板):
+      // 纯文本 = 派活。★ 分两种(用户 2026-09-22 拍板):
       //   · **有当前会话** → 「继续已有会话」= assign.continue —— **免费也有**(让免费用户能接着聊)
       //   · **没有当前会话** → 等同开新任务 = assign.new —— 付费才有
       //   这样既满足"能继续聊",又保住"开新任务/管会话"是会员能力。
@@ -896,7 +896,7 @@ export class WeChatRuntime {
   }
 
   /**
-   * **每月消息额度闸**(业主 2026-09-22:免费给每月 N 条,超出引导升级)。
+   * **每月消息额度闸**(用户 2026-09-22:免费给每月 N 条,超出引导升级)。
    * `messages_per_month` 为 0/缺省 = 不限(付费档走这条)。
    * ⚠️ 只在**派活**前拦;审批回执与指令不计数、也不拦 ——
    *    否则免费用户会为了省额度不敢拍板,那等于把安全阀关掉。
@@ -1005,7 +1005,7 @@ export class WeChatRuntime {
     // 只勾细粒度 `assign.new` 而不勾粗粒度根 `assign` 时,旧的 `#can("assign")` 返回**假**,
     // 于是**付费用户**拿到一份写着"你没有这些功能"的免费档帮助;
     // 反过来(勾了粗根又关掉某个子能力)则会把做不到的指令列成"你能用的"。
-    // 两个方向都违反业主红线「话术与权限必须一致、不多承诺」。
+    // 两个方向都违反用户红线「话术与权限必须一致、不多承诺」。
     // 现在每一行都挂一个判据,能不能用由 `#can(...)` **逐条**决定。
     const canNew = this.#can("assign.new");
     const canContinue = this.#can("assign.continue");
@@ -1015,7 +1015,7 @@ export class WeChatRuntime {
       { ok: this.#can("status"), text: "· /status 查看绑定与推送状态" },
       { ok: true, text: "· /quiet 暂停推送(回复任意消息恢复)" }, // 本地开关,不需要任何能力
       { ok: true, text: "· /unbind 解除微信绑定" },
-      // 「接着当前任务聊」与「开新任务」是**两个独立能力**(业主 2026-09-22 拍板把 assign 拆成两半),
+      // 「接着当前任务聊」与「开新任务」是**两个独立能力**(用户 2026-09-22 拍板把 assign 拆成两半),
       // 所以这里也拆成两行、各自判各自的:免费用户会看到第一行可用、第二行落在会员区。
       // ⚠️ 行内**不要**再写"会员功能"三个字 —— 那是下面分区标题的专属词,
       //    混进可用段会让"会员区之前不得出现 /new"这类结构断言失准(读起来也乱)。
@@ -1047,7 +1047,7 @@ export class WeChatRuntime {
   /**
    * 免费用户越界时的回复:说清「通知版能做什么」+ 给出可点击的 App 链接。
    *
-   * 业主口径:免费用户要去做别的事情时,就在消息后面跟一个访问 App 的链接,
+   * 用户约定:免费用户要去做别的事情时,就在消息后面跟一个访问 App 的链接,
    * 点一下就能到我们的 App 界面 —— 这既是解释,也是把用户引回远程控制主功能的入口。
    * ⚠️ 微信不渲染 Markdown,所以这里用「」和纯文本,不要写 `**`。
    */
@@ -1130,7 +1130,7 @@ export class WeChatRuntime {
     // ⚠️ 这里以前直接透传上游 `handleCommand()` 的 replyText,而它拼的是**静态** HELP_TEXT ——
     //    那份清单把 `/new`、`/ls`、`/use`、`/summary` 与"直接发一句话"一并列成"你能用的"。
     //    免费用户敲错一个字,拿到的就是这张会员清单:照着做 → 再吃一次拒绝,
-    //    于是"打错命令"被理解成"这功能坏了"。业主红线是「话术与权限必须一致、不多承诺」,
+    //    于是"打错命令"被理解成"这功能坏了"。用户红线是「话术与权限必须一致、不多承诺」,
     //    而 `#helpText()` 存在的唯一理由就是按档位如实分层(见它的注释)。
     //    另外把用户敲的那条**原样回显** —— 他才知道是哪个字打错了。
     if (cmd) {
@@ -1161,7 +1161,7 @@ export class WeChatRuntime {
    *
    * 为什么必须有它：`#rememberSession` 只在推送真的发出去了才会被调用 —— 一旦推送失败
    * （微信侧 ret=-2）或者订阅漏了 turn/end，当前会话指针就**停在旧会话上**，用户回话会发进
-   * 那个旧会话（业主 2026-09-25 实测：「刚才我回了个话，而且回到了另外一个对话里面去了」）。
+   * 那个旧会话（用户 2026-09-25 实测：「刚才我回了个话，而且回到了另外一个对话里面去了」）。
    * 有了这个记录，回话前就能对一次表（见 `#retargetToLatestCompletion`）。
    */
   #rememberCompletion(sessionId, title) {
@@ -1206,7 +1206,7 @@ export class WeChatRuntime {
   /**
    * 可切换会话列表（`/ls` 与 `/use` **共用同一份**）—— 过滤必须收口在这里。
    *
-   * 为什么（业主反馈「/ls 列出一堆(未命名)会话」）：`listSessions` 返回的会话里有大量**空白会话**
+   * 为什么（用户反馈「/ls 列出一堆(未命名)会话」）：`listSessions` 返回的会话里有大量**空白会话**
    * （新建后一句话没说的坑），官方已经在数据里标了 `blank`（`dsh-events.mjs:1654` 解析出来却
    * 一直没人用）。规则：只留 **有名字 / 正在跑 / 当前选中** 的会话；`blank === true` 一律剔除。
    *
@@ -1238,7 +1238,7 @@ export class WeChatRuntime {
   /**
    * `/new [任务]` —— 建一个 DSH 会话,可选地立刻把任务下发进去。
    * 默认**沿用最近项目**(cwd 取最近一个会话的 cwd);要换项目就显式给路径,
-   * 避免把简单事做复杂(业主拍板)。
+   * 避免把简单事做复杂(用户拍板)。
    */
   async #cmdNew(from, task) {
     if (!this.subscriber || typeof this.subscriber.createSession !== "function") {
@@ -1440,14 +1440,14 @@ export class WeChatRuntime {
     //    ⚠️ 这里顺手修掉一个「从来没生效过」的入口:此前提醒的「邀请好友 / 知道了」
     //       被当成提问派给 `subscriber.answerQuestion`,拿一个**不存在的 question id** 去答,
     //       必然失败 → 用户看到的是「没能替你完成这个选择」。选项文案承诺了、行为却做不到,
-    //       正是业主红线里"话术与权限不一致"的那一类。
+    //       正是用户红线里"话术与权限不一致"的那一类。
     if (pending.notice) {
       this.channel.registry.consume(pending.eventId);
       this.pendingReplies = this.pendingReplies.filter((p) => p.eventId !== pending.eventId);
       if (String(option.value) === "invite") {
         const lines = ["邀请好友:在 App 里的「邀请」入口取你的专属链接,发给他即可。"];
         if (this.appUrl) lines.push(this.appUrl);
-        // 只说事实,不报具体奖励数字(那是 App/后台的口径,这里报错了就成了假承诺)
+        // 只说事实,不报具体奖励数字(那是 App/后台的约定,这里报错了就成了假承诺)
         lines.push("（只有邀请人得奖励,被邀请方没有奖励;奖励档位以 App 内展示为准。）");
         await this.reply(from, lines.join("\n"));
       } else {
@@ -1485,7 +1485,7 @@ export class WeChatRuntime {
     }
     await this.reply(from, `已按你的选择处理:${option.label || digits}。`);
     // ★ 还有待拍板的 → 把下一条重发到底部,用户直接在最新那条上回数字即可。
-    //   (不重发的话用户得往上翻找哪条没答 —— 翻错就是"答错对象",正是业主报的那个 bug 的成因。)
+    //   (不重发的话用户得往上翻找哪条没答 —— 翻错就是"答错对象",正是用户报的那个 bug 的成因。)
     await this.#resurfaceNext(from);
   }
 
@@ -1545,7 +1545,7 @@ export class WeChatRuntime {
 
   // ── 待补发队列（主动推送失败不再静默丢失） ──────────────────────────────
   //
-  // 【2026-09-25 事故】业主的任务跑完后**一条微信都没收到**，而日志里躺着 48 条
+  // 【2026-09-25 故障】用户的任务跑完后**一条微信都没收到**，而日志里躺着 48 条
   // `sendmessage 失败:sendMessage: ret=-2 errmsg=prepare failed` —— 平台侧发送失败是
   // **间歇性**的（实测同一台机器上有的消息发得出去、有的发不出去），而旧实现失败即丢弃：
   // 用户永远不知道那条"任务跑完了"存在过。
@@ -1742,7 +1742,7 @@ export class WeChatRuntime {
       ].includes(eventNode.kind);
       if (!important) {
         // ★ 0.6.15：静音也要**记账**。完成推送被静音时，这条"最近完成的任务"仍然必须被记下来 ——
-        //   否则用户下一秒回话就会发进上一次的会话（业主实测的那个"回到另一个对话"）。
+        //   否则用户下一秒回话就会发进上一次的会话（用户实测的那个"回到另一个对话"）。
         //   静音只表示"不打扰"，不表示"当它没发生过"。
         if (eventNode.kind === NODE_KINDS.TURN_END && eventNode.sessionId) {
           this.#rememberCompletion(eventNode.sessionId, "");
@@ -1768,7 +1768,7 @@ export class WeChatRuntime {
     }
 
     // 日报要能回答"今天干了啥" → 在既有的 notified/answered 之外,再记完成与失败。
-    // (owner 口径:日报不该是"今天要做啥"的清单,而是"今天做了什么"的回顾)
+    // (owner 约定:日报不该是"今天要做啥"的清单,而是"今天做了什么"的回顾)
     if (formatterKind === "stopped") {
       this.#bumpToday(String(eventNode.reason || "") === "completed" ? "completed" : "failed");
     }
@@ -1787,7 +1787,7 @@ export class WeChatRuntime {
         const hit = list ? list.find((s) => s.sessionId === sid) : null;
         if (hit && hit.title) title = hit.title;
       }
-      // ★ 0.6.15 修（业主实测）：**完成推送要把"当前会话"切到刚跑完的那个**。
+      // ★ 0.6.15 修（用户实测）：**完成推送要把"当前会话"切到刚跑完的那个**。
       //   旧行为只在 sid 已经是当前会话时才更新标题，于是：B 会话跑完推了结论，用户直接在微信里
       //   回一句"再改一下"，那条消息却被 `#sendToSession` 发给了**上一次的当前会话 A** ——
       //   A 莫名其妙多了一条指令，B 永远收不到。用户看到的正是"推送过来了，我准备回话，
@@ -1796,7 +1796,7 @@ export class WeChatRuntime {
       //
       // ★ 0.6.15 补：**先无条件记下"最近完成的任务"**（与推送成败无关）。
       //   推送失败（微信 ret=-2）或订阅漏了 turn/end 时，这一步是回话前对表的唯一依据，
-      //   否则当前会话指针会停在旧会话上，用户回话直接发进旧会话（业主实测的第二个症状）。
+      //   否则当前会话指针会停在旧会话上，用户回话直接发进旧会话（用户实测的第二个症状）。
       this.#rememberCompletion(sid, title);
       if (sid && sid !== this.currentSessionId) {
         this.#rememberSession(sid, title);
@@ -1825,7 +1825,7 @@ export class WeChatRuntime {
       // 现在被降级只有两种原因,文案要分别说清是**哪一种**(否则用户不知道该防什么):
       //   · 有内容且命中破坏性模式 → 是这一步的**内容**危险;
       //   · 内容为空但降级了 → 是**这个工具本身**属于删除/覆盖类(按工具名判的)。
-      // ⚠️ 「看不到内容」不再降级(业主拍板:DSH 自身有权限控制,不要过严),所以这里
+      // ⚠️ 「看不到内容」不再降级(用户拍板:DSH 自身有权限控制,不要过严),所以这里
       //    不会出现"因为看不见所以不给点"的说法 —— 那样说会与实现不一致。
       built = {
         text: [
@@ -1848,7 +1848,7 @@ export class WeChatRuntime {
     if (!built || !built.text) return { ok: false, reason: "no_text" };
 
     // 已经还有别的待拍板 → 明确说"不止这一条"。不说的话用户会以为答完就结束了,
-    // 后面几条就变成"没人回应"(业主报的那个 bug 的后半段现象)。
+    // 后面几条就变成"没人回应"(用户报的那个 bug 的后半段现象)。
     // ⚠️ 数字必须取**发送前**的快照:push 之后它会包含这一条自己。
     // ⚠️ 只数**决策**:提醒类(额度/会员到期)不占拍板位,更不该在提醒里说"你还有 N 条待拍板"。
     const isNotice = NOTICE_FORMATTER_KINDS.includes(formatterKind);
@@ -1911,7 +1911,7 @@ export class WeChatRuntime {
    * 会员/试用临近到期的提醒(提前 2 天、提前 1 天、到期当天)。
    *
    * ⚠️ 这条**以前根本不存在**:`notifyMembershipExpiring()` 只有定义、全仓零调用方 ——
-   *    业主以为"提前两天发、提前一天也发",实际一次都没发过。这里补上唯一的触发点。
+   *    用户以为"提前两天发、提前一天也发",实际一次都没发过。这里补上唯一的触发点。
    *
    * 数据来源:`opts.accountInfo`(由 bridge 注入,复用它查档位时那次 `/api/me`,不额外打网络)。
    * 拿不到就**什么都不发** —— 宁可漏发一次,也不要拿"猜的到期日"去骚扰用户。
@@ -1955,7 +1955,7 @@ export class WeChatRuntime {
    *    与 `#maybeRemindExpiry()` 同一套模式(落盘去重 + 只有真发出去了才记账),
    *    调用点也照它那样 fire-and-forget(见 `#cmdNew` / `#sendToSession`)。
    *
-   * 触发口径(两个条件取**较宽松**的那个,谁先到用谁 —— 别让用户到 0 才收到):
+   * 触发约定(两个条件取**较宽松**的那个,谁先到用谁 —— 别让用户到 0 才收到):
    *   · 已用 ≥ 80% ;或 · 剩余 ≤ 2 条
    * 频控:**每个自然月最多一次**(`#monthKey()` 落盘去重)。每发一条就念一遍额度是骚扰,
    *     而且微信里挡住消息的正是额度本身 —— 提醒的价值在"提前预告",不是"复读"。
@@ -2022,12 +2022,12 @@ export class WeChatRuntime {
    *
    * ⚠️ 旧实现有三个问题,一起修了:
    *   ① 只把 `{notified, answered}` 交给下游,**没有 lines** → 用户每天收到的是兜底句
-   *      「今天暂时没有要做的事。」—— 那不是"今天干了啥",等于白发(业主:"日报发的内容有点问题")。
+   *      「今天暂时没有要做的事。」—— 那不是"今天干了啥",等于白发(用户:"日报发的内容有点问题")。
    *   ② 先把 `last_digest_day` 落盘**再**发送 → 一旦这次没发出去(网络抖动/节点被权限关掉),
    *      当天的简报就被**烧掉**、当天再也不会补发。
    *   ③ 「读 state → 发送 → 写 state」是一段**跨 await 的读-改-写**:发送要等网络,
    *      这段窗口里第二个执行者会读到"今天还没发"→ **两条都发出去**
-   *      (2026-09-23 真机:业主收到两条简报)。现在用**原子占位**把"今天这条归我发"锁死。
+   *      (2026-09-23 真机:用户收到两条简报)。现在用**原子占位**把"今天这条归我发"锁死。
    */
   async #maybeDigest() {
     if (this.stopping || !this.channel.account || !this.subscriber) return;
@@ -2109,7 +2109,7 @@ export class WeChatRuntime {
     } catch { /* 目录读不了就算了:占位本身仍生效 */ }
   }
 
-  /** 简报正文:回答"**今天**干了啥"(业主口径:日报是回顾,不是待办清单)。 */
+  /** 简报正文:回答"**今天**干了啥"(用户约定:日报是回顾,不是待办清单)。 */
   #digestLines() {
     const s = this.todayStats;
     const lines = [];
@@ -2178,7 +2178,7 @@ export class WeChatRuntime {
   async beginBind() {
     if (this.disabled) return { ok: false, error: "微信通道已禁用" };
     if (this.channel.account) return { ok: false, error: "已经绑定过了;如需更换请先解绑" };
-    // ★ 权限门槛(业主拍板:必须注册登录后才能用微信机器人)。
+    // ★ 权限门槛(用户拍板:必须注册登录后才能用微信机器人)。
     //   判据是**本机配置里有账号**(登录后才会写入)。放在最前面:没登录就连二维码都不给,
     //   而不是"给二维码但绑上用不了"——后者会让用户白扫一次,体验更差。
     //   bridge 侧这道闸与面板侧"未登录不显示 tab"是双保险(bridge 可能被别的客户端调)。

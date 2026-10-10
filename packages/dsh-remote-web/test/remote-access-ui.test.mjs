@@ -428,7 +428,7 @@ test("「更多」只收纳营销入口：档位规格数字（Mbps / GB / 价�
 
   // 【0.6.11】档位明细整块删除：标题「套餐与额度」、PRO / Pro Max 规格行、价格与结论句都不再渲染
   assert.ok(!textHas(body, "套餐与额度"), "「套餐与额度」标题应删除");
-  assert.ok(!textHas(body, "Mbps"), "不得再渲染带宽数值（业主口径：本地面板不展示 PRO 版本流量带宽）");
+  assert.ok(!textHas(body, "Mbps"), "不得再渲染带宽数值（用户约定：本地面板不展示 PRO 版本流量带宽）");
   assert.ok(!textHas(body, "GB"), "不得再渲染流量数值");
   assert.ok(!textHas(body, "¥"), "不得再渲染价格");
   assert.ok(!textHas(body, "以套餐页为准"), "随档位明细一起删掉的结论句不得残留");
@@ -436,7 +436,7 @@ test("「更多」只收纳营销入口：档位规格数字（Mbps / GB / 价�
   assert.ok(!textHas(tree, "Mbps"), "账号卡里不得出现 Mbps");
   assert.ok(!textHas(tree, "¥"), "账号卡里不得出现价格");
 
-  // 但两条**折叠的营销入口**仍在（业主只要数字走，入口留着）
+  // 但两条**折叠的营销入口**仍在（用户只要数字走，入口留着）
   const upsell = find(body, (n) => n.type === "button" && (n.children || []).some((c) => typeof c === "string" && c.includes("升级 PRO")));
   const invite = find(body, (n) => n.type === "button" && (n.children || []).some((c) => typeof c === "string" && c.includes("带新用户换会员")));
   assert.ok(upsell, "「更多」里应保留「🚀 升级 PRO」入口");

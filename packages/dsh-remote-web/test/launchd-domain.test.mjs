@@ -114,7 +114,7 @@ test("★ 两份 plist 模板的 PATH 必须一致（插件那份曾漏掉 /usr/
 });
 
 test("★ 被监管者(launchd)拉起的实例不得因『已有游离守护』而秒退", () => {
-  // 真机事故链：KeepAlive 重拉 → 本进程发现 pid 文件里已有游离守护 → 秒退
+  // 真机故障链：KeepAlive 重拉 → 本进程发现 pid 文件里已有游离守护 → 秒退
   //   → 监管者判为崩溃并节流（`launchctl print` = `state = spawn scheduled`）
   //   → 插件自愈认定"服务坏了" → bootout 摘作业（入口判定成立时连 plist 一起删）
   //   → **自启动彻底消失，`launchctl kickstart` 报"域里找不到该服务"**。
@@ -184,7 +184,7 @@ test("★ watcher 退出前必须确保子进程真的死了（只『请』不�
 });
 
 test("★ 守护惊群：启动锁必须排在去重读取**之前**，且先写 pid 再释放锁", () => {
-  // 2026-09-26 真机事故：一次重启窗口里同时活下来 6 个 `dsh-setup.mjs run` + 6 个 bridge，
+  // 2026-09-26 真机故障：一次重启窗口里同时活下来 6 个 `dsh-setup.mjs run` + 6 个 bridge，
   // 全部用同一 deviceId 抢 router 注册（日志刷满 `replaced by new connection`），隧道无限抖动。
   // 成因：去重是"先读 pid 文件、后写 pid 文件"，N 个实例同时启动时每个都读到"没有别人"。
   const rb = src.slice(src.indexOf("async function runBridge()"), src.indexOf("// ---------- setup"));

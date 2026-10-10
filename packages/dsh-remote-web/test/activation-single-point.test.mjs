@@ -1,7 +1,7 @@
 /**
  * 激活点唯一性 —— 配置不变量 + 安装器方向守护。
  *
- * 背景（2026-09-22 实测事故）：插件被两处同时激活时，dsh web **启动即挂**：
+ * 背景（2026-09-22 实测故障）：插件被两处同时激活时，dsh web **启动即挂**：
  *   `duplicate loader entry id: dsh-remote-web` → `plugin tree failed to load`。
  * 不是"插件不生效"，是**dsh 起不来**。
  *

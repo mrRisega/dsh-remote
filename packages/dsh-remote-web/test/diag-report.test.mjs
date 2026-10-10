@@ -219,7 +219,7 @@ test("修复提示词：带当前故障上下文（目录/上游/版本），便
     const b = await getJson(`${base}/dsh-remote/diag/fix-prompt`);
     assert.equal(b.ok, true);
     assert.match(b.prompt, new RegExp(env.relayDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "提示词要带上本机配置目录");
-    assert.match(b.prompt, /127\.0\.0\.1:3080/, "提示词要带上上游地址（端口错配是本次事故的最大嫌疑）");
+    assert.match(b.prompt, /127\.0\.0\.1:3080/, "提示词要带上上游地址（端口错配是本次故障的最大嫌疑）");
     assert.match(b.prompt, /\.dsh-bridge\.log/);
     assert.match(b.prompt, /\.dsh-setup-install\.log/);
     assert.match(b.reportTitle, /dsh-remote 诊断结论/, "报告格式要有固定首行，便于后台机器解析");

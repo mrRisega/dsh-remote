@@ -2,7 +2,7 @@
 /**
  * mobile-adapter **图片上传兼容**契约测试（假 DOM + vm 执行真实注入脚本）。
  *
- * 业主反馈（2026-09）：「手机端无法识别图片」——选了照片发出去，模型看不到图 / 被当成普通文件。
+ * 用户反馈（2026-09）：「手机端无法识别图片」——选了照片发出去，模型看不到图 / 被当成普通文件。
  *
  * 根因（官方 dsh web 客户端 `dsh-client-ui-conversation` 的 createDrafts）：
  *   只有 `file.type ∈ {image/png,image/jpeg,image/webp,image/gif}` 才走**图片**通道

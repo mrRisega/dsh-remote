@@ -15,7 +15,7 @@
 //     （no_account/no_runtime/installing/starting/connecting/online/error），并在返回前自动补装运行环境、
 //     拉起 bridge、清理卡死标记（带退避）；区分「bridge 进程在跑」与「设备已在中继注册成功（online）」。
 //     面板用 2~3s 短轮询自动推进到 online（无需点按钮/刷新页面），error 才给重试与诊断信息；
-//     另 POST /dsh-remote/connect/retry 手动重试、POST <api>/api/install-report 上报安装口径
+//     另 POST /dsh-remote/connect/retry 手动重试、POST <api>/api/install-report 上报安装约定
 //     （install_source/version + host_os/arch，详见 installSourceOf）。
 //   - 0.1.2+ ?token 浏览器鉴权会话代持（0.4.1 起）
 //
@@ -90,14 +90,14 @@ const DEFAULT_RELAY_DIR = process.env.DSH_RELAY_DIR || join(homedir(), ".dsh-rem
 // 默认云端服务地址（SaaS 入口；自建用户在设置页/面板切换）。
 // DSH_RELAY_DEFAULT_API 只改「配置里根本没写 api_url」时的兜底：测试脚本把它指向本地死端口，
 // 这样任何**在临时目录被拆掉之后**才跑到的后台请求（如装机上报的重试）都不会打生产。
-// 真实事故形态见 test/wechat-bind-telemetry.test.mjs 的注释：用例拆目录 → 读到空配置 → 回落生产。
+// 真实故障形态见 test/wechat-bind-telemetry.test.mjs 的注释：用例拆目录 → 读到空配置 → 回落生产。
 const DEFAULT_API = String(process.env.DSH_RELAY_DEFAULT_API || "").trim()
   || "https://n.risegao.cn:13443/relay-api";
 const DEFAULT_APP_URL = "https://n.risegao.cn:13443/app/";
 
 // ---------- 上游 dsh web 地址（bridge/watcher 都要连它，绝不写死 3080） ----------
 //
-// 【2026-09-23 用户实测事故】这里（以及运行时的 checkUpstream）原本把上游**写死**
+// 【2026-09-23 用户实测故障】这里（以及运行时的 checkUpstream）原本把上游**写死**
 // `http://127.0.0.1:3080`：只要用户的 dsh web 不在默认端口（`dsh web --port 8090`、
 // profile 里配了 port、或 `--port 0` 让系统分配空闲端口），watcher 的「dsh web 在线吗」
 // 探测就永远失败 → **bridge 永远不启动**，而面板只会说「正在启动 Bridge…」（错误为空）
@@ -491,7 +491,7 @@ function npxInvocation() {
 /** 子进程环境：把 node 目录补进 PATH（npx 及其 shebang 需要），可附加额外变量。 */
 function spawnEnv(extra) {
   // ⚠️ 这里刻意用 **process.execPath**，不是 NODE_BIN：PATH 首位的用途是让 npx 的
-  // `#!/usr/bin/env node` 解析到**正在跑本插件的那个 node**（与 npxInvocation 同口径）。
+  // `#!/usr/bin/env node` 解析到**正在跑本插件的那个 node**（与 npxInvocation 同约定）。
   // NODE_BIN 回答的是另一个问题——"自启动服务里该登记哪个解释器"（真实 node 优先）。
   // 两者语义不同，混用会悄悄改掉 web 版上 npx 用哪个 node。
   const nodeDir = dirname(process.execPath);
@@ -759,9 +759,9 @@ function fetchFailReason(e) {
 }
 
 /**
- * Cookie 按 **authority 分文件**(0.7.0-beta.2 起,2026-10-09 事故根治)。
+ * Cookie 按 **authority 分文件**(0.7.0-beta.2 起,2026-10-09 故障根治)。
  *
- * 【事故】`~/.dsh-remote/` 只有一份 `.harness-cookie.json`,而 Web 端(3080)与桌面端(每次启动
+ * 【故障】`~/.dsh-remote/` 只有一份 `.harness-cookie.json`,而 Web 端(3080)与桌面端(每次启动
  *   随机端口)是**两个宿主进程**,各自的插件都往里写"自己 authority 的 Cookie" → 互相覆盖。
  *   桥撞 401 后重读磁盘,拿到的是另一个宿主刚写的 Cookie → 重试 → 还是 401 → 再读 → 又被
  *   覆盖回去……**乒乓,永不自愈**,手机端持续白页(现象与"自愈坏了"一模一样,极易误判)。
@@ -782,7 +782,7 @@ function harnessCookieFileFor(authority) {
 function harnessCookieRevokedFileFor(authority) {
   return `${HARNESS_COOKIE_REVOKED_FILE}.${authoritySlug(authority)}`;
 }
-/** 由本进程 webServer 端口推出 authority(与 bridge 的 Host 口径一致)。 */
+/** 由本进程 webServer 端口推出 authority(与 bridge 的 Host 约定一致)。 */
 function harnessAuthorityOfPort(port) {
   return port ? `127.0.0.1:${port}` : "";
 }
@@ -832,7 +832,7 @@ async function mintHarnessCookie(ctx, relayDir) {
     if (UNINSTALLED_DIRS.has(relayDir)) return false;
     const out = { authority: `127.0.0.1:${port}`, cookie, mintedAt: Date.now() };
     mkdirSync(dirname(configPathOf(relayDir)), { recursive: true });
-    // ① 本宿主专属文件(权威,两个宿主互不覆盖 —— 事故根治点)
+    // ① 本宿主专属文件(权威,两个宿主互不覆盖 —— 故障根治点)
     const ownPath = join(relayDir, harnessCookieFileFor(out.authority));
     writeFileSync(ownPath, JSON.stringify(out, null, 2), { mode: 0o600 });
     hardenFile(ownPath); // 会话 Cookie ≈ dsh web 的完整访问权，同样要收紧
@@ -1003,7 +1003,7 @@ function runtimeManifest(relayDir) {
 /**
  * 桌面运行环境缺失/不完整的文件清单（空 = 就绪）。
  *
- * 【2026-09-23 用户实测事故】判据原本是「`dsh-setup.mjs` 存在即就绪」——**存在 ≠ 能加载**。
+ * 【2026-09-23 用户实测故障】判据原本是「`dsh-setup.mjs` 存在即就绪」——**存在 ≠ 能加载**。
  * npx 补装是「先拷入口脚本、再递归拷 clients/」，中途被打断（用户关窗口 / 杀软锁文件 /
  * 机器休眠 / 看门狗判超时结束进程）就会留下一个**只有入口脚本的半装运行时**。此后：
  *   · runtimeReady() 恒为 true → 插件再也不补装（自愈彻底停摆）；
@@ -1049,7 +1049,7 @@ function launchAgentPath() {
 /**
  * ★ 这份自启动 plist 是否**确实是为本 relayDir 装的**（内容里写着 `<relayDir>/dsh-setup.mjs`）。
  *
- * 🔴 2026-10-10 事故（两次，同一根因）：`reapBrokenAutostart()` 用**当前 relayDir** 判断
+ * 🔴 2026-10-10 故障（两次，同一根因）：`reapBrokenAutostart()` 用**当前 relayDir** 判断
  *   "入口脚本缺失"（测试的临时 relayDir 当然没有 dsh-setup.mjs → 判 true），
  *   但删除的却是 `launchAgentPath()` = **真实 HOME 下那份 plist** → 把开发者本机的自启动
  *   连 bootout 带删文件一起干掉了（远程访问中断，且日志里看不出异常）。
@@ -1136,7 +1136,7 @@ WantedBy=default.target
 /**
  * Linux：拉起 bridge 的阶梯（**与 macOS 同构：可自愈优先，可用兜底**）。
  *
- * 【0.6.15 事故根因】0.6.14 及更早，`startBridge` 只认 macOS 的 launchd，Linux 直接返回
+ * 【0.6.15 故障根因】0.6.14 及更早，`startBridge` 只认 macOS 的 launchd，Linux 直接返回
  * `unsupported: 当前平台（linux）暂不支持自启动服务`。于是：
  *   · 自愈轮次每轮都调用它、每轮都拿到 unsupported、**bridge 永远起不来**；
  *   · 用户面板上的表现是永远停在「正在启动 Bridge…」+「bridge 进程: 未运行」；
@@ -1188,7 +1188,7 @@ function startBridgeLinux(relayDir) {
 /**
  * launchd 域名阶梯（**必须与 dsh-setup.mjs 一致**）。
  *
- * 事故（2026-09-19 实测）：安装器按 macOS 26 的修复把作业装在 **`user/<uid>`** 域
+ * 故障（2026-09-19 实测）：安装器按 macOS 26 的修复把作业装在 **`user/<uid>`** 域
  * （gui 域会被系统置为 on-demand-only，RunAtLoad/KeepAlive 失效），
  * 但插件这边只认 `gui/<uid>` → 切换账号时那次"重启 bridge"实际执行的是
  *   launchctl bootout gui/501/com.dshremote.bridge   → 找不到
@@ -1449,7 +1449,7 @@ function appendLogLine(relayDir, name, line) {
  * 注意：默认优先官方源——镜像(npmmirror)可能滞后于刚发布的版本，装到旧版会把
  * 已被 0.4.5 移除的“用户 include”重新写回 profile（历史上造成 dsh web 重复 ID 崩溃）。 */
 /**
- * 补装失败退避（2026-09-15 生产事故）。
+ * 补装失败退避（2026-09-15 生产故障）。
  *
  * 背景：Windows 用户补装 `npx @mrrisega/dsh-remote` 持续失败时，自愈调度每轮都重试，
  * 生产遥测里看到单机 12 秒一次、累计 606 次的失败风暴（1659 次 install_failed 全在 Windows）。
@@ -1673,7 +1673,7 @@ function ensureRuntime(relayDir) {
 /**
  * 生成 plist（与 dsh-setup.mjs 的 writeAutostartFile **必须同构**），返回路径。
  *
- * ⚠️ 两份模板历史上漂移过、并因此各造成一个真机事故（插件每次自愈/启动都会重写 plist，
+ * ⚠️ 两份模板历史上漂移过、并因此各造成一个真机故障（插件每次自愈/启动都会重写 plist，
  *    所以**插件这份谁写谁说了算**，漂移等于把安装器那份正确的覆盖掉）：
  *   · 漏 `/usr/sbin`、`/sbin`（SERVICE_PATH）→ bridge 找不到 `ioreg` → 机器指纹静默退化成
  *     hostname 哈希（改一次主机名就被当成新设备）；
@@ -2007,7 +2007,7 @@ function stopBridge(relayDir) {
   }
   const targets = launchTargets();
   if (!targets.length) return { ok: false, status: "unsupported", detail: `当前平台（${osPlatform()}）没有 launchd 服务可停，请手动结束 \`dsh-remote run\` 进程` };
-  // 两个域都要停：作业可能由安装器装在 user/<uid>，而旧版插件只会去 gui/<uid> 找不到（实测事故）
+  // 两个域都要停：作业可能由安装器装在 user/<uid>，而旧版插件只会去 gui/<uid> 找不到（实测故障）
   let lastErr = "";
   for (const target of targets) {
     const r = sh(`launchctl bootout ${target}`);
@@ -2065,7 +2065,7 @@ function uninstallRuntime(relayDir, protectedPath) {
     // a) 停服务 + 移除自启动文件
     try {
       if (isDarwin()) {
-        /* 🔴 2026-10-10 事故护栏：**relayDir 不在当前 HOME 之下时，绝不碰真实自启动**。
+        /* 🔴 2026-10-10 故障护栏：**relayDir 不在当前 HOME 之下时，绝不碰真实自启动**。
            当天某个用例用「真 HOME + 临时 relayDir」调到了这里：plist 路径解析到真实的
            ~/Library/LaunchAgents/com.dshremote.bridge.plist → 先 bootout 真桥、再把 plist 删了
            → **开发者本机的远程访问被测试整个卸掉**（job 消失、桥停摆）。
@@ -2085,7 +2085,7 @@ function uninstallRuntime(relayDir, protectedPath) {
         // 只处理「plist 位于当前 HOME」的服务：本插件/dsh-setup.mjs 安装的服务一定在此
         const plistPath = launchAgentPath();
         if (plistPath && existsSync(plistPath)) {
-          /* ★★ 归属校验（2026-10-10 事故的最终护栏）：
+          /* ★★ 归属校验（2026-10-10 故障的最终护栏）：
              这份 plist 必须**确实是为本 relayDir 装的**（内容里写着 <relayDir>/dsh-setup.mjs）。
              不校验的话，只要有用例拿「真 HOME + 临时 relayDir」走到这里，就会把开发者本机
              真实的服务**先 bootout 再删文件**（当天实测发生：桥停摆、远程访问中断）。
@@ -3240,7 +3240,7 @@ async function proxyFeedback(relayDir, req, res, pathname) {
 
 /**
  * 把 `/dsh-remote/announcements*` 代理到云端公告 API（契约冻结见
- * dsh-relay-enterprise/docs/announcements-contract.md §3）：
+ * 服务端公告契约文档（冻结 v1） §3）：
  *   · GET  /dsh-remote/announcements       → 上游 GET  {api}/api/announcements?client=desktop[&install_id=…]
  *   · POST /dsh-remote/announcements/click → 上游 POST {api}/api/announcements/click  {id[, install_id]}
  *
@@ -3251,7 +3251,7 @@ async function proxyFeedback(relayDir, req, res, pathname) {
  *    两者**同时**带上会让唯一索引 (announcement_id, user_id, install_id) 把"同一人两台机器"
  *    算成两行 —— UV 直接翻倍。所以下面是有 Bearer 就不带 install_id，反之亦然。
  * ② **install_id 复用本机既有的 device_id，绝不新造 ID**：服务端那个维度就是"这台电脑"，
- *    再生成一个 ID 只会让同一台机器在统计里变成两台（且新 ID 与反馈/设备列表的口径对不上）。
+ *    再生成一个 ID 只会让同一台机器在统计里变成两台（且新 ID 与反馈/设备列表的约定对不上）。
  *    注意 `cfg.device_id` 是**本机设备标识**，与遥测的 `.telemetry-install-id` 不是一回事：
  *    后者在 DSH_REMOTE_TELEMETRY=0 时根本不生成，公告不该被遥测开关牵连。
  * ③ **失败一律软着陆**：上游 404（老服务端）/ 不可达 / 超时都只回一个 JSON，**绝不抛**。
@@ -3271,7 +3271,7 @@ async function proxyAnnouncements(relayDir, req, res, pathname) {
     }
 
     const headers = { "x-dsh-client": `dsh-remote-web/${PLUGIN_VERSION}` };
-    // 浏览器已带的 Bearer 优先透传（与 proxyFeedback 同口径：那是请求方自己的身份）；
+    // 浏览器已带的 Bearer 优先透传（与 proxyFeedback 同约定：那是请求方自己的身份）；
     // 否则由 node 半附当前账号 JWT —— 只有"确实配了账号"才值得为此跑一次 device-login。
     const auth = req.headers.authorization;
     let bearer = "";
@@ -3497,7 +3497,7 @@ async function fetchDistTags() {
   return {};
 }
 
-/** 在「当前通道」与 latest 之间取更高者（**更新与"检查更新"必须用同一口径**，否则面板会说"已是最新"而更新却装新版）。 */
+/** 在「当前通道」与 latest 之间取更高者（**更新与"检查更新"必须用同一约定**，否则面板会说"已是最新"而更新却装新版）。 */
 function pickBestTag(tags) {
   const t = tags || {};
   const channelVer = typeof t[UPDATE_TAG] === "string" ? t[UPDATE_TAG] : "";
@@ -3511,7 +3511,7 @@ function pickBestTag(tags) {
   return { tag: UPDATE_TAG, version: channelVer, why: `当前通道 ${UPDATE_TAG}(${channelVer}) 不低于 latest(${latestVer})` };
 }
 
-/** 查询"对我而言"的最新版本号（口径同 pickBestTag）。 */
+/** 查询"对我而言"的最新版本号（约定同 pickBestTag）。 */
 async function npmLatestVersion() {
   return pickBestTag(await fetchDistTags()).version;
 }
@@ -3607,7 +3607,7 @@ function spawnUpdater(relayDir, extraEnv, onError, spec = UPDATE_SPEC) {
     // Windows 上跑 npx.cmd 必须经 shell（Node ≥20.12 起否则 EINVAL）；走 node+npx-cli.js 时不需要。
     shell: npx.shell,
     windowsHide: true, // Windows：不弹控制台窗口（POSIX 上该选项被忽略）
-    // PATH 补 node 目录：App 最小 PATH 下也能跑 npx；同时保持本机既有的安装来源口径
+    // PATH 补 node 目录：App 最小 PATH 下也能跑 npx；同时保持本机既有的安装来源约定
     // （在线更新会重跑安装器并重写 plist，若不带来源就会把 plugin_market 误记成 npx）。
     env: spawnEnv({
       DSH_BRIDGE_INSTALL_SOURCE: installSourceOf(relayDir),
@@ -3877,7 +3877,7 @@ function rotateUpdateLog(relayDir) {
 /**
  * 判断 patch 文本是否是「合法的顶层 YAML 数组文档」。
  *
- * 为什么必须判（2026-09-18 Windows 用户实测的致命事故）：dsh 解析 cordis.patch.yml 时
+ * 为什么必须判（2026-09-18 Windows 用户实测的致命故障）：dsh 解析 cordis.patch.yml 时
  * **要求顶层是数组**，而**纯注释文档的 YAML 解析结果是 `null` 而不是空数组**，于是 dsh 直接：
  *   `Error: dsh: overlay …/cordis.patch.yml must be a top-level YAML array of loader patch entries`
  * 官方空 profile 模板是「注释 + `[]`」——`[]` 这个占位符不能省。
@@ -3907,7 +3907,7 @@ function stripOwnEntriesFromPatch(patch) {
   // ① 管理标记块（dsh-setup 写入的形式）
   // 结尾标记后面可能还有残留文字（历史变体），用 [^\n]* 吃掉整行，避免留下半截内容
   const out = String(patch ?? "").replace(/\n?# >>> dsh-remote-(?:web|ui)[^\n]*\n[\s\S]*?# <<< dsh-remote-(?:web|ui)[^\n]*\n?/g, "\n");
-  // ② 无标记的 insert 块（旧版 / 其它工具写入的形式，历史事故里出现过）。
+  // ② 无标记的 insert 块（旧版 / 其它工具写入的形式，历史故障里出现过）。
   //    只摘标记块是不够的：目录已删而 patch 仍引用 → dsh 插件树加载失败 → 整个 dsh web 起不来。
   const lines = out.split("\n");
   const kept = [];
@@ -3949,7 +3949,7 @@ function writePatchDocument(patchFile, text) {
 /**
  * 「运行时清理助手」源码（卸载用；由插件生成、detached 执行）。
  *
- * 为什么必须是独立进程（2026-09-18 用户实测的僵死事故）：
+ * 为什么必须是独立进程（2026-09-18 用户实测的僵死故障）：
  *   uninstallRuntime() 里有 spawnSync("schtasks"/"powershell"/"taskkill")，同步子进程调用会把
  *   **dsh web 的事件循环整个钉死** —— 不只是这一个请求不返回，手机端隧道、其它页面、所有 API
  *   一起停摆，表现为「端口在听、连接建立、但永不响应」。而 spawnSync 的 timeout 在 Windows 上
@@ -3959,7 +3959,7 @@ function writePatchDocument(patchFile, text) {
  * 助手做的是「宁可少做也不卡住」的有界清理：杀残留进程 → 删自启动 → 清配置目录，每步独立 try/catch。
  */
 function buildRuntimeCleanupHelper(relayDir, protectedPath) {
-  /* ★ 归属校验（2026-10-10 事故第三条路径）：计划里的 plistPath 用的是**当前 homedir**，
+  /* ★ 归属校验（2026-10-10 故障第三条路径）：计划里的 plistPath 用的是**当前 homedir**，
      而 relayDir 来自调用方 —— 两者不必是同一个目录。曾有测试用「真 HOME + 临时 relayDir」
      走到这里，于是这个 detached 助手把**开发者本机真实的自启动 plist 删了**（异步删，
      所以在进程内插桩根本抓不到）。现在：plist 里没写着本 relayDir 的入口脚本 → **不给路径**，
@@ -3986,7 +3986,7 @@ import { dirname, join, sep } from "node:path";
 
 const PLAN = ${plan};
 // 与主进程一致的测试隔离开关：置位时**绝不做任何真实系统操作**（不碰 launchctl/systemctl/schtasks/taskkill），
-// 但仍清空配置目录 —— 否则用例会去动开发者本机真实的自启动服务（历史事故，见 setup-output 用例的护栏）。
+// 但仍清空配置目录 —— 否则用例会去动开发者本机真实的自启动服务（历史故障，见 setup-output 用例的护栏）。
 const SKIP_SYSTEM_OPS = process.env.DSH_RELAY_SKIP_SERVICE === "1";
 function log(m) { try { appendFileSync(PLAN.log, "\\n[" + new Date().toISOString() + "] " + m + "\\n"); } catch (e) { /* 日志失败不阻断清理 */ } }
 function run(cmd, args, timeout) {
@@ -4086,7 +4086,7 @@ function accountFingerprintOf(cfg) {
 /**
  * 账号（或模式/设备身份）变化后，**必须让 bridge 用新凭据重新登记**。
  *
- * 事故（2026-09-19 实测）：从 A 账号切到 B 账号后，配置已经改了、device_id 也清了，
+ * 故障（2026-09-19 实测）：从 A 账号切到 B 账号后，配置已经改了、device_id 也清了，
  * 但**正在运行的 bridge 是启动时把账号/密码固化在环境变量里的**，它不会自己换账号；
  * 而那次"重启 bridge"又因 launchd 域名不一致（插件只认 gui/<uid>，安装器装在 user/<uid>）静默失败
  * → 设备继续留在 A 账号，B 账号的设备列表里永远看不到这台机器。
@@ -4477,7 +4477,7 @@ async function composeConnect(relayDir, opts = {}) {
   // ── 中继注册证据（只有 bridge 进程在跑时才算「现在能用」） ──
   // ⚠️ 先判「这个 bridge 是不是当前账号的」：账号切换后进程不会自己换凭据，
   // 旧账号留下的状态文件（phase=online + 旧 device_id）会让面板谎报「已连接」，
-  // 自愈也就永远不会去重启它（2026-09-19 实测事故）。
+  // 自愈也就永远不会去重启它（2026-09-19 实测故障）。
   const accountCurrent = bridgeMatchesCurrentAccount(relayDir, cfg);
   let registered = false;
   let registerSource = "";
@@ -4815,7 +4815,7 @@ async function submitFeedback(relayDir, payload) {
     "content-type": "application/json",
     "x-dsh-device": cfg.device_id || "",
     "x-dsh-client": `dsh-remote-web/${PLUGIN_VERSION}`,
-    // 与 proxyFeedback 同一口径：结构化平台字段 + 真实 UA（此处没有浏览器请求可转发，
+    // 与 proxyFeedback 同一约定：结构化平台字段 + 真实 UA（此处没有浏览器请求可转发，
     // 就如实写本机平台，绝不冒充浏览器 UA）。
     "user-agent": `dsh-remote-web/${PLUGIN_VERSION} (${process.platform}; ${process.arch})`,
     "x-dsh-platform": process.platform,
@@ -4890,7 +4890,7 @@ function ensureConnection(relayDir, opts = {}) {
   const watcherRunning = Boolean(launchd.running || watcherProcs.length);
   if (bridgeProcs.length || watcherRunning) {
     // 进程在跑 ≠ 跑对了账号：切换账号后旧 bridge 会一直用旧凭据，
-    // 只看"有没有进程"会让自愈永久停摆（实测事故）。这里多判一次账号归属。
+    // 只看"有没有进程"会让自愈永久停摆（实测故障）。这里多判一次账号归属。
     if (bridgeProcs.length && !bridgeMatchesCurrentAccount(relayDir, cfg)) {
       book.lastAttemptAt = now;
       book.attempts += 1;
@@ -5473,7 +5473,7 @@ function telemetryRuntimeReady(relayDir) {
 }
 
 /**
- * 运行环境探针（在补装 watcher 与面板轮询里顺手调用，不额外起定时器）：
+ * 运行环境探测（在补装 watcher 与面板轮询里顺手调用，不额外起定时器）：
  *   - 现在缺运行环境 → 记下「本进程见过缺失」，并在超过 INSTALL_STALE_MS 仍缺时归因为
  *     install_failed(runtime_install_timeout)（每进程一次）；
  *   - 之前见过缺失、现在已就绪 → runtime_ready（每进程一次）。
@@ -5729,7 +5729,7 @@ export const __telemetryInternals = {
 
 /**
  * 安装信息上报（插件侧通道）：登录后把本机安装信息发给企业端，供「已登录用户升级插件后刷新版本号」
- * 之类的口径统计。无账号凭据不上报；失败静默（绝不阻塞面板、不弹错误）。
+ * 之类的约定统计。无账号凭据不上报；失败静默（绝不阻塞面板、不弹错误）。
  * 契约：POST <api_url>/api/install-report，头 `authorization: Bearer <device-login JWT>`，
  * body { device_id?, install_source, install_version, harness_version, host_os, host_arch }，成功 200 {ok:true}；
  * 404/400 一律忽略（老服务端没有该接口时不能报错）。
@@ -6218,7 +6218,7 @@ function registerRoutes(ctx, relayDir) {
       handler: async (_req, res) => {
         // 彻底卸载 = ① 插件 profile 清理（快、纯 fs、可预期）② 运行时/bridge 清理（慢、要调外部命令）
         //
-        // ⚠️ 顺序是刻意的，别改回去（2026-09-18 用户实测的僵死事故）：
+        // ⚠️ 顺序是刻意的，别改回去（2026-09-18 用户实测的僵死故障）：
         //   旧实现把**慢的** uninstallRuntime 排在最前、uninstallSelf 排在其后，于是
         //   uninstallRuntime 里任何一次 spawnSync 卡住（Windows 沙箱拦 schtasks，而 spawnSync 的
         //   timeout 在 Windows 上并不可靠，实测 18s+ 未返回），uninstallSelf 就**永远不执行**
@@ -6596,7 +6596,7 @@ function registerRoutes(ctx, relayDir) {
         invalidateRelayToken(relayDir); // 账号可能变了：丢弃旧 token 缓存，立即用新账号认证
         if (accountFingerprintOf(cfg) !== accountFpBefore) resetBridgeForAccountChange(relayDir, "账号/模式已变更");
         const bridgeRestart = startBridge(relayDir);
-        // 登录成功即上报本机安装信息（企业端用于「升级插件后刷新版本号」口径）；失败静默。
+        // 登录成功即上报本机安装信息（企业端用于「升级插件后刷新版本号」约定）；失败静默。
         maybeReportInstall(relayDir, { force: true });
         sendJson(res, 200, { ok: true, bridgeRestart, ...(await composeStatus(relayDir)) });
       },
@@ -6627,7 +6627,7 @@ function registerRoutes(ctx, relayDir) {
         // 首次安装/在线更新后重启 DeepSeek harness：插件本体与浏览器半在进程启动时装载，
         // 不重启则面板入口与 /dsh-remote/* 路由都不会出现。只重启承载本插件的进程。
         //
-        // 🔴 2026-10-11 业主口径：**桌面端绝不代为重启**。
+        // 🔴 2026-10-11 用户约定：**桌面端绝不代为重启**。
         //   "自动重启会很突兀地把窗口给关掉，关没了……我们应该提示用户自己重启，不要由我们来重启。"
         //   桌面端 Host 由 Electron 托管，重启 = 强杀承载窗口的进程（还会弹原生致命错误）。
         //   这里做成**硬拒绝**（不只是前端藏按钮）：任何调用方都拿不到"被重启"的结果，
@@ -6754,7 +6754,7 @@ function registerRoutes(ctx, relayDir) {
         const password = String(body.password ?? "");
         if (!phone || !smsCode || !password) return sendJson(res, 400, { ok: false, error: "手机号、短信验证码与密码必填" });
         // 全量透传 body（不挑字段）：注册来源 reg_source（面板=panel_register／手机端网页=remoteweb_register）
-        // 等扩展字段必须原样进企业端，否则「用户从哪注册的」这类增长口径会全部丢失。
+        // 等扩展字段必须原样进企业端，否则「用户从哪注册的」这类增长约定会全部丢失。
         const payload = { ...body, phone, sms_code: smsCode, password };
         delete payload.__parseError;
         const captchaId = body.captcha_id ?? body.captchaId;
@@ -6904,7 +6904,7 @@ function registerRoutes(ctx, relayDir) {
 // 自己持有 webserver 配置（实测监听 43120 / 回环），我们的 LAN 绑定补丁并不生效，于是它一直
 // 用的是原生那条路。**不能把"手机能不能选工作区"押在宿主的绑定地址上。**
 //
-// 【0.6.15 事故修正 —— 0.6.14 的"先建 browse、后摘 auto"在 DSH Desktop 上必然失败】
+// 【0.6.15 故障修正 —— 0.6.14 的"先建 browse、后摘 auto"在 DSH Desktop 上必然失败】
 //
 // 现场（用户诊断日志）：
 //   error: service "directoryPicker" has been registered at .dLateDirectoryPicker3
@@ -7064,9 +7064,9 @@ const PICKER_PIN_PROBE_WAIT_MS = 30_000;  // 等服务挂出来的上限（只�
 const PICKER_PIN_PROBE_GAP_MS = 3_000;    // 上面那段轮询间隔
 
 /**
- * 目录选择器的**延后**接线 —— 这是 2026-09-26 启动事故的直接修复。
+ * 目录选择器的**延后**接线 —— 这是 2026-09-26 启动故障的直接修复。
  *
- * 🔴 事故：旧实现在 `apply()` 里**立刻**调 `pinBrowseDirectoryPicker(ctx)`（最多 6 次 × 700ms 轮询）。
+ * 🔴 故障：旧实现在 `apply()` 里**立刻**调 `pinBrowseDirectoryPicker(ctx)`（最多 6 次 × 700ms 轮询）。
  *    `loader.remove()` / `loader.create()` 会触发 dsh 的 `internal/plugin` 事件，而
  *    `@deepseek-ai/dsh-client-modules` 收到事件就**重新 compose 整张前端插件图**
  *    （`ClientModuleRegistry.flush() → buildCombo() → newlineCount()/identitySectionMap()`）。
@@ -7184,7 +7184,7 @@ export function apply(ctx, config = {}) {
   // 0.1.2-rc.1+ 浏览器会话代持：换取 Harness 会话 Cookie 供 bridge 上游携带（手机点设备不再 401 白页）
   ctx.effect(() => scheduleHarnessMint(ctx, relayDir), "dsh-remote-web: harness browser-session mint");
   // 目录选择器:远程控制下必须用浏览器内实现(否则手机点「添加工作区」像没反应) —— 见上方长注释
-  // ⚠️ **必须延后**：绝不能在 apply() 里直接切 Loader —— 会把宿主启动拖成假死（2026-09-26 事故，
+  // ⚠️ **必须延后**：绝不能在 apply() 里直接切 Loader —— 会把宿主启动拖成假死（2026-09-26 故障，
   //    见 schedulePickerPin 上方长注释）。schedulePickerPin 自己等"宿主已 listen + 静置"再动手。
   ctx.effect(() => schedulePickerPin(ctx), "dsh-remote-web: pin browser directory picker");
   // 插件市场一键全功能:缺桌面运行环境则自动安装,登录后自动拉起 bridge(不依赖用户跑 npx)
@@ -7200,7 +7200,7 @@ export function apply(ctx, config = {}) {
     telemetryRuntimeProbe(relayDir); // 匿名遥测：记下「本进程见过运行环境缺失」（装好后发 runtime_ready）
   }
   // 插件启动即上报本机安装信息（install_source/version + 主机 OS/架构；仅有账号凭据时上报，失败静默）。
-  // 面板登录成功（POST /dsh-remote/config）时会再上报一次，覆盖「已登录用户升级插件」的口径。
+  // 面板登录成功（POST /dsh-remote/config）时会再上报一次，覆盖「已登录用户升级插件」的约定。
   maybeReportInstall(relayDir);
   ctx.logger?.info?.(`dsh-remote-web: /dsh-remote routes ready (relayDir=${relayDir})`);
 }

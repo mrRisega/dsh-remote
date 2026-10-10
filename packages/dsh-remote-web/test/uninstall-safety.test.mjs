@@ -89,7 +89,7 @@ async function plantProfile(home, { extraPatch = "", unmarked = false } = {}) {
   fs.mkdirSync(path.join(home, "relay"), { recursive: true });
   // ⚠️ api_url 必须指向本地死端口：这些是**假账号**，一旦按默认地址请求生产，
   //    /api/device-login 会带着假密码失败，而服务端登录限流是按出口 IP 计的（5 次/15 分钟）——
-  //    实测结果是把**本机真实的 bridge** 连坐进限流（2026-09-19 事故）。
+  //    实测结果是把**本机真实的 bridge** 连坐进限流（2026-09-19 故障）。
   fs.writeFileSync(path.join(home, "relay", ".dsh-config.json"),
     JSON.stringify({ phone: "13800000000", password: "pw", api_url: "http://127.0.0.1:1" }));
   return { profile, patchFile: path.join(profile, "cordis.patch.yml") };
@@ -418,7 +418,7 @@ test("安全：三处机密写入都要显式收紧 ACL（Windows 上 mode 0o600
 });
 
 test("安全：Cookie 的每个写入点都必须紧跟着 hardenFile（按 authority 分文件后不得漏收）", () => {
-  // 0.7.0-beta.2 把 Cookie 从「一份共享文件」改成「本宿主专属 + 旧版镜像」两份（见 P0-2 事故根治）。
+  // 0.7.0-beta.2 把 Cookie 从「一份共享文件」改成「本宿主专属 + 旧版镜像」两份（见 P0-2 故障根治）。
   // 写点从 1 个变 2 个 —— 逐个按变量名断言，漏收的那一份在 Windows 上就是 ACL 敞开状态。
   const mint = INDEX_SRC.slice(INDEX_SRC.indexOf("async function mintHarnessCookie"), INDEX_SRC.indexOf("function readHarnessCookie"));
   assert.ok(mint.length > 0, "应能定位到 mintHarnessCookie（找不到说明函数被改名，请同步本用例）");

@@ -2,7 +2,7 @@
 /**
  * 把本机环境同步成**仓库当前代码**（桥半 + 插件半），一条命令搞定。
  *
- * 为什么需要它（业主口径 2026-10-10：「开发完每次让本地是最新代码和插件」）：
+ * 为什么需要它（用户约定 2026-10-10：「开发完每次让本地是最新代码和插件」）：
  *   · 桥半跑在 `~/.dsh-remote`（客户端的运行环境），插件半跑在
  *     `~/.dsh/profiles/<profile>/dsh-remote-web-plugin`（宿主进程里）；
  *   · 两者都**不是**仓库里的文件，改了仓库不等于本机在跑新代码 ——
@@ -41,8 +41,8 @@ const PROFILE = valOf("--profile", "desktop");
 /**
  * DeepSeek Harness 桌面应用是否在运行。
  *
- * 🔴 2026-10-11 事故：在应用运行中改写 `~/.dsh/profiles/desktop/` 的插件文件，
- *    应用会**自己退出/重启**（业主："怎么又触发了 dsh 的关闭"）。安装器早就写明
+ * 🔴 2026-10-11 故障：在应用运行中改写 `~/.dsh/profiles/desktop/` 的插件文件，
+ *    应用会**自己退出/重启**（用户："怎么又触发了 dsh 的关闭"）。安装器早就写明
  *    「请先完全退出应用再安装」。这条必须由脚本强制，不能靠人记得。
  */
 function dshDesktopAppRunning() {
@@ -145,7 +145,7 @@ log(`\n=== 2) 桥半 → ${RELAY_DIR} ===`);
     changed += 1;
   }
   log(changed === 0 ? "  已是最新（0 个文件需要更新）" : `  更新了 ${changed} 个文件`);
-  // 就绪判据：与插件半 missingRuntimeFiles 同口径（含裸依赖 ws）
+  // 就绪判据：与插件半 missingRuntimeFiles 同约定（含裸依赖 ws）
   const need = ["dsh-setup.mjs", "clients/dsh-remote/dsh-bridge.mjs", "clients/dsh-remote/src/lifecycle.mjs", "node_modules/ws/package.json"];
   const miss = need.filter((rel) => !existsSync(path.join(RELAY_DIR, rel)));
   miss.length === 0 ? ok("运行环境完整（含 ws）") : bad(`仍缺：${miss.join(", ")}`);
@@ -156,7 +156,7 @@ log(`\n=== 3) 插件半 → ${PLUGIN_DIR} ===`);
 if (!existsSync(PLUGIN_DIR)) {
   warn(`该 profile 下没有插件目录（${PROFILE}）。若确实要装：npx @mrrisega/dsh-remote@${REPO_VERSION.includes("-") ? "beta" : "latest"} plugin --profile ${PROFILE}`);
 } else if (PROFILE === "desktop" && dshDesktopAppRunning() && !FORCE_PLUGIN) {
-  /* 桌面端应用独占该 profile：运行中改写会让应用自己退出/重启（实测事故）。
+  /* 桌面端应用独占该 profile：运行中改写会让应用自己退出/重启（实测故障）。
      这里**只跳过插件半** —— 桥半照常同步、桥照常重启，都不影响应用。 */
   warn("DeepSeek Harness 应用正在运行 → **跳过插件半**（应用独占该 profile，运行中改写会让应用退出/重启）");
   warn("  要更新桌面端插件：先完全退出应用再跑本命令，或用应用内「插件」页安装（官方路径）；");

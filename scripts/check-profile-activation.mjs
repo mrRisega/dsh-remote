@@ -1,7 +1,7 @@
 /**
  * DSH profile 配置不变量：本插件必须**恰好一个激活点**。
  *
- * 为什么必须存在这条检查（2026-09-22 实测事故）：
+ * 为什么必须存在这条检查（2026-09-22 实测故障）：
  *   插件被两处同时激活时，dsh web **启动即挂**：
  *     Error: dsh: plugin tree failed to load: failed to apply loader entry include
  *            (cordis:include): duplicate loader entry id: dsh-remote-web

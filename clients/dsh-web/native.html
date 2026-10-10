@@ -1476,7 +1476,7 @@ async function refreshDevices() {
  *        http 请求   "dsh-e2ee/v1\0http\0<reqNonceB64>\0p2b"  (reqNonce=请求信封 n)
  *        http 响应   "…\0http\0<reqNonceB64>\0b2p"            (响应信封 n 回显请求 n)
  *        ws 流       "…\0ws\0<wsLabel>\0p2b|b2p"
- *        ctrl 探针   "…\0ctrl\0p2b|b2p"
+ *        ctrl 探测   "…\0ctrl\0p2b|b2p"
  *   4. AAD = UTF8("dsh-e2ee/v1\0<kind>\0<sessId>\0<dir>\0<counter>")。
  *   5. 信封 {v:2,k,s,c,n,t,d}:n=base64url(12B nonce),d=base64url(AES-256-GCM 密文‖16B tag)。
  *   6. ctrl 通道(/_e2ee/ctrl):hello/hello-ack/e2ee-error 为明文 JSON;probe 为 k:"ctrl" AEAD 信封。
@@ -1819,7 +1819,7 @@ function wcHasEnvelopeMarker(headers = {}) {
 /* ===DSH-E2EE-WC-CORE-END=== */
 
 /* ===DSH-E2EE-HANDOVER-CORE-START=== */
-// Phase-4 一次性交接单(键 dsh-e2ee-handover;镜像页读后即删)。取舍:只放「已探针互认的
+// Phase-4 一次性交接单(键 dsh-e2ee-handover;镜像页读后即删)。取舍:只放「已探测互认的
 // 会话材料」{v,s,shk,salt,profile,epoch}(sessId+SHK+saltH 32B b64url),绝不放 MK/密码;
 // 镜像页(side e2ee-shim-script.js)用同 sessId 复用桥端已验证会话(24h TTL)。
 var DSH_E2EE_HANDOVER_KEY = "dsh-e2ee-handover";
@@ -1861,7 +1861,7 @@ const E2EE_ERR_TEXT = {
   no_cap: "电脑端版本过旧或不支持端到端加密,已按明文路径继续。",
   busy: "电脑端正忙,请稍后重试。",
   unknown_session: "会话不存在或已过期,请重新解锁。",
-  not_verified: "会话尚未完成探针校验,请重新解锁。",
+  not_verified: "会话尚未完成探测校验,请重新解锁。",
   replay: "检测到重放,请重新解锁。",
   ws_closed: "与电脑端的加密握手连接提前关闭,请检查网络后重试。",
   ws_timeout: "加密握手超时,请检查网络后重试。",
@@ -1946,7 +1946,7 @@ function e2eeCtrlWsUrl(deviceId) {
 }
 
 /**
- * §5.2 手机侧全握手:hello → hello-ack → deriveShk → 探针(ctrl AEAD)→ probe-ok。
+ * §5.2 手机侧全握手:hello → hello-ack → deriveShk → 探测(ctrl AEAD)→ probe-ok。
  * @param {string} deviceId
  * @param {object} o { password?, params, mkBytes? }
  *   password=账号密码时现场派生 MK;mkBytes(32B,方案A 桌面授权引导下发)=直接用,免输密码。
@@ -2032,7 +2032,7 @@ function e2eeCommitSession(deviceId, params, r) {
   return { ok: true, code: "ok", sessId: r.sessId };
 }
 
-/** 解锁设备:密码 → 派生 MK → ctrl 握手(探针通过即「双方 MK 一致」)。会话仅存内存;
+/** 解锁设备:密码 → 派生 MK → ctrl 握手(探测通过即「双方 MK 一致」)。会话仅存内存;
  *  成功后派生 MK 按用户决策写入 localStorage(刷新后自动解锁用,退出登录清除)。 */
 async function e2eeUnlockDevice(deviceId, password) {
   if (!e2eeSubtleAvailable()) return { ok: false, code: "no_webcrypto", text: "当前浏览器不支持端到端加密所需的安全环境,请用系统浏览器(HTTPS)重试;已按明文路径继续。" };

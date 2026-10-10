@@ -45,7 +45,7 @@ function loadTierResolver({ localKey = "", token = "tok-1", status = 200, body =
     if (throws) throw new Error("network down");
     return { ok: status >= 200 && status < 300, status, json: async () => bodyFor() };
   };
-  // 多出口两个"内部状态"的只读探针 —— 否则"token 缓存被清空""快照不因缺 user 被覆盖"
+  // 多出口两个"内部状态"的只读探测 —— 否则"token 缓存被清空""快照不因缺 user 被覆盖"
   // 这两条只能用间接行为猜,抓不住回归(它们都在闭包里)。
   const make = new Function("process", "resolveToken", "API_BASE", "fetch", "AbortSignal", "Date",
     `${BRIDGE_SRC.slice(from, to)}
@@ -145,7 +145,7 @@ test("★档位来源：启动时必须复用桥接刚拿到的 JWT（否则每�
   assert.ok(seedAt < startAt, "★必须在 startWeChat() **之前**喂，否则档位校准仍会再登录一次");
 });
 
-test("App 链接：由账号 API 地址推导，与插件半的 DEFAULT_APP_URL 同口径", () => {
+test("App 链接：由账号 API 地址推导，与插件半的 DEFAULT_APP_URL 同约定", () => {
   assert.equal(loadAppUrl(API_BASE)(), "https://api.example/app/");
   assert.equal(loadAppUrl("https://n.risegao.cn:13443/relay-api")(), "https://n.risegao.cn:13443/app/",
     "生产地址必须推导出真实可点的 App 入口");

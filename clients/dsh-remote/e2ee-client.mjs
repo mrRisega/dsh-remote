@@ -22,7 +22,7 @@
  *        http 请求   "dsh-e2ee/v1\0http\0<reqNonceB64>\0p2b"(reqNonce=请求信封 n)
  *        http 响应   "…\0http\0<reqNonceB64>\0b2p"(响应信封 n 回显请求 n)
  *        ws 流       "…\0ws\0<wsLabel>\0p2b|b2p"(wsLabel 见 parseWsE2eeParams)
- *        ctrl 探针   "…\0ctrl\0p2b|b2p"
+ *        ctrl 探测   "…\0ctrl\0p2b|b2p"
  *   4. AAD = UTF8("dsh-e2ee/v1\0<kind>\0<sessId>\0<dir>\0<counter>")。
  *      [偏差] 评审稿 §4.3 建议把路径摘要也放进 AAD,但因解密方在打开前并不知道
  *      明文里的路径(循环依赖),v1 规范化 AAD 不含路径;模块保留 extra 参数供后续绑定。
@@ -247,7 +247,7 @@ export class E2eeSession {
     this.saltH = saltH;
     this.profile = profile;
     this.epoch = epoch;
-    this.verified = false; // 探针通过前不接受任何数据流/请求
+    this.verified = false; // 探测通过前不接受任何数据流/请求
     this.createdAt = Date.now();
     this.usedAt = this.createdAt;
   }
@@ -681,7 +681,7 @@ export class E2eeService {
    * dsh_token cookie 完成「同账号」授权(device/channel 形态都只到本设备)——
    * 信任模型见 docs/e2ee-protocol.md §5.4 [DECISION]:引导瞬间以「持有效扫码会话=账号本人」
    * 为准,存在被中继主动冒充的理论窗口(与扫码登录产品一致);引导后数据面照常走
-   * hello/probe 探针(双方已同持 MK)与 AEAD 信封。
+   * hello/probe 探测(双方已同持 MK)与 AEAD 信封。
    * @returns {{mk:string, profile:string, epoch:number}}
    */
   introGrant() {
@@ -765,15 +765,15 @@ export class E2eeService {
   handleProbe(sessId, env) {
     const session = this.sessionOf(sessId);
     if (!session) throw new E2eeError("unknown_session", "e2ee: 会话不存在或已过期(请重新解锁)");
-    // 先解密成功再推进计数:失败的尝试(密钥不符)不得消耗合法探针的计数
+    // 先解密成功再推进计数:失败的尝试(密钥不符)不得消耗合法探测的计数
     const opened = session.open({ kind: "ctrl", dir: DIR_P2B, env, counter: env?.c ?? 0, reqNonceB64: env?.n });
     let pt;
     try {
       pt = JSON.parse(opened.data.toString("utf8"));
     } catch {
-      throw new E2eeError("bad_key", "e2ee: 探针明文非法(密钥不一致?)");
+      throw new E2eeError("bad_key", "e2ee: 探测明文非法(密钥不一致?)");
     }
-    if (pt?.p !== "dsh-e2ee-probe-v1") throw new E2eeError("bad_key", "e2ee: 探针载荷不符");
+    if (pt?.p !== "dsh-e2ee-probe-v1") throw new E2eeError("bad_key", "e2ee: 探测载荷不符");
     const guards = this.ctrlCounters.get(sessId) || { p2b: new SequenceGuard(), b2p: new SequenceGuard() };
     guards.p2b.check(Number(env?.c) || 0); // 成功后推进,后续重放被拒
     session.verified = true;
@@ -791,7 +791,7 @@ export class E2eeService {
   guardHttpRequest(sessId, env) {
     const session = this.sessionOf(sessId);
     if (!session) throw new E2eeError("unknown_session", "e2ee: 会话不存在或已过期(请重新解锁)");
-    if (!session.verified) throw new E2eeError("not_verified", "e2ee: 会话未完成探针校验");
+    if (!session.verified) throw new E2eeError("not_verified", "e2ee: 会话未完成探测校验");
     if (!this.httpNonces.check(sessId, env.n)) throw new E2eeError("replay", "e2ee: HTTP 信封 nonce 重放");
     return session;
   }

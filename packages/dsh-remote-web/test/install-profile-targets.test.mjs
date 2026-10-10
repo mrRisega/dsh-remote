@@ -1,7 +1,7 @@
 /**
- * 「默认安装装给谁」契约测试（2026-10-11 业主口径）。
+ * 「默认安装装给谁」契约测试（2026-10-11 用户约定）。
  *
- * 事故/反馈：业主执行官方那条 `npx --yes @mrrisega/dsh-remote@beta`（不带参数）后，
+ * 故障/反馈：用户执行官方那条 `npx --yes @mrrisega/dsh-remote@beta`（不带参数）后，
  * 插件**全进了 Web 版 profile**，而他面对的是**桌面应用** —— 面板永远不出现，
  * 且面板/文档里都看不出来"装错了地方"。根因：`resolveProfileDir()` 在没有 `--profile`
  * 与 `DSH_PROFILE_DIR` 时**写死 `profileDirOfName("web")`**。
@@ -60,7 +60,7 @@ test("默认（不带 --profile）：桌面端与 Web 版**都装**，实验 pro
     const headless = makeProfile(home, "headless");
     const r = runPlugin(home);
     assert.equal(r.code, 0, `安装应成功：${r.err.slice(0, 300)}`);
-    // ★ 业主的核心诉求：默认也要装给 desktop
+    // ★ 用户的核心诉求：默认也要装给 desktop
     assert.ok(hasPlugin(desktop), "★ 默认安装必须装进 desktop profile（否则桌面端用户看不到面板）");
     assert.ok(patched(desktop), "desktop 的 patch 必须写入激活行");
     assert.ok(hasPlugin(web), "Web 版 profile 同样要装");

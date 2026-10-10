@@ -11,7 +11,7 @@
 //          插在其前方、同布局不覆盖官方按钮；点击直达该栏目，首次带引导红点）
 //          ⚠️ 只认**语义锚点**（`button[aria-haspopup="dialog"]`，且必须在设置弹层之外）：
 //             0.2 桌面端的设置面板本身就是 role="dialog" 的弹层，它的栏目也叫「通用设置」，
-//             旧代码用「文本包含『设置』」去找锚点 → 按钮被塞进设置面板栏目列表最上面（业主反馈的
+//             旧代码用「文本包含『设置』」去找锚点 → 按钮被塞进设置面板栏目列表最上面（用户反馈的
 //             「植入错了地方」）。现在找不到锚点就**不注入**，绝不将就一个错误的落点。
 //   - 栏目内联渲染配置面板（浅色高对比 UI，遵循主流登录体验）
 //     · 登录态：已登录显示账号 + 退出登录；未登录显示 登录/注册 tabs
@@ -23,8 +23,8 @@
 //     · 📱 远程访问卡：一次性访问密钥（扫码/直接打开/复制 + 到期倒计时自动刷新）与已授权设备管理
 //     · 🤖 微信机器人通道：与「☁️ 云端服务 / 🖥 自建服务」并列的**第三个 tab**（条形 tab 由 home 与
 //       wechat 两个视图共用，所以切过去还能切回来）；不再是独立的 settings.section 栏目 ——
-//       业主口径：「不要给它单独弄一个菜单，直接放到面板里面」（0.6.11）
-//       🔒 登录门（业主口径）：微信通道要求**已注册并登录**，未登录不渲染这个 tab；若会话在
+//       用户约定：「不要给它单独弄一个菜单，直接放到面板里面」（0.6.11）
+//       🔒 登录门（用户约定）：微信通道要求**已注册并登录**，未登录不渲染这个 tab；若会话在
 //          tab 开着的时候过期，view 复位回 home（兜底 effect + 分派条件），绝不留空面板。
 //       🧭 首屏导览：内容体最上面三行讲清用途（推送 / 回数字拍板 / 微信里交代任务），
 //          排在「连接微信机器人」按钮之前 —— 它是绑定的理由，又不把按钮挤出首屏。
@@ -33,7 +33,7 @@
 //     · bridge 状态与启停开关 + 关于 dsh-remote 说明卡片
 //     · 🧰 账号卡「更多」：只收纳（用户关掉邀请引导之后的）「升级 / 带新用户」两个入口 ——
 //       主界面只剩一个入口，减少营销露出；**档位规格数字（Mbps / GB / 价格）一律不展示**
-//       （0.6.11 业主口径：「插件面板里面不要展示『更多』里的 PRO 版本流量带宽」）
+//       （0.6.11 用户约定：「插件面板里面不要展示『更多』里的 PRO 版本流量带宽」）
 //   - 首次安装引导：设置页「远程访问」栏目（官方导航 navCell）旁小红点（localStorage dsh-remote-seen-dot 控制）
 //   - shell.overlay：满意度弹窗（安装体验至少 1 小时后弹出，只弹一次）
 // 所有数据经同源 /dsh-remote/* 宿主路由读写（node 半提供）。
@@ -48,7 +48,7 @@ window.__ModuleLoader__.load({
     //
     // ⚠️ 这两份必须一致，`wechat-bot-ui.test.mjs` 会逐项比对。
     //    面板多承诺一项，用户绑完去微信一试就会拿到付费提示 —— 只会觉得产品骗人。
-    //    业主口径：「免费用户支持什么能力，就有什么能力，不要承诺过多的能力，保持前后一致」。
+    //    用户约定：「免费用户支持什么能力，就有什么能力，不要承诺过多的能力，保持前后一致」。
     //    之所以放在顶层常量而不是内联在 JSX 里：测试要能把它们抠出来跟运行时表对账。
     var WECHAT_FREE_CAPS = ["notify", "approve", "status", "stop", "assign.continue"];
     // 付费侧也用**细粒度**列出:面板要能跟"文案挂在哪个能力上"一一对上,
@@ -281,7 +281,7 @@ window.__ModuleLoader__.load({
       ".dru-wx-intro{display:flex;flex-direction:column;gap:4px;background:var(--dru-surface-2);border:1px solid var(--dru-border-soft);border-radius:10px;padding:10px 12px;margin:0}",
       ".dru-wx-intro-title{font-size:12.5px;font-weight:700;color:var(--dru-fg)}",
       ".dru-wx-intro-row{font-size:12px;line-height:1.5;color:var(--dru-fg-muted)}",
-      // 未绑定时的**动效引导**（业主口径「动效引导」）：主按钮走很慢的呼吸光晕（2.8s/次，
+      // 未绑定时的**动效引导**（用户约定「动效引导」）：主按钮走很慢的呼吸光晕（2.8s/次，
       // 不闪烁、不改布局、不位移），旁边那颗装饰小圆点同步呼吸。
       // 无障碍铁律：① prefers-reduced-motion:reduce 直接关掉动画（见下面媒体查询）；
       // ② 状态**绝不靠动效单独表达** —— 按钮文字「连接微信机器人」与同一卡片里的文字提示
@@ -717,7 +717,7 @@ window.__ModuleLoader__.load({
     }
 
     // ── 🧰 营销入口「收纳进更多」的记忆（0.6.10）────────────────────────────
-    // 产品口径（用户原话）：新用户第一次进面板**必须**看得见「升级 PRO / 带新用户换会员」
+    // 产品约定（用户原话）：新用户第一次进面板**必须**看得见「升级 PRO / 带新用户换会员」
     // 两个入口，否则不知道有这两个功能；用户把它们**关掉之后**，再收进账号卡的「更多」里，
     // 「让整个功能使用界面更加清爽，将商业化的逻辑稍微隐藏到深一层」。
     //
@@ -806,7 +806,7 @@ window.__ModuleLoader__.load({
     /**
      * 是否位于「设置」弹层内部。
      *
-     * 🔴 这一条是 2026-10-09 桌面端事故的根治点。官方设置面板本身就是一个
+     * 🔴 这一条是 2026-10-09 桌面端故障的根治点。官方设置面板本身就是一个
      * `role="dialog" aria-modal="true"` 的弹层（0.2 实测，见 ui-settings-general 的 SettingsRoot），
      * 它的左侧栏目同样长得像「导航」（`nav` + `navCell`），于是会被 navCellLike 命中。
      * 旧代码用「文本包含『设置』」去找侧栏那颗齿轮按钮 —— 而弹层里的第一项叫
@@ -827,7 +827,7 @@ window.__ModuleLoader__.load({
     /**
      * 官方「设置」触发器的**候选列表**（设置-like 的排前面）。
      *
-     * 🔴 2026-10-10 修（业主实测"点入口没反应"）：这里以前还要求 `navCellLike(el)`
+     * 🔴 2026-10-10 修（用户实测"点入口没反应"）：这里以前还要求 `navCellLike(el)`
      *   —— 而桌面端侧栏那套 class 里**没有** sidebar/nav 字样（都是 `_3WPZCG_*`），
      *   于是候选全被挡掉 → 触发器 null → 点击静默返回，表现就是"点了没反应"。
      *   现在只认语义特征：`aria-haspopup="dialog"` + 不在弹层内 + 不是菜单类；
@@ -836,7 +836,7 @@ window.__ModuleLoader__.load({
     function settingsTriggerCandidates() {
       var ranked = [];
       try {
-        /* 排名而不是「谁先扫到谁」（2026-10-11 业主实测「点入口弹出的是 token 用量小弹窗」）：
+        /* 排名而不是「谁先扫到谁」（2026-10-11 用户实测「点入口弹出的是 token 用量小弹窗」）：
              ① 官方设置槽位里的按钮 = 确定是设置触发器（sidebar.settings / settings.launcher）
              ② 带快捷键或文案含「设置」的弹层触发器
              ③ 其它弹层触发器（最后兜底）
@@ -850,7 +850,7 @@ window.__ModuleLoader__.load({
           if (navInDialog(el)) continue;                 // 弹层内的（关闭键/栏目）一律不要
           try { if (el.closest && el.closest('[data-slot="sidebar.footer.action"]')) continue; } catch (eF) { /* 忽略 */ }
           if (NAV_BAD_RE.test(String(el.className || ""))) continue;
-          /* 🔴 2026-10-11 业主实测「点入口弹出的是本轮用量」：那次弹窗锚在**右上角**，
+          /* 🔴 2026-10-11 用户实测「点入口弹出的是本轮用量」：那次弹窗锚在**右上角**，
              说明候选里混进了**顶栏**的按钮（用量/上下文那些同样带 aria-haspopup="dialog"）。
              这里加几何闸门：只认**侧栏范围内**的候选（左侧窄条），顶栏/内容区的按钮一律不碰。 */
           try {
@@ -910,7 +910,7 @@ window.__ModuleLoader__.load({
     /**
      * 从**账号菜单**里进设置（桌面端的「设置」就是账号菜单里的一项）。
      *
-     * 为什么需要：桌面端侧栏底部那颗"齿轮"在 Electron 渲染器里不一定存在 —— 业主截图里
+     * 为什么需要：桌面端侧栏底部那颗"齿轮"在 Electron 渲染器里不一定存在 —— 用户截图里
      * 底部只有「远程访问」+ 账号（高昂），「设置」在**账号菜单**里。所以当侧栏候选全部落空时，
      * 必须能"打开账号菜单 → 点设置 → 再点我们的栏目"，否则入口点下去就是没反应。
      */
@@ -1006,10 +1006,10 @@ window.__ModuleLoader__.load({
     /**
      * 用**官方设置快捷键**（⌥⌘, / Alt+Meta+,）打开设置面板。
      *
-     * 为什么用快捷键而不是"点账号菜单里的设置"（2026-10-11 业主反馈）：
+     * 为什么用快捷键而不是"点账号菜单里的设置"（2026-10-11 用户反馈）：
      *   桌面端侧栏没有设置齿轮，只能从账号菜单进 —— 但那会让**账号菜单先弹出来再关掉**，
-     *   业主的原话是「会触发一个小弹窗……有一瞬间会闪出一下，体验不好」。
-     *   实测（探针在桌面渲染器里验证）：向 document 派发一次
+     *   用户的原话是「会触发一个小弹窗……有一瞬间会闪出一下，体验不好」。
+     *   实测（探测在桌面渲染器里验证）：向 document 派发一次
      *   `keydown {key:",", metaKey:true, altKey:true}` 就能**直接**打开设置面板，没有任何中间弹层。
      *   快捷键取自设置行自带的 `aria-keyshortcuts="Alt+Meta+,"`（宿主自己的约定）。
      */
@@ -1092,7 +1092,7 @@ window.__ModuleLoader__.load({
        前两次都栽在"自己找 DOM 落点"上：
          · 一修前：按文案包含「设置」找锚点 → 命中的是设置面板里的「通用设置」→ 按钮跑到设置面板顶部；
          · 二修：改成只认 aria-haspopup="dialog" 且必须在弹层外 → 桌面端侧栏那颗齿轮不满足
-           navCellLike，于是**干脆不注入**（业主看到的就是"那个位置是空的"）。
+           navCellLike，于是**干脆不注入**（用户看到的就是"那个位置是空的"）。
        而宿主本来就为这个位置提供了官方列表槽 `sidebar.footer.action`（0.1.x 与 0.2 都有；
        0.2 实测该槽就在侧栏底部、且**当前是空的**）—— 位置、宽度、折叠态全由宿主负责。
        所以这里不再注入任何 DOM，直接注册进槽位。id 仍保留 `dru-nav-remote`：
@@ -1122,7 +1122,7 @@ window.__ModuleLoader__.load({
       ]);
     }
 
-    /* 📱 账号菜单里的入口（2026-10-11 业主指定位置：「放在设置那一行的上面，小弹窗里面」）。
+    /* 📱 账号菜单里的入口（2026-10-11 用户指定位置：「放在设置那一行的上面，小弹窗里面」）。
        ────────────────────────────────────────────────────────────────────────────
        那个「小弹窗」= 桌面端自带的**账号菜单**（设置 / 意见反馈 / 登录 / 更多），由
        `@deepseek-ai/dsh-client-ui-settings-account` 渲染（它只在桌面渲染器里注册，且有
@@ -1131,7 +1131,7 @@ window.__ModuleLoader__.load({
        因此这里的写法刻意保守：
          · 只在"确实是账号菜单"（含「意见反馈」这一独有文案）的浮层里动手，别的浮层一律不碰；
          · 幂等（插过就跳过）；找不到「设置」那一行就**什么都不做**（绝不猜位置）；
-         · 只用自己创建的 button（**不 cloneNode** —— 克隆会继承官方事件委托，历史事故）；
+         · 只用自己创建的 button（**不 cloneNode** —— 克隆会继承官方事件委托，历史故障）；
          · 整段 try/catch，任何异常都不影响面板本身。
        失败的可见后果只是"弹窗里没有这一项"，侧栏那个官方槽位入口仍然在。 */
     function navEnsureStart() {
@@ -1146,7 +1146,7 @@ window.__ModuleLoader__.load({
 
     // ══ 📣 公告（0.6.18）模块级状态 ═══════════════════════════════════════════
     //
-    // 契约：dsh-relay-enterprise/docs/announcements-contract.md（冻结 v1）+ 926 迭代 §1（`client=desktop`）。
+    // 契约：服务端公告契约文档（冻结 v1）（冻结 v1）+ 926 迭代 §1（`client=desktop`）。
     //   GET  /dsh-remote/announcements?client=desktop → { bubble_enabled, items[], unread_count, popup|null }
     //   POST /dsh-remote/announcements/click { id }   → 记 clicked_at（= 已读上报；现契约**没有** /read）
     //
@@ -1401,7 +1401,7 @@ window.__ModuleLoader__.load({
 
     // ══ 📶 网络延迟（0.6.18）——**绝不主动测速**，只在既有周期请求上量 ══════════
     //
-    // 用户口径原话：「根据网络请求实际情况显示延迟。**不要主动测速**，可以根据最近一次心跳
+    // 用户约定原话：「根据网络请求实际情况显示延迟。**不要主动测速**，可以根据最近一次心跳
     // 检测或者必要的本身有的请求来进行测算。」
     //
     // 所以这里**不新增任何请求**：面板本来就有 `/dsh-remote/status` 的周期轮询
@@ -1434,7 +1434,7 @@ window.__ModuleLoader__.load({
      * 延迟 → 人话。
      * 🔒 无样本时必须说「测速中…」而**不是 0ms**：0ms 是句谎话（这个页面根本还没量过），
      *    而"测速中"如实表达了"还没有样本"。
-     *    分档（2026-09-27 按业主口径放宽）：≤500 顺畅 / ≤1000 正常 / ≤2000 偏慢 / >2000 很慢 ——
+     *    分档（2026-09-27 按用户约定放宽）：≤500 顺畅 / ≤1000 正常 / ≤2000 偏慢 / >2000 很慢 ——
      *    文本窗口的远程操作，500ms 内都算顺畅、1000ms 内正常流畅；旧 120/300 会把正常网络误报成"较慢"。
      */
     function netLatText() {
@@ -1621,13 +1621,13 @@ window.__ModuleLoader__.load({
      */
     var slowConnTrack = { since: 0 };
     var SLOW_CONNECT_HINT_MS = 90000; // 非 online 阶段持续 90s 才认为「明显偏慢」
-    // ── 事实口径常量（🔒 只写线上真值，一个字都不编）─────────────────────────────
+    // ── 事实约定常量（🔒 只写线上真值，一个字都不编）─────────────────────────────
     // 邀请奖励：线上 public-config 下发 invite_rule { n: 1, days: 3 }。
     //   此处只在 public-config 取不到时（旧 node 半 / 请求失败）兜底，
-    //   用「与线上一致」的值，避免面板显示 3 位/15 天这种和线上对不上的旧口径。
+    //   用「与线上一致」的值，避免面板显示 3 位/15 天这种和线上对不上的旧约定。
     //   注意：被邀请人**没有任何额外奖励**（trial_days = 0），所以禁止任何「双方都得」的写法。
     var INVITE_RULE_FALLBACK = { n: 1, days: 3 };
-    // ── 套餐口径：**先读线上真形状** ─────────────────────────────────────────
+    // ── 套餐约定：**先读线上真形状** ─────────────────────────────────────────
     // 线上实测（GET https://n.risegao.cn:13443/relay-api/api/public-config）：
     //   plans.free    = { max_mbps: 1,  monthly_gb: 1 }
     //   plans.pro     = { max_mbps: 5,  monthly_gb: 20, devices: 1,  monthly_resets: 5 }
@@ -2448,7 +2448,7 @@ window.__ModuleLoader__.load({
           setUpdated(true);
         }
         // 【0.6.18】收尾时必须**主动收起黑框**：`log` 来自宿主那个只增不减的持久文件，
-        // 不清掉的话下一次渲染（以及刷新页面后的 mount 探针）会把它原样拉回来 ——
+        // 不清掉的话下一次渲染（以及刷新页面后的 mount 探测）会把它原样拉回来 ——
         // 那就是"更新早就结束了、黑框却永远挂在面板上"的另一半原因。
         // 主动查看的路留在「查看最近一次更新日志」折叠里：把这份尾巴另存进 lastLog 再清空 log。
         setLastLog(nextLog);
@@ -2473,7 +2473,7 @@ window.__ModuleLoader__.load({
       var logTimer = useCallback(function () {
         return api("/dsh-remote/self/update-log").then(function (b) {
           applyUpdLog(b);
-        }).catch(function () { /* 探针失败不影响面板 */ });
+        }).catch(function () { /* 探测失败不影响面板 */ });
       }, [applyUpdLog]);
 
       useEffect(function () { loadVer(); doCheck(); logTimer(); }, [loadVer, doCheck, logTimer]);
@@ -2898,7 +2898,7 @@ window.__ModuleLoader__.load({
       // 旧版 host 的响应里没有该字段 → false，行为与改动前完全一致。
       // 🔴 2026-10-11 修：node 半把该字段下在 **connect** 里（`connect.desktopHost`），
       // 这里以前读顶层 `st.desktopHost` → **永远 false** → 桌面端被当成 Web 版：
-      // 面板照样摆「立即重启」按钮、照样走倒计时自动重启那条路（业主实测"装插件时窗口被突兀关掉"）。
+      // 面板照样摆「立即重启」按钮、照样走倒计时自动重启那条路（用户实测"装插件时窗口被突兀关掉"）。
       // 兼容两种位置，桌面端的"不自动重启/只提示用户自己重启"这才真正生效。
       var desktopHost = !!(st && (st.desktopHost || (st.connect && st.connect.desktopHost)));
       // kind === "refresh" = 插件文件在运行中被改写(装完/更新完),只需刷新页面;
@@ -3441,7 +3441,7 @@ window.__ModuleLoader__.load({
       /**
        * 账号落盘（POST /dsh-remote/config）后的统一提示。
        *
-       * 为什么单独抽出来：这次"换账号后设备不出现"的事故就是**静默失败**造成的 ——
+       * 为什么单独抽出来：这次"换账号后设备不出现"的故障就是**静默失败**造成的 ——
        * /config 会顺带重启 bridge（让新账号生效），但其返回的 bridgeRestart 前端从来不看，
        * 于是"服务没重启成功"和"一切正常"在界面上长得一模一样。
        */
@@ -3509,7 +3509,7 @@ window.__ModuleLoader__.load({
         if (rpass.length < 8) { setMsg("err", "密码至少 8 位"); return; }
         if (rpass !== rpass2) { setMsg("err", "两次输入的密码不一致"); return; }
         setBusy("register");
-        // reg_source：注册来源（增长口径）——面板内注册 = panel_register；
+        // reg_source：注册来源（增长约定）——面板内注册 = panel_register；
         // 手机端网页注册走 clients/dsh-web/native.html（= remoteweb_register）。
         // 节点半 /dsh-remote/register 全量透传 body，企业端白名单外的值会归一成 api_unknown。
         var regPayload = { phone: rphone.trim(), sms_code: rsms.trim(), password: rpass, reg_source: "panel_register" };
@@ -3768,7 +3768,7 @@ window.__ModuleLoader__.load({
       var input = function (attrs) { return h("input", Object.assign({ className: "dru-input", type: "text" }, attrs)); };
       var card = function (title, children) { return h("div", { className: "dru-card" }, title ? h("h3", null, title) : null, children); };
       /**
-       * 邀请奖励口径：优先 public-config 下发的 invite_rule，取不到才用与线上一致的兜底常量。
+       * 邀请奖励约定：优先 public-config 下发的 invite_rule，取不到才用与线上一致的兜底常量。
        * off=true（n / days 被显式配成 0）表示拉新已关闭 → 所有拉新入口/卡片整体隐藏。
        */
       function inviteRuleOf() {
@@ -3858,7 +3858,7 @@ window.__ModuleLoader__.load({
         };
       }
       // 【0.6.11 删除】`planSpecText()` / `freeMbpsOf()` 已随「更多」里的档位明细（renderPlanDetail）
-      // 一起删掉：面板从此**不再渲染任何 Mbps / GB / 价格数字**（业主口径：「插件面板里面不要展示
+      // 一起删掉：面板从此**不再渲染任何 Mbps / GB / 价格数字**（用户约定：「插件面板里面不要展示
       // 『更多』里的 PRO 版本流量带宽，我看你把数字都展示出来了」）。
       // 特意**保留** planFactsOf() / PLAN_FACTS / firstNum()：planFactsOf 仍被 upgradePath() 用来取
       // 档位**展示名**（PRO / Pro Max，服务端不下发名字），它们仍然可达，不是死代码。
@@ -3867,8 +3867,8 @@ window.__ModuleLoader__.load({
        * 后者用于「连接偏慢」场景）。免费 → 升 PRO；PRO → 升 Pro Max；Pro Max 无更高档 → null（只剩拉新路）。
        *
        * 【0.6.10】这里只给**定性**措辞（更快 / 额度更多），不再把「5 Mbps · 20 GB/月，¥20/月」写在
-       * 按钮和 title 上 —— 主界面不摆具体数值（业主口径：外面写死带宽数字与设计语言冲突）。
-       * 【0.6.11】面板里已经**没有**任何地方摆精确规格了（renderPlanDetail 按业主口径删除，
+       * 按钮和 title 上 —— 主界面不摆具体数值（用户约定：外面写死带宽数字与设计语言冲突）。
+       * 【0.6.11】面板里已经**没有**任何地方摆精确规格了（renderPlanDetail 按用户约定删除，
        * 见下）；所以 title 里也不再指路「档位规格见账号卡『更多』」——那块已经不存在。
        * label / title 仍然同源（同一句 gain），服务端下发了 pub.plans 也不会自相矛盾。
        */
@@ -3895,13 +3895,13 @@ window.__ModuleLoader__.load({
        * 不再是一行 12px 灰字文字链；拉新那条必须说清是**交换**（带 N 位新用户 → 得 M 天 PRO），
        * 不能只说「邀请好友」。
        *
-       * 事实口径（线上 public-config / 运营公布值，见文件顶部 PLAN_FACTS 注释）：
+       * 事实约定（线上 public-config / 运营公布值，见文件顶部 PLAN_FACTS 注释）：
        *   · 邀请：每 n 位**新用户** → 邀请人得 days 天 PRO（invite_rule {n:1, days:3}）
        *   · 被邀请人**没有任何额外奖励**（trial_days = 0）→ 绝不写「双方都得」
        *   · 计入条件：对方用你的链接**注册新账号** + 在电脑上**装好 dsh-remote-web 并上线**
        *   · 会员按自然月计量：3 天是**会员时长**、不是额度（不写「3 天能拿 20GB」）
        *   · 【0.6.10】这块只给**定性**措辞（更快 / 额度更多）
-       *   · 【0.6.11】具体 Mbps / GB / 价格**全面板都不再出现**（原「更多」里的档位明细已按业主口径删除）
+       *   · 【0.6.11】具体 Mbps / GB / 价格**全面板都不再出现**（原「更多」里的档位明细已按用户约定删除）
        * kind = "quota"（额度将尽/已限速）| "slow"（连接偏慢，带宽维度措辞）
        *
        * 关闭态（invite_rule.n / days 配成 0）与单路收敛：
@@ -3983,9 +3983,9 @@ window.__ModuleLoader__.load({
       }
       // 【0.6.11 删除】上面这里原本是 renderPlanDetail()：账号卡「更多」里的档位明细
       // （「PRO：5 Mbps · 20 GB/月，¥20/月」那一行 + 「当前：带宽 ≈N Mbps」）。
-      // 业主口径：「插件面板里面不要展示『更多』里的 PRO 版本流量带宽，我看你把数字都展示出来了。
+      // 用户约定：「插件面板里面不要展示『更多』里的 PRO 版本流量带宽，我看你把数字都展示出来了。
       // 在本地的设置面板里面，把这个功能删掉。」→ 整块连标题「套餐与额度」一起删掉。
-      // 「更多」里只留下面那两个**折叠的营销入口**（升级 PRO / 带新用户换会员），业主仍要它们收在这里。
+      // 「更多」里只留下面那两个**折叠的营销入口**（升级 PRO / 带新用户换会员），用户仍要它们收在这里。
       // 🔒 顺带更强的一条不变量：整个面板从此不渲染任何 Mbps / GB / 价格数字
       //    （「已限速 / 不限速」仍由服务端 quota.limit_enabled / quota.max_mbps 驱动，但只给定性措辞）。
       function renderAccount() {
@@ -3998,7 +3998,7 @@ window.__ModuleLoader__.load({
         var quotaPctNum = Number(quotaPct);
         var planText;
         // 【0.6.10】首屏额度行：**不提档位、不提带宽数值**，只给一句中性的「还剩多少额度」。
-        // 业主口径：「外面关于流量的说明，不要叫『流量剩余』，就说『剩余额度』；咱也别说它是『流量』，
+        // 用户约定：「外面关于流量的说明，不要叫『流量剩余』，就说『剩余额度』；咱也别说它是『流量』，
         // 就说是『额度』」「那个地方也不要展示『Pro会员什么什么额度』、『普通用户什么什么额度』，
         // 首页面都不展示会员相关的信息」。
         // 数值仍然**只来自服务端下发**（quota-absent.test.mjs 的硬约束：服务端没说的限制一个字都不许编）：
@@ -4011,7 +4011,7 @@ window.__ModuleLoader__.load({
             var remainText = (quotaPct !== null && isFinite(quotaPctNum))
               ? "剩余额度 " + Math.max(0, Math.round(100 - quotaPctNum)) + "%"
               : "额度用量未下发";
-            // max_mbps 没下发而 limit_enabled 为真 → 服务端口径就是「正在限速」，如实说（定性，不带数值）
+            // max_mbps 没下发而 limit_enabled 为真 → 服务端约定就是「正在限速」，如实说（定性，不带数值）
             planText = quota.max_mbps ? remainText : "已限速 · " + remainText;
           } else if (quota) {
             planText = "当前不限速、不限额度";
@@ -4037,7 +4037,7 @@ window.__ModuleLoader__.load({
         // 计算一次给按钮的 aria-describedby 用（气泡没渲染时不能指向不存在的 id）。
         var invTipOn = !invOff && !inviteTipDismissed;
         var invTipRule = invTipOn ? inviteRuleOf() : null;
-        // 【0.6.10】营销入口「在哪一层」的四个开关（口径：新用户第一次看得见，用户关掉后收进「更多」）：
+        // 【0.6.10】营销入口「在哪一层」的四个开关（约定：新用户第一次看得见，用户关掉后收进「更多」）：
         //   · 没关过（mktFolded=false）→ 「升级 PRO」与「带新用户换会员」摆在账号卡正面（与今天一致）
         //   · 关过（mktFolded=true）   → 正面只留一个「更多」，两条入口搬进「更多」里
         // 两个边界：
@@ -4054,7 +4054,7 @@ window.__ModuleLoader__.load({
             h("div", { className: "dru-avatar" }, (st.config.phone || "D").charAt(0).toUpperCase()),
             h("div", null,
               h("div", { className: "mail" }, st.config.phone),
-              // 【0.6.10】首屏不再挂档位标签（业主口径：「首页面都不展示会员相关的信息」）。
+              // 【0.6.10】首屏不再挂档位标签（用户约定：「首页面都不展示会员相关的信息」）。
               // 只给**已付费**用户留一个最小、非促销的状态字样（PRO / Pro Max —— 没有「会员」二字、
               // 没有额度、没有升级引导）：付费用户需要一眼看出自己是付费档，而下面那条状态行
               // （「PRO 会员 · 到期 …」）讲的是**功能性**的到期时间，不是营销。
@@ -4114,7 +4114,7 @@ window.__ModuleLoader__.load({
           // 无障碍：aria-expanded 表达开合，aria-controls 指向下面的内容体（内容体始终在 DOM 里、
           // 收起时 hidden，所以 aria-controls 永远指向一个真实存在的元素，不指向空气）。
           // 【0.6.18】加 .dru-disclose-inline：原来它继承 .dru-disclose 的 width:100%，
-          //   在账号卡里被撑成一条横贯整卡的宽条，和上面那排按钮完全不是一个视觉重量（业主："宽而丑"）。
+          //   在账号卡里被撑成一条横贯整卡的宽条，和上面那排按钮完全不是一个视觉重量（用户："宽而丑"）。
           //   ⚠️ 变体只加在**这一处**：邀请页的「活动规则」披露仍是整行，那是对的（它是那一屏的主折叠）。
           //   id / aria-controls / aria-expanded 一个都不能动 —— remote-access-ui.test.mjs 按它们定位。
           h("button", {
@@ -4135,7 +4135,7 @@ window.__ModuleLoader__.load({
             hidden: !moreOpen
           },
             // 【0.6.11】这里**不再**有「套餐与额度」标题与档位明细（renderPlanDetail 已删）：
-            // 业主口径 —— 本地面板不展示 PRO 的带宽/流量/价格数字。「更多」只剩下面两个折叠入口。
+            // 用户约定 —— 本地面板不展示 PRO 的带宽/流量/价格数字。「更多」只剩下面两个折叠入口。
             // 用户收纳过之后，两条营销入口就住在这里（正面不再摆它们）
             (showUpsellInMore || showInviteInMore)
               ? h("div", { className: "dru-more-actions" },
@@ -4834,7 +4834,7 @@ window.__ModuleLoader__.load({
        * 选中态：模式两个 tab 只在 view !== "wechat" 时选中；微信 tab 只在 view === "wechat" 时选中。
        * 点模式 tab 时一并把 view **复位成 home**（否则从微信页点「自建服务」会切了 mode 却留在微信页）。
        *
-       * 🔒 登录门（业主口径：微信通道**要求已注册并登录**）：未登录时**不渲染**这第三个 tab。
+       * 🔒 登录门（用户约定：微信通道**要求已注册并登录**）：未登录时**不渲染**这第三个 tab。
        *    登录态来自 st.config（phone / hasLocalKey），登录成功后 st 更新即重新渲染 ——
        *    tab 当场出现，**不需要刷新页面**；登出/会话过期则当场消失（view 的兜底见 RemoteControlSection
        *    里那条复位 effect 与底部的 view 分派）。除登录态外，不为任何其它理由隐藏它。
@@ -5089,7 +5089,7 @@ window.__ModuleLoader__.load({
       //    那是明确的主动动作（且只用于列表，绝不用它的返回值弹窗）。
       /**
        * 打开发布项详情：置 annOpenId；**未读**才上报点击（已读的重复上报只会在服务端
-       * 保留首次 clicked_at，没有副作用，但白白多一次请求 —— 契约 §3 的口径是"点击即已读证据"）。
+       * 保留首次 clicked_at，没有副作用，但白白多一次请求 —— 契约 §3 的约定是"点击即已读证据"）。
        */
       function openAnnItem(it) {
         if (!it) return;
@@ -5333,7 +5333,7 @@ window.__ModuleLoader__.load({
       );
     }
     // ══ 🤖 微信机器人（「📱 远程访问」面板里的第三个 tab：微信机器人通道） ═════════
-    // 【0.6.11 业主口径】「不要给它单独弄一个菜单，直接放到面板里面。在面板里单开一个
+    // 【0.6.11 用户约定】「不要给它单独弄一个菜单，直接放到面板里面。在面板里单开一个
     // table 页，命名为『微信机器人通道』，并增加上微信的绿泡泡小图标，点开后可以进行绑定设置。」
     // → 不再注册第二个 settings.section 栏目（只有 📱 远程访问 一个），本组件由 renderWeChat()
     //    以 embedded=true 作为**子组件**渲染（见 renderMainTabs / renderWeChat）。
@@ -5592,22 +5592,22 @@ window.__ModuleLoader__.load({
       var msgKind = message ? (message.kind === "ok" ? "ok" : message.kind === "warn" ? "warn" : "err") : "";
       var body = [];
 
-      // ── 首屏「这功能是干什么用的」导览（业主口径：先讲清用途，它就是绑定的理由） ──────────
+      // ── 首屏「这功能是干什么用的」导览（用户约定：先讲清用途，它就是绑定的理由） ──────────
       // 位置：内嵌内容体的**最上面**，在「连接微信机器人」按钮之前（DOM 顺序也一样）——
       // 第一次进来的人先看懂用途，再决定要不要绑。紧凑小字，
       // 不会把连接按钮挤出首屏（见 .dru-wx-intro 的样式注释）。
       //
       // ★ 能力对照是**数据驱动**的，不再是写死的四行：
       //   · 判定来源 = `wx.caps`（微信通道**实际在用**的那一份，见 status()），
-      //     所以"面板上写的"与"微信里强制的"不可能不一致（业主：话术与权限必须一致）；
+      //     所以"面板上写的"与"微信里强制的"不可能不一致（用户：话术与权限必须一致）；
       //   · 拿不到才退回本地面板镜像（旧版 bridge），两份由 wechat-bot-ui.test.mjs 锁死；
-      //   · 免费用户会看到**锁定的会员项**（🔒）—— 这就是业主要的"对比展示付费多什么"。
+      //   · 免费用户会看到**锁定的会员项**（🔒）—— 这就是用户要的"对比展示付费多什么"。
       // 已绑定态同样保留：它是常驻的用途说明（不是一次性引导气泡），不占用任何按钮。
       var wxPlan = (wx && wx.plan) ? String(wx.plan) : "free";
       var wxIsPaid = wxPlan !== "free";
-      // ★ 判据是「wx.caps 是不是数组」,**空数组也算权威**(与服务端/bridge 同一口径):
+      // ★ 判据是「wx.caps 是不是数组」,**空数组也算权威**(与服务端/bridge 同一约定):
       //   通道下发 `caps: []` = 后台把这一档清空了(契约 §4.1)。若当成"没给"而回退本地面板镜像,
-      //   面板就会展示出一个用户**实际没有**的能力清单 —— 展示与判定分叉,正是业主红线。
+      //   面板就会展示出一个用户**实际没有**的能力清单 —— 展示与判定分叉,正是用户红线。
       var wxCaps = (wx && Array.isArray(wx.caps)) ? wx.caps : null;
       var wxHas = function (cap) {
         var list = wxCaps || (wxIsPaid ? WECHAT_PAID_CAPS : WECHAT_FREE_CAPS);
@@ -5624,7 +5624,7 @@ window.__ModuleLoader__.load({
           //   · 免费用户看到一个用不了的能力 → 「（会员）」是准确的（这正是升级理由）
           //   · 付费用户看到一个用不了的能力 → 那是**后台把他的这项关了**，
           //     再写「（会员）」就是对着会员说"这是会员功能"，纯属胡话。
-          //     改成「（当前套餐不含）」，与后台配置保持一致（业主：话术与权限必须一致）。
+          //     改成「（当前套餐不含）」，与后台配置保持一致（用户：话术与权限必须一致）。
           var lockNote = wxIsPaid ? "（当前套餐不含）" : "（会员）";
           capRows.push(h("div", { className: "dru-wx-intro-row", key: "cap" + i },
             (ok ? "✅ " : "🔒 ") + text + (ok ? "" : lockNote)));
@@ -5669,7 +5669,7 @@ window.__ModuleLoader__.load({
       // （用户在微信里发 /help 收到的就是它）。浏览器半与 bridge 是两个 bundle，没有可用的
       // require 通道，所以这里放一份**镜像**（WECHAT_HELP_CMDS，见顶层注释），由测试逐条对账。
       //
-      // ClawBot 三条说明是"第二步"的正文（用户口径：把这一步讲清楚，否则他不知道去哪儿找入口）：
+      // ClawBot 三条说明是"第二步"的正文（用户约定：把这一步讲清楚，否则他不知道去哪儿找入口）：
       //   · 微信 ClawBot = 在微信里与 OpenClaw 收发消息；
       //   · 只接收 OpenClaw 在 24 小时内的回复；
       //   · 有「我的 ClawBot」与「连接新的 OpenClaw」两个入口。
@@ -5810,7 +5810,7 @@ window.__ModuleLoader__.load({
           !wx.channel_running
             ? h("div", { className: "dru-msg dru-msg-warn" }, "提示：后台服务的微信通道当前没有在运行（绑定状态不受影响）。到「📱 远程访问」面板重启后台服务后会自动恢复。")
             : null,
-          // ── 事件订阅 / 推送健康（2026-09-25 事故加的）────────────────────────────
+          // ── 事件订阅 / 推送健康（2026-09-25 故障加的）────────────────────────────
           // 那次「任务跑完一条推送都没收到、日志里也没有任何报错」的两个可用信号：
           //   ① 待补发队列非空 = 平台侧刚才发不出去（现在会补发，但要如实告诉用户）；
           //   ② 事件订阅没就绪 / 最近有订阅异常 = 任务通知根本不会来（"没收到推送"的另一种成因，
@@ -5941,12 +5941,12 @@ window.__ModuleLoader__.load({
       // settings.section（列表槽，由 ui-settings-general 在 sidebar.settings 下声明）。
       // order 30 > Agent 预设(20)，栏目落在「Agent 预设」下方；label 即栏目名（📱 远程访问）。
       // 【0.6.11】本插件在这个槽里**只有一个栏目**（📱 远程访问）：🤖 微信机器人原先以 order 31
-      // 注册成第二个栏目，业主口径「不要给它单独弄一个菜单，直接放到面板里面」→ 已改成面板里的
+      // 注册成第二个栏目，用户约定「不要给它单独弄一个菜单，直接放到面板里面」→ 已改成面板里的
       // 第三个 tab（renderMainTabs / renderWeChat）。不要再往这个槽里加第二个 register。
       /* 📱 侧栏底部的快捷入口 —— 官方列表槽 `sidebar.footer.action`（2026-10-10 三修）。
          这个槽由 `@deepseek-ai/dsh-client-ui-sidebar` 声明，渲染在侧栏底部的 footerActions 里
          （在「设置」那一行的上方、与「意见反馈/登录/更多」同属底部区域）。0.1.x 与 0.2 都有该槽，
-         0.2 实测此槽当前为空 —— 正合业主"就要放那个位置"的要求，而且不用我们再猜任何 DOM。
+         0.2 实测此槽当前为空 —— 正合用户"就要放那个位置"的要求，而且不用我们再猜任何 DOM。
          order 60：排在该槽内既有条目之后（宿主自己的条目不带 order，按注册序在前）。
          老宿主若没有这个槽，`inject` 会静默不生效（不会抛）——面板内的 settings.section 入口仍在。 */
       try {

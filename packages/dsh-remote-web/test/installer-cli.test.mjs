@@ -11,7 +11,7 @@
  *   ② 参数拼错（不认识的 flag）→ 明确报错、退出码 1、**也不碰磁盘**。
  *
  * ⚠️ 隔离：所有用例都伪造 HOME + DSH_PROFILE_DIR，并设 DSH_RELAY_SKIP_SERVICE=1，
- * 否则会污染真实的自启动服务与 ~/.dsh-remote（见 setup-output.test.mjs 的事故复盘）。
+ * 否则会污染真实的自启动服务与 ~/.dsh-remote（见 setup-output.test.mjs 的故障回顾）。
  */
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";

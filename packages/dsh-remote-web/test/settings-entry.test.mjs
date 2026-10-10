@@ -165,7 +165,7 @@ function loadPlugin(opts = {}) {
 test("入口：settings.section 栏目（id/order/label）+ 侧栏底部官方槽 sidebar.footer.action", () => {
   const plugin = loadPlugin();
 
-  // 2026-10-10 三修（业主口径「就要放侧栏底部那个位置」）：入口改注册进**官方列表槽**
+  // 2026-10-10 三修（用户约定「就要放侧栏底部那个位置」）：入口改注册进**官方列表槽**
   // `sidebar.footer.action`（宿主为侧栏底部区域提供的扩展点；0.2 实测该槽当前为空）。
   // 不再自己注入 DOM —— 前两次都是"自己找落点"找错的。
   assert.ok(plugin.injects.has("sidebar.footer.action"), "应注入官方侧栏底部槽");
@@ -359,7 +359,7 @@ test("源码约束：侧栏注入「远程访问」按钮与官方「设置」�
 });
 
 test("源码约束：侧栏入口走官方槽位/无浮动面板/无切换账号；命名统一为「远程访问」", () => {
-  // 2026-10-10 三修：侧栏入口**改回**官方槽位（业主口径「就要放侧栏底部那个位置」），
+  // 2026-10-10 三修：侧栏入口**改回**官方槽位（用户约定「就要放侧栏底部那个位置」），
   // 所以这条从"不得出现 footer.action"翻转为"必须走官方槽位、不得自己注入 DOM"。
   assert.match(SOURCE, /slots\.inject\("sidebar\.footer\.action"/);
   assert.doesNotMatch(SOURCE, /insertBefore\(btn, host\)/, "不得再自己插 DOM 找落点");

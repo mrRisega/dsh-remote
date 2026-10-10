@@ -506,7 +506,7 @@ test("注册来源透传：/dsh-remote/register 全量转发 body（reg_source=p
       assert.equal(r.ok, true);
       const reg = relay.seen.filter((s) => s.path === "/api/register").pop();
       assert.ok(reg, "应转发到企业端 /api/register");
-      assert.equal(reg.body.reg_source, "panel_register", "注册来源必须透传（增长口径）");
+      assert.equal(reg.body.reg_source, "panel_register", "注册来源必须透传（增长约定）");
       assert.equal(reg.body.invite_code, "A8K2M4XQ", "未知/扩展字段不得被丢弃");
       assert.equal(reg.body.captcha_id, "cap-1");
       assert.equal(reg.body.captcha_answer, "1234");

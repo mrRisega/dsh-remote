@@ -8,7 +8,7 @@
 //      已授权设备列表（全程不刷新页面）；
 //   ③ error 阶段必须有可操作项：重试 / 复制诊断信息 / 日志路径（不留死胡同）；
 //   ④ document.hidden 时短轮询暂停（后台标签页不空转），回前台立即补一次；online 后退避到 15s；
-//   ⑤ 面板注册带注册来源 reg_source=panel_register（增长口径）。
+//   ⑤ 面板注册带注册来源 reg_source=panel_register（增长约定）。
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
@@ -377,7 +377,7 @@ test("轮询策略：document.hidden 时暂停短轮询，回前台立即补一�
   assert.ok(plugin.counts().connCalls > onlineCalls + extra, "online 后仍应按 ~15s 节奏保活（新设备扫码后列表能自动出现）");
 });
 
-test("面板注册带注册来源 reg_source=panel_register（增长口径：电脑端 vs 手机端网页注册）", async () => {
+test("面板注册带注册来源 reg_source=panel_register（增长约定：电脑端 vs 手机端网页注册）", async () => {
   const plugin = loadPlugin({ status: NOT_LOGGED });
   let tree = await plugin.settle();
   const regTab = nodeWithText(tree, "注册");

@@ -83,7 +83,7 @@ export function resolveClientVersion(raw) {
 
 /**
  * 数值协议常量 —— **逐个抄自归档参考实现**,不是猜的:
- *   /Users/mac/AIWorkSpace/myFreeWork/dsh-relay-internal/reference/openclaw-weixin/plugin-2.4.9/src/api/types.ts
+ *   OpenClaw 微信插件（第三方实现，仅作字段命名参考）
  *     · MessageType      (types.ts:64-68)   NONE:0 / USER:1 / BOT:2
  *     · MessageItemType  (types.ts:70-79)   NONE:0 TEXT:1 IMAGE:2 VOICE:3 FILE:4 VIDEO:5
  *                                           TOOL_CALL_START:11 TOOL_CALL_RESULT:12
@@ -702,7 +702,7 @@ export class IlinkClient {
     //   **入站消息**里（官方实现见 messaging/send.js 的 buildTextMessageReq：`msg.context_token`；
     //   腾讯自家插件同样是「从入站取出 → 按 (账号, 用户) 缓存 → 发送时回带」）。
     //   🔴 我们以前**从不发它** → 真机症状就是日志里的 `ret=-2 errmsg=prepare failed`：
-    //   消息发不出去（业主 2026-09-23：「没收到微信通道」）。
+    //   消息发不出去（用户 2026-09-23：「没收到微信通道」）。
     //   ⚠️ 只在"有令牌且属于同一个对端"时带上，绝不拿 A 的上下文发给 B。
     const peer = String(to);
     // 本产品一个 bot 只绑定一个微信用户,所以只要有令牌就回带;`contextTokenPeer` 仅作诊断。
@@ -715,7 +715,7 @@ export class IlinkClient {
       message_type: MessageType.BOT,
       message_state: MessageState.FINISH,
       item_list: text ? [{ type: MessageItemType.TEXT, text_item: { text: String(text) } }] : [],
-      // 没有就**不出现这个键**（不是空串）—— 与官方 `contextToken ?? undefined` 同口径
+      // 没有就**不出现这个键**（不是空串）—— 与官方 `contextToken ?? undefined` 同约定
       ...(ctxToken ? { context_token: ctxToken } : {})
     };
     const { json } = await this.request({
@@ -1774,7 +1774,7 @@ export function markUnbound(relayDir, reason = "", onWarn) {
 export const DEFAULT_REPLY_TTL_MINUTES = 5;
 
 /**
- * 完成通知里「结论」的展示上限(字)。业主口径(2026-09-22):
+ * 完成通知里「结论」的展示上限(字)。用户约定(2026-09-22):
  * 「任务完成通知里有些关键结论被大量截断了,加长一些,更完整地展示最终结论 ——
  *   这可能是用户关注的内容,所以都给他们展示出来」。
  * 原值 400 对真实结论太短(实测一条正常的修复总结就有 190+ 字,稍详细就超)。
@@ -1898,7 +1898,7 @@ export function formatNotification(node = {}, opts = {}) {
       for (const l of Array.isArray(node.lines) ? node.lines : []) lines.push(String(l));
       // 措辞对齐"回顾今天做了什么" —— 日报不是待办清单
       if (!Array.isArray(node.lines) || !node.lines.length) lines.push("今天这台电脑上没有跑任务。");
-      // 品牌轻露出(业主:让用户知道我们在给他提供服务)。**克制一行**、放在最底,不喧宾夺主。
+      // 品牌轻露出(用户:让用户知道我们在给他提供服务)。**克制一行**、放在最底,不喧宾夺主。
       lines.push("", "—— DSH 远程控制 · 微信机器人通道");
       // ⚠️ 这句是**功能**不是客套:微信 24h 推送窗口靠用户回消息续期,
       // 简报的产品作用正是每天制造一次互动(§7)。必须出现「回复」字样,否则用户不会回。
@@ -1974,7 +1974,7 @@ function clipText(s, n) {
  * 为什么必须转:微信**不渲染 Markdown**(最强证据是腾讯自己的插件在出站路径跑
  * `StreamingMarkdownFilter` 主动剥离"不支持的 markdown 语法")。所以模型写的表格会以
  * `| a | b |` 的**字面竖线**出现在气泡里、`**加粗**` 会显示成星号。
- * 业主原话:「现在的表格形式看起来很奇怪,整个格式在微信上没有做过任何兼容,体验很差很差」
+ * 用户原话:「现在的表格形式看起来很奇怪,整个格式在微信上没有做过任何兼容,体验很差很差」
  * —— 根因就在这里,不是"排版没调好"。
  *
  * 规则(只改"怎么显示",不改语义):
@@ -2365,10 +2365,10 @@ export function isDestructiveTool(toolName, detail) {
   if (DESTRUCTIVE_TOOL_NAME_RE.test(name)) return true;
 
   const text = flattenToolDetail(detail);
-  // ⚠️ 2026-09-22 按业主决定**删掉**了原来的规则③:「能跑命令的工具 + 完全看不到内容 → 算破坏性」。
+  // ⚠️ 2026-09-22 按用户决定**删掉**了原来的规则③:「能跑命令的工具 + 完全看不到内容 → 算破坏性」。
   //   原意是防"盲批",但 DSH 的审批节点本来就只下发 toolName、常常没有命令原文,
   //   那条规则会把**绝大多数正常 Bash 审批**都降级成"只能回电脑确认",过严且伤体验。
-  //   业主明确:安全边界松一点没问题,**DSH 自身有权限控制**。
+  //   用户明确:安全边界松一点没问题,**DSH 自身有权限控制**。
   //   所以现在只看**内容**:看得出是 rm -rf / 强推 / DROP TABLE / 批量覆盖这类才拦;
   //   看不到内容时按普通审批处理(保留一步回执)。SHELL_TOOL_NAME_RE 仍保留,
   //   供将来若要恢复"盲批保护"时使用,并由测试固化其语义。
@@ -2834,7 +2834,7 @@ export class WeChatChannel {
     //   冷却原本只按"撞到 -14"计时,但**换绑会拿到全新的 bot_token** ——
     //   旧 token 的会话超时对新 token 毫无意义。不清的后果:用户解绑→重绑拿到新 token,
     //   却仍被旧 token 的 1 小时冷却挡着,表现成"刚绑上就一小时内不能聊天",
-    //   而且面板只说"通知会延迟",用户完全不知道为什么。(业主实测撞到)
+    //   而且面板只说"通知会延迟",用户完全不知道为什么。(用户实测撞到)
     this.cooldown.clear();
     return this.uiAccount();
   }

@@ -2,7 +2,7 @@
 /**
  * SSE(`text/event-stream`)流式转发 —— 中继 ↔ bridge 的**跨文件协议契约**。
  *
- * 事故原貌(2026-09-23):DSH 的 `/plugins/events`(client-hmr 事件通道)是一条**永不结束**的流,
+ * 故障原貌(2026-09-23):DSH 的 `/plugins/events`(client-hmr 事件通道)是一条**永不结束**的流,
  * 而旧协议只有「一个完整响应」帧 —— bridge 只能一直 await 到自己 120s 的上游超时才报错;
  * 手机端于是每次开页面都挂满两分钟,浏览器 EventSource 再立刻重连,
  * **Network 里永远有一条转圈的请求**,页面也始终拿不到任何事件。
@@ -110,13 +110,15 @@ test("★ 能力协商:bridge 只在**中继声明** http-stream 时才用流式
 /**
  * SaaS（闭源）中继的同一条契约。
  *
- * ⚠️ 它读的是**同级检出的另一个仓库**（dsh-relay-enterprise）—— 开源仓库的 CI 里没有它，
+ * ⚠️ 它读的是**仓库外的服务端实现**（由 DSH_SAAS_ROUTER_DIR 指定）—— 开源仓库的 CI 里没有它，
  * 老写法直接 readFileSync → ENOENT → 整个 `npm test` 从这里开始全红（而且掩盖了后面所有用例）。
  * 现在：没有检出就**显式跳过**（并说明原因），有就照旧断言。
  */
-const SAAS_ROUTER = path.resolve(ROOT, "..", "dsh-relay-enterprise", "relay-router", "src", "index.mjs");
+const SAAS_ROUTER = process.env.DSH_SAAS_ROUTER_DIR
+  ? path.resolve(process.env.DSH_SAAS_ROUTER_DIR, "relay-router", "src", "index.mjs")
+  : null;
 test("SaaS 中继也必须声明同一组能力（需要同级检出闭源仓库，否则跳过）",
-  { skip: existsSync(SAAS_ROUTER) ? false : "未检出同级 dsh-relay-enterprise（开源仓库 CI 的正常情况）" },
+  { skip: SAAS_ROUTER && existsSync(SAAS_ROUTER) ? false : "未提供同级服务端实现（设 DSH_SAAS_ROUTER_DIR；开源仓库 CI 的正常情况）" },
   () => {
     const SAAS = readFileSync(SAAS_ROUTER, "utf8");
     assert.match(SAAS, /const ROUTER_FRAME_CAPS = \["http-stream"\]/, "SaaS 中继也要声明(线上跑的是它)");

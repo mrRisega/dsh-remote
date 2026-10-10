@@ -1,6 +1,6 @@
 // 📣 公告（插件端）回归：徽标 / 面板入口 / 电脑端弹窗 / 已读上报 / 一条铁律（**不轮询**）。
 //
-// 契约：dsh-relay-enterprise/docs/announcements-contract.md（冻结 v1）+ 926 迭代 §1（client=desktop）。
+// 契约：服务端公告契约文档（冻结 v1）（冻结 v1）+ 926 迭代 §1（client=desktop）。
 //   GET  /dsh-remote/announcements?client=desktop → { bubble_enabled, items[], unread_count, popup|null }
 //   POST /dsh-remote/announcements/click { id }   → 记 clicked_at（**现契约只有 /click，没有 /read**）
 //

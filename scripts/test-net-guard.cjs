@@ -1,7 +1,7 @@
 /**
  * 测试期网络护栏（NODE_OPTIONS=--require 注入，见 package.json 的 test 脚本）。
  *
- * 为什么必须有（2026-09-19 实测事故）：
+ * 为什么必须有（2026-09-19 实测故障）：
  *   有测试用例在 profile 配置里写了**假账号**（phone/password）却没覆盖 `api_url`，
  *   于是插件按默认地址去请求**生产中继** `https://n.risegao.cn:…`。其中
  *   `/api/device-login` 带着假密码必然失败，而服务端的登录限流是**按出口 IP**

@@ -77,9 +77,9 @@ bash scripts/release-tarballs.sh        # 或 npm run release:tarballs
 
 | 字段 | 来源 | 何时更新 |
 |---|---|---|
-| `stars` | GitHub 仓库 star（上游 `probe-stars.mjs` → `data/stars.json` → `build-site.mjs`） | 探针每日刷新，但**只有站点 build 成功才写进 plugins.json** |
+| `stars` | GitHub 仓库 star（上游 `probe-stars.mjs` → `data/stars.json` → `build-site.mjs`） | 探测每日刷新，但**只有站点 build 成功才写进 plugins.json** |
 | `downloads` | **npm 包最近 30 天**下载量（`probe-downloads.mjs`，`api.npmjs.org last-month`） | 仅覆盖已映射到 npm 的条目 |
-| `npm` / `version` | `probe-npm.mjs` 读**条目子目录** `package.json.name` → registry；要求该包 `repository` 指回被收录仓库 | 探针周期内 |
+| `npm` / `version` | `probe-npm.mjs` 读**条目子目录** `package.json.name` → registry；要求该包 `repository` 指回被收录仓库 | 探测周期内 |
 
 推论：条目指向 404 子目录或名字未发 npm → 三个字段全空；上游站点 build 失败期间 plugins.json 整体冻结，
 stars/条目/下载量全部停更（先看他们的 build 工作流，再怀疑自己）。市场显示的数字**不是市场安装数**。
@@ -98,7 +98,7 @@ stars/条目/下载量全部停更（先看他们的 build 工作流，再怀疑
 > **公开的内容一定要精简**。」
 
 本仓库及其 GitHub / Gitee 镜像是**公开**的。`CHANGELOG.md` 与提交信息都是写给
-**使用者**看的，不是内部复盘文档。改之前先问一句：**"用户会在意这一条吗？"**
+**使用者**看的，不是内部回顾文档。改之前先问一句：**"用户会在意这一条吗？"**
 
 ### 写什么
 
@@ -115,14 +115,14 @@ stars/条目/下载量全部停更（先看他们的 build 工作流，再怀疑
 ### 不写什么
 
 - 内部函数名 / 类名 / CSS 选择器 / 行号 / `z-index` 等实现细节；
-- 内部事故复盘、根因分析、严重级别（P1 / P2 / F2）、"自引入的回归"这类自我检讨；
+- 内部故障回顾、根因分析、严重级别（P1 / P2 / F2）、"自引入的回归"这类自我检讨；
 - 内部指标与商业化措辞（装机数、转化、埋点、渠道、定价策略）；
 - 未发布的计划、内部时间表、协作过程（谁在哪个分支改了什么）。
 
 ### 细节放哪里
 
-1. **闭源仓库 `dsh-relay-enterprise` 的对应提交**（工程复盘、内部成因）；
-2. 仓库外的 `../dsh-relay-internal/release-notes-internal/`（诊断/复盘类产物一律不入库）；
+1. **闭源服务端仓库的对应提交**（工程回顾、内部成因）；
+2. 仓库外的私有发布说明目录（诊断/回顾类产物一律不入库）；
 3. **代码注释** —— 改到哪一行，注释就在那一行旁边，这是最自然的落点。
 
 ### 长度
@@ -135,7 +135,7 @@ stars/条目/下载量全部停更（先看他们的 build 工作流，再怀疑
 
 - [ ] `grep -nE "z-index|选择器|行号|P[0-9]|回归|埋点|装机|根因" CHANGELOG.md` 无命中？
 - [ ] 每一条非开发的用户都能读懂？
-- [ ] 内部复盘已经移到 `../dsh-relay-internal/` 或闭源仓库？
+- [ ] 内部回顾已经移到仓库外的私有目录或闭源仓库？
 - [ ] 提交信息是否也只说"用户能感知到什么 + 为什么"，而不是实现过程？
 
 ## 9. `beta` 与 `latest` 的约定（转正流程）

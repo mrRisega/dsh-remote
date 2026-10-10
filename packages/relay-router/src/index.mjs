@@ -169,7 +169,7 @@ function reportMilestone(userId, kind) {
  * router 是**唯一真正知道 bridge 当前是否在线**的地方(内存 devices Map),因此在:
  *   ① bridge 注册成功 → 立刻上报 online=true;
  *   ② 断开(cleanupDevice)→ 上报 online=false;
- *   ③ 每 60s 给仍在线设备各补一次 true(**兼作心跳**,让企业端的 last_seen 新鲜度口径可用)。
+ *   ③ 每 60s 给仍在线设备各补一次 true(**兼作心跳**,让企业端的 last_seen 新鲜度约定可用)。
  * 失败静默:企业端不可达绝不影响隧道业务。
  */
 const PRESENCE_SWEEP_MS = 60_000;

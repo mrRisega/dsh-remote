@@ -1,7 +1,7 @@
 /**
  * 插件清单与「一键更新静默失败」契约测试（node:test，零框架）。
  *
- * 事故背景（2026-09-15 生产反馈）：
+ * 故障背景（2026-09-15 生产反馈）：
  *  A. 用户扫码后报「fail to load plugin / DeepSeek client collection」。
  *     排查发现 package.json 的 dsh.client.inject 声明了 `@deepseek-ai/dsh-client-runtime`，
  *     而该包在 harness 安装树里**根本不存在**（harness 只有 dsh-client-ui-* 等真包）。
@@ -84,7 +84,7 @@ test("一键更新：前端在进程结束但没成功时必须报错，而不�
 });
 
 test("运行时同步：客户端脚本必须按**内容**补齐（否则手机端修复永远到不了用户）", () => {
-  // 事故背景（2026-09-15 实测）：手机端遮罩 bug 的修复落在 clients/dsh-remote/mobile-adapter.mjs，
+  // 故障背景（2026-09-15 实测）：手机端遮罩 bug 的修复落在 clients/dsh-remote/mobile-adapter.mjs，
   // 而 bridge 是把**配置目录里那份**脚本注入官方页面后发给手机的。装置器原先只在"版本号变化"时
   // 才覆盖运行时副本，于是出现过：改了、发了版、用户升级了，但手机端拿到的仍是旧脚本 —— 修复不生效。
   // 现在按内容比对，只要与装置器手里的不一致就覆盖。

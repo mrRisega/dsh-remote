@@ -234,7 +234,7 @@ test("集成:204 响应不压缩", async () => {
 });
 
 test("★ 回归:上游自己 gzip 过(content-encoding: gzip),bridge 仍必须重压回传", async () => {
-  /* 事故原貌(2026-09-23):
+  /* 故障原貌(2026-09-23):
    *   undici 的 fetch 会**自动解压** body,但**保留** `content-encoding: gzip` 响应头。
    *   旧代码把该头当作"buf 已编码"传给 maybeCompressResponse → 函数保守 return null →
    *   **永不重压**。于是线上 dsh web 的 /plugins/?? 聚合包(上游 gzip 后 5.12MB)
