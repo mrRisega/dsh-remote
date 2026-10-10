@@ -851,8 +851,16 @@ window.__ModuleLoader__.load({
           var el = cands[i];
           if (!el || el.id === NAV_ENTRY_ID) continue;   // 排除我们自己的入口
           if (navInDialog(el)) continue;                 // 弹层内的（关闭键/栏目）一律不要
-          try { if (el.closest && el.closest('[data-slot="sidebar.footer.action"]')) continue; } catch (e0) { /* 忽略 */ }
+          try { if (el.closest && el.closest('[data-slot="sidebar.footer.action"]')) continue; } catch (eF) { /* 忽略 */ }
           if (NAV_BAD_RE.test(String(el.className || ""))) continue;
+          /* 🔴 2026-10-11 业主实测「点入口弹出的是本轮用量」：那次弹窗锚在**右上角**，
+             说明候选里混进了**顶栏**的按钮（用量/上下文那些同样带 aria-haspopup="dialog"）。
+             这里加几何闸门：只认**侧栏范围内**的候选（左侧窄条），顶栏/内容区的按钮一律不碰。 */
+          try {
+            var r0 = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+            if (r0 && (r0.width === 0 || r0.height === 0)) continue;      // 不可见
+            if (r0 && r0.left > 360) continue;                            // 明显在右侧（顶栏/内容区）
+          } catch (e0) { /* 拿不到几何信息就放行（老宿主/测试替身） */ }
           var inSettingsSlot = false;
           try {
             inSettingsSlot = !!(el.closest && el.closest('[data-slot="sidebar.settings"], [data-slot="settings.launcher"]'));
@@ -903,6 +911,64 @@ window.__ModuleLoader__.load({
       return null;
     }
     /**
+     * 从**账号菜单**里进设置（桌面端的「设置」就是账号菜单里的一项）。
+     *
+     * 为什么需要：桌面端侧栏底部那颗"齿轮"在 Electron 渲染器里不一定存在 —— 业主截图里
+     * 底部只有「远程访问」+ 账号（高昂），「设置」在**账号菜单**里。所以当侧栏候选全部落空时，
+     * 必须能"打开账号菜单 → 点设置 → 再点我们的栏目"，否则入口点下去就是没反应。
+     */
+    function accountMenuTrigger() {
+      try {
+        var all = document.querySelectorAll('[aria-haspopup="menu"], button, [role="button"]');
+        var best = null;
+        for (var i = 0; i < all.length; i++) {
+          var el = all[i];
+          if (!el || el.id === NAV_ENTRY_ID) continue;
+          var aria = String((el.getAttribute && el.getAttribute("aria-label")) || "");
+          if (/账号菜单|Account menu/i.test(aria)) return el;            // 首选：明确的 aria 标签
+          var r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+          var inSidebarFoot = r && r.left < 360 && r.top > 300;           // 侧栏底部区域
+          if (!best && inSidebarFoot && String(el.getAttribute && el.getAttribute("aria-haspopup") || "") === "menu") best = el;
+        }
+        return best;   // 兜底：侧栏底部里唯一带 aria-haspopup=menu 的（就是账号 chip）
+      } catch (e) { return null; }
+    }
+    /** 账号菜单打开后，点里面的「设置」。 */
+    function viaAccountMenu() {
+      try {
+        var trigger = accountMenuTrigger();
+        if (!trigger) return;
+        try { trigger.click(); } catch (e) { return; }
+        var tries = 0;
+        var iv = setInterval(function () {
+          tries += 1;
+          var menus = document.querySelectorAll('[role="menu"], [role="dialog"], [role="listbox"]');
+          for (var i = 0; i < menus.length; i++) {
+            var items = menus[i].querySelectorAll ? menus[i].querySelectorAll('button, [role="menuitem"]') : [];
+            for (var k = 0; k < items.length; k++) {
+              var t = String(items[k].textContent || "").replace(/\s+/g, "").trim();
+              if (t === "设置" || t === "Settings") {
+                clearInterval(iv);
+                try { items[k].click(); } catch (e2) { /* 忽略 */ }
+                var tries2 = 0;
+                var iv2 = setInterval(function () {          // 设置面板开了以后，再点我们的栏目
+                  tries2 += 1;
+                  var cell = pickNavByToken("远程访问", { insideDialog: true });
+                  if (cell) { clearInterval(iv2); cell.click(); }
+                  else if (tries2 >= NAV_POLL_MAX) clearInterval(iv2);
+                }, 150);
+                try { if (iv2 && typeof iv2.unref === "function") iv2.unref(); } catch (e3) { /* 忽略 */ }
+                return;
+              }
+            }
+          }
+          if (tries >= NAV_POLL_MAX) clearInterval(iv);
+        }, 150);
+        try { if (iv && typeof iv.unref === "function") iv.unref(); } catch (e4) { /* 忽略 */ }
+      } catch (e) { /* 忽略 */ }
+    }
+
+    /**
      * 打开「远程访问」设置栏目。
      * 栏目已渲染 → 直接点；否则**依次试每个"设置"候选**：点一下 → 轮询 ≤3s 看栏目出没出来 →
      * 没出来就换下一个候选。为什么要逐个试（2026-10-10）：桌面端侧栏可能同时有多个
@@ -917,7 +983,7 @@ window.__ModuleLoader__.load({
         if (!cands.length) return;
         var idx = 0;
         var tryNext = function () {
-          if (idx >= cands.length) return;
+          if (idx >= cands.length) { return viaAccountMenu(); }   // 侧栏里找不到触发器 → 走账号菜单
           var el = cands[idx++];
           try { el.click(); } catch (eClick) { return tryNext(); }
           var tries = 0;
