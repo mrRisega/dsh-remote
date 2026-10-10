@@ -67,6 +67,10 @@ npx @mrrisega/dsh-remote@beta plugin --profile desktop
   已修 + 有用例锁住）。
 - **宿主版本探测**：桌面端（Electron）的 `argv[1]` 是 `--expose-internals`（开关，不是路径），
   宿主根在 `argv[3]`（`…/app.asar/dsh`）—— 只读 `argv[1]` 会永远取不到版本。
+- **🔴 桌面应用运行时，绝不要改写 `~/.dsh/profiles/desktop/`**（安装/更新插件都会写）：
+  应用独占该目录，运行中被改写会**自己退出/重启**（业主原话："怎么又触发了 dsh 的关闭"）。
+  `npm run sync:local` 与安装器现在都会检测并**自动跳过**（`--force-plugin` / `--force` 可强写），
+  正路是：先完全退出应用，或在应用内「插件」页安装。
 - **桌面端 profile 由 App 独占**：npm 版 `dsh` 拒绝管理它，只能走安装器或 App 内「插件」页。
 
 ---

@@ -34,8 +34,31 @@ const args = process.argv.slice(2);
 const has = (f) => args.includes(f);
 const valOf = (f, d) => { const i = args.indexOf(f); return i > -1 && args[i + 1] ? args[i + 1] : d; };
 const DRY = has("--dry-run");
+const FORCE_PLUGIN = has("--force-plugin");
 const RESTART = !has("--no-restart");
 const PROFILE = valOf("--profile", "desktop");
+
+/**
+ * DeepSeek Harness 桌面应用是否在运行。
+ *
+ * 🔴 2026-10-11 事故：在应用运行中改写 `~/.dsh/profiles/desktop/` 的插件文件，
+ *    应用会**自己退出/重启**（业主："怎么又触发了 dsh 的关闭"）。安装器早就写明
+ *    「请先完全退出应用再安装」。这条必须由脚本强制，不能靠人记得。
+ */
+function dshDesktopAppRunning() {
+  // 显式覆盖（测试隔离 / 探测误报时的逃生口）：DSH_DESKTOP_APP_RUNNING=0|1
+  const override = String(process.env.DSH_DESKTOP_APP_RUNNING || "").trim();
+  if (override === "0" || override === "1") return override === "1";
+  if (process.platform !== "darwin") return false;
+  try {
+    // 实测（2026-10-11）：`pgrep -x DeepSeek` 与 `pgrep -f "...app/Contents/MacOS"` 都匹配不到，
+    // 必须用下面的写法（`Contents/MacOS/DeepSeek` 或短名 `DeepSeek Harness.app` 均可命中）。
+    const a = spawnSync("pgrep", ["-f", "Contents/MacOS/DeepSeek"], { encoding: "utf8" });
+    if (a.status === 0 && String(a.stdout || "").trim()) return true;
+    const b = spawnSync("lsof", ["-nP", "-iTCP:19387", "-sTCP:LISTEN"], { encoding: "utf8" });
+    return b.status === 0 && /LISTEN/.test(String(b.stdout || ""));
+  } catch { return false; }
+}
 
 const REPO_VERSION = JSON.parse(readFileSync(path.join(ROOT, "package.json"), "utf8")).version;
 const RELAY_DIR = process.env.DSH_RELAY_DIR || path.join(homedir(), ".dsh-remote");
@@ -132,6 +155,12 @@ log(`\n=== 2) 桥半 → ${RELAY_DIR} ===`);
 log(`\n=== 3) 插件半 → ${PLUGIN_DIR} ===`);
 if (!existsSync(PLUGIN_DIR)) {
   warn(`该 profile 下没有插件目录（${PROFILE}）。若确实要装：npx @mrrisega/dsh-remote@${REPO_VERSION.includes("-") ? "beta" : "latest"} plugin --profile ${PROFILE}`);
+} else if (PROFILE === "desktop" && dshDesktopAppRunning() && !FORCE_PLUGIN) {
+  /* 桌面端应用独占该 profile：运行中改写会让应用自己退出/重启（实测事故）。
+     这里**只跳过插件半** —— 桥半照常同步、桥照常重启，都不影响应用。 */
+  warn("DeepSeek Harness 应用正在运行 → **跳过插件半**（应用独占该 profile，运行中改写会让应用退出/重启）");
+  warn("  要更新桌面端插件：先完全退出应用再跑本命令，或用应用内「插件」页安装（官方路径）；");
+  warn("  确实要强行写入：npm run sync:local -- --force-plugin");
 } else {
   let changed = 0;
   changed += syncTree(path.join(PKG_DIR, "lib"), path.join(PLUGIN_DIR, "lib"));

@@ -42,7 +42,9 @@ function makeProfile(home, name, { withPlugin = false } = {}) {
 
 /** 跑真实的 `plugin` 子进程。**显式清掉 DSH_PROFILE_DIR**：宿主环境天然带着它（会盖掉默认多选）。 */
 function runPlugin(home, args = []) {
-  const env = { ...process.env, HOME: home, DSH_PROFILE_DIR: "", DSH_RELAY_DIR: join(home, ".dsh-remote"), DSH_RELAY_SKIP_SERVICE: "1" };
+  const env = { ...process.env, HOME: home, DSH_PROFILE_DIR: "", DSH_RELAY_DIR: join(home, ".dsh-remote"), DSH_RELAY_SKIP_SERVICE: "1",
+    // 假 HOME 与真机无关：显式声明"桌面应用未运行"，否则会命中"应用在跑就别写 desktop"的保护
+    DSH_DESKTOP_APP_RUNNING: "0" };
   const r = spawnSync(process.execPath, [SETUP, "plugin", ...args], { encoding: "utf8", env, timeout: 120000 });
   return { out: String(r.stdout || ""), err: String(r.stderr || ""), code: r.status };
 }

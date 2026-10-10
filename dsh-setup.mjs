@@ -194,7 +194,7 @@ function printHelp() {
 // 认识的参数（只给 flag 也要能装上去，所以不认识时才拦）。
 const KNOWN_FLAGS = new Set([
   "--api", "--server", "--key", "--profile",
-  "--no-autostart", "--no-plugin", "--no-restart", "--uninstall"
+  "--no-autostart", "--no-plugin", "--no-restart", "--uninstall", "--force"
 ]);
 
 // ⚠️ 这一整块必须挡在 ensureRuntimeCopy() **之前**：它会往 ~/.dsh-remote 同步运行时脚本。
@@ -1139,6 +1139,30 @@ function resolveProfileDir(argv = []) {
  * `pluginCmd()` 时原本传的是空数组 —— 于是"指定 desktop profile"会被静默忽略、
  * 插件仍然装进 Web 版 profile（桌面端用户装了却看不到面板，且极难自查）。
  */
+/**
+ * DeepSeek Harness **桌面应用**是否正在运行。
+ *
+ * 🔴 2026-10-11 事故：我在应用运行中改写了 `~/.dsh/profiles/desktop/` 里的插件文件，
+ *    应用随即**自己退出/重启**（业主："怎么又触发了 dsh 的关闭"）。安装器自己的提示早就写着
+ *    「请先**完全退出** DeepSeek Harness 应用再安装（应用独占该 profile）」—— 这条必须由程序强制，
+ *    不能靠"我记得"。
+ * 检测方式：macOS 上桌面应用的进程名就是 `DeepSeek`（lsof/pgrep 实测），另加 App 包路径兜底。
+ */
+function dshDesktopAppRunning() {
+  // 显式覆盖（测试隔离 / 探测误报时的逃生口）：DSH_DESKTOP_APP_RUNNING=0|1
+  const override = String(process.env.DSH_DESKTOP_APP_RUNNING || "").trim();
+  if (override === "0" || override === "1") return override === "1";
+  if (process.platform !== "darwin") return false;
+  try {
+    // 实测（2026-10-11）：`pgrep -x DeepSeek` 与 `pgrep -f "...app/Contents/MacOS"` 都匹配不到，
+    // 必须用下面的写法（`Contents/MacOS/DeepSeek` 或短名 `DeepSeek Harness.app` 均可命中）。
+    const a = sh("pgrep -f 'Contents/MacOS/DeepSeek'");
+    if (a.ok && String(a.stdout || "").trim()) return true;
+    const b = sh("lsof -nP -iTCP:19387 -sTCP:LISTEN");
+    return Boolean(b.ok && /LISTEN/.test(String(b.stdout || "")));
+  } catch { return false; }
+}
+
 /**
  * 探测本机**已存在**的 profile（可装载 = 同时有 package.json 与 cordis.patch.yml）。
  * desktop 排在前面：业主主用的是桌面应用，多个 profile 一起装时它是"首选/权威"那个。
@@ -2787,14 +2811,27 @@ async function pluginCmd(argv) {
   }
   let last = null;
   let ok = 0;
+  let skippedRunning = 0;
+  const force = hasFlag(argv, "--force");
   for (const t of targets) {
+    // ⚠️ 桌面应用在运行时**绝不改写它的 profile**：应用会因此退出/重启（2026-10-11 实测事故）
+    if (t.name === "desktop" && !force && dshDesktopAppRunning()) {
+      console.log(`⚠️ 跳过 desktop：DeepSeek Harness 应用正在运行。`);
+      console.log(`   应用独占该 profile，运行中改写会让应用自己退出/重启。请任选其一：`);
+      console.log(`     · 完全退出应用后重跑本命令；或`);
+      console.log(`     · 在应用内「插件」页安装/更新 dsh-remote-web（官方路径，装完即热加载）。`);
+      console.log(`   （确实要强行写入：加 --force）`);
+      skippedRunning += 1;
+      continue;
+    }
     if (multi) console.log(`\n── profile: ${t.name}（${t.dir}）`);
     const r = await pluginApplyTo(t.dir, uninstall, multi);
     if (r === "skip") continue;
     ok += 1;
     if (r !== undefined && r !== null) last = r;
   }
-  if (ok === 0) process.exit(1);
+  if (ok === 0 && skippedRunning === 0) process.exit(1);
+  if (skippedRunning > 0) console.log(`ℹ 本次跳过了 ${skippedRunning} 个 profile（应用在运行）；桥与运行环境不受影响。`);
   return last;
 }
 

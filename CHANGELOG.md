@@ -3,6 +3,22 @@
 All notable changes to dsh-remote are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.0-beta.8] - 2026-10-11
+
+### 🛡 装/更新插件时，不再把正在运行的桌面应用"弄关掉"
+
+- **根因**：桌面应用**独占**自己的插件目录。在应用运行时改写
+  `~/.dsh/profiles/desktop/`（安装/更新插件都会写）→ 应用会**自己退出/重启**，
+  表现就是"DSH 突然被关掉了"。安装器文案一直写着"请先完全退出应用"，但之前只靠人记得。
+- **现在由程序强制**：
+  · `dsh-remote` 检测到桌面应用在运行时，**跳过 desktop profile 的写入**（不影响 Web 版 profile、
+    也不影响桥与运行环境），并告诉你两条正路：先完全退出应用再装，或在应用内「插件」页安装；
+    确需强行写入可加 `--force`。
+  · 本机同步脚本 `npm run sync:local` 同样保护：应用在运行就**只跳过插件半**，桥半照常同步/重启；
+    确需强行写入可加 `--force-plugin`。
+- 顺带说明：插件的"重启 DeepSeek harness"逻辑本来就对桌面端**硬拒绝**（返回 `desktop-managed`），
+  本次关掉应用的原因与它无关 —— 是运行中改写插件目录触发了应用自身的重载。
+
 ## [0.7.0-beta.7] - 2026-10-11
 
 这一版把「远程访问」入口的**点击体验**收干净 —— 三次现场反馈，逐个定位到真实原因。

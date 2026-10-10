@@ -226,3 +226,26 @@ test("★ 自启动配置里可以钉住上游（多 profile 时代，各宿主�
   const svcAt = src.indexOf("svc = installAutostart()");
   assert.ok(pinAt > 0 && svcAt > 0 && pinAt < svcAt, "钉定必须发生在 installAutostart() 之前");
 });
+
+test("★ 桌面应用在运行时，绝不改写它的 profile（否则应用会自己退出/重启）", () => {
+  // 2026-10-11 事故：在应用运行中改写 ~/.dsh/profiles/desktop/ 的插件文件 →
+  // 应用随即自己退出/重启（业主："怎么又触发了 dsh 的关闭"）。安装器文案早就写了"先完全退出应用"，
+  // 但必须由程序强制，不能靠人记得。
+  const src = readFileSync(SETUP, "utf8");
+  assert.match(src, /function dshDesktopAppRunning\(/, "要有「桌面应用是否在运行」的探测");
+  assert.match(src, /Contents\/MacOS\/DeepSeek/, "探测要匹配 App 包内可执行文件（-x DeepSeek 匹配不到，实测）");
+  // 必须在真正写 profile **之前**判断
+  const loopAt = src.indexOf("for (const t of targets) {");
+  const guardAt = src.indexOf("dshDesktopAppRunning()", loopAt);
+  const applyAt = src.indexOf("await pluginApplyTo(", loopAt);
+  assert.ok(loopAt > 0 && guardAt > loopAt && applyAt > guardAt,
+    "顺序必须是：循环 → 应用在运行？→ 跳过；否则才 pluginApplyTo()");
+  assert.match(src, /跳过 desktop：DeepSeek Harness 应用正在运行/, "要如实说明跳过了 desktop");
+  assert.match(src, /应用内「插件」页安装/, "要给出官方替代路径（应用内插件页）");
+  assert.match(src, /"--force"/, "要留 --force 逃生口");
+  // sync-local 脚本同样要保护（本机同步最常用）
+  const sync = readFileSync(join(HERE, "..", "..", "..", "scripts", "sync-local.mjs"), "utf8");
+  assert.match(sync, /function dshDesktopAppRunning\(/, "本机同步脚本也要有同样的保护");
+  assert.match(sync, /跳过插件半/, "要明确说「只跳过插件半」（桥半不受影响）");
+  assert.match(sync, /--force-plugin/, "要留逃生口");
+});
