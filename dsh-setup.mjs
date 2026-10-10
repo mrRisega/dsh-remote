@@ -807,6 +807,28 @@ function spawnDetachedBridge() {
  *      但实测 kickstart 只解决"这一次"，进程被杀后不会重建（KeepAlive 已被系统绕过）→ 如实告知
  *   ③ 后台进程  ← 连 launchd 都托管不了时保证可用
  */
+/**
+ * 🔴 标签占用保护（2026-10-10 事故）：`com.dshremote.bridge` 这个 launchd label 是**全局唯一**的，
+ *   谁 bootstrap 谁就接管它。当天跑测试时，某个用例用**假 HOME + 真 launchctl** 把测试临时目录的
+ *   plist 登记到了同一个 label 上 → **真桥被顶掉**、远程访问中断，而日志里看不出任何异常。
+ *
+ *   所以 bootstrap 之前先问一句：这个 label 现在登记的 plist 是**本 relayDir 的**那份吗？
+ *   · 不是（别人家的）→ **拒绝接管**并明确报错。要强行接管得显式设
+ *     `DSH_BRIDGE_ALLOW_LABEL_TAKEOVER=1`（给人留后门，但默认安全）。
+ *   · 查不出来（launchctl 不可用/未登记）→ 照旧继续，不误伤正常安装。
+ */
+function labelOwnedByOtherDir(plistPath, domain) {
+  try {
+    const r = sh(`launchctl print ${domain}/${BRIDGE_LABEL}`);
+    if (!r.ok) return null;                       // 未登记 → 不是"别人家的"
+    const cur = String(r.stdout || "").match(/^\s*path = (.+)$/m);
+    if (!cur) return null;                        // 读不出路径 → 不拦
+    const a = cur[1].trim();
+    const b = String(plistPath).trim();
+    return a === b ? false : a;                   // 返回"占用者的 plist 路径"= 别人家的
+  } catch { return null; }
+}
+
 function startBridgeDarwin(plistPath) {
   const uid = process.getuid();
   const q = (s) => "'" + String(s).replace(/'/g, `'\\''`) + "'";
@@ -816,6 +838,16 @@ function startBridgeDarwin(plistPath) {
     // 清掉另一个 domain 的历史注册，避免两处并存导致重复实例
     for (const d of [`user/${uid}`, `gui/${uid}`]) {
       if (d !== domain) sh(`launchctl bootout ${d}/${BRIDGE_LABEL}`);
+    }
+    // 先确认这个 label 不是别人（别的 relayDir）的，否则**拒绝接管**——见 labelOwnedByOtherDir
+    const foreign = labelOwnedByOtherDir(plistPath, domain);
+    if (foreign && String(process.env.DSH_BRIDGE_ALLOW_LABEL_TAKEOVER || "") !== "1") {
+      return {
+        ok: false,
+        status: "label-owned-by-other",
+        detail: `${domain}/${BRIDGE_LABEL} 已被另一个 relayDir 占用（${foreign}）—— 拒绝接管。`
+          + `真要用本目录接管，请先停掉那边的桥，或显式设 DSH_BRIDGE_ALLOW_LABEL_TAKEOVER=1。`,
+      };
     }
     sh(`launchctl bootout ${target}`);
     let boot = sh(`launchctl bootstrap ${domain} ${q(plistPath)}`);

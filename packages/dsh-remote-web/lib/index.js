@@ -21,7 +21,7 @@
 //
 // 不依赖任何第三方包：只使用 node 内置模块与 cordis 注入的 webServer 服务。
 import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync, accessSync, chmodSync, openSync, closeSync, readSync, fstatSync, rmSync, renameSync, statSync, copyFileSync, cpSync, constants as fsConstants } from "node:fs";
-import { join, dirname, sep, delimiter, isAbsolute } from "node:path";
+import { join, dirname, sep, delimiter, isAbsolute, relative } from "node:path";
 import { execSync, spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
@@ -741,6 +741,24 @@ function applySaaSMode(cfg) {
  */
 const HARNESS_COOKIE_FILE = ".harness-cookie.json";
 /**
+ * fetch 失败时**把真实原因带出来**（2026-10-10）。
+ * undici 只给一句 "fetch failed"，真因藏在 `e.cause`（ECONNREFUSED / ENOTFOUND /
+ * CERT_HAS_EXPIRED / UND_ERR_CONNECT_TIMEOUT / 代理相关…）。以前这层被吞掉，
+ * 于是面板上只有"验证码服务不可达: fetch failed"，排查只能猜。
+ */
+function fetchFailReason(e) {
+  const parts = [String((e && e.message) || e)];
+  let c = e && e.cause;
+  for (let i = 0; c && i < 3; i += 1) {
+    const bit = c.code || c.message || c.name;
+    if (bit) parts.push(String(bit));
+    c = c.cause;
+  }
+  try { if (e && e.name && !parts.includes(e.name)) parts.push(String(e.name)); } catch { /* 忽略 */ }
+  return [...new Set(parts)].join(" ← ");
+}
+
+/**
  * Cookie 按 **authority 分文件**(0.7.0-beta.2 起,2026-10-09 事故根治)。
  *
  * 【事故】`~/.dsh-remote/` 只有一份 `.harness-cookie.json`,而 Web 端(3080)与桌面端(每次启动
@@ -1028,6 +1046,23 @@ function launchAgentPath() {
   if (isDarwin()) return join(homedir(), "Library/LaunchAgents/com.dshremote.bridge.plist");
   return null;
 }
+/**
+ * ★ 这份自启动 plist 是否**确实是为本 relayDir 装的**（内容里写着 `<relayDir>/dsh-setup.mjs`）。
+ *
+ * 🔴 2026-10-10 事故（两次，同一根因）：`reapBrokenAutostart()` 用**当前 relayDir** 判断
+ *   "入口脚本缺失"（测试的临时 relayDir 当然没有 dsh-setup.mjs → 判 true），
+ *   但删除的却是 `launchAgentPath()` = **真实 HOME 下那份 plist** → 把开发者本机的自启动
+ *   连 bootout 带删文件一起干掉了（远程访问中断，且日志里看不出异常）。
+ *   判据与删除目标必须是**同一个东西**：先确认这份 plist 属于本 relayDir，再动手。
+ */
+function plistOwnedByRelayDir(relayDir) {
+  try {
+    const p = launchAgentPath();
+    if (!p || !existsSync(p)) return false;
+    return readFileSync(p, "utf8").includes(join(relayDir, "dsh-setup.mjs"));
+  } catch { return false; }
+}
+
 
 /**
  * Linux 的 systemd user unit 路径（与 dsh-setup.mjs 的 `autostartFilePath()` **同一路径**）。
@@ -1699,6 +1734,8 @@ function reapBrokenAutostart(relayDir) {
   // 只有 macOS 有 launchd 自启动项可摘；Windows/Linux 走的是 systemd/无自启动，判据不适用。
   if (!isDarwin()) return false;
   if (!plistEntryMissing()) return false;
+  // 归属校验：这份 plist 不是给本 relayDir 装的 → 一个字节都不动（见 plistOwnedByRelayDir）
+  if (!plistOwnedByRelayDir(relayDir)) return false;
   const st = launchdStatus();
   if (!st.running && !st.crashing && !st.state) return false; // 作业未被 launchd 加载、无可摘的东西
   for (const target of launchTargets()) sh(`launchctl bootout ${target}`);
@@ -2028,9 +2065,36 @@ function uninstallRuntime(relayDir, protectedPath) {
     // a) 停服务 + 移除自启动文件
     try {
       if (isDarwin()) {
+        /* 🔴 2026-10-10 事故护栏：**relayDir 不在当前 HOME 之下时，绝不碰真实自启动**。
+           当天某个用例用「真 HOME + 临时 relayDir」调到了这里：plist 路径解析到真实的
+           ~/Library/LaunchAgents/com.dshremote.bridge.plist → 先 bootout 真桥、再把 plist 删了
+           → **开发者本机的远程访问被测试整个卸掉**（job 消失、桥停摆）。
+           判据：生产部署里 relayDir 一定在 HOME 之下（~/.dsh-remote）；
+           测试夹具的 relayDir 在 /var/folders/... 而 HOME 是真实的 —— 这个不一致必须拒绝。
+           显式要跨目录操作时设 DSH_RELAY_ALLOW_FOREIGN_SERVICE=1。 */
+        const underHome = (() => {
+          try {
+            const rel = relative(homedir(), relayDir);
+            return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+          } catch { return false; }
+        })();
+        if (!underHome && process.env.DSH_RELAY_ALLOW_FOREIGN_SERVICE !== "1") {
+          out.serviceSkipped = `relayDir 不在 HOME 之下（${relayDir}），拒绝改动真实自启动服务`;
+          return out;
+        }
         // 只处理「plist 位于当前 HOME」的服务：本插件/dsh-setup.mjs 安装的服务一定在此
         const plistPath = launchAgentPath();
         if (plistPath && existsSync(plistPath)) {
+          /* ★★ 归属校验（2026-10-10 事故的最终护栏）：
+             这份 plist 必须**确实是为本 relayDir 装的**（内容里写着 <relayDir>/dsh-setup.mjs）。
+             不校验的话，只要有用例拿「真 HOME + 临时 relayDir」走到这里，就会把开发者本机
+             真实的服务**先 bootout 再删文件**（当天实测发生：桥停摆、远程访问中断）。
+             归属不符 → 整个服务分支跳过（并如实说明），绝不越界。 */
+          const ownedByThisDir = plistOwnedByRelayDir(relayDir);
+          if (!ownedByThisDir) {
+            out.serviceSkipped = `plist 不属于本 relayDir，拒绝改动：${plistPath}`;
+            return out;
+          }
           // crashing 也要 bootout：崩溃循环中的作业在 launchd 里仍是「已加载」，
           // 只删 plist 文件它照样被 KeepAlive 反复重拉（见 launchdStatus 注释）。
           const st = launchdStatus();
@@ -3252,7 +3316,7 @@ async function proxyAnnouncements(relayDir, req, res, pathname) {
     res.end(text);
   } catch (e) {
     // 网络不可达 / 超时 / JSON 异常：一律 502 + 人话，绝不把异常抛回 webServer（那会变成 500 堆栈）
-    return sendJson(res, 502, { ok: false, error: `公告服务不可达: ${e.message}` });
+    return sendJson(res, 502, { ok: false, error: `公告服务不可达: ${fetchFailReason(e)}` });
   }
 }
 
@@ -3895,13 +3959,22 @@ function writePatchDocument(patchFile, text) {
  * 助手做的是「宁可少做也不卡住」的有界清理：杀残留进程 → 删自启动 → 清配置目录，每步独立 try/catch。
  */
 function buildRuntimeCleanupHelper(relayDir, protectedPath) {
+  /* ★ 归属校验（2026-10-10 事故第三条路径）：计划里的 plistPath 用的是**当前 homedir**，
+     而 relayDir 来自调用方 —— 两者不必是同一个目录。曾有测试用「真 HOME + 临时 relayDir」
+     走到这里，于是这个 detached 助手把**开发者本机真实的自启动 plist 删了**（异步删，
+     所以在进程内插桩根本抓不到）。现在：plist 里没写着本 relayDir 的入口脚本 → **不给路径**，
+     助手自然一个字节都不动。 */
+  const homePlist = join(homedir(), "Library", "LaunchAgents", "com.dshremote.bridge.plist");
+  const ownsHomePlist = (() => {
+    try { return existsSync(homePlist) && readFileSync(homePlist, "utf8").includes(join(relayDir, "dsh-setup.mjs")); } catch { return false; }
+  })();
   const plan = JSON.stringify({
     relayDir,
     protectedPath: protectedPath || "",
     platform: osPlatform(),
     taskName: WIN_TASK_NAME,
     pidFiles: [WATCHER_PID_FILE, BRIDGE_PID_FILE],
-    plistPath: join(homedir(), "Library", "LaunchAgents", "com.dshremote.bridge.plist"),
+    plistPath: ownsHomePlist ? homePlist : "",
     unitPath: join(homedir(), ".config", "systemd", "user", "dsh-bridge.service"),
     log: join(tmpdir(), "dsh-remote-uninstall.log"),
   });
@@ -6651,7 +6724,7 @@ function registerRoutes(ctx, relayDir) {
           res.writeHead(200, { "content-type": type || "application/json; charset=utf-8", "cache-control": "no-store" });
           res.end(buf);
         } catch (e) {
-          sendJson(res, 502, { ok: false, error: `验证码服务不可达: ${e.message}` });
+          sendJson(res, 502, { ok: false, error: `验证码服务不可达: ${fetchFailReason(e)}` });
         }
       },
     },

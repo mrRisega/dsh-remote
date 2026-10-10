@@ -264,7 +264,15 @@ exit 0
     // 当前 HOME 的 LaunchAgents 里有 plist（服务此前装过，但现在未运行）
     const plist = path.join(tempHome, "Library", "LaunchAgents", "com.dshremote.bridge.plist");
     await mkdir(path.dirname(plist), { recursive: true });
-    await writeFile(plist, "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict/></plist>");
+    /* ⚠️ 2026-10-10：夹具必须写成**真实形态的 plist** —— 内容里要含 `<relayDir>/dsh-setup.mjs`。
+       清理助手（与插件里的两条路径）现在会先校验"这份 plist 是不是给本 relayDir 装的"：
+       只有含本 relayDir 入口脚本的 plist 才允许删。以前这里写的是空 `<dict/>`，
+       于是它同时**掩盖**了两件事：① 夹具不像真 plist；② 真实世界里那个守卫若缺失，
+       这条件会真的去删开发者的 plist（当天就发生了）。 */
+    await writeFile(plist, `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>ProgramArguments</key><array><string>/usr/bin/node</string><string>${path.join(relayDir, "dsh-setup.mjs")}</string><string>run</string></array>
+</dict></plist>`);
 
     const routes = boot(relayDir);
     const { host, base } = await serve(routes);

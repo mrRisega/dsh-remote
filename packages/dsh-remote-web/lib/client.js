@@ -824,20 +824,37 @@ window.__ModuleLoader__.load({
      * `aria-haspopup="dialog"` 是**语言无关**的语义标记，比匹配文案稳（换语言/换文案都不失效）。
      * 找不到就**不注入** —— 宁可不显示快捷入口，也绝不把按钮塞到别人家的面板里。
      */
-    function pickSettingsTrigger() {
+    /**
+     * 官方「设置」触发器的**候选列表**（设置-like 的排前面）。
+     *
+     * 🔴 2026-10-10 修（业主实测"点入口没反应"）：这里以前还要求 `navCellLike(el)`
+     *   —— 而桌面端侧栏那套 class 里**没有** sidebar/nav 字样（都是 `_3WPZCG_*`），
+     *   于是候选全被挡掉 → 触发器 null → 点击静默返回，表现就是"点了没反应"。
+     *   现在只认语义特征：`aria-haspopup="dialog"` + 不在弹层内 + 不是菜单类；
+     *   其中 **带 aria-keyshortcuts / 文案或 aria-label 含「设置」** 的优先（语言无关 + 精确）。
+     */
+    function settingsTriggerCandidates() {
+      var out = [];
       try {
         var cands = document.querySelectorAll('button[aria-haspopup="dialog"], [aria-haspopup="dialog"]');
+        var rest = [];
         for (var i = 0; i < cands.length; i++) {
           var el = cands[i];
-          if (!el || el.id === NAV_ENTRY_ID) continue;   // 排除注入按钮自身
-          if (navInDialog(el)) continue;                 // 弹层里的（含面板内的关闭/栏目）一律不要
-          if (!navCellLike(el)) continue;
+          if (!el || el.id === NAV_ENTRY_ID) continue;   // 排除我们自己的入口
+          if (navInDialog(el)) continue;                 // 弹层内的（关闭键/栏目）一律不要
           if (NAV_BAD_RE.test(String(el.className || ""))) continue;
-          return el;
+          var label = String(navAttrOf(el) || navCleanText(el) || "");
+          var hasShortcut = !!(el.getAttribute && el.getAttribute("aria-keyshortcuts"));
+          if (hasShortcut || /设置|Settings/i.test(label)) out.push(el);
+          else rest.push(el);
         }
-      } catch (e) { /* 忽略 */ }
-      // 兜底：严格等值匹配（**不做子串匹配**，否则又会命中「通用设置」）；且必须在弹层外
-      return pickNavByToken("设置", { exactOnly: true, insideDialog: false });
+        return out.concat(rest);   // 兜底也不能空着：实在认不出就逐个试（见 openRemoteSettings）
+      } catch (e) { return out; }
+    }
+    /** 官方「设置」触发器（首选候选，保持旧名字给测试与调用方用）。 */
+    function pickSettingsTrigger() {
+      var list = settingsTriggerCandidates();
+      return list.length ? list[0] : null;
     }
     /**
      * 按文案/aria-label 找导航项。
@@ -870,23 +887,34 @@ window.__ModuleLoader__.load({
       } catch (e) { /* 忽略 */ }
       return null;
     }
-    /** 打开「远程访问」设置栏目：栏目已渲染直接点；否则先点官方「设置」再 ≤3s 轮询补点。 */
+    /**
+     * 打开「远程访问」设置栏目。
+     * 栏目已渲染 → 直接点；否则**依次试每个"设置"候选**：点一下 → 轮询 ≤3s 看栏目出没出来 →
+     * 没出来就换下一个候选。为什么要逐个试（2026-10-10）：桌面端侧栏可能同时有多个
+     * `aria-haspopup="dialog"`（账号/更多…），认错了就会"点了没反应"；逐个试则只要有**一个**
+     * 能打开设置面板，入口就一定能用。
+     */
     function openRemoteSettings() {
       try {
-        // 栏目项在设置弹层内 → 这里**允许**弹层内匹配（insideDialog: true）；
-        // 精确相等优先，避免命中「通用设置」这类含「设置」的邻居。
         var cell = pickNavByToken("远程访问", { insideDialog: true });
         if (cell) { cell.click(); return; }
-        var st = pickSettingsTrigger();   // 侧栏那颗齿轮（语义锚点，绝不落进弹层）
-        if (!st) return;
-        st.click();
-        var tries = 0;
-        var iv = setInterval(function () {
-          tries++;
-          var c2 = pickNavByToken("远程访问", { insideDialog: true });
-          if (c2) { clearInterval(iv); c2.click(); }
-          else if (tries >= NAV_POLL_MAX) clearInterval(iv);
-        }, 150);
+        var cands = settingsTriggerCandidates();
+        if (!cands.length) return;
+        var idx = 0;
+        var tryNext = function () {
+          if (idx >= cands.length) return;
+          var el = cands[idx++];
+          try { el.click(); } catch (eClick) { return tryNext(); }
+          var tries = 0;
+          var iv = setInterval(function () {
+            tries++;
+            var c2 = pickNavByToken("远程访问", { insideDialog: true });
+            if (c2) { clearInterval(iv); c2.click(); return; }
+            if (tries >= NAV_POLL_MAX) { clearInterval(iv); tryNext(); }   // 这个候选没打开设置 → 换下一个
+          }, 150);
+          try { if (iv && typeof iv.unref === "function") iv.unref(); } catch (eIv) { /* 忽略 */ }
+        };
+        tryNext();
       } catch (e) { /* 忽略 */ }
     }
     /**

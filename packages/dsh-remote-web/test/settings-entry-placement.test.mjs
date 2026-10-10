@@ -19,7 +19,8 @@ const SOURCE = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8"
 /** 把 `var NAV_ENTRY_ID` 到 `openRemoteSettings` 之前的那段辅助函数切出来（含依赖的常量）。 */
 function navHelpersSource() {
   const start = SOURCE.indexOf('var NAV_ENTRY_ID = "dru-nav-remote";');
-  const end = SOURCE.indexOf("/** 打开「远程访问」设置栏目");
+  // 末端锚点用**函数声明**而不是注释（注释会被重写，2026-10-10 就因此失效过一次）
+  const end = SOURCE.indexOf("function openRemoteSettings()");
   assert.ok(start > 0 && end > start, "切片锚点失效：侧栏入口辅助函数结构变了");
   return SOURCE.slice(start, end);
 }
