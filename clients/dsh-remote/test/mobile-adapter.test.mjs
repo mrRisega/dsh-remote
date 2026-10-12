@@ -101,6 +101,18 @@ test("适配层文本不含口令类敏感标记(仅结构提示)", () => {
   assert.ok(!/password|secret|token\s*=/i.test(mod.ADAPTER_TAG + "")); // ADAPTER_TAG 只是 id 常量
 });
 
+test("注入体里不得出现反引号(模板字符串会被提前闭合 —— 本仓 AGENTS.md 明列的坑)", () => {
+  const r = injectMobileAdapter(OFFICIAL_HTML);
+  const cssAt = r.html.indexOf('<style id="dsh-mobile-adapter-css"');
+  const jsAt = r.html.indexOf('<script id="dsh-mobile-adapter-js"');
+  const css = r.html.slice(r.html.indexOf(">", cssAt) + 1, r.html.indexOf("</style>", cssAt));
+  const js = r.html.slice(r.html.indexOf(">", jsAt) + 1, r.html.indexOf("</script>", jsAt));
+  assert.ok(css.length > 1000 && js.length > 1000, "应取到注入体");
+  // 注入体是 JS 模板字符串拼出来的：里面再出现反引号就会提前闭合，报错信息往往毫不相干。
+  assert.equal(css.includes("`"), false, "注入样式体内出现反引号（注释里也不行）");
+  assert.equal(js.includes("`"), false, "注入脚本体内出现反引号（注释里也不行）");
+});
+
 test("fix2:设置区用精确类+小字号,浮层不再持久 will-change,鲸鱼协同 JS 载荷存在", () => {
   const r = injectMobileAdapter(OFFICIAL_HTML);
   const css = r.html.slice(r.html.indexOf('<style id="dsh-mobile-adapter-css"'), r.html.indexOf("</style>"));
@@ -121,4 +133,27 @@ test("fix2:设置区用精确类+小字号,浮层不再持久 will-change,鲸鱼
   // 上述 CSS/JS 都只能落在 ≤820px 运行时:CSS 规则整体在 media 内;JS 执行由 NARROW() 把关
   assert.ok(css.indexOf("@media (max-width: 820px)") !== -1);
   assert.match(js, /NARROW\s*=\s*\(\)\s*=>\s*window\.innerWidth\s*<=\s*820/);
+});
+
+test("2026-10-13:0.2 前缀(Dws9Sa_*)与结构兜底都在(官方改名不再整段静默失效)", () => {
+  const r = injectMobileAdapter(OFFICIAL_HTML);
+  const css = r.html.slice(r.html.indexOf('<style id="dsh-mobile-adapter-css"'), r.html.indexOf("</style>"));
+  const js = r.html.slice(r.html.indexOf('<script id="dsh-mobile-adapter-js"'));
+  // ① 0.2.0-rc.2 实测前缀:VOzbGW_* → Dws9Sa_*(结构/类名一一对应,只换哈希)
+  for (const k of ["overlay", "panel", "nav", "navTitle", "navList", "navCell", "content", "header", "close", "options"]) {
+    assert.match(css, new RegExp(`\\[class~="VOzbGW_${k}"\\]`), `0.1.5 前缀钩子 ${k} 必须保留`);
+    assert.match(css, new RegExp(`\\[class~="Dws9Sa_${k}"\\]`), `0.2 前缀钩子 ${k} 必须并挂`);
+  }
+  // ② 结构兜底:JS 打稳定类 + CSS 认稳定类 + :has() 纯 CSS 兜底
+  assert.match(js, /maTagSettingsDialog/);
+  assert.match(js, /dsh-ma-settings-panel/);
+  assert.match(css, /\.dsh-ma-settings-panel/);
+  assert.match(css, /div\[role="dialog"\]:has\(> nav\)/);
+  // ③ 可见的降级诊断(不得引入覆盖层):console.warn 走适配层既有通道
+  assert.match(js, /\[dsh-mobile-adapter\]/);
+  assert.match(js, /window\.console\.warn|console\.warn/);
+  // ④ 通用弹层按手机尺寸收敛
+  assert.match(css, /max-width:\s*calc\(100vw - 24px\)\s*!important/);
+  assert.match(css, /max-height:\s*calc\(100dvh - 24px\)\s*!important/);
+  assert.match(css, /\.dru-popup-card/);
 });

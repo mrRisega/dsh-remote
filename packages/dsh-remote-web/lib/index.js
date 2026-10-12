@@ -215,19 +215,28 @@ async function discoverUpstreamSelf(relayDir, { force = false } = {}) {
  * 开机自启的 watcher（Windows 登录任务 / launchd）由系统拉起，拿不到本进程的 env，
  * 只有插件半知道 dsh web 真实监听在哪个端口。运行时（0.6.12+）读这个文件当第二优先来源。
  * 内容没变就不写（面板每轮都会走到这里，别把磁盘写热）。
+ *
+ * @returns {{changed:boolean, url:string}} `changed=true` = **这一次真的改写了文件**。
+ *   ★ 2026-10-13 为什么必须回报这个：修「12 秒重启风暴」时，唯一还站得住的"需要重启一个
+ *   **正在健康运行**的 bridge"的理由就是"它的上游地址变了（进程环境里是旧地址，不重启不生效）"。
+ *   而这个判据必须是**磁盘上的真实变化**，不能是"我觉得它可能变了" —— 后者又会变成
+ *   每轮自愈都重启一次。调用方一律忽略返回值也没关系（旧行为不变）。
  */
 const UPSTREAM_FILE = ".dsh-upstream";
 function publishUpstream(relayDir) {
-  if (skipsSystemOps()) return; // 测试/诊断隔离：不得对磁盘产生任何副作用（含创建配置目录）
+  if (skipsSystemOps()) return { changed: false, url: "", skipped: true }; // 测试/诊断隔离：不得对磁盘产生任何副作用（含创建配置目录）
   try {
     const url = upstreamUrl();
     const file = join(relayDir, UPSTREAM_FILE);
     let cur = "";
     try { cur = readFileSync(file, "utf8").trim(); } catch { /* 首次 */ }
-    if (cur === url) return;
+    if (cur === url) return { changed: false, url };
     mkdirSync(relayDir, { recursive: true });
     writeFileSync(file, url + "\n", { mode: 0o600 });
-  } catch { /* 非关键：读不到就沿用运行时的回退链 */ }
+    return { changed: true, url };
+  } catch { /* 非关键：读不到就沿用运行时的回退链 */
+    return { changed: false, url: "" };
+  }
 }
 
 /**
@@ -1102,6 +1111,41 @@ function systemdUserAvailableCached(ttlMs = 60_000) {
   return ok;
 }
 
+/**
+ * ★★ 2026-10-13 修复（线上反馈 fb_3c4c5a13bc47 / 用户 842）：Linux 上「bridge 到底在不在跑」的
+ * **权威**判据 —— 问服务管理器本人，而不是猜进程名。
+ *
+ * 为什么 `pgrep` 不能当就绪判据：自愈 watcher 每 `selfhealIntervalMs()`（默认 12s）拍一次，
+ * 旧就绪判据是 `manualStatus(relayDir).watcher.length > 0`，它靠
+ * `pgrep -fl 'dsh-setup.mjs|dsh-bridge.mjs'` 的名称匹配。这个探测**极易拿到空结果**
+ * （PATH 里没有 /usr/bin、pgrep 不存在、进程名与模式不匹配、进程属于别的会话……），
+ * 而拿到空结果后的动作是 `systemctl --user restart dsh-bridge` —— **restart 会杀掉正在
+ * 健康运行的 bridge**。实测后果：该设备 `audit_log` 的 `device.claim`（= bridge 进程启动的
+ * 必然产物）一天 **3567** 次、相邻间隔 p50 **12001ms**、连续 10 小时整点 300 次/小时；
+ * 全站上百台设备每天 1.1~1.5 万次重登记。每次重启都以新连接顶掉旧隧道，中继随即把该设备
+ * **所有手机镜像 WS 关掉（close 1012 "bridge offline"）**，镜像页每 ~12.3 秒断线重连并全量重放
+ * 界面状态 —— 用户看到的就是"选项窗口一会儿显示、一会儿消失"。
+ * 而中继侧对这类 churn 只做了日志抑制，所以运维侧长期看不见。
+ *
+ * 🔴 结论：**探测失败 ≠ 进程死了**，绝不允许把前者翻译成"每 12 秒杀一次隧道"。
+ *
+ * 为什么必须是三态而不是布尔：`known:false`（问不到 systemd —— NAS/容器里没有 user manager、
+ * 甚至没有 systemctl 命令）与「问了，明确不是 active」在语义上完全不同：
+ *   · known=false → 回退到进程探测（与旧行为一致，不能因为问不到就认为它死了）；
+ *   · known=true & active=false → 才可以动手拉起。
+ * 把这两种混成一个 `false`，等于又制造了一次"判据失败就重启"的事故。
+ */
+function linuxSystemdUnitState() {
+  if (!isLinux()) return { known: false, active: false, raw: "" };
+  const r = sh("systemctl --user is-active dsh-bridge");
+  const raw = String(r.stdout || "").trim();
+  if (raw === "active") return { known: true, active: true, raw };
+  // is-active 对 inactive/failed/activating… 会以非 0 退出，但**会打印状态字** —— 那是有效回答。
+  // 一个字都没打印 = systemctl 根本没回答（没有 user manager / 没有这个命令）→ 未知，不是"死"。
+  if (!raw) return { known: false, active: false, raw };
+  return { known: true, active: false, raw };
+}
+
 /** 写 Linux systemd user unit（与 dsh-setup.mjs 同内容）。写不了返回 null（不致命，还有脱离进程兜底）。 */
 function writeLinuxUnit(relayDir) {
   const unitPath = linuxUnitPath();
@@ -1160,23 +1204,93 @@ function startBridgeLinux(relayDir) {
       detail: "桌面运行环境（bridge）尚未安装，已在后台自动安装，完成后会自动启动 bridge——请稍候刷新面板（也可点下方「一键更新」查看进度）",
     };
   }
-  publishUpstream(relayDir); // 脱离进程拉起的 watcher 没有本进程 env，只认这个文件
+  const up = publishUpstream(relayDir); // 脱离进程拉起的 watcher 没有本进程 env，只认这个文件
   const unit = writeLinuxUnit(relayDir);
   if (unit && systemdUserAvailable()) {
-    sh("systemctl --user daemon-reload");
-    const en = sh("systemctl --user enable dsh-bridge");
-    const rs = sh("systemctl --user restart dsh-bridge");
-    const act = rs.ok ? sh("systemctl --user is-active dsh-bridge") : { ok: false, stdout: "", stderr: "" };
-    if (rs.ok && act.ok && act.stdout.trim() === "active") {
-      return { ok: true, status: "running", pid: null, detail: "已由 systemd --user 托管 bridge（开机自启 + 崩溃自愈）" };
+    // ★★ 2026-10-13 幂等闸门（修「12 秒重启风暴」的核心）：
+    //   先问**服务管理器本人**这个 unit 是不是 active，而不是拿 pgrep 猜进程名。
+    //   active = systemd 把它拉起来了、正在跑 —— 此时绝不能 restart（restart 会杀掉旧进程、
+    //   新建隧道，中继随即 close(1012) 掉该设备所有手机镜像 WS，镜像页全量重放）。
+    //   旧代码在这里**无条件 restart**：只要上游判据（pgrep）拿不到，它就每 12 秒把一台
+    //   健康运行的 bridge 杀掉重建一次，一天 3567 次（见 linuxSystemdUnitState 的长注释）。
+    const state = linuxSystemdUnitState();
+    if (state.active && !up.changed) {
+      // 唯一还站得住的"需要重启"的理由不存在 → 什么都不做，如实回报"在跑、没重启"。
+      return {
+        ok: true, status: "running", pid: null, reused: true,
+        detail: "已由 systemd --user 托管 bridge（运行中，未重启）",
+      };
+    }
+    const why = state.active
+      // 上游地址**确实变了**（运行中的进程环境里是旧地址，不重启就会对着旧端口转发）——
+      // 这是唯一允许动一个健康服务的理由，所以必须过护栏：万一上游地址在抖，
+      // 也不能退化成"每 12 秒重启一次"（那正是本次故障的形态）。
+      ? `上游地址变更为 ${up.url}`
+      // 没在跑（含 is-active=activating/failed 这类瞬时态）：本该起它，但**反复 restart 一个
+      // 起不来的 unit** 每次都会派生一个新 bridge 进程（= 一次 device.claim = 顶掉一次隧道），
+      // 所以这里的 restart 同样要过护栏 —— 护栏就该放在"破坏性动作"的调用点上，
+      // 而不是指望每个调用者自己记得限流。
+      : `systemd --user 说它没在跑（is-active=${state.raw || "无回答"}）`;
+    const g = guardedSystemdRestart(relayDir, why);
+    if (!g.allowed) {
+      // ⚠️ 被护栏拦下时**绝不能**再落到下面的"脱离进程"兜底：那条路会直接派生一个新 watcher，
+      //    每拍一个 —— 护栏就形同虚设（这正是我们要止住的东西）。
+      // 而回报要分两种：unit 本来就 active 时它**仍在运行**，不能因为"我们没重启"就报失败
+      // （否则面板会把一台好机器显示成故障）。
+      if (state.active) {
+        return {
+          ok: true, status: "running", pid: null, reused: true, staleUpstream: true,
+          detail: `bridge 正在运行；上游地址已变更为 ${up.url}，但为避免重启风暴暂不重启它（重开 dsh web 后自然生效）`,
+        };
+      }
+      return {
+        ok: false, status: "selfheal-throttled",
+        detail: `自愈护栏拦下了对 systemd unit 的重启（${g.gate.reason === "exhausted" ? "已达本进程重启上限" : "距上次重启过近"}），本轮不重启 bridge`,
+      };
+    }
+    if (g.ok) {
+      // accounted: true = 这次破坏性重启已经在 guardedSystemdRestart 里记过账（护栏额度 + 可见日志）。
+      // 调用方（自愈 watcher）据此**不得再记一次**，否则一次尝试吃掉两格额度，5 分钟退避缩水成 2.5 分钟。
+      return { ok: true, status: "running", pid: null, accounted: true, detail: "已由 systemd --user 托管 bridge（开机自启 + 崩溃自愈）" };
+    }
+    if (state.active) {
+      // 因上游变更而重启、但重启后仍不是 active：如实回报（已在 guardedSystemdRestart 里记账）
+      return {
+        ok: true, status: "running", pid: null, reused: true, staleUpstream: true,
+        detail: `bridge 仍在运行，但上游地址已变更为 ${up.url} 且本次重启未确认生效（详见安装日志）`,
+      };
     }
     appendLogLine(relayDir, AUTO_INSTALL_LOG,
-      `[dsh-remote-web] systemd --user 拉起 bridge 失败（enable=${en.ok ? "ok" : "fail"}, restart=${rs.ok ? "ok" : "fail"}），改用后台进程`);
+      `[dsh-remote-web] systemd --user 拉起 bridge 失败（restart=${g.rs.ok ? "ok" : "fail"}），改用后台进程`);
   }
   const d = startBridgeDetached(relayDir, unit
     ? "本机没有可用的 user systemd 会话（NAS / 容器 / 精简系统常见），已改为后台进程"
     : "systemd unit 写入失败，已改为后台进程");
   return d;
+}
+
+/**
+ * 执行一次「systemd 破坏性重启 bridge」：**先过护栏，过了才真的 restart**，并记账 + 写可见日志。
+ *
+ * 为什么要把 `systemctl --user restart` 收敛到这一个函数里：这条命令是本次故障里唯一真正
+ * 造成伤害的动作（杀旧 bridge → 新进程 → 新隧道 → 中继 close(1012) 掉手机镜像）。
+ * 它散落在多处调用点时，任何一处忘了限流就又是一次"十二秒杀一次隧道"；
+ * 收到一处之后，"什么情况下允许执行它"就有了唯一答案，也能被单测直接钉住。
+ * @returns {{allowed:boolean, gate:object, ok:boolean, en:object, rs:object, act:object}}
+ */
+function guardedSystemdRestart(relayDir, why) {
+  const gate = selfhealRestartGate(relayDir);
+  if (!gate.allowed) {
+    noteSelfhealBlocked(relayDir, gate);
+    return { allowed: false, gate, ok: false, en: null, rs: null, act: null };
+  }
+  sh("systemctl --user daemon-reload");
+  const en = sh("systemctl --user enable dsh-bridge");
+  const rs = sh("systemctl --user restart dsh-bridge");
+  const act = rs.ok ? sh("systemctl --user is-active dsh-bridge") : { ok: false, stdout: "", stderr: "" };
+  const active = Boolean(rs.ok && act.ok && String(act.stdout).trim() === "active");
+  noteSelfhealRestart(relayDir, why, active ? "running" : `restart=${rs.ok ? "ok" : "fail"}/is-active=${String(act.stdout).trim() || "?"}`);
+  return { allowed: true, gate, ok: active, en, rs, act };
 }
 
 /**
@@ -1425,6 +1539,97 @@ const PROVISIONED_MARKER = ".dsh-provisioned-by-plugin";
  */
 function selfhealIntervalMs() {
   return Math.max(200, Number(process.env.DSH_RELAY_SELFHEAL_MS) || 12_000);
+}
+
+/**
+ * ★★ 2026-10-13 自愈重启护栏（熔断 + 退避）—— 修「12 秒重启风暴」的第二道闸。
+ *
+ * 为什么在"权威存活判据"之外还必须再有一道：
+ *   权威判据解决的是"**活着却被判成死**"（见 `linuxSystemdUnitState()`）。
+ *   但如果 bridge **真的**起不来（上游端口不对、运行环境半装、unit 写不进去、unit 一直 failed），
+ *   旧的 12s 循环同样会每拍重启一次 —— 那是同一个病的另一种形态：
+ *   **一次真实故障被翻译成"每天 7200 次重启"**（历史上 Windows 补装失败就出过 12 秒一次、
+ *   累计 606 次的失败风暴，见 `provisionRetryGate` 的注释）。所以：
+ *     · 同一 relayDir、**本进程生命周期内**的破坏性重启最多 `SELFHEAL_MAX_RESTARTS` 次；
+ *     · 两次之间至少隔 `selfhealMinRestartMs()`（默认 5 分钟）；
+ *     · 超限就**停手**，并把原因明确写进安装日志（面板「复制诊断信息」与用户主动上报的
+ *       诊断包里都会带上它）——而不是静默地每 12 秒再来一次。
+ *
+ * 为什么上限按"本进程生命周期"而不是"每天"：合法的上游变更（dsh web 换端口）几乎总伴随着
+ * dsh web 重启，而重启就会重置这份记录 —— 所以 3 次对正常用户绰绰有余，对故障循环刚好够呛。
+ * `DSH_RELAY_SELFHEAL_MIN_RESTART_MS` 仅供本仓库测试把节奏压到亚秒级
+ * （与 `DSH_RELAY_SELFHEAL_MS` / `DSH_RELAY_WEDGE_MS` 同一约定）：生产不设置。
+ */
+const SELFHEAL_MAX_RESTARTS = 3;
+const SELFHEAL_MIN_RESTART_MS = 5 * 60 * 1000;
+function selfhealMinRestartMs() {
+  const v = Number(process.env.DSH_RELAY_SELFHEAL_MIN_RESTART_MS);
+  return Number.isFinite(v) && v >= 0 ? v : SELFHEAL_MIN_RESTART_MS;
+}
+/** relayDir → { count, lastAt, blockedLine }；blockedLine = 已经告知过的"被拦下"结论（防刷屏）。 */
+const selfhealRestarts = new Map();
+function selfhealGuardOf(relayDir) {
+  return selfhealRestarts.get(relayDir) || { count: 0, lastAt: 0, blockedLine: "" };
+}
+
+/**
+ * 现在允许对这个 relayDir 做**破坏性重启**吗？（纯查询，不改状态 —— 调用方在真的重启之后
+ * 用 `noteSelfhealRestart` 记账，这样"只查不记"的路径不会凭空消耗额度。）
+ * @returns {{allowed:boolean, reason:"ok"|"too-soon"|"exhausted", count:number, waitMs:number}}
+ */
+function selfhealRestartGate(relayDir, now = Date.now()) {
+  const rec = selfhealGuardOf(relayDir);
+  if (rec.count >= SELFHEAL_MAX_RESTARTS) return { allowed: false, reason: "exhausted", count: rec.count, waitMs: 0 };
+  const min = selfhealMinRestartMs();
+  const since = now - (rec.lastAt || 0);
+  if (rec.lastAt && since < min) return { allowed: false, reason: "too-soon", count: rec.count, waitMs: min - since };
+  return { allowed: true, reason: "ok", count: rec.count, waitMs: 0 };
+}
+
+/**
+ * 记一次**真的做了**破坏性重启，并留下一行可见日志。
+ *
+ * ★ 可观测性是这次修复的一半：这个故障拖了 3 个月才被定位，直接原因就是"重连风暴在中继侧
+ *   只被日志抑制、在客户端侧又什么都没记"——运维侧全程看不见。所以重启事件必须留痕：
+ *   写既有的安装日志（`.dsh-setup-install.log`，面板诊断与用户上报都会带它的尾部），不新造通道。
+ * @param {string} why 人类可读的原因（"权威判据说没在跑" / "上游地址变更"）
+ * @param {string} outcome 重启后的结果（"running" / "failed: …"）
+ */
+function noteSelfhealRestart(relayDir, why, outcome = "") {
+  const rec = selfhealGuardOf(relayDir);
+  rec.count += 1;
+  rec.lastAt = Date.now();
+  rec.blockedLine = ""; // 结论变了：下一次"被拦下"要重新说一遍
+  selfhealRestarts.set(relayDir, rec);
+  appendLogLine(relayDir, AUTO_INSTALL_LOG,
+    `[dsh-remote-web] 自愈重启 bridge（第 ${rec.count}/${SELFHEAL_MAX_RESTARTS} 次·本进程生命周期内，`
+    + `之后 ${Math.round(selfhealMinRestartMs() / 1000)} 秒内不再重启）：${why}${outcome ? ` → ${outcome}` : ""}`);
+  return rec;
+}
+
+/**
+ * 「这一拍本来想重启，但被护栏拦下了」——**同一条结论只说一次**（理由同 `noteAutostartFailure`：
+ * 每 12 秒写一行的日志等于没有日志，用户复制过来的诊断里会全是重复行，第一现场反而被淹没）。
+ * 注意：文案里**不得带倒计时秒数**，否则每一拍的文本都不同，去重就失效了。
+ */
+function noteSelfhealBlocked(relayDir, gate) {
+  const rec = selfhealGuardOf(relayDir);
+  const line = gate.reason === "exhausted"
+    ? `已停止自愈重启 bridge：本进程生命周期内已重启 ${SELFHEAL_MAX_RESTARTS} 次仍未就绪，`
+      + `为避免"每 ${Math.round(selfhealIntervalMs() / 1000)} 秒杀掉一次正在跑的隧道"已熔断；`
+      + `请点面板「一键更新」，或查看 bridge 日志确认真正的失败原因`
+    : `已暂缓自愈重启 bridge：距上次重启不足 ${Math.round(selfhealMinRestartMs() / 1000)} 秒`
+      + `（不会每 ${Math.round(selfhealIntervalMs() / 1000)} 秒重启一次，那样会反复切断手机镜像连接）`;
+  if (rec.blockedLine === line) return false;
+  rec.blockedLine = line;
+  selfhealRestarts.set(relayDir, rec);
+  appendLogLine(relayDir, AUTO_INSTALL_LOG, `[dsh-remote-web] ${line}`);
+  return true;
+}
+
+/** 桥已确认就绪：清掉护栏状态，让"后来真的再挂一次"能重新自愈（否则额度会被历史故障吃光）。 */
+function resetSelfhealGuard(relayDir) {
+  selfhealRestarts.delete(relayDir);
 }
 
 /** 向日志追加一行（多个子进程写同一日志用 append 模式，互不覆盖）。 */
@@ -1936,6 +2141,26 @@ function startBridge(relayDir) {
  *     → watcher `done = true` 永久停摆，自动补装（ensureRuntime）再也不会执行，
  *     这正是「市场装完插件、bridge 却起不来」且永不恢复的直接原因；
  *   - 补装运行环境不该等用户先登录：市场安装只给到插件半，登录那一刻就会 startBridge。
+ *
+ * ★★ 2026-10-13 重写就绪判据与"动手"策略（修线上反馈 fb_3c4c5a13bc47 的 12 秒重启风暴）：
+ *   【症状】Linux 用户（npx 安装，0.6.18）的 bridge 被本函数**每 12.001 秒重启一次**，
+ *     一天 3567 次；每次重启换一条新隧道 → 中继 close(1012) 掉该设备所有手机镜像 WS →
+ *     镜像页每 ~12.3 秒断线重连并全量重放 → 用户看到的交互选择窗口"一会显示、一会儿消失"。
+ *     全站上百台设备每天 1.1~1.5 万次重登记，多台设备间隔 p50 精确 ≈12.0s。
+ *   【成因】就绪判据只有 `launchdStatus().running`（macOS）与
+ *     `manualStatus().watcher.length > 0`（靠 pgrep 名称匹配，Linux/Windows 共用）。
+ *     这两个判据都**可能在服务其实健康时返回"没在跑"**，而拿到"没在跑"之后直接
+ *     `startBridge()` → `systemctl --user restart`（**破坏性**：杀旧进程、建新隧道）。
+ *     于是"判据失败"被逐字翻译成"每 12 秒杀一次隧道"，而且 `done` 永远不置位。
+ *   【现在】三层，缺一不可：
+ *     ① **权威判据优先**：Linux 问 `systemctl --user is-active dsh-bridge`（见
+ *        `linuxSystemdUnitState()`），pgrep 只作为"问不到 systemd 时"的兜底；
+ *     ② **成功即止**：任一判据确认就绪 → 立刻 `done = true; clearInterval`，
+ *        不再依赖下一拍去重新猜（旧代码即使这次 startBridge 成功，也要等下一拍 pgrep 认得出来
+ *        才算成功，而它恰恰认不出来 → 永远重启）；
+ *     ③ **护栏**：确需动手时先过 `selfhealRestartGate()`（≥5 分钟最小间隔 + 本进程内最多 3 次），
+ *        被拦下或触顶都写入**可见**的安装日志（这个故障之所以拖了三个月，正是因为客户端侧
+ *        什么都没记、中继侧又把 churn 日志抑制了，运维全程看不见）。
  */
 function scheduleRuntime(relayDir) {
   let done = false;
@@ -1963,20 +2188,84 @@ function scheduleRuntime(relayDir) {
       const cfg = loadConfig(relayDir);
       const hasAcct = Boolean((cfg.phone || cfg.email) && cfg.password) || Boolean(cfg.local_key);
       if (!hasAcct) return;
+      // ── ① 权威判据（按平台各问各的服务管理器）──
       // 运行环境已在，看服务是否已在运行（runtime 可能位于 npx 缓存/固化目录，不必重复安装）
       const st = launchdStatus();
-      if (st.running) { done = true; clearInterval(iv); return; }
+      if (st.running) {
+        done = true; clearInterval(iv); resetSelfhealGuard(relayDir);
+        logSelfhealReady(relayDir, cfg, `launchd state=${st.state || "running"}`);
+        return;
+      }
+      // Linux：**systemd 才是权威**。它说 active 就是 bridge 真的在跑（隧道是它的职责），
+      // 此时哪怕 pgrep 一个进程都没匹配上，也必须认为"就绪"并停摆 —— 这正是本次故障的正解。
+      if (isLinux()) {
+        const sys = linuxSystemdUnitState();
+        if (sys.active) {
+          done = true; clearInterval(iv); resetSelfhealGuard(relayDir);
+          logSelfhealReady(relayDir, cfg, "systemd --user is-active=active");
+          return;
+        }
+      }
+      // ── ② 兜底判据（问不到服务管理器时，还是得靠进程探测；Windows 只有这一条）──
       // 非 macOS（Windows **与 Linux**）没有 launchd：以「watcher 进程在跑」为就绪判据。
       // 否则 launchdStatus 永远是 false，done 永远不置位，watcher 会一直空转。
       // ★ Linux 也必须走这一支：`startBridge` 现在能在 Linux 上真正拉起 bridge（0.6.15），
       //   但就绪判据漏了 Linux 的话，每轮自愈都会重复走一遍"写 unit + 起进程"。
-      if (!isDarwin() && manualStatus(relayDir).watcher.length > 0) { done = true; clearInterval(iv); return; }
-      startBridge(relayDir); // 环境在但服务没起 → 拉起
+      if (!isDarwin() && manualStatus(relayDir).watcher.length > 0) {
+        done = true; clearInterval(iv); resetSelfhealGuard(relayDir);
+        logSelfhealReady(relayDir, cfg, "进程探测（pgrep/pid 文件）");
+        return;
+      }
+      // ── ③ 确实没在跑 → 过护栏后才动手（绝不允许"判据失败"直接变成"每 12 秒杀一次隧道"）──
+      const gate = selfhealRestartGate(relayDir);
+      if (!gate.allowed) { noteSelfhealBlocked(relayDir, gate); return; }
+      const r = startBridge(relayDir); // 环境在但服务没起 → 拉起
+      if (r && r.ok) {
+        // 起来了：立刻置位 + 记账 + 清掉失败去重状态。**不再等下一拍重新判据** ——
+        // 旧代码把"是否成功"交给下一拍的 pgrep 去回答，而它答不出来，于是永远重启。
+        // `accounted` = 这次重启已经在 startBridgeLinux/guardedSystemdRestart 里记过账，别再记一次。
+        if (!r.reused && !r.accounted) noteSelfhealRestart(relayDir, "权威判据说没在跑", r.status || "running");
+        clearAutostartFailure(relayDir);
+        done = true; clearInterval(iv); resetSelfhealGuard(relayDir);
+        logSelfhealReady(relayDir, cfg, `startBridge=${r.status || "running"}${r.reused ? "（幂等：本来就在跑）" : ""}`);
+        return;
+      }
+      // 测试隔离（DSH_RELAY_SKIP_SERVICE=1）：startBridge 只会返回 `skipped` —— 它**什么都没做**，
+      // 既不该吃掉护栏额度，也不该往安装日志里写"自愈重启"（生产不会出现这个状态）。
+      if (r && r.status === "skipped") return;
+      // Linux 的 systemd 重启已经在 `guardedSystemdRestart` 里记过账、也写过日志（含"被拦下"），
+      // 这里不能再记一次 —— 否则一次尝试吃掉两格额度，5 分钟的退避会缩水成 2.5 分钟。
+      if (r && r.status === "selfheal-throttled") return;
+      // 其它路径（macOS launchd 失败 / Windows / 脱离进程）没有自带护栏：在此记账 + 写可见日志，
+      // 否则"拉起失败 → 下一拍再试 → 每 12 秒一次"就是同一个病换个平台复发。
+      noteSelfhealRestart(relayDir, "权威判据说没在跑", (r && r.detail) || (r && r.status) || "未知原因");
+      // 触顶：护栏会在下一拍开始拦住我们并写一行"已停止自愈重启"，这里不再做任何动作。
     } catch { /* 下一轮再试 */ }
   }, selfhealIntervalMs());
   iv.unref?.();
   return () => clearInterval(iv);
 }
+
+/**
+ * 自愈判定「已就绪、循环停摆」时留一行可见日志（同一条结论只写一次）。
+ *
+ * 为什么值得单独记一行：用户反馈里"连接是不是自己在修、修好了没有"无从判断 ——
+ * 旧代码在就绪时**什么都不写**，于是"自愈watcher 判据失败→每 12 秒重启"这种故障
+ * 在日志里只留下 bridge 反复重启的痕迹，看不出是插件在动手。这一行把"是我判定的、依据是什么"钉住。
+ * ⚠️ 带上**隧道注册**证据（bridge 状态文件里的 device_id / 日志尾部），但不拿它当就绪判据：
+ *   它比进程存活更容易闪断，若用它当 done 的条件，等于又造一个会抖的判据（正是本次故障的病因）。
+ */
+function logSelfhealReady(relayDir, cfg, basis) {
+  if (lastSelfhealReadyLine.get(relayDir) === basis) return;
+  lastSelfhealReadyLine.set(relayDir, basis);
+  const state = bridgeStateFile(relayDir);
+  const registered = Boolean(state && state.device_id) && (!cfg || !cfg.device_id || String(state.device_id) === String(cfg.device_id));
+  appendLogLine(relayDir, AUTO_INSTALL_LOG,
+    `[dsh-remote-web] 自愈判定 bridge 已就绪，已停止自愈循环（依据：${basis}；`
+    + `隧道注册：${registered ? `已登记（device_id=${state.device_id}）` : "尚无登记证据（不影响就绪判定，注册由 bridge/watcher 自己负责）"}）`);
+}
+/** `logSelfhealReady` 的去重状态：同一个 relayDir 只有判据变了才再写一行。 */
+const lastSelfhealReadyLine = new Map();
 
 /** 停止 bridge：macOS 走 launchctl bootout；Linux 走 systemd/脱离进程；Windows 结束 watcher/bridge 进程。 */
 function stopBridge(relayDir) {
@@ -4096,6 +4385,10 @@ function accountFingerprintOf(cfg) {
  * 自愈也就永远不会去纠正）；③ 交给调用方随后重新启动。
  */
 function resetBridgeForAccountChange(relayDir, why) {
+  // ★ 2026-10-13：账号/模式变更是**人**做的决定（登录、切换账号、改自建模式），
+  //   它必须无条件生效 —— 所以顺手清掉自愈护栏额度，绝不允许"自愈循环之前用完了 3 次额度"
+  //   导致切换账号后新 bridge 起不来（那会让设备继续留在旧账号里，是 2026-09-19 那个老故障的翻版）。
+  resetSelfhealGuard(relayDir);
   const stopped = stopBridge(relayDir);
   // 脱离进程形态（launchd 托管不住时的兜底）也要收干净，否则它会用旧凭据继续跑
   try { stopBridgeDetached(relayDir, { force: true }); } catch { /* 非关键 */ }
@@ -4626,6 +4919,10 @@ async function composeConnect(relayDir, opts = {}) {
     watcherAgeMs: wedge.known ? wedge.ageMs : 0,
     watcherWedged: Boolean(wedge.wedged),
     watcherRestarts: wedge.restarts,
+    // 自愈循环自己的重启账本（见 scheduleRuntime 的长注释）：面板诊断据此如实说明
+    // "插件为这台机器重启过几次 bridge、是不是已经熔断停手"。默认 0 = 正常，不产生任何文案。
+    selfhealRestarts: selfhealGuardOf(relayDir).count,
+    selfhealExhausted: selfhealGuardOf(relayDir).count >= SELFHEAL_MAX_RESTARTS,
     upstreamUrl: upstreamUrl(),
     upstreamSource: upstreamSourceLabel(),
     // 宿主形态：桌面端（Electron）与 Web 版（node）在若干动作上语义不同 ——
@@ -4723,6 +5020,12 @@ function buildConnectDiagnostics(relayDir, conn, log) {
       : `运行环境缺文件: ${conn.runtimeMissing.slice(0, 8).join(", ")}${conn.runtimeMissing.length > 8 ? ` 等 ${conn.runtimeMissing.length} 个` : ""}`,
     `bridge 进程: ${conn.bridgeRunning ? "在运行" : "未运行"}（pid=${conn.bridgePids && conn.bridgePids.length ? conn.bridgePids.join(",") : "-"}，launchd state=${conn.launchdState || "-"}，崩溃循环=${conn.launchdCrashLoop ? "是" : "否"}）`,
     `后台守护: ${conn.watcherRunning ? `在运行（pid=${conn.watcherPids.join(",")}${conn.watcherAgeMs ? `，已 ${Math.round(conn.watcherAgeMs / 1000)} 秒` : ""}${conn.watcherWedged ? "，⚠️ 迟迟未拉起 bridge" : ""}${conn.watcherRestarts ? `，已自动重启 ${conn.watcherRestarts} 次` : ""}）` : "未运行"}`,
+    // 只在真的重启过 bridge 时才出现这一行（正常用户零新增文案，不制造噪音）：
+    // 它回答的是"插件自己有没有在反复重启 bridge"—— 2026-10-13 那个故障里，这个问题
+    // 在客户端侧完全没有答案，运维只能从服务端 audit_log 反推。
+    conn.selfhealRestarts
+      ? `自愈重启: 本进程内已重启 bridge ${conn.selfhealRestarts} 次${conn.selfhealExhausted ? "（⚠️ 已达上限，已停止自动重启，请点「一键更新」）" : ""}`
+      : "",
     `上游 dsh web: ${conn.upstreamUrl}（${conn.upstreamSource}${conn.upstreamReachable === null ? "" : conn.upstreamReachable ? "，可达" : `，⚠️ 不可达：${conn.upstreamError}`}）`,
     `目录选择器: ${pickerPinState.kind === "native" ? "⚠️ 系统原生（远程时对话框弹在电脑那台机器上 → 手机上点「添加工作区」会像没反应）" : (pickerPinState.kind || "未知")}${pickerPinState.detail ? `（${pickerPinState.detail}）` : ""}`,
     `中继注册: ${conn.registered ? "已注册（" + conn.registerSource + "）" : "未注册"}`,
@@ -4782,7 +5085,7 @@ async function buildDiagReport(relayDir, opts = {}) {
     `【插件】v${PLUGIN_VERSION}　运行时 ${runtimeVersionOf(relayDir) || "未知"}　宿主 ${harnessVersion() || "未知"}　${osPlatform()}/${process.arch}　node ${String(process.versions.node).split(".")[0]}`,
     `【阶段】${conn.phase}（${conn.text}）`,
     `【设备】ID=${conn.deviceId || "（未生成）"}　运行环境=${conn.runtimeReady ? "就绪" : `缺失${conn.runtimeMissing && conn.runtimeMissing.length ? `（缺 ${conn.runtimeMissing.slice(0, 3).join("、")}）` : ""}`}`,
-    `【bridge】${conn.bridgeRunning ? `在运行 pid=${conn.bridgePids.join(",")}` : "未运行"}　守护=${conn.watcherRunning ? `在运行 pid=${conn.watcherPids.join(",")}${conn.watcherAgeMs ? `（${Math.round(conn.watcherAgeMs / 1000)}s）` : ""}` : "未运行"}${conn.watcherWedged ? " ⚠️活着但拉不起 bridge" : ""}${conn.watcherRestarts ? ` 已自动重启 ${conn.watcherRestarts} 次` : ""}`,
+    `【bridge】${conn.bridgeRunning ? `在运行 pid=${conn.bridgePids.join(",")}` : "未运行"}　守护=${conn.watcherRunning ? `在运行 pid=${conn.watcherPids.join(",")}${conn.watcherAgeMs ? `（${Math.round(conn.watcherAgeMs / 1000)}s）` : ""}` : "未运行"}${conn.watcherWedged ? " ⚠️活着但拉不起 bridge" : ""}${conn.watcherRestarts ? ` 已自动重启 ${conn.watcherRestarts} 次` : ""}${conn.selfhealRestarts ? `　【自愈重启】本进程内 ${conn.selfhealRestarts} 次${conn.selfhealExhausted ? "（已达上限，已停止自动重启）" : ""}` : ""}`,
     `【上游】${conn.upstreamUrl}（${conn.upstreamSource}${conn.upstreamReachable === null ? "" : conn.upstreamReachable ? "，可达" : `，⚠️不可达：${conn.upstreamError}`}）`,
     `【中继】${conn.registered ? `已注册（${conn.registerSource}）` : "未注册"}　账号=${conn.accountCurrent === false ? "⚠️上一个账号（需重启 bridge）" : "当前账号"}　自动重试=${conn.attempts} 次`,
     `【错误】${conn.error ? `${conn.error.code}: ${conn.error.message}` : (conn.detail ? "无（见上方阶段说明）" : "无")}`,
@@ -4868,6 +5171,10 @@ function ensureConnection(relayDir, opts = {}) {
   // 顺手治一次「卡住的更新」（复用面板已有的轮询，不需要新定时器 —— 诊断报告 F5）
   healStalledJobs(relayDir);
   const book = connectBook(relayDir);
+  // ★ 2026-10-13：**人工操作永远立即放行**（与 provisionRetryGate 的 resetProvisionRetry 同一原则）。
+  //   面板的「重试 / 一键修复」走的就是 force=true；若不放行，护栏触顶后用户点重试会静默无效 ——
+  //   那就把"安全阀"变成了"用户被自己的插件锁在门外"。护栏只约束**自动**自愈，不约束人。
+  if (opts.force) resetSelfhealGuard(relayDir);
   if (opts.force) { book.attempts = 0; book.lastAttemptAt = 0; }
   const now = Date.now();
   if (!opts.force && book.lastAttemptAt && now - book.lastAttemptAt < connectBackoffMs(book.attempts)) return null;
@@ -6651,6 +6958,9 @@ function registerRoutes(ctx, relayDir) {
       method: "POST",
       path: "/dsh-remote/start",
       handler: async (_req, res) => {
+        // 用户点了「启动」= 人工指令：清掉自愈护栏额度再动手（同 resetProvisionRetry 的原则），
+        // 否则"自动自愈刚刚熔断"会把用户这一次明确的操作也一起挡掉。
+        resetSelfhealGuard(relayDir);
         const r = startBridge(relayDir);
         // 【0.6.2】composeStatus 自带 ok:true（那是「状态查询成功」），必须先展开再覆盖，
         // 否则不管启动成没成功都回 ok:true → 面板一律弹「✅ bridge 已启动」。
@@ -7210,4 +7520,15 @@ export function apply(ctx, config = {}) {
 // 单独导出才能把「**先摘 auto、后建 browse**」这个顺序契约钉死。
 export { pinBrowseDirectoryPicker as __pinBrowseDirectoryPicker, schedulePickerPin as __schedulePickerPin, pickerPinState as __pickerPinState, directoryPickerKind as __directoryPickerKind, PICKER_AUTO_ENTRY_ID as __PICKER_AUTO_ENTRY_ID, PICKER_AUTO_PACKAGE as __PICKER_AUTO_PACKAGE, PICKER_BROWSE_PACKAGES as __PICKER_BROWSE_PACKAGES,
   // 日志去重（同一条失败不刷屏）也要能被单测钉住 —— 它属于「诊断可读性」，见 test/linux-bridge.test.mjs
-  noteAutostartFailure as __noteAutostartFailure, clearAutostartFailure as __clearAutostartFailure };
+  noteAutostartFailure as __noteAutostartFailure, clearAutostartFailure as __clearAutostartFailure,
+  // ★ 2026-10-13 自愈重启策略（修 12 秒重启风暴）必须能被**行为级**单测钉住，见 test/selfheal-restart-guard.test.mjs。
+  //   为什么必须导出而不是只靠 apply()：这一组用例要断言的是"定时器跑 N 拍之后，
+  //   `systemctl restart` 到底被调用了几次"——只有把定时器本体拿到用例里才能确定性地驱动它，
+  //   靠 apply() 间接跑就得靠真实 sleep 猜拍数（脆弱且慢）。
+  //   系统命令仍然走**假 PATH 上的假 systemctl**（与 test/linux-bridge.test.mjs 同一套手法），
+  //   所以不需要为了可测性往生产代码里插入任何依赖注入层。
+  scheduleRuntime as __scheduleRuntime, startBridge as __startBridge, manualStatus as __manualStatus,
+  linuxSystemdUnitState as __linuxSystemdUnitState,
+  selfhealRestartGate as __selfhealRestartGate, noteSelfhealRestart as __noteSelfhealRestart,
+  noteSelfhealBlocked as __noteSelfhealBlocked, resetSelfhealGuard as __resetSelfhealGuard,
+  selfhealGuardOf as __selfhealGuardOf, SELFHEAL_MAX_RESTARTS as __SELFHEAL_MAX_RESTARTS };

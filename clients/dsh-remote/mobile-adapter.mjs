@@ -85,6 +85,30 @@
  *      ③ 遮罩不变量:只要遮罩在拦截点击而视口内没有任何可交互抽屉,立刻摘掉(800ms 看门狗 +
  *      300ms 复核),且**只摘遮罩不动展开 class**(不破坏抽屉的滑入动画与"点一下就打开")。
  *
+ * 🔴 2026-10-13 手机端设置面板「挤成一条竖线」根治(用户反馈,真机 390×844 + 本机 0.2 宿主实测):
+ *   现象:窄屏打开「设置」,左侧 nav(通用设置/模型/内置插件/…)是一条竖列,右侧内容被压成
+ *         四五字宽的竖条并向右溢出被裁。用户明确要求的目标形态:**tab 放顶部(横排)+ 下方内容满宽**。
+ *   根因(实测数字):官方设置弹层是**桌面两栏**布局 —— 本机 0.2.0-rc.2(dsh-web-frontend
+ *         0.2 + dsh-client-ui-settings-general 0.2)实测 panel 342×796、`nav` 188 宽(flex column)、
+ *         `content` 可视宽只剩 **154px**。而适配层只挂了 `[class~="VOzbGW_*"]` 精确类,那是
+ *         **0.1.2–0.1.5** 的混淆前缀;0.2 重新打包后前缀变成 **`Dws9Sa_*`**(结构、类名一一对应:
+ *         Dws9Sa_overlay/panel/nav/navTitle/navList/navCell/content/header/close/options)
+ *         → 整段设置区 CSS **静默失效**。这正是文件开头"类名变化退化策略"预言过的失效模式:
+ *         页面照常打开、只有真机看得出布局坏,而且没人会收到任何信号。
+ *   修法(三层识别,任一层命中即可成型,不再可能整段静默失效):
+ *     ① 已知前缀:`[class~="VOzbGW_*"]` 与 `[class~="Dws9Sa_*"]` 并挂(CSS 与 JS 都改);
+ *     ② **结构兜底**:JS 按 `[role=dialog]/[aria-modal] + 直接子 <nav> + 近似全屏` 认面板,
+ *        再按"子元素最多者为 tab 列表"认 navList,打 `dsh-ma-settings-*` 稳定类,由 CSS 成型
+ *        —— 前缀再改也是"仍然基本可用",而不是彻底坏掉;
+ *     ③ CSS `:has()` 兜底(`div[role="dialog"]:has(> nav)` 等):支持 :has 的浏览器连 JS 都不等。
+ *   降级诊断(**可见**,但不引入任何覆盖层 —— 护栏明令禁止):① 前缀认不出 → 报
+ *     `console.warn("[dsh-mobile-adapter]", …注意 …混淆前缀已变化…)` 一次;② 有"大弹层"却认不出
+ *     设置面板结构 → 报一次"手机端可能仍是桌面两栏布局"。两条都只在 ≤820px 发生。
+ *   同批:窄屏**通用弹层**按手机尺寸收敛(`[role=dialog]/[role=alertdialog]/[aria-modal]/.dru-popup-card`
+ *     宽 ≤ 100vw-24px、高 ≤ 100dvh-24px 且内部可滚、圆角收敛 12px),修掉"内容裁在右边"。
+ *   ⚠️ 顺序有讲究:通用弹层规则必须排在设置弹层规则**之前** —— 两者特异性相同,靠顺序让
+ *      "设置面板铺满全屏"赢(否则设置面板会被 100vw-24px 钉住,又变成带边的浮层)。
+ *
  * 开关:环境变量 DSH_MOBILE_ADAPTER=0 整体关闭(默认开启)。
  */
 
@@ -98,6 +122,17 @@ const HOST_FEATURE_RE =
    data-rightbar-collapsed = 官方 0.1.5-rc.2 起第三列(原 details)的折叠属性。 */
 const RUNTIME_HOST_RE =
   /(data-sidebar-collapsed|data-details-collapsed|data-rightbar-collapsed|data-shell-overlay)|(pI_x6G_frame|hHd-Xa_root|hHd-Xa_toggle)/;
+
+/**
+ * 【可选】官方锚点清单 —— 供 scripts/check-ui-anchors.mjs 分类用(它直接读这个常量)。
+ * 这些名字**存在就用、不存在就按结构/几何退化**,所以它们缺失**不算故障**:
+ *   · data-details-collapsed —— 官方 0.1.5-rc.2 已改名 data-rightbar-collapsed,这里只为兼容旧版保留;
+ *   · data-sidebar-open      —— 官方是否输出这个属性本身就不确定(见下面对 sidebarAttrSeen 的注释),
+ *                               适配层刻意做了"认不到就只信几何"的分支;
+ *   · data-rtt               —— 适配层**自己**的延迟角标属性(不是官方锚点),列出只为让自检脚本不去它身上找。
+ * 约定:这里**只放**这种"缺了也无所谓"的锚点;凡是缺了会让布局坏掉的锚点,一律不要写进来。
+ */
+const OPTIONAL_UI_ANCHORS = ["data-details-collapsed", "data-sidebar-open", "data-rtt"];
 
 const STYLE = `
 
@@ -226,11 +261,42 @@ const STYLE = `
   div.wSkVaW_heroWorkspaceRow > * { max-width: calc(100vw - 32px); }
   div.wSkVaW_composerStack, div.wSkVaW_composerHero, div.uV2eYG_card { min-width: 0; }
 
-  /* --- 设置面板(fix2 硬化版;实测 390×844:官方模块 CSS 运行期注入在适配层之后,
-        普通规则会被官方后加载样式覆盖——nav 是 <nav> 而非 div,圆1 的 div.VOzbGW_nav
-        从未命中;overlay 被官方宽度 min(800px,84vw) 钉在左侧 328px,呈“抽屉感”。
-        故本版全部用 [class~=...] 精确类 + 几何 !important,官方前缀变化则整段静默失效) --- */
-  [class~="VOzbGW_overlay"] {
+  /* ===== 通用弹层(dialog/modal)按手机尺寸收敛(2026-10-13)=====
+     官方弹层(设置 / 审批 / 确认 / 各类 modal)在桌面上写死 px 宽高,窄屏会右溢被裁;
+     本项目自己的 .dru-popup 卡片同理。这里只加三条**尺寸**硬约束,不动配色与结构:
+       · 宽 ≤ 100vw - 24px(两侧各留 12px)—— 用户报的"内容裁在右边"根治;
+       · 高 ≤ 100dvh - 24px 且自身可滚(先写 100vh 给不认 dvh 的老浏览器兜底);
+       · 窄屏圆角收敛到 12px(官方 --dsw-radius-panel 在手机上偏大)。
+     ⚠️ 必须放在设置弹层规则**之前**:两者特异性相同,靠顺序让"设置面板铺满全屏"赢。 */
+  [role="dialog"], [role="alertdialog"], [aria-modal="true"], .dru-popup-card {
+    box-sizing: border-box;
+    max-width: calc(100vw - 24px) !important;
+    max-height: calc(100vh - 24px) !important;
+    max-height: calc(100dvh - 24px) !important;
+    border-radius: 12px !important;
+    overflow: auto !important;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+  /* .dru-popup 是遮罩层,卡片 .dru-popup-card 才是"弹窗":窄屏把 24px 外边距收到 12px */
+  .dru-popup { padding: 12px !important; }
+  .dru-popup-card { width: 100% !important; max-width: calc(100vw - 24px) !important; }
+
+  /* ===== 设置弹层:窄屏「顶部横向 tab 行 + 下方内容区满宽」(2026-10-13 重写)=====
+     🔴 根因(真机 390×844 实测,用户报「设置界面挤成一条竖线」):
+        官方弹层是**桌面两栏** —— 0.2.0-rc.2 实测 panel 342×796、nav 188 宽竖排、
+        content(内容区)只剩 **154px** 可视宽 → 内容被压成竖条并向右溢出被裁。
+        旧实现只有 [class~="VOzbGW_*"](0.1.2–0.1.5 的混淆前缀);0.2.0-rc.2 重新打包后
+        前缀变成 Dws9Sa_*,**整段 CSS 静默失效** —— 页面照常打开,只有真机看得出坏。
+        所以识别分三层,任一层命中即可成型(这是"不再静默失效"的核心):
+          ① 已知前缀 [class~="VOzbGW_*"] / [class~="Dws9Sa_*"](最短路径,随版本追加);
+          ② JS 结构识别后打的稳定类 .dsh-ma-settings-*(role=dialog + 直接子 <nav> + 几何,
+             见脚本里的 maTagSettingsDialog)—— 前缀再改也照样生效;
+          ③ CSS :has() 兜底(div[role="dialog"]:has(> nav) 等),不必等 JS 就能成型。
+     ⚠️ 全部 !important:官方模块 CSS 是**运行期**注入 head 的(晚于本 <style>),
+        同特异性下后加载者赢 —— fix2 之前 nav 选择器"从未命中"正是这个原因。 */
+  [class~="VOzbGW_overlay"], [class~="Dws9Sa_overlay"], .dsh-ma-settings-overlay,
+  div[role="presentation"]:has(> div[role="dialog"] > nav) {
     position: fixed !important;
     inset: 0 !important;
     width: auto !important; max-width: none !important;
@@ -240,31 +306,37 @@ const STYLE = `
     box-sizing: border-box;
     justify-content: center; align-items: stretch;
   }
-  [class~="VOzbGW_panel"] {
+  /* 面板:nav 在上、content 在下的**竖排**,并铺满视口(圆角/外边距在窄屏收敛为 0) */
+  [class~="VOzbGW_panel"], [class~="Dws9Sa_panel"], .dsh-ma-settings-panel,
+  div[role="dialog"]:has(> nav) {
     box-sizing: border-box;
     width: 100% !important; max-width: 100% !important;
     height: 100% !important; max-height: 100% !important;
     margin: 0 !important; border-radius: 0 !important;
     flex-direction: column !important;
+    overflow: hidden !important; /* 内层 options 自己滚 */
   }
   /* 顶部 tab 行:整行铺满,字号调小(≤13px),横向可滚动 */
-  [class~="VOzbGW_nav"] {
+  [class~="VOzbGW_nav"], [class~="Dws9Sa_nav"], .dsh-ma-settings-nav,
+  div[role="dialog"] > nav {
     box-sizing: border-box;
     flex: none;
     width: 100% !important;
     flex-direction: row !important;
     align-items: center;
     gap: 4px;
-    padding: max(4px, env(safe-area-inset-top)) 4px 0;
+    padding: max(4px, env(safe-area-inset-top)) 8px 6px;
     overflow: visible;
   }
-  [class~="VOzbGW_navTitle"] {
+  [class~="VOzbGW_navTitle"], [class~="Dws9Sa_navTitle"], .dsh-ma-settings-navtitle,
+  div[role="dialog"] > nav > :first-child {
     flex: none;
     font-size: 13px !important; line-height: 1.2;
     padding: 0 4px 0 8px;
     white-space: nowrap;
   }
-  [class~="VOzbGW_navList"] {
+  [class~="VOzbGW_navList"], [class~="Dws9Sa_navList"], .dsh-ma-settings-navlist,
+  div[role="dialog"] > nav > :last-child {
     box-sizing: border-box;
     flex: 1 1 auto; min-width: 0;
     flex-direction: row !important;
@@ -274,33 +346,40 @@ const STYLE = `
     scrollbar-width: none;
     padding: 0 0 6px;
   }
-  [class~="VOzbGW_navList"]::-webkit-scrollbar { display: none; }
-  [class~="VOzbGW_navCell"] {
+  [class~="VOzbGW_navList"]::-webkit-scrollbar,
+  [class~="Dws9Sa_navList"]::-webkit-scrollbar,
+  .dsh-ma-settings-navlist::-webkit-scrollbar { display: none; }
+  [class~="VOzbGW_navCell"], [class~="Dws9Sa_navCell"], .dsh-ma-settings-cell,
+  div[role="dialog"] > nav > :last-child > * {
     flex: none; min-width: max-content;
     box-sizing: border-box;
     font-size: 13px !important;
     height: 32px !important;
     padding: 0 12px !important;
+    white-space: nowrap;
   }
   /* 内容区:全宽拉满,收敛内边距,最大化有效宽度 */
-  [class~="VOzbGW_content"] {
+  [class~="VOzbGW_content"], [class~="Dws9Sa_content"], .dsh-ma-settings-content,
+  div[role="dialog"]:has(> nav) > div {
     box-sizing: border-box;
     width: 100% !important; max-width: none !important;
     flex: 1 1 auto; min-width: 0; min-height: 0;
   }
-  [class~="VOzbGW_header"] {
+  [class~="VOzbGW_header"], [class~="Dws9Sa_header"], .dsh-ma-settings-header {
     box-sizing: border-box;
     flex: none;
-    min-height: 40px;
+    min-height: 40px; height: auto !important;
     padding: 6px 8px 4px 14px !important;
     align-items: center;
   }
-  [class~="VOzbGW_close"] { width: 32px; height: 32px; }
-  [class~="VOzbGW_options"] {
+  [class~="VOzbGW_close"], [class~="Dws9Sa_close"], .dsh-ma-settings-close {
+    width: 32px !important; height: 32px !important;
+  }
+  [class~="VOzbGW_options"], [class~="Dws9Sa_options"], .dsh-ma-settings-options {
     box-sizing: border-box;
     flex: 1 1 auto; min-height: 0; overflow-y: auto;
     -webkit-overflow-scrolling: touch;
-    padding: 2px 14px calc(14px + env(safe-area-inset-bottom)) !important;
+    padding: 4px 14px calc(14px + env(safe-area-inset-bottom)) !important;
   }
 }
 
@@ -995,13 +1074,177 @@ const SCRIPT = `(() => {
       whaleNativeDragToBottomRight();
     }
 
+    /* ===== 设置面板:结构识别 + 稳定类(2026-10-13;根因见 CSS 里那段长注释)=====
+       为什么不能只靠 [class~="VOzbGW_*"]:官方重新打包会换混淆前缀(0.1.5 = VOzbGW_,
+       0.2.0-rc.2 = Dws9Sa_),改名后整段 CSS **静默失效** —— 页面照常打开,
+       只是手机端布局坏掉,而且只有真机看得出。所以这里再按**结构 + 几何**认一遍:
+         · 面板 = [role=dialog]/[aria-modal] 且**直接子元素里有 <nav>**、尺寸接近全屏
+           (0.1.5 与 0.2 的面板都是 div[role=dialog] > nav + div 两栏,且都是固定像素宽);
+         · 列表 = nav 里子元素最多的那个孩子(单元格 ≥3 个);
+         · content = 面板里除 nav 之外的孩子;header/options = content 的首/末孩子。
+       命中 → 打 .dsh-ma-settings-* 稳定类,由 CSS 接管(前缀改名后**仍然基本可用**);
+       命中不到 → 原样放过(绝不破坏官方默认),只 warn 一次作为**可见的降级诊断**
+       —— 护栏禁止适配层引入全屏覆盖层,所以诊断只能走 console / 既有上报通道。 */
+    var MA_SETTINGS_PREFIX_RE = /(^|\s)(VOzbGW_|Dws9Sa_)/;
+    var maSettingsPanelEl = null;   // 已识别的面板(靠 isConnected 判存活,官方重渲染后自动重认)
+    var maSettingsCells = [];       // 已识别的 tab 单元格
+    var maSettingsNextScan = 0;     // 未命中时的扫描节流(见 maSettingsMaybeTag)
+    var maSettingsWarned = "";
+    function maSettingsWarn(msg) {
+      if (maSettingsWarned === msg) return;
+      maSettingsWarned = msg;
+      /* window.console 优先(镜像页里它就是页面控制台),拿不到再退到全局 console ——
+         诊断**必须**能出得来,否则"静默失效"只是换了个地方静默。 */
+      try {
+        var c = (typeof window !== "undefined" && window && window.console) || (typeof console !== "undefined" ? console : null);
+        if (c && c.warn) c.warn("[dsh-mobile-adapter]", msg);
+      } catch (eW) {}
+    }
+    function maClsOf(el) { try { return (el && typeof el.className === "string") ? el.className : ""; } catch (eC) { return ""; } }
+    function maKidsOf(el) { try { return (el && el.children) ? [].slice.call(el.children) : []; } catch (eK) { return []; } }
+    /** 面板级几何门:排除小气泡/菜单/下拉,只认接近全屏的弹层。 */
+    function maPanelSized(el) {
+      try {
+        var r = el.getBoundingClientRect();
+        if (!r || !(r.width > 0) || !(r.height > 0)) return false;
+        return r.width >= Math.max(240, window.innerWidth * 0.5) && r.height >= 160;
+      } catch (eG) { return false; }
+    }
+    /** 结构识别:找到官方设置面板(flex 两栏 = 直接子 <nav> + 另一栏)。 */
+    function maFindSettingsPanel() {
+      var cands = [];
+      try {
+        cands = [].slice.call(document.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"]'));
+      } catch (eQ) { return null; }
+      var best = null, bestArea = 0;
+      for (var i = 0; i < cands.length; i++) {
+        var el = cands[i];
+        var kids = maKidsOf(el);
+        if (kids.length < 2) continue;              // 两栏才有 content 可谈
+        var nav = null;
+        for (var j = 0; j < kids.length; j++) { if (kids[j] && kids[j].tagName === "NAV") { nav = kids[j]; break; } }
+        if (!nav || maKidsOf(nav).length < 2) continue;  // 设置面板的 nav = 标题 + tab 列表
+        if (!maPanelSized(el)) continue;
+        var r = el.getBoundingClientRect();
+        var area = r.width * r.height;
+        if (area > bestArea) { bestArea = area; best = el; }
+      }
+      return best;
+    }
+    /** nav 里的 tab 列表 = 子元素最多的那个孩子(标题只有一个文本孩子)。 */
+    function maNavListOf(nav) {
+      var kids = maKidsOf(nav);
+      if (!kids.length) return null;
+      var best = null, bestN = 0;
+      for (var i = 0; i < kids.length; i++) {
+        var n = maKidsOf(kids[i]).length;
+        if (n > bestN) { bestN = n; best = kids[i]; }
+      }
+      return bestN >= 2 ? best : (kids.length > 1 ? kids[kids.length - 1] : null);
+    }
+    /** 当前选中项:官方状态类(任意前缀 + _active)或 aria-current —— 两者都不依赖前缀。 */
+    function maCellActive(cell) {
+      try {
+        if (cell.getAttribute && cell.getAttribute("aria-current") === "true") return true;
+        /* 只认「整段 token 以 _active 结尾」或「token 就叫 active」——
+           不能用 *active 这种宽松匹配:inactive 也会命中,会把没选中的 tab 当成当前项。
+           ⚠️ 本文件是模板字符串,注释里**不得出现反引号**(会提前闭合注入体,见 AGENTS.md)。 */
+        return /(^|\s)(?:[A-Za-z0-9_-]+_active|active)(\s|$)/.test(maClsOf(cell));
+      } catch (eA) { return false; }
+    }
+    function maMarkActiveCells() {
+      for (var i = 0; i < maSettingsCells.length; i++) {
+        var c = maSettingsCells[i];
+        try { if (c && c.isConnected && maCellActive(c)) c.classList.add("dsh-ma-settings-active"); } catch (eM) {}
+      }
+    }
+    function maTagSettingsDialog() {
+      var panel = maFindSettingsPanel();
+      if (!panel) {
+        /* 认不到面板时给一条**可见的**降级诊断:现场是"大弹层 + 首栏比次栏窄"的桌面两栏形态,
+           说明官方又换了结构(或换成了我们不认识的前缀)—— 这条 warn 就是下次定位问题的起点。 */
+        try {
+          var any = document.querySelector('[role="dialog"], [aria-modal="true"]');
+          if (any && maPanelSized(any)) {
+            maSettingsWarn("检测到大弹层但未能识别为设置面板(官方结构/类名可能已变化):手机端可能仍是桌面两栏布局。");
+          }
+        } catch (eAny) {}
+        maSettingsPanelEl = null; maSettingsCells = [];
+        return;
+      }
+      var kids = maKidsOf(panel);
+      var nav = null, content = null;
+      for (var i = 0; i < kids.length; i++) {
+        if (!nav && kids[i].tagName === "NAV") { nav = kids[i]; continue; }
+        if (!content) content = kids[i];
+      }
+      var list = nav ? maNavListOf(nav) : null;
+      var title = null;
+      var navKids = maKidsOf(nav);
+      for (var k = 0; k < navKids.length; k++) { if (navKids[k] !== list) { title = navKids[k]; break; } }
+      var contentKids = maKidsOf(content);
+      var header = contentKids[0] || null;
+      var options = contentKids.length > 1 ? contentKids[contentKids.length - 1] : null;
+      var overlay = null;
+      try {
+        var p = panel.parentElement || panel.parent || null;   // parentElement 是标准属性;parent 兜底给极简 DOM
+        if (p && p.getBoundingClientRect) {
+          var pr = p.getBoundingClientRect();
+          if (pr && pr.width >= window.innerWidth * 0.9 && pr.height >= window.innerHeight * 0.9) overlay = p;
+        }
+      } catch (eP) {}
+      try {
+        panel.classList.add("dsh-ma-settings-panel");
+        if (nav) nav.classList.add("dsh-ma-settings-nav");
+        if (title) title.classList.add("dsh-ma-settings-navtitle");
+        if (list) list.classList.add("dsh-ma-settings-navlist");
+        if (content) content.classList.add("dsh-ma-settings-content");
+        if (header) header.classList.add("dsh-ma-settings-header");
+        if (options) options.classList.add("dsh-ma-settings-options");
+        if (overlay) overlay.classList.add("dsh-ma-settings-overlay");
+        maSettingsCells = list ? maKidsOf(list) : [];
+        for (var c = 0; c < maSettingsCells.length; c++) maSettingsCells[c].classList.add("dsh-ma-settings-cell");
+        maMarkActiveCells();
+      } catch (eT) { /* 打类失败也要继续:已知前缀那条 CSS 仍可能命中 */ }
+      maSettingsPanelEl = panel;
+      /* 前缀认不出 = 官方改名的**直接信号** —— 这时布局靠结构类仍然可用,所以只警告不降级。 */
+      if (!MA_SETTINGS_PREFIX_RE.test(maClsOf(panel) + " " + maClsOf(nav))) {
+        maSettingsWarn("设置面板已按**结构**识别(官方混淆前缀已变化:既不是 VOzbGW_ 也不是 Dws9Sa_);布局仍可用,但请把新前缀补进适配层。");
+      }
+    }
+    /**
+     * 每拍调用(节流):已识别且面板还在文档里 → 只刷新选中态;否则限频重扫。
+     * 为什么要节流:未命中时每拍都要 querySelectorAll 一遍全文档,流式输出时每帧一拍。
+     */
+    function maSettingsMaybeTag() {
+      if (!NARROW()) return;
+      try {
+        if (maSettingsPanelEl && maSettingsPanelEl.isConnected) { maMarkActiveCells(); return; }
+      } catch (eLive) { /* 掉进重扫 */ }
+      var now = Date.now();
+      if (now < maSettingsNextScan) return;
+      maSettingsNextScan = now + 400;   // 未命中时最多 2.5 次/秒;命中后面板引用直接短路,不再全扫
+      maTagSettingsDialog();
+    }
+
     /* 设置面板打开时,把当前 tab 滚进横向可视区(顶部 tab 行手机横向滚动) */
     let settingsWatchOn = false;
     let settingsTick = 0;
     function scrollActiveSettingsTab() {
-      const act = document.querySelector(
-        '[class~="VOzbGW_navCell"].VOzbGW_active, [class~="VOzbGW_navCell"][aria-current="true"]'
-      );
+      /* 逐个尝试而不是写一条长选择器:结构类(前缀无关)优先,已知前缀退居兜底;
+         任何一条在旧浏览器上解析失败都不影响其余。 */
+      const SEL = [
+        ".dsh-ma-settings-cell.dsh-ma-settings-active",
+        '[class~="Dws9Sa_navCell"].Dws9Sa_active',
+        '[class~="VOzbGW_navCell"].VOzbGW_active',
+        '[class~="Dws9Sa_navCell"][aria-current="true"]',
+        '[class~="VOzbGW_navCell"][aria-current="true"]'
+      ];
+      let act = null;
+      for (const sel of SEL) {
+        try { act = document.querySelector(sel); } catch (e13a) { act = null; }
+        if (act) break;
+      }
       if (act && act.scrollIntoView) {
         try { act.scrollIntoView({ block: "nearest", inline: "nearest" }); } catch (e13) {
           try { act.scrollIntoView(); } catch (e14) {}
@@ -1014,7 +1257,12 @@ const SCRIPT = `(() => {
       try {
         const ob = new MutationObserver(function () {
           clearTimeout(settingsTick);
-          settingsTick = setTimeout(function () { if (NARROW()) scrollActiveSettingsTab(); }, 140);
+          settingsTick = setTimeout(function () {
+            if (!NARROW()) return;
+            maSettingsNextScan = 0;             // 官方刚挂上面板:别被节流挡在门外
+            try { maSettingsMaybeTag(); } catch (e16) {}
+            scrollActiveSettingsTab();
+          }, 140);
         });
         ob.observe(document.body, { childList: true, subtree: true });
       } catch (e15) {}
@@ -2056,6 +2304,9 @@ const SCRIPT = `(() => {
       if (!whaleGuardsOn || !settingsWatchOn) {
         try { whaleHookInit(); watchSettings(); } catch (eHook) { /* 两者内部都自带一次性守卫 */ }
       }
+      /* 设置面板结构识别(自带节流,幂等):官方每次重新打包都换混淆前缀,
+         这一步保证"改名后仍然基本可用",而不是整段静默失效(2026-10-13 根因)。 */
+      try { maSettingsMaybeTag(); } catch (eSetTag) { /* 忽略 */ }
     };
     /* 节流:一次 DOM 变更往往产生几十条记录,逐条 boot() 就是忙轮询。
        统一合并成"本帧最多跑一次"(有 rAF 用 rAF,没有就退化成 0ms 宏任务) —— 天然去重。 */

@@ -20,6 +20,10 @@
  *   DSH_ENTERPRISE_JWT_SECRET JWT 密钥(必填;从配置文件读,勿写死)
  *   DSH_INTERNAL_TOKEN        enterprise 内部里程碑上报密钥(可选;开启「成功使用/连接成功」统计)
  *   DSH_ENTERPRISE_INTERNAL_URL enterprise 内部端点基址(默认 http://127.0.0.1:13446)
+ *   DSH_LOCAL_SESSION_TTL_MS 开源自部署本地会话时长(默认 30 天;硬夹 [7 天,1 年];非法值回落默认)。
+ *                             与 SaaS 侧 auth_session_ttl_ms 的默认口径对齐 —— 同一产品不该有两种时长口径。
+ *   DSH_LOCAL_SESSION_ABS_MAX_MS 本地会话绝对上限,自 token 里的首次登录锚 sat 起算(默认 1 年,下限 7 天)。
+ *                             到点后不再滑动续签(cookie 自然过期 → 用户重新输访问密钥),防止会话被无限续期。
  * 命令行:
  *   node src/index.mjs [--env-file /path/.env]   # --env-file 简易 KEY=VALUE 加载
  *
@@ -84,6 +88,42 @@ if (LOCAL_JWT_SECRET && !LOCAL_ACCESS_KEYS.length) {
   logger.warn("[router] 已设 DSH_LOCAL_JWT_SECRET 但无 DSH_LOCAL_ACCESS_KEYS,本地认证未启用");
 }
 if (LOCAL_AUTH_ENABLED) logger.info("[router] 本地认证已启用(开源自部署模式,POST /_login)");
+
+// 本地会话时长(自部署模式)。用户反馈「手机端一天要登录好多次」的根因之一:
+// 本地 JWT 曾写死 2 小时(exp: now + 7200)且**没有任何续签** —— 自建用户每 2 小时就得重新输一次访问密钥。
+// 为什么默认 30 天:与 SaaS 侧 auth_session_ttl_ms 的默认口径对齐,同一产品不该有两套时长。
+// 为什么硬夹 [7 天, 1 年]:用户明确要求「至少保留 7 天以上」,配置漂移(手滑写成 1h/1ms)也不许低于它;
+//   上限 1 年是因为更长的会话没有安全收益 —— 滑动续签 + sat 绝对锚已经解决了「老掉线」。
+// 为什么非法值(NaN / ≤0)回落**默认**而不是夹到下限:写错的值通常是笔误,回落默认最不意外。
+const LOCAL_SESSION_TTL_DEFAULT_MS = 30 * 24 * 60 * 60 * 1000;
+const LOCAL_SESSION_TTL_MIN_MS = 7 * 24 * 60 * 60 * 1000;
+const LOCAL_SESSION_TTL_MAX_MS = 365 * 24 * 60 * 60 * 1000;
+
+/** 解析毫秒环境变量:非法/≤0 → 回落 def,再夹到 [min, max]。 */
+function clampMsEnv(raw, def, min, max) {
+  const n = Number(raw);
+  const v = Number.isFinite(n) && n > 0 ? n : def;
+  return Math.min(max, Math.max(min, v));
+}
+
+const LOCAL_SESSION_TTL_MS = clampMsEnv(
+  process.env.DSH_LOCAL_SESSION_TTL_MS,
+  LOCAL_SESSION_TTL_DEFAULT_MS,
+  LOCAL_SESSION_TTL_MIN_MS,
+  LOCAL_SESSION_TTL_MAX_MS
+);
+// 绝对上限:滑动续签不能无限续下去 —— 没有它,只要客户端一直来请求,一个 cookie 可以续到天荒地老。
+// 默认 = 1 年(TTL 上限),下限 7 天(比 TTL 下限还短就没有意义:会话至少得活过一个完整 TTL 周期)。
+const LOCAL_SESSION_ABS_MAX_MS = clampMsEnv(
+  process.env.DSH_LOCAL_SESSION_ABS_MAX_MS,
+  LOCAL_SESSION_TTL_MAX_MS,
+  LOCAL_SESSION_TTL_MIN_MS,
+  Number.MAX_SAFE_INTEGER
+);
+/** 本地 JWT 的 TTL(秒);签发与 Set-Cookie 的 Max-Age 共用同一份,避免两个口径漂移。 */
+function localTtlSeconds() {
+  return Math.floor(LOCAL_SESSION_TTL_MS / 1000);
+}
 
 /**
  * bridge 重连日志抑制。
@@ -194,14 +234,126 @@ function verifyAnyJwt(token) {
   return null;
 }
 
-/** 签发本地 JWT(自部署访问密钥换取;HS256,2 小时)。 */
-function signLocalJwt(sub, plan) {
+/**
+ * 签发本地 JWT(自部署访问密钥换取;HS256;TTL = DSH_LOCAL_SESSION_TTL_MS,默认 30 天)。
+ *
+ * claims:sub / plan / iat / exp + **sat**。
+ * 为什么要有 sat(首次登录时间锚,**毫秒**):滑动续签必须有个"这一切从哪一刻开始"的锚,
+ * 否则客户端只要一直来请求,会话就能被无限续下去(等于永不过期)。sat 只在真正重新输
+ * 访问密钥(POST /_login)时重置;续签时**继承**旧值(见 renewLocalSession)。
+ *
+ * @param {string} sub
+ * @param {string} plan
+ * @param {{satMs?:number, nowMs?:number}} [opts] satMs 缺省 = 本次签发时刻(即首次登录)
+ */
+function signLocalJwt(sub, plan, opts = {}) {
   const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
   const header = b64({ alg: "HS256", typ: "JWT" });
-  const now = Math.floor(Date.now() / 1000);
-  const body = b64({ sub, plan, iat: now, exp: now + 7200 });
+  const nowMs = Number.isFinite(opts.nowMs) ? opts.nowMs : Date.now();
+  const now = Math.floor(nowMs / 1000);
+  const sat = Number.isFinite(opts.satMs) && opts.satMs > 0 ? Math.round(opts.satMs) : Math.round(nowMs);
+  const body = b64({ sub, plan, iat: now, exp: now + localTtlSeconds(), sat });
   const sig = createHmac("sha256", LOCAL_JWT_SECRET).update(`${header}.${body}`).digest("base64url");
   return `${header}.${body}.${sig}`;
+}
+
+/**
+ * 读 token 里的首次登录锚 sat。
+ * 单位:**毫秒**(本实现签发毫秒);顺带兼容秒级时间戳(只有 < 1e11 才可能是秒 ——
+ * 毫秒时间戳现在是 ≈1.7e12)。缺失/非法(本改动之前签发的"老 token")→ 以 nowMs 为锚:
+ *   ① 老 token **仍然能被续签**(不追溯吊销已登录会话 —— 用户没做错什么,不该被踢下线);
+ *   ② 这个锚会在下一次续签时写进新 token,此后就固定下来了。
+ */
+function localSatMs(claims, nowMs) {
+  const raw = Number(claims?.sat);
+  if (!Number.isFinite(raw) || raw <= 0) return nowMs;
+  return raw < 1e11 ? Math.round(raw * 1000) : Math.round(raw);
+}
+
+/**
+ * 本地会话滑动续签(自部署模式)。**只加长 TTL 而不续签是没用的** ——
+ * 用户只是从"每 2 小时登录一次"变成"每 30 天登录一次",到期照样掉登录。
+ *
+ * 三条纪律:
+ *   ① 只续**本地** token。enterprise 签发的令牌必须由 enterprise 体系自己续签
+ *      (native.html 侧走 /api/session/refresh)。router 重签会**绕过** enterprise 的 sat 锚
+ *      与黑名单/吊销语义 —— 一个已被踢下线的账号,凭手里那个还没过期的旧令牌就能被 router
+ *      一路续命,等于把吊销做废。所以先按 enterprise 密钥验:验得通就立刻放手
+ *      (哪怕运维把两个密钥配成同一个值,也按更保守的 enterprise 处理)。
+ *   ② 绝对上限:now - sat 超过 DSH_LOCAL_SESSION_ABS_MAX_MS 就不再续签。
+ *   ③ 幂等 + 节流:同一个请求最多续一次;剩余充足(> TTL/2)时什么都不做,不产生多余 Set-Cookie。
+ * 失败静默:续签里的任何异常(解析/编码/合并响应头)都只当"这次没续",绝不影响代理与设备列表,绝不 500。
+ */
+const LOCAL_RENEWED = Symbol("dshLocalSessionRenewed"); // 幂等标记:每个 HTTP 请求最多续签一次
+
+function renewLocalSession(req, res) {
+  if (!LOCAL_AUTH_ENABLED) return; // 未启用本地认证(SaaS 部署):完全不介入,行为与改动前一致
+  if (req[LOCAL_RENEWED]) return;
+  try {
+    const token = getCookie(req, "dsh_token");
+    if (!token) return;
+    if (verifyJwt(token, JWT_SECRET)) return; // ① enterprise 令牌:绝不重签(理由见上方长注释)
+    const claims = verifyJwt(token, LOCAL_JWT_SECRET);
+    if (!claims) return; // 本地密钥验不过(签名不符/已过期):不该续,让用户重新输访问密钥
+    req[LOCAL_RENEWED] = true;
+
+    const nowMs = Date.now();
+    const expMs = Number(claims.exp) * 1000;
+    // ② 节流:剩余 > TTL/2 就放过(绝大多数请求走这里,不产生多余 Set-Cookie)
+    if (!Number.isFinite(expMs) || expMs - nowMs > LOCAL_SESSION_TTL_MS / 2) return;
+    const satMs = localSatMs(claims, nowMs);
+    // ③ 绝对上限到点:不续签。旧 cookie 按自身 exp 自然过期;本次请求**照常放行**(这里不能 401)
+    if (nowMs - satMs > LOCAL_SESSION_ABS_MAX_MS) return;
+
+    const fresh = signLocalJwt(claims.sub, claims.plan || "pro_max", { satMs, nowMs });
+    appendResponseCookie(res, localSessionSetCookie(fresh));
+  } catch { /* 静默:续签失败只当"这次没续",绝不影响正常代理与设备列表 */ }
+}
+
+/**
+ * 本地会话 cookie 的 Set-Cookie 值。属性照抄手机外壳 native.html 的 writeSessionCookie
+ * (`path=/; max-age=…; SameSite=Lax; Secure`),两处写的是同一个 cookie,属性必须一致。
+ *
+ * 为什么**刻意不加 HttpOnly**:手机端 JS 要读这个 cookie(会话恢复/退出登录/把令牌放进
+ * localStorage 都靠它),加了 HttpOnly 客户端就读不到,等于把外壳的会话恢复做废。
+ * 同理不加 Domain:保持 host-only,与客户端写入的那条完全等价。
+ */
+function localSessionSetCookie(token) {
+  return `dsh_token=${encodeURIComponent(token)}; Path=/; Max-Age=${localTtlSeconds()}; SameSite=Lax; Secure`;
+}
+
+/**
+ * 把一条 Set-Cookie 追加进本次响应(不动响应里**已有**的 Set-Cookie)。
+ *
+ * 为什么不能只用 res.setHeader("Set-Cookie", …):代理回包走的是
+ * `res.writeHead(status, headers)`(headers 来自上游回包),而 Node 里 writeHead 的同名头
+ * 会**整体覆盖** setHeader 写下的值(实测:上游一带 set-cookie,我们续签的那条会被整个吃掉)。
+ * 所以这里包一层 writeHead,把 cookie 追加到调用方给的头里 —— 上游自己的 cookie 原样保留。
+ */
+function appendResponseCookie(res, cookie) {
+  const origWriteHead = res.writeHead;
+  res.writeHead = function writeHeadWithCookie(statusCode, ...rest) {
+    const last = rest.length ? rest[rest.length - 1] : null;
+    if (Array.isArray(last)) {
+      // 原始头数组形态:writeHead(status, ["k", "v", …])
+      rest[rest.length - 1] = [...last, "Set-Cookie", cookie];
+    } else if (last && typeof last === "object") {
+      const headers = { ...last };
+      const cookies = [];
+      for (const k of Object.keys(headers)) {
+        if (k.toLowerCase() !== "set-cookie") continue;
+        const v = headers[k];
+        delete headers[k];
+        if (Array.isArray(v)) cookies.push(...v.filter(Boolean));
+        else if (v !== undefined && v !== null && v !== "") cookies.push(String(v));
+      }
+      headers["Set-Cookie"] = [...cookies, cookie];
+      rest[rest.length - 1] = headers;
+    } else {
+      rest.push({ "Set-Cookie": cookie });
+    }
+    return origWriteHead.apply(this, [statusCode, ...rest]);
+  };
 }
 
 // 设备 id 格式:dev-<12hex>(与 bridge 稳定 identity 一致);也兼容旧 bridge-xxx(宽松)
@@ -263,7 +415,18 @@ function getCookie(req, name) {
     const idx = part.indexOf("=");
     if (idx < 0) continue;
     const k = part.slice(0, idx).trim();
-    if (k === name) return decodeURIComponent(part.slice(idx + 1).trim());
+    if (k === name) {
+      // 🔴 decodeURIComponent 对畸形百分号转义(%zz)会抛 URIError，而 getCookie 是在
+      //   **async handler** 里被调用的 —— 未捕获的 rejection 在 Node 里会直接把进程带崩
+      //   (实测:v1 版本的 `cookie: dsh_token=%zz` 请求 /_devices → router exit 1)。
+      //   cookie 是**公网可控输入**,这里必须持久化为"取不到就算没有这个 cookie",
+      //   而不是让一次畸形请求把整个中继打死。续签/鉴权对空串的处理本来就是失败路径。
+      try {
+        return decodeURIComponent(part.slice(idx + 1).trim());
+      } catch {
+        return "";
+      }
+    }
   }
   return "";
 }
@@ -657,7 +820,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // 本地认证登录:POST /_login {key}(开源自部署模式)。
-  // 校验 DSH_LOCAL_ACCESS_KEYS 中的访问密钥 → 签发本地 JWT(plan=pro_max,2 小时)。
+  // 校验 DSH_LOCAL_ACCESS_KEYS 中的访问密钥 → 签发本地 JWT(plan=pro_max,TTL=DSH_LOCAL_SESSION_TTL_MS,默认 30 天)。
   // 未启用本地认证时返回 404。
   if (req.method === "POST" && url.pathname === "/_login") {
     if (!LOCAL_AUTH_ENABLED) {
@@ -688,6 +851,10 @@ const server = http.createServer(async (req, res) => {
     res.end(r.body);
     return;
   }
+
+  // 本地会话滑动续签:只对**本地** token 生效(enterprise 令牌由 enterprise 自己续签)。
+  // 放在 /_login 之后、各需鉴权端点之前 —— 于是 /_devices 与全部 /remote/ 代理请求都覆盖到。
+  renewLocalSession(req, res);
 
   // 实时设备列表:GET /_devices(同源只读)。校验 dsh_token JWT,只返回 JWT 所属用户
   // 当前 WebSocket 为 OPEN 的设备 id/name,不返回其他用户或连接内部信息。
