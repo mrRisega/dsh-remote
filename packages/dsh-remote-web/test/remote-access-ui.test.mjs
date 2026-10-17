@@ -436,13 +436,23 @@ test("「更多」只收纳营销入口：档位规格数字（Mbps / GB / 价�
   assert.ok(!textHas(tree, "Mbps"), "账号卡里不得出现 Mbps");
   assert.ok(!textHas(tree, "¥"), "账号卡里不得出现价格");
 
-  // 但两条**折叠的营销入口**仍在（用户只要数字走，入口留着）
-  const upsell = find(body, (n) => n.type === "button" && (n.children || []).some((c) => typeof c === "string" && c.includes("升级 PRO")));
+  // 2026-10-17 版式简化（业主）：正面只留「升级/续费 + 用户反馈 + 更多」；
+  // 「带新用户换会员 / 修改密码」收进「更多」。升级入口**永远在正面**（不再随收纳状态搬家）。
+  const upsell = find(tree, (n) => n.type === "button" && (n.children || []).some((c) => typeof c === "string" && c.includes("升级 PRO")));
   const invite = find(body, (n) => n.type === "button" && (n.children || []).some((c) => typeof c === "string" && c.includes("带新用户换会员")));
-  assert.ok(upsell, "「更多」里应保留「🚀 升级 PRO」入口");
+  assert.ok(upsell, "正面应保留「🚀 升级 PRO」入口（主行动，位置稳定）");
   assert.ok(invite, "「更多」里应保留「🎁 带新用户换会员」入口");
   assert.equal(typeof upsell.props.onClick, "function");
   assert.equal(typeof invite.props.onClick, "function");
+  // 正面不应再出现「带新用户换会员」（已收进「更多」）
+  const actions = find(tree, (n) => n.props?.className === "dru-actions");
+  assert.ok(actions, "应有主按钮行");
+  assert.ok(!textHas(actions, "带新用户换会员"), "带新用户入口不再占正面按钮行");
+  // 「更多」现在与主行动同排：按钮本体带 .dru-btn（原来的整宽 .dru-disclose 披露条已去掉）
+  const moreBtn = find(tree, (n) => n.props?.id === "dru-account-more");
+  assert.ok(moreBtn, "「更多」按钮应存在");
+  assert.match(String(moreBtn.props.className || ""), /dru-btn/, "「更多」必须与主行动同排（按钮样式，不再是整宽披露条）");
+  assert.doesNotMatch(String(moreBtn.props.className || ""), /dru-disclose(?!-inline)/, "不得再继承整宽披露条样式");
 
   // 源码级：函数与其调用都删掉了（不留死代码）。
   // ⚠️ 断言「代码形态」而不是裸标识符 —— 注释里**故意**留着「这里原本是什么、为什么删」的说明
@@ -472,4 +482,107 @@ test("E2EE 徽标（源码级约束）：client 含徽标字段/文案与 reason
   assert.match(SOURCE, /derive_failed/);
   assert.match(SOURCE, /describeE2ee/);
   assert.match(SOURCE, /dru-e2ee-line/);
+});
+
+// ── 2026-10-17 版式与文案精简（业主 UX 反馈）──────────────────────────────────
+// 动线：账号（我是谁 / 退出）→ 主行动（升级或续费）→ 次要（反馈）→ 更多（其它入口）。
+
+test("★ 正面按钮收敛为三个：升级/续费 + 用户反馈 + 更多（不再一排按钮疯狂换行）", () => {
+  const plugin = loadPlugin();
+  plugin.states[0] = { config: { phone: "13800000000", deviceId: "dev-x" }, service: { running: true } };
+  const tree = plugin.render();
+  // 面板里可能有多处 .dru-actions（访问密钥卡等）；账号卡那一处用「更多」按钮定位。
+  const actions = find(tree, (n) => {
+    if (n.props?.className !== "dru-actions") return false;
+    let hit = false;
+    walk(n, (x) => { if (x.props?.id === "dru-account-more") hit = true; });
+    return hit;
+  });
+  assert.ok(actions, "应有账号卡主按钮行");
+
+  const btns = [];
+  walk(actions, (n) => { if (n.type === "button") btns.push(n); });
+  // 三个按钮：主行动、用户反馈、更多
+  assert.equal(btns.length, 3, `正面按钮应为 3 个，实际 ${btns.length} 个（多了就是又回到"按钮墙"）`);
+  const labels = btns.map((b) => JSON.stringify(b.children || []));
+  assert.ok(labels.some((t) => t.includes("升级 PRO") || t.includes("续费会员")), "第一个是主行动");
+  assert.ok(labels.some((t) => t.includes("用户反馈")), "用户反馈留在正面");
+  assert.ok(labels.some((t) => t.includes("更多")), "「更多」与主行动同排");
+
+  // 退出登录**不在**主按钮行里，而在账号行（.dru-user）右侧
+  const logoutInActions = btns.some((b) => (b.children || []).some((c) => c === "退出登录"));
+  assert.equal(logoutInActions, false, "退出登录不得再占主按钮行");
+  const userRow = find(tree, (n) => n.props?.className === "dru-user");
+  assert.ok(userRow, "应有账号行");
+  const logout = find(userRow, (n) => n.type === "button" && (n.children || []).includes("退出登录"));
+  assert.ok(logout, "退出登录应在账号行里（业主：放到账号那一行旁边）");
+  assert.match(String(logout.props.className || ""), /dru-user-logout/);
+});
+
+test("★ 次要入口全部在「更多」里：带新用户 / 修改密码 / 加入交流群（展开后可见）", () => {
+  const plugin = loadPlugin();
+  plugin.states[0] = { config: { phone: "13800000000", deviceId: "dev-x" }, service: { running: true } };
+  let tree = plugin.render();
+  const toggle = find(tree, (n) => n.props?.id === "dru-account-more");
+  assert.ok(toggle, "应有「更多」按钮");
+  toggle.props.onClick(); // 展开
+  tree = plugin.render();
+  const body = find(tree, (n) => n.props?.className === "dru-more-body");
+  assert.ok(body && body.props.hidden === false, "展开后「更多」内容体可见");
+  const btns = [];
+  walk(body, (n) => { if (n.type === "button") btns.push(n); });
+  const labels = btns.map((b) => JSON.stringify(b.children || []));
+  assert.ok(labels.some((t) => t.includes("带新用户换会员")), "带新用户换会员在「更多」里");
+  assert.ok(labels.some((t) => t.includes("修改密码")), "修改密码在「更多」里");
+});
+
+test("★ 删除了两段解释性文案：升级带登录态说明 / 重启 DeepSeek Harness 说明", () => {
+  assert.doesNotMatch(SOURCE, /升级\/续费以带登录态方式打开/, "升级说明必须删除（用户点一下就知道，不需要解释机制）");
+  assert.doesNotMatch(SOURCE, /桌面端由应用本身托管运行环境/, "重启说明必须删除");
+  assert.doesNotMatch(SOURCE, /请直接退出并重新打开应用/, "不得再引导退出重开应用");
+});
+
+// ── 2026-10-17 安装/配对自检（真机事故：~/.dsh-remote 被删后面板没有明确提示）────────
+test("★ setup=配对缺失：面板顶部明确提示 + 可一键恢复历史配对", async () => {
+  const plugin = loadPlugin();
+  plugin.states[0] = {
+    config: {},
+    service: { running: false },
+    setup: {
+      kind: "pairing_missing", runtimePresent: true, configPresent: false,
+      text: "未配对：需要在面板里登录一次（账号密码），登录后会自动重建运行环境并启动 bridge",
+      detail: "本机有运行环境，但缺少账号配对信息",
+      relayDir: "/tmp/relay",
+      backup: {
+        available: true, name: "dsh-config-20261017.json", at: 1792200000000,
+        text: "检测到历史配对备份（2026-10-17 12:34），可一键恢复",
+        action: { kind: "restore_config", method: "POST", path: "/dsh-remote/config/restore", body: { backup: "dsh-config-20261017.json" } },
+      },
+    },
+  };
+  const tree = plugin.render();
+  assert.ok(textHas(tree, "未配对：需要在面板里登录一次"), "必须显示明确的配对缺失结论");
+  const restore = find(tree, (n) => n.type === "button" && (n.children || []).includes("恢复历史配对"));
+  assert.ok(restore, "有备份时必须给「恢复历史配对」按钮（不自动恢复，防误用旧账号）");
+  restore.props.onClick();
+  await flush();
+  await flush();
+  await flush();
+  const call = plugin.requests.find((r) => r.path === "/dsh-remote/config/restore");
+  assert.ok(call, "点击后必须调用恢复接口");
+  assert.equal(call.method, "POST");
+  assert.equal(call.body.backup, "dsh-config-20261017.json", "必须带上选定的备份文件名");
+});
+
+test("★ setup=ok / 缺字段：不渲染自检提示（绝不无病呻吟）", () => {
+  const plugin = loadPlugin();
+  plugin.states[0] = { config: { phone: "13800000000", deviceId: "dev-x" }, service: { running: true }, setup: { kind: "ok", runtimePresent: true, configPresent: true } };
+  const tree = plugin.render();
+  assert.equal(textHas(tree, "未配对"), false);
+  assert.equal(textHas(tree, "运行环境缺失"), false);
+  // 缺 setup 字段（旧 node 半）同样安静
+  const plugin2 = loadPlugin();
+  plugin2.states[0] = { config: { phone: "13800000000", deviceId: "dev-x" }, service: { running: true } };
+  const tree2 = plugin2.render();
+  assert.equal(textHas(tree2, "未配对"), false);
 });

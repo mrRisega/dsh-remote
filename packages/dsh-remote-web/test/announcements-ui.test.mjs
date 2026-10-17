@@ -357,7 +357,8 @@ test("点一条未读公告 → 立刻 POST /dsh-remote/announcements/click（�
   assert.ok(click, "点公告必须上报点击（现契约只有 /click，没有 /read）");
   assert.equal(click.method, "POST", "点击上报必须是 POST");
   assert.equal(JSON.parse(click.body).id, 3, "请求体必须带该条公告的 id");
-  assert.ok(textHas(tree, "已读状态已同步到后台"), "点击后应展开详情弹窗");
+  // 2026-10-17（业主）：点开**不再**当已读 —— 弹窗页脚不再出现「已读状态已同步到后台」。
+  assert.ok(!textHas(tree, "已读状态已同步到后台"), "点开不等于已读：页脚不得再出现「已读状态已同步到后台」");
   assert.ok(textHas(tree, "扫码登录更快了"), "详情应展示公告正文");
 });
 
@@ -471,9 +472,11 @@ test("绝不轮询：每次页面加载只自动拉一次公告（重复拉会�
   assert.ok(gets[0].path.includes("client=desktop"), "必须显式声明 client=desktop");
 });
 
-test("源码级：面板卡片里的「刷新公告」是唯一的手动重拉入口，且**不**用于弹窗", () => {
+test("源码级：公告只在打开面板时拉一次（2026-10-17 删掉「刷新公告」按钮）", () => {
+  // 业主约定：删除手动刷新按钮 —— 打开看板时自动拉一次即可，避免用户重复点击消耗"待弹公告"。
+  assert.doesNotMatch(SOURCE, /刷新公告/, "「刷新公告」按钮必须已删除");
   assert.match(SOURCE, /annPullOnce/, "必须有 sessionStorage 一次性拉取标记");
-  assert.match(SOURCE, /openPopup:\s*false/, "手动刷新必须显式关闭弹窗（openPopup:false）");
+  assert.match(SOURCE, /openPopup:\s*true/, "自动拉取那一次按需弹窗（openPopup:true）");
   // 一次性标记必须写在 sessionStorage（localStorage 的 origin 会随端口变，挡不住同页重复拉）
   const fn = SOURCE.slice(SOURCE.indexOf("function annPullOnce("), SOURCE.indexOf("function annReportClick("));
   assert.match(fn, /sessionStorage/, "一次性标记必须在 sessionStorage 上");

@@ -941,27 +941,45 @@ test("★ 护栏：解析期绝不许往页面塞东西（0.6.14 首屏提示层
   assert.ok(!/dsh-ma-boot/.test(css), "首屏提示层的样式必须已彻底删除");
 });
 
-test("★ 加载疑似失败时的提示：只在**已有的悬浮菜单**里多一行（不新增层、解析期不碰 DOM）", () => {
-  // 替代被删除的首屏提示层：同样的需求（让用户知道"没加载完、该怎么办"），
-  // 但换成安全的失败方向 —— 判断错了最多是菜单里多一行字，不会挡住任何人。
+test("★ 加载疑似失败时的提示：菜单里一行 + **底部可操作提示条**（不是全屏层、解析期不碰 DOM）", () => {
+  // 2026-09-25：替代被删除的首屏提示层 —— 换成安全方向。
+  // 2026-10-17（真实事故：~/.dsh-remote 被误删 → 镜像页干等 47 秒且无操作入口）：
+  //   · 阈值 25s → 12s（25 秒提示太晚）；
+  //   · 新增底部**可操作**提示条（重试 / 返回设备列表 / 复制诊断信息 / ✕），但它的形态必须仍然是
+  //     "轻量、可关闭、不遮挡主界面" —— 绝不能退回全屏覆盖层。
+  // 具体按钮行为与"关闭后不再弹"见 test/mobile-adapter-load-watch.test.mjs（那里跑真实脚本）。
   const { js: script, css } = injected();
   const gate = script.indexOf("/* —— 主机门解除");
   const preGate = script.slice(script.indexOf('"use strict";'), gate);
-  assert.ok(!/appendChild/.test(preGate), "解析期仍不得 appendChild（看门狗只置状态）");
+  assert.ok(!/appendChild/.test(preGate), "解析期仍不得 appendChild（看门狗只置状态/懒创建提示条）");
 
   // 提示必须挂在菜单里（菜单是被动展开的 → 天然不会覆盖界面）
   assert.match(script, /dsh-ma-menu[\s\S]{0,600}?data-role="load-warn"/, "提示行必须放在悬浮菜单的 HTML 里");
   assert.match(css, /div\.dsh-ma-menu \.dsh-ma-load-warn/, "样式必须限定在菜单内（不得是 body 级固定层）");
   assert.ok(!/\.dsh-ma-load-warn\s*\{[^}]*position:\s*(fixed|absolute)/.test(css),
-    "提示行不得用 fixed/absolute 定位（那就又变成覆盖层了）");
-  assert.ok(!/\.dsh-ma-load-warn\s*\{[^}]*z-index/.test(css), "提示行不得有 z-index（压层）");
+    "菜单里的提示行不得用 fixed/absolute 定位");
+  assert.ok(!/\.dsh-ma-load-warn\s*\{[^}]*z-index/.test(css), "菜单里的提示行不得有 z-index（压层）");
 
-  // 阈值要宽松：宁可漏报，不可吓人
-  assert.match(script, /if \(maLoadReadyNow\(\)\) return;/, "认出官方界面就不该报警");
-  assert.match(script, /\}, 25 \* 1000\);/, "看门狗阈值应为 25 秒（宽松）");
+  // 阈值 12 秒：25 秒太晚（用户实测干等 47 秒才看到任何东西）
+  assert.match(script, /if \(maLoadReadyNow\(\)\) return;/, "认出官方界面就不该提示");
+  assert.match(script, /var MA_LOAD_WATCH_MS = 12 \* 1000;/, "看门狗阈值常量应为 12 秒");
+  assert.match(script, /\}, MA_LOAD_WATCH_MS\);/, "setTimeout 必须用该常量");
+  assert.ok(!/25 \* 1000/.test(script), "不得残留 25 秒阈值");
   // 一句话要能直接发给客服
   assert.match(script, /dsh-remote 手机端加载疑似卡住/, "必须给一句可直接发给客服的话");
   assert.match(script, /maLoadCopyLine/, "要能复制（否则用户只能截图）");
+
+  // 底部提示条：**不是全屏层**（这是 0.6.14 永久盖住 UI 那个事故的直接教训）
+  const barRule = /div\.dsh-ma-loadbar\s*\{([\s\S]*?)\}/.exec(css);
+  assert.ok(barRule, "应有底部提示条样式");
+  assert.ok(!/inset:\s*0/.test(barRule[1]), "提示条不得是全屏层（inset:0）");
+  assert.ok(!/top:\s*0(px)?;/.test(barRule[1]), "提示条不得同时钉 top:0（那就是全屏覆盖）");
+  assert.match(barRule[1], /max-height:/, "提示条必须限高（不遮挡主界面）");
+  assert.match(barRule[1], /bottom:\s*calc\(/, "提示条应贴底部");
+  assert.ok(!/z-index:\s*\d{7,}/.test(css), "不得出现百万级 z-index");
+  // 关闭后不再弹：脚本里必须有 dismissed 闸门，且 ✕ 走它
+  assert.match(script, /dismissed:\s*false/, "提示条必须有「本页不再弹」的状态位");
+  assert.match(script, /maLoadDismissBar\(\)/, "✕ 关闭必须走 maLoadDismissBar");
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1100,7 +1118,9 @@ test("护栏：延迟角标必须是 FAB 内的子元素（不得新增 body 级
   //    它不是适配层注入的。原来的写法拿"白名单命中数 === body.children.length"去比，
   //    等于要求官方 frame 也得命中白名单 → 恒差 1（假红）。现在改成**指名道姓找漏网节点**，
   //    既排除了官方 frame，又比原来更严：多出来的节点会被打印出来。
-  const allowed = ["dsh-ma-fab", "dsh-ma-menu", "dsh-ma-scrim", "dsh-ma-hamburger", "dsh-ma-sessionbar"];
+  // ⚠️ 白名单：dsh-ma-loadbar 是 2026-10-17 新增的「加载慢」底部可操作提示条（懒创建、
+  //    限高、可关闭，不是全屏层；具体形态契约见 test/mobile-adapter-load-watch.test.mjs）。
+  const allowed = ["dsh-ma-fab", "dsh-ma-menu", "dsh-ma-scrim", "dsh-ma-hamburger", "dsh-ma-sessionbar", "dsh-ma-loadbar"];
   const stray = env.body.children
     .filter((c) => !c._cls.has("pI_x6G_frame"))                                  // 官方 frame 不是我们注入的
     .filter((c) => !allowed.some((k) => c._cls.has(k)));

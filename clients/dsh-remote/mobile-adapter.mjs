@@ -554,6 +554,67 @@ div.dsh-ma-menu .dsh-ma-load-warn[hidden] { display: none !important; }
 div.dsh-ma-menu .dsh-ma-load-warn .ico { flex: none; }
 div.dsh-ma-menu .dsh-ma-load-warn .txt { min-width: 0; overflow-wrap: anywhere; }
 
+/* ===== 加载疑似卡住时的**可操作**底部提示条（2026-10-17 事故新增） =====
+   事故现场：用户本机 ~/.dsh-remote（bridge 运行时 + 账号配对信息/设备密钥）被误删 → bridge 起不来、
+   手机端镜像页第一次加载**干等 47 秒**才报错；页面上只有悬浮菜单里一行"已等 N 秒…复制给客服"，
+   没有任何可点的操作。这里补一条**底部轻量提示条**（不是全屏层、不遮挡主界面）：
+     · 只在 12 秒看门狗判定 slow 之后才**懒创建**（解析期一个节点都不往页面塞）；
+     · 只占视口底部一条、高度受限（max-height），浮层外的区域照常可点 → 用户还能继续操作；
+     · 三个按钮：重试 / 返回设备列表 / 复制诊断信息，外加 ✕ 关闭；关掉后本页不再弹；
+     · 认出官方界面后自动收起（判断错了也不会一直挂着）——失败方向仍然安全：
+       最坏只是底部多一条**可关闭**的提示，而不是"永远盖住整片界面"。
+   动画只在「支持 prefers-reduced-motion 且用户没要求减少动效」时挂上：
+   老浏览器不认识这个媒体查询 → 不匹配 → 无动画（无需用 matchMedia 判断，也不会有兼容异常）。 */
+div.dsh-ma-loadbar {
+  position: fixed;
+  left: max(10px, env(safe-area-inset-left));
+  right: max(10px, env(safe-area-inset-right));
+  bottom: calc(10px + env(safe-area-inset-bottom));
+  /* 低于 FAB(400) 与菜单(401)：提示条不得压住"自救出口"（悬浮按钮永远点得到） */
+  z-index: 399;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  box-sizing: border-box;
+  width: auto;
+  max-height: min(38vh, 260px);
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--dsw-alias-bg-elevated, #fff);
+  border: .5px solid var(--dsw-alias-border-l3, rgba(127,127,127,.3));
+  box-shadow: 0 6px 24px rgba(0,0,0,.24);
+  color: var(--dsw-alias-label-primary, #111);
+  font: 400 13px/1.5 -apple-system, system-ui, sans-serif;
+}
+/* ⚠️ 必须显式写 [hidden]：UA 的 [hidden]{display:none} 会被上面的 display:flex 盖过（本仓踩过）。 */
+div.dsh-ma-loadbar[hidden] { display: none !important; }
+div.dsh-ma-loadbar .dsh-ma-loadbar-txt { flex: 1 1 160px; min-width: 0; overflow-wrap: anywhere; }
+div.dsh-ma-loadbar .dsh-ma-loadbar-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+div.dsh-ma-loadbar button {
+  flex: none; padding: 8px 12px; border-radius: 9px; cursor: pointer;
+  border: .5px solid var(--dsw-alias-border-l3, rgba(127,127,127,.35));
+  background: var(--dsw-alias-button-elevated-fill, rgba(127,127,127,.08));
+  color: var(--dsw-alias-label-primary, #111);
+  font: 600 13px/1 -apple-system, system-ui, sans-serif;
+  touch-action: manipulation; -webkit-tap-highlight-color: transparent;
+}
+div.dsh-ma-loadbar button:active { transform: scale(.98); }
+div.dsh-ma-loadbar button.dsh-ma-loadbar-close {
+  padding: 6px 9px; border-color: transparent; background: transparent;
+  color: var(--dsw-alias-label-tertiary, #6b7280);
+}
+@media (prefers-reduced-motion: no-preference) {
+  div.dsh-ma-loadbar { animation: dsh-ma-loadbar-in .18s ease-out; }
+  @keyframes dsh-ma-loadbar-in {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: none; }
+  }
+}
+/* 双保险：显式要求减少动效时一律无动画（老浏览器不匹配上面的 no-preference → 天然无动画） */
+@media (prefers-reduced-motion: reduce) {
+  div.dsh-ma-loadbar { animation: none !important; transition: none !important; }
+}
+
 /* 会话过期引导条:镜像页在会话过期后只会"连不上"，这里给一句能照做的话 + 一个出口。
    非阻塞(顶部细条)，点关闭即消失；不拦截任何请求。 */
 div.dsh-ma-sessionbar {
@@ -656,21 +717,33 @@ const SCRIPT = `(() => {
     }
   })();
 
-  /* ===== 「加载疑似没完成」看门狗（2026-09-25，替代被整块删除的首屏提示层）=====
-     那个提示层是全屏覆盖 + 启发式退出 —— 判断错一次就把**已经加载完**的界面永久盖住
-     （用户实测：秒表走到 187 秒，刷新也一样）。所以这里换一条**安全的失败方向**：
+  /* ===== 「加载疑似没完成」看门狗（2026-09-25 起；2026-10-17 提速并改成**可操作**提示）=====
+     历史：0.6.14 的首屏提示层是全屏覆盖 + 启发式退出 —— 判断错一次就把**已经加载完**的界面永久盖住
+     （用户实测：秒表走到 187 秒，刷新也一样）。所以 0.6.16 换了安全的失败方向：只置 slow 标记，
+     在**已有的**悬浮菜单里多一行字。这个方向本身是对的，但**提示太晚、且没有操作入口**——
+     2026-10-17 真实事故：用户本机 ~/.dsh-remote（运行时 + 账号配对信息/设备密钥）被误删后，
+     手机端镜像页第一次加载**干等 47 秒**才报错，页面上只有一行"已等 N 秒…复制给客服"，
+     用户完全不知道该重新安装还是重新登录。
 
-       · 解析期**不创建任何 DOM**（只有几个变量 + 一个定时器）—— 页面还没过主机门，
+     现在（2026-10-17）：
+       · 解析期仍然**不创建任何 DOM**（只有几个变量 + 一个定时器）—— 页面还没过主机门，
          更不该有任何覆盖层；
-       · 25 秒后仍认不出官方界面 → 只置一个 slow 标记，**不往页面塞任何东西**；
-       · 标记生效时，往**已有的**「远程控制」悬浮菜单里多一行字（点一下复制一句话给客服），
-         并建议点菜单里本来就有的「返回设备列表」重来；
-       · 判断错了的代价 = 菜单里多一行字（用户不点开菜单完全看不到）；不会再挡住任何人。
+       · **12 秒**后仍认不出官方界面 → 置 slow + 显示**底部轻量提示条**（懒创建）：
+         文案「电脑端可能未连接 / 页面加载较慢」+ 已等待秒数；
+         按钮：重试（location.reload）/ 返回设备列表（/app/）/ 复制诊断信息 / ✕ 关闭；
+       · 提示条**不是全屏层**：只占底部一条、高度受限、浮层外照常可点、可关闭，
+         关掉后本页不再弹；认出官方界面后自动收起 —— 失败方向仍然安全；
+       · 菜单里那一行字**保留**（被动展开，不打扰，也仍可复制诊断话术）。
 
-     ⚠️ 刻意**不**做成页面顶部/底部的固定细条：那种细条同样会盖住官方 UI 的一部分，
-        而且同样有"永不消失"的失败方向。菜单是被动展开的，天然没有这个问题。 */
+     ⚠️ 12 秒是"开始提示"的阈值，不是"判定失败"：限速放开后正常首屏 1~3 秒，
+        12 秒既能及时帮到用户，也不至于刚打开就吓人（宁可晚一点，也别误报）。
+     ⚠️ 注入体是模板字符串：本段注释/文案**一律用「」**，不得出现反引号。 */
   var maLoadWatch = { startedAt: Date.now(), slow: false, wired: false, bound: false, warnEl: null, warnTxt: null,
-                      reported: false, reportMs: 0 };
+                      reported: false, reportMs: 0,
+                      // 2026-10-17：底部可操作提示条（barEl = 懒创建的节点；barTimer = 秒数刷新）
+                      barEl: null, barTxt: null, barTimer: 0, dismissed: false };
+  /** 看门狗阈值（毫秒）：12 秒仍认不出官方界面就开始提示。测试按常量断言，不要散落魔法数。 */
+  var MA_LOAD_WATCH_MS = 12 * 1000;
   /** 官方界面是否已经可用（只看最强信号；只用于决定"要不要多显示一行字"）。 */
   function maLoadReadyNow() {
     try {
@@ -718,8 +791,8 @@ const SCRIPT = `(() => {
    *   ② **全程静默**：任何异常都吞掉，失败绝不影响页面，也绝不做重试；
    *   ③ 只在**已有的**同一批请求之外发这一次（一次 POST，几十字节），不是测速、不轮询。
    * body = { ms, outcome, at }：ms=耗时毫秒（截到 [0,600000]，与契约一致）；outcome ∈ {ok,slow}
-   * （slow = 25 秒看门狗兜底，是"删失下限"，后台只把 ok 计入 P50/P90）；at=事件发生的 epoch ms。
-   */
+   * （slow = 12 秒看门狗兜底，是"删失下限"，后台只把 ok 计入 P50/P90）；at=事件发生的 epoch ms。
+   * ⚠️ 2026-10-17：阈值 25s→12s，**字段与一次语义一律不变**（后台契约不动）。 */
   function maReportMirrorLoad(outcome) {
     if (maLoadWatch.reported) return;
     maLoadWatch.reported = true;
@@ -748,10 +821,140 @@ const SCRIPT = `(() => {
     try { ua = String((navigator && navigator.userAgent) || "").slice(0, 120); } catch (e) { /* 忽略 */ }
     return "dsh-remote 手机端加载疑似卡住：等待 " + maLoadWaitedSec() + " 秒后仍未出现对话界面。UA=" + ua;
   }
+
+  /* ===== 底部可操作提示条（2026-10-17，见上方看门狗注释）=====
+     纪律：
+       · **懒创建**：只有 slow 且用户没关过时才创建节点；
+       · **绝不阻塞**：只占底部一条（CSS 限高），浮层外照常可点；按钮动作全部就地完成；
+       · **任何异常都吞掉**：提示层坏掉也绝不影响页面（每个入口都有 try/catch）；
+       · **只提示一次**：用户点 ✕ 后 dismissed=true，本页不再弹（不骚扰）。 */
+  /** 提示条主文案：电脑端未连接/加载慢 + 已等待秒数（秒数由 barTimer 每秒刷新）。 */
+  function maLoadBarText() {
+    return "电脑端可能未连接 / 页面加载较慢（已等待 " + maLoadWaitedSec() + " 秒）";
+  }
+  /** 收起提示条并停掉秒数刷新（不改变 dismissed：用于"认出界面后自动收起"这类临时收起）。 */
+  function maLoadHideBar() {
+    try { if (maLoadWatch.barEl) maLoadWatch.barEl.hidden = true; } catch (e) { /* 忽略 */ }
+    try {
+      if (maLoadWatch.barTimer) { clearInterval(maLoadWatch.barTimer); maLoadWatch.barTimer = 0; }
+    } catch (e2) { /* 忽略 */ }
+  }
+  /** 用户点 ✕：本页不再弹（dismissed 是**本页**语义；刷新页面会重新开始一次提示机会）。 */
+  function maLoadDismissBar() {
+    try {
+      maLoadWatch.dismissed = true;
+      maLoadHideBar();
+      maLoadRenderWarn(); // 菜单里那一行也一起收起（关闭 = 本页只提示一次）
+    } catch (e) { /* 忽略 */ }
+  }
+  /** 导航（返回设备列表）：assign 失败退回 href。 */
+  function maLoadGoto(to) {
+    try { window.location.assign(to); return; } catch (e) { /* 继续 */ }
+    try { window.location.href = to; } catch (e2) { /* 忽略 */ }
+  }
+  /** 复制诊断信息（沿用 maLoadCopyLine：含 UA 与耗时）；剪贴板不可用时把整句显示在提示条上让用户截图。 */
+  function maLoadCopyDiag() {
+    var line = maLoadCopyLine();
+    var show = function (t) {
+      try { if (maLoadWatch.barTxt) maLoadWatch.barTxt.textContent = t; } catch (e) { /* 忽略 */ }
+    };
+    try {
+      if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
+        var p = navigator.clipboard.writeText(line);
+        if (p && typeof p.then === "function") {
+          p.then(function () { show("已复制诊断信息（含等待时长与机型），可直接发给客服。"); },
+                 function () { show(line); });
+          return;
+        }
+      }
+    } catch (e) { /* 落到显示 */ }
+    show(line);
+  }
+  /** 懒创建提示条（只在 slow 之后调用；解析期绝不碰 DOM）。 */
+  function maLoadMountBar() {
+    try {
+      if (maLoadWatch.barEl || maLoadWatch.dismissed) return maLoadWatch.barEl;
+      var body = document.body || document.documentElement;
+      if (!body || !body.appendChild) return null;
+      var bar = document.createElement("div");
+      bar.className = "dsh-ma-loadbar";
+      /* role=status + aria-live=polite：读屏软件会把"加载较慢"念出来，但不会抢焦点；
+         它**不是** dialog/alert，不抢键盘、不锁滚动。 */
+      bar.setAttribute("role", "status");
+      bar.setAttribute("aria-live", "polite");
+      bar.innerHTML =
+        '<div class="dsh-ma-loadbar-txt" data-role="loadbar-txt"></div>' +
+        '<div class="dsh-ma-loadbar-actions">' +
+          '<button type="button" class="dsh-ma-loadbar-btn" data-role="loadbar-retry">重试</button>' +
+          '<button type="button" class="dsh-ma-loadbar-btn" data-role="loadbar-back">返回设备列表</button>' +
+          '<button type="button" class="dsh-ma-loadbar-btn" data-role="loadbar-copy">复制诊断信息</button>' +
+        '</div>' +
+        '<button type="button" class="dsh-ma-loadbar-close" data-role="loadbar-close" aria-label="关闭提示">✕</button>';
+      bar.hidden = true;
+      maLoadWatch.barEl = bar;
+      maLoadWatch.barTxt = bar.querySelector('[data-role="loadbar-txt"]');
+      bar.addEventListener("click", function (ev) {
+        // 事件委托：真实浏览器里目标可能是按钮内的文字节点；从 target 往上找到 [data-role]
+        try {
+          if (ev && typeof ev.preventDefault === "function") ev.preventDefault();
+        } catch (e0) { /* 忽略 */ }
+        try {
+          var t = ev && ev.target ? ev.target : null;
+          var role = "";
+          var guard = 0;
+          while (t && t !== bar && guard < 16 && !role) {
+            guard += 1;
+            try {
+              if (t.getAttribute) role = String(t.getAttribute("data-role") || "");
+            } catch (e1) { role = ""; }
+            t = t.parentNode || null;
+          }
+          if (role === "loadbar-retry") {
+            try { window.location.reload(); } catch (e2) { /* 忽略 */ }
+          } else if (role === "loadbar-back") {
+            maLoadGoto("/app/"); // 绝对路径：镜像页当前路径可能是 /remote/<deviceId>/…
+          } else if (role === "loadbar-copy") {
+            maLoadCopyDiag();
+          } else if (role === "loadbar-close") {
+            maLoadDismissBar();
+          }
+        } catch (e3) { /* 提示条失败绝不影响页面 */ }
+      });
+      body.appendChild(bar);
+      return bar;
+    } catch (e) { return null; }
+  }
+  /** 按当前状态渲染提示条（slow + 未关闭 → 显示；否则收起）。 */
+  function maLoadRenderBar() {
+    try {
+      if (!maLoadWatch.slow || maLoadWatch.dismissed) { maLoadHideBar(); return; }
+      var bar = maLoadWatch.barEl || maLoadMountBar();
+      if (!bar) return;
+      if (maLoadWatch.barTxt) maLoadWatch.barTxt.textContent = maLoadBarText();
+      bar.hidden = false;
+      if (!maLoadWatch.barTimer) {
+        // 每秒刷新「已等待 N 秒」；同时复核"是不是其实早就好了"——好了就自动收起（不长期挂着）。
+        maLoadWatch.barTimer = setInterval(function () {
+          try {
+            if (!maLoadWatch.slow || maLoadWatch.dismissed) { maLoadHideBar(); return; }
+            if (maLoadReadyNow()) {
+              maLoadWatch.slow = false;
+              maLoadHideBar();
+              maLoadRenderWarn(); // 菜单那一行也一起收起
+              return;
+            }
+            if (maLoadWatch.barTxt) maLoadWatch.barTxt.textContent = maLoadBarText();
+          } catch (e) { /* 忽略 */ }
+        }, 1000);
+        try { if (maLoadWatch.barTimer && maLoadWatch.barTimer.unref) maLoadWatch.barTimer.unref(); } catch (e2) { /* 忽略 */ }
+      }
+    } catch (e) { /* 提示条失败绝不影响页面 */ }
+  }
   function maLoadRenderWarn() {
     try {
       if (!maLoadWatch.warnEl) return;
-      if (!maLoadWatch.slow) { maLoadWatch.warnEl.hidden = true; return; }
+      // 用户点过 ✕ = 本页不想再被这事打扰：菜单里那一行也一起收起（"只提示一次"）
+      if (!maLoadWatch.slow || maLoadWatch.dismissed) { maLoadWatch.warnEl.hidden = true; return; }
       if (maLoadWatch.warnTxt) {
         maLoadWatch.warnTxt.textContent = "本次页面可能没加载完整（已等 " + maLoadWaitedSec()
           + " 秒）。点这里复制一句话发给客服，或点下方「返回设备列表」重来。";
@@ -785,18 +988,18 @@ const SCRIPT = `(() => {
       }
     } catch (e) { /* 忽略 */ }
   }
-  // 25 秒后仍认不出官方界面 → 置慢标记（**只改状态，不碰 DOM**）。
-  // 阈值取得很宽松：宁可漏报（什么都不显示，与今天一致），也不要误报吓人。
-  // 同一处顺手把 mirror_load 的**兜底样本**发出去（outcome="slow"）：25 秒没就绪的页面上报的
-  // 必然是"≥25 秒"，这是**删失下限**而不是真实耗时，后台只把它单列，不混进 P50/P90。
+  // 12 秒后仍认不出官方界面 → 置慢标记 + 懒创建底部提示条（**只在这时才碰 DOM**）。
+  // 同一处顺手把 mirror_load 的**兜底样本**发出去（outcome="slow"）：12 秒没就绪的页面上报的
+  // 必然是"≥12 秒"，这是**删失下限**而不是真实耗时，后台只把它单列，不混进 P50/P90。
   setTimeout(function () {
     try {
       if (maLoadReadyNow()) return;
       maLoadWatch.slow = true;
       if (maLoadWatch.wired) maLoadRenderWarn();
+      maLoadRenderBar(); // 底部可操作提示条（重试 / 返回设备列表 / 复制诊断 / 关闭）
       maReportMirrorLoad("slow");
     } catch (e) { /* 忽略 */ }
-  }, 25 * 1000);
+  }, MA_LOAD_WATCH_MS);
 
   try {
     const HOST_RE = new RegExp(${JSON.stringify(RUNTIME_HOST_RE.source)});
@@ -2511,13 +2714,24 @@ const SCRIPT = `(() => {
       maObserver = null;
       try { if (maInterval) clearInterval(maInterval); } catch (eD2) { /* 忽略 */ }
       maInterval = 0;
+      // 加载提示条的秒数刷新也一起停掉（页面卸载/进 bfcache 后不留悬挂回调）
+      try { if (maLoadWatch.barTimer) { clearInterval(maLoadWatch.barTimer); maLoadWatch.barTimer = 0; } } catch (eD3) { /* 忽略 */ }
     };
     try { window.addEventListener("pagehide", maTeardown); } catch (ePh) { /* 忽略 */ }
     try { window.addEventListener("unload", maTeardown); } catch (eUl) { /* 忽略 */ }
     /* 手机上"切到别的 App 再切回来"走的常是 bfcache:pagehide(persisted=true) → pageshow(persisted=true)。
-       DOM 原样保留但计时器/观察者已断 —— 这里重新武装,否则回到页面后看门狗就永久失灵了。 */
+       DOM 原样保留但计时器/观察者已断 —— 这里重新武装,否则回到页面后看门狗就永久失灵了。
+       2026-10-17：加载提示条的秒数刷新也在 maTeardown 里停了，回到前台要按现状重新挂上
+       （否则用户切回来看的是"冻结的已等待 N 秒"）。 */
     try {
-      window.addEventListener("pageshow", (ev) => { try { if (ev && ev.persisted) maArm(); } catch (ePs) { /* 忽略 */ } });
+      window.addEventListener("pageshow", (ev) => {
+        try {
+          if (ev && ev.persisted) {
+            maArm();
+            if (maLoadWatch.slow && !maLoadWatch.dismissed) maLoadRenderBar();
+          }
+        } catch (ePs) { /* 忽略 */ }
+      });
     } catch (ePs2) { /* 忽略 */ }
   } catch (e) { if (window.console) console.warn("[dsh-mobile-adapter]", e && e.message); }
 })();`;

@@ -20,7 +20,7 @@
 //   - 0.1.2+ ?token 浏览器鉴权会话代持（0.4.1 起）
 //
 // 不依赖任何第三方包：只使用 node 内置模块与 cordis 注入的 webServer 服务。
-import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync, accessSync, chmodSync, openSync, closeSync, readSync, fstatSync, rmSync, renameSync, statSync, copyFileSync, cpSync, constants as fsConstants } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync, accessSync, chmodSync, openSync, closeSync, readSync, fstatSync, rmSync, renameSync, statSync, copyFileSync, cpSync, readdirSync, constants as fsConstants } from "node:fs";
 import { join, dirname, sep, delimiter, isAbsolute, relative } from "node:path";
 import { execSync, spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -736,6 +736,309 @@ function applySaaSMode(cfg) {
   cfg.api_url = String(cfg.api_url || DEFAULT_API).replace(/\/+$/, "");
   cfg.tunnel_url = cfg.api_url.replace(/\/relay-api\/?$/, "").replace(/^https/, "wss");
   return cfg;
+}
+
+// ---------- 安装/配对自检 + 配对信息备份（2026-10-17 事故） ----------
+//
+// 事故：用户本机 `~/.dsh-remote`（bridge 运行时 + **账号配对信息/设备密钥**）被误删 →
+// bridge 无法启动、设备离线；手机端镜像页干等 47 秒；面板状态机只显示模糊的「未运行/准备中」，
+// 用户完全不知道该**重新安装**还是该**重新登录**。
+//
+// 这一段的职责（全部只读 + 明确的下一步动作，绝不偷偷替用户做决定）：
+//   ① setupStateOf：把「运行时在不在（clients/）」「配对信息在不在（.dsh-config.json）」分开如实报告，
+//      并给出面向非技术用户的一句话结论（缺什么、下一步做什么）；
+//   ② 运行时缺失 → 复用既有 ensureRuntime 从插件自带 runtime/ 自愈补装（配对缺失**必须用户登录**，
+//      绝不自动填入任何凭据）；
+//   ③ 配对备份（**双份**，2026-10-17 二次加固）：
+//        · 配置目录：<relayDir>/backup/dsh-config-<ISO>.json；
+//        · **插件 profile 下的独立数据目录**：<profile>/dsh-remote-web-data/config-backup/。
+//      真机事故里用户删的是**整个 ~/.dsh-remote 目录** —— 只备份在 relayDir 里等于没备份，
+//      所以必须再存一份在不随 relayDir 删除、也不随插件包升级（`<id>-plugin/` 会被整体替换）
+//      消失的位置。落点与插件 profile 同源（profile 目录推导规则见 pluginProfileDir，与
+//      registerRoutes 用的是同一份），目录 700 / 文件 600 / 每处保留最近 3 份。
+//      启动时发现主配置缺失但备份存在 → **不自动恢复**（防误用旧账号/别人的账号），
+//      只在状态里提示「检测到历史配对备份（时间），可一键恢复」并给恢复入口。
+//
+// 🔒 安全边界（备份文件里是明文密码/设备私钥）：
+//   · 日志只写**文件名与时间**，绝不写内容；状态对象里也不带任何凭据字段；
+//   · 备份失败一律静默（不影响安装/登录；两份里成功一份就算成功）；
+//   · 恢复前先把"当前状态"再备份一份（可回滚）；恢复必须由用户在面板里显式点击；
+//   · 彻底卸载时 profile 数据目录里的这份也一起删（否则"已卸载"还留着账号密钥，
+//     而且重装后会提示恢复一个用户已经不要了的旧账号）。
+
+/** 配对备份目录（相对 relayDir；第二份在 profile 数据目录，见 PROFILE_* 常量）。 */
+const CONFIG_BACKUP_DIR = "backup";
+const CONFIG_BACKUP_KEEP = 3;
+const CONFIG_BACKUP_PREFIX = "dsh-config-";
+/** profile 下本插件自己的**独立数据目录**：不随 `<id>-plugin/`（升级时整体替换）消失。 */
+const PROFILE_DATA_DIR = "dsh-remote-web-data";
+const PROFILE_BACKUP_SUBDIR = "config-backup";
+/**
+ * 备份来源与优先级：`profile` = 插件 profile 数据目录（抗整目录删除），`relay` = 配置目录。
+ * 数组顺序 = 默认优先级（恢复默认选"最新的一份"，时间相同时 **profile 胜** ——
+ * 它能在 relayDir 整个被删时活下来，是同一次写入里更耐久的那份副本）。
+ */
+const CONFIG_BACKUP_SOURCES = ["profile", "relay"];
+/** 来源 → 用户可见的中文标签（只说明位置，不含凭据信息）。 */
+const CONFIG_BACKUP_SOURCE_TEXT = { profile: "插件持久目录", relay: "配置目录" };
+
+/**
+ * 本插件所在的 profile 目录（与 registerRoutes 同一份推导规则：
+ * 由插件自身文件位置推导，覆盖市场 git 安装 / 本地 include 两种形态；取不到用默认 web profile）。
+ *
+ * ⚠️ 为什么不直接用 plugin 包目录：升级/重装会整目录替换 `<profile>/<id>-plugin/`，
+ *    放在它里面的备份会跟着没 —— 所以数据目录放在 profile 下的**同级独立目录**。
+ */
+function pluginProfileDir() {
+  let dir = join(homedir(), ".dsh", "profiles", "web");
+  try {
+    const here = fileURLToPath(import.meta.url);
+    // 依次尝试两种安装布局（当前名优先，历史名兜底）；split()[0] 未命中时返回原串，需显式判断后再试下一种
+    let m = here.split("/dsh-remote-web-plugin/")[0];
+    if (m === here) m = here.split("/node_modules/dsh-remote-web/")[0];
+    if (m === here) m = here.split("/dsh-remote-ui-plugin/")[0];
+    if (m === here) m = here.split("/node_modules/dsh-remote-ui/")[0];
+    if (m !== here) dir = m;
+  } catch { /* 保持默认 */ }
+  return dir;
+}
+
+/** 某个来源的备份目录绝对路径。 */
+function configBackupDirOf(relayDir, source = "relay") {
+  if (source === "relay") return join(relayDir, CONFIG_BACKUP_DIR);
+  return join(pluginProfileDir(), PROFILE_DATA_DIR, PROFILE_BACKUP_SUBDIR);
+}
+
+/** 人类可读时间（只用于状态/日志的"时间"提示，不含任何凭据）。 */
+function fmtLocalTime(ms) {
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n <= 0) return "";
+  try {
+    const d = new Date(n);
+    const p = (v) => String(v).padStart(2, "0");
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  } catch { return ""; }
+}
+
+/** 备份文件名的唯一合法形态（时间戳 + 可选序号；拒绝任何路径成分）。 */
+const CONFIG_BACKUP_FILE_RE = /^dsh-config-[\w.-]+\.json$/;
+
+/**
+ * 列出**某一个来源**的备份（新 → 旧）。只读目录；**绝不读取/返回备份文件内容**。
+ * @returns {Array<{source:string, file:string, name:string, at:number, size:number}>}
+ */
+function listConfigBackupsIn(relayDir, source) {
+  try {
+    const dir = configBackupDirOf(relayDir, source);
+    const files = readdirSync(dir).filter((n) => CONFIG_BACKUP_FILE_RE.test(String(n)));
+    return files.map((file) => {
+      let at = 0;
+      let size = 0;
+      try {
+        const st = statSync(join(dir, file));
+        at = Number(st.mtimeMs) || 0;
+        size = Number(st.size) || 0;
+      } catch { /* 文件刚被删/无权限：忽略该项时间 */ }
+      // name 里体现来源：profile:<file> / relay:<file>（状态/恢复接口都用它，绝不把绝对路径发散出去）
+      return { source, file, name: `${source}:${file}`, at, size };
+    });
+  } catch { return []; }
+}
+
+/**
+ * 列出**两个来源合并**后的备份（新 → 旧）。
+ * 时间相同时 **profile 排前面**（默认优先恢复它，见 CONFIG_BACKUP_SOURCES 注释）。
+ * @returns {Array<{source:string, file:string, name:string, at:number, size:number}>}
+ */
+function listConfigBackups(relayDir) {
+  const order = new Map(CONFIG_BACKUP_SOURCES.map((s, i) => [s, i]));
+  const all = [];
+  for (const source of CONFIG_BACKUP_SOURCES) all.push(...listConfigBackupsIn(relayDir, source));
+  return all.sort((a, b) => (b.at - a.at) || ((order.get(a.source) ?? 9) - (order.get(b.source) ?? 9))
+    || String(b.file).localeCompare(String(a.file)));
+}
+
+/**
+ * 解析用户/状态给出的备份引用 → 列表里的真实条目（**只认列表内文件**，防路径穿越/任意文件读）。
+ *   · 省略 / 空串 → 默认：最新一份（时间相同优先 profile）
+ *   · `profile:<file>` / `relay:<file>` → 指定来源（状态里下发的就是这种 name）
+ *   · 裸 `<file>` → 兼容旧状态（2026-10-17 之前只写 relay 一份）：两个来源里找，命中多个时优先 profile
+ * @returns {{source:string,file:string,name:string,at:number,size:number}|null}
+ */
+function findConfigBackup(relayDir, ref = "") {
+  const raw = String(ref || "").trim();
+  const all = listConfigBackups(relayDir);
+  if (!all.length) return null;
+  if (!raw) return all[0]; // listConfigBackups 已按"新→旧、时间相同 profile 先"排好
+  if (/[\\/]/.test(raw) || raw.includes("..")) return null; // 明显是路径/穿越：直接拒绝
+  const m = /^(profile|relay):(.+)$/.exec(raw);
+  if (m) return all.find((b) => b.source === m[1] && b.file === m[2]) || null;
+  // 裸文件名（兼容旧状态）：同名的可能两份都在 → 优先 profile
+  const hits = all.filter((b) => b.file === raw);
+  return hits.find((b) => b.source === "profile") || hits[0] || null;
+}
+
+/** 只保留**每个来源**最近 CONFIG_BACKUP_KEEP 份（更老的删掉；失败静默）。 */
+function pruneConfigBackups(relayDir, keep = CONFIG_BACKUP_KEEP) {
+  for (const source of CONFIG_BACKUP_SOURCES) {
+    try {
+      const all = listConfigBackupsIn(relayDir, source);
+      for (const b of all.slice(Math.max(0, keep))) {
+        try { rmSync(join(configBackupDirOf(relayDir, source), b.file), { force: true }); } catch { /* 忽略 */ }
+      }
+    } catch { /* 单个来源失败不影响另一个 */ }
+  }
+}
+
+/**
+ * 把当前 `.dsh-config.json` **同时**复制到两处（relayDir/backup 与 profile 数据目录），
+ * 每处权限 600（目录 700）、各保留最近 3 份。
+ *
+ * 调用点：① 面板登录/配对成功（POST /dsh-remote/config）；② 运行环境安装完成（ensureRuntime 成功）；
+ *         ③ 恢复前先备份当前状态。
+ * 🔒 日志只写文件名+时间，**绝不写内容**；任何失败静默返回，绝不影响安装/登录主流程。
+ *    单个落点失败（例如 relayDir 只读）不影响另一份成功 —— 至少有一份就返回 ok。
+ * @returns {{ok:boolean, at?:number, name?:string, sources?:{profile?:string, relay?:string}, reason?:string}}
+ *          name = 默认恢复会选中的那一份（profile 优先）；sources = 两个落点各自的文件名
+ */
+function backupConfigFile(relayDir) {
+  try {
+    const src = configPathOf(relayDir);
+    if (!existsSync(src)) return { ok: false, reason: "no-config" }; // 还没配对：无可备份
+    const at = Date.now();
+    const stamp = new Date(at).toISOString().replace(/[:.]/g, "-");
+    const sources = {};
+    for (const source of CONFIG_BACKUP_SOURCES) {
+      try {
+        const dir = configBackupDirOf(relayDir, source);
+        mkdirSync(dir, { recursive: true, mode: 0o700 });
+        // 文件名只含时间戳（不含账号/手机号等任何内容）；同一毫秒重复备份时加序号，绝不覆盖已有备份
+        let file = `${CONFIG_BACKUP_PREFIX}${stamp}.json`;
+        for (let i = 2; existsSync(join(dir, file)) && i < 100; i += 1) {
+          file = `${CONFIG_BACKUP_PREFIX}${stamp}-${i}.json`;
+        }
+        copyFileSync(src, join(dir, file));
+        // 备份里是明文密码/设备私钥：POSIX 上 0600；Windows 显式收紧 ACL（mode 是空操作）
+        try { chmodSync(join(dir, file), 0o600); } catch { /* 非关键 */ }
+        try { hardenFile(join(dir, file)); } catch { /* 非关键 */ }
+        sources[source] = file;
+      } catch { /* 单个落点失败：另一份仍然有效（relayDir 只读/磁盘满等情况） */ }
+    }
+    if (!Object.keys(sources).length) return { ok: false, reason: "failed" }; // 两份都失败：静默返回
+    pruneConfigBackups(relayDir);
+    // 日志只写文件名与时间（两份各列出，便于排查到底哪一份没写成）
+    const names = CONFIG_BACKUP_SOURCES.filter((s) => sources[s]).map((s) => `${s}:${sources[s]}`).join("、");
+    appendLogLine(relayDir, AUTO_INSTALL_LOG,
+      `[dsh-remote-web] 已备份配对配置 ${names}（${fmtLocalTime(at)}，权限 600；内容不写入日志）`);
+    const preferred = sources.profile ? `profile:${sources.profile}` : `relay:${sources.relay}`;
+    return { ok: true, at, name: preferred, sources };
+  } catch {
+    return { ok: false, reason: "failed" }; // 备份失败静默：绝不影响安装/登录
+  }
+}
+
+/**
+ * 从备份恢复配对配置。**只能由用户在面板里显式触发**（绝不自动调用 —— 旧账号备份可能是
+ * 别人的/已失效的，误用会把设备绑到错误账号）。
+ * 恢复前先把当前配置再备份一份（同时写两份），失败静默。
+ * @param {string} relayDir
+ * @param {string} [name] `profile:<file>` / `relay:<file>` / 裸文件名（兼容旧状态）；省略 = 最新一份
+ * @returns {{ok:boolean, restored?:string, source?:string, at?:number, reason?:string}}
+ */
+function restoreConfigBackup(relayDir, name = "") {
+  try {
+    const list = listConfigBackups(relayDir);
+    if (!list.length) return { ok: false, reason: "no-backup" };
+    // ⚠️ 只接受**列表里真实存在**的文件名（防路径穿越/任意文件读）
+    const target = findConfigBackup(relayDir, name);
+    if (!target) return { ok: false, reason: "no-such-backup" };
+    const src = join(configBackupDirOf(relayDir, target.source), target.file);
+    if (existsSync(configPathOf(relayDir))) backupConfigFile(relayDir); // 恢复前先备份当前状态（可回滚）
+    mkdirSync(relayDir, { recursive: true });
+    copyFileSync(src, configPathOf(relayDir));
+    try { chmodSync(configPathOf(relayDir), 0o600); } catch { /* 非关键 */ }
+    try { hardenFile(configPathOf(relayDir)); } catch { /* 非关键 */ }
+    appendLogLine(relayDir, AUTO_INSTALL_LOG,
+      `[dsh-remote-web] 用户一键恢复配对配置：${target.name}`
+      + `（来自${CONFIG_BACKUP_SOURCE_TEXT[target.source] || target.source}，备份时间 ${fmtLocalTime(target.at)}；内容不写入日志）`);
+    return { ok: true, restored: target.name, source: target.source, at: target.at };
+  } catch {
+    return { ok: false, reason: "failed" };
+  }
+}
+
+/** 运行时本体是否在：`<relayDir>/clients`（插件自带 runtime/ 自愈补装的就是它）。 */
+function runtimeDirPresent(relayDir) {
+  try { return existsSync(join(relayDir, "clients")); } catch { return false; }
+}
+
+/** 配对信息是否在：`<relayDir>/.dsh-config.json`（账号密码 + 设备密钥）。 */
+function configPresent(relayDir) {
+  try { return existsSync(configPathOf(relayDir)); } catch { return false; }
+}
+
+/**
+ * 安装/配对自检（对外状态的核心）：明确区分「运行时缺失」与「配对缺失」。
+ *
+ * kind：ok | runtime_missing | pairing_missing | all_missing | uninstalled
+ * text：面向非技术用户的一句话结论（面板直接展示；旧客户端也可从 connect.detail 看到）
+ * @returns {{kind:string, runtimePresent:boolean, configPresent:boolean, text:string, detail:string,
+ *            relayDir:string, backup:null|{available:boolean,name:string,at:number,text:string,action:object}}}
+ */
+function setupStateOf(relayDir) {
+  const rt = runtimeDirPresent(relayDir);
+  const cfg = configPresent(relayDir);
+  // 两份来源合并（新→旧；时间相同 profile 先）。只要任一份存在就能恢复 ——
+  // 这正是「整个 ~/.dsh-remote 被删、但 profile 持久目录那份还在」时的救命路径。
+  const backups = listConfigBackups(relayDir);
+  const latest = backups[0] || null;
+  const backup = (!cfg && latest)
+    ? {
+        available: true,
+        name: latest.name,      // profile:<file> / relay:<file>（来源可区分）
+        source: latest.source,  // profile | relay
+        at: latest.at,
+        // 两份都在时把清单也带上（面板/诊断可以显示"还有哪一份"）；仍不含任何凭据内容
+        sources: backups.map((b) => ({ name: b.name, at: b.at })),
+        text: `检测到历史配对备份（${fmtLocalTime(latest.at) || "时间未知"}，`
+          + `${CONFIG_BACKUP_SOURCE_TEXT[latest.source] || latest.source}），可一键恢复`,
+        action: {
+          kind: "restore_config",
+          method: "POST",
+          path: "/dsh-remote/config/restore",
+          body: { backup: latest.name },
+        },
+      }
+    : null;
+  const base = { runtimePresent: rt, configPresent: cfg, relayDir, backup };
+
+  // 已彻底卸载：不再提示"重新安装"（那是用户自己的选择；重启宿主后自然回到未安装状态）
+  if (UNINSTALLED_DIRS.has(relayDir)) {
+    return { ...base, kind: "uninstalled", text: "", detail: "本插件已彻底卸载（配置与运行时已清理）" };
+  }
+
+  const RUNTIME_TEXT = "运行环境缺失：需要重新安装（应用内插件页重装或 npx @mrrisega/dsh-remote@latest）";
+  const PAIRING_TEXT = "未配对：需要在面板里登录一次（账号密码），登录后会自动重建运行环境并启动 bridge";
+  const runtimeDetail = () => {
+    const inst = installStateOf(relayDir);
+    if (inst.installing) return "插件正在后台用自带的运行环境自动补装（无需操作）；若 1~2 分钟后仍缺失，请按上面方式重新安装。";
+    return "插件会在下一轮状态查询时自动尝试用自带的运行环境补装；若补装失败，请按上面方式重新安装。";
+  };
+  const pairingDetail = () => (backup
+    ? `登录会重新生成配对信息；也可以先点「恢复历史配对备份」（${fmtLocalTime(latest.at) || "时间未知"}）再用旧配对。`
+    : "登录是唯一会写入配对信息的入口：插件绝不自动填入任何凭据。");
+
+  if (!rt && !cfg) {
+    return { ...base, kind: "all_missing", text: RUNTIME_TEXT + "\n" + PAIRING_TEXT,
+      detail: runtimeDetail() + " " + pairingDetail() };
+  }
+  if (!rt) {
+    return { ...base, kind: "runtime_missing", text: RUNTIME_TEXT, detail: runtimeDetail() };
+  }
+  if (!cfg) {
+    return { ...base, kind: "pairing_missing", text: PAIRING_TEXT, detail: pairingDetail() };
+  }
+  return { ...base, kind: "ok", text: "", detail: "" };
 }
 
 // ---------- Harness 浏览器会话代持(0.1.2-rc.1+ 的 ?token 鉴权) ----------
@@ -1764,6 +2067,7 @@ function ensureRuntime(relayDir) {
   if (local.ok) {
     appendLogLine(relayDir, AUTO_INSTALL_LOG,
       `[dsh-remote-web] 已用插件自带的运行环境就地补齐（v${PLUGIN_VERSION}，本地拷贝，未使用 npx）`);
+    backupConfigFile(relayDir); // 安装完成后备份配对信息（文件不存在则静默跳过；内容绝不写日志）
     telemetryRuntimeReady(relayDir);
     return true;
   }
@@ -1845,6 +2149,7 @@ function ensureRuntime(relayDir) {
       appendLogLine(relayDir, AUTO_INSTALL_LOG, `[auto-install] npx 退出 code=${code ?? "?"}`);
       if (code === 0 && runtimeReady(relayDir)) {
         noteProvisionSuccess(relayDir);
+        backupConfigFile(relayDir); // 安装完成后备份配对信息（无配置/失败都静默）
         telemetryRuntimeReady(relayDir); // 退出码 0 ≠ 装好了
       } else {
         // 退出码非 0、卡住超时、或退出码 0 但安装脚本没落盘（装到一半/装错包）→ 都算失败并进入退避
@@ -3386,6 +3691,10 @@ async function composeStatus(relayDir) {
     // 是否需要重启 DeepSeek harness（首次安装 / 在线更新后必须重启才加载插件本体）：
     // {pending, kind: first-install|update, reason, at}，供面板顶部醒目提示 + 重启按钮。
     restart: readRestartState(relayDir),
+    // 安装/配对自检（2026-10-17 事故）：运行时（clients/）与配对（.dsh-config.json）是否齐全、
+    // 缺什么、下一步该做什么；配对主配置缺失但备份存在时给出可一键恢复的 backup.action。
+    // 字段契约见 setupStateOf；connect.setup 是同一份对象（bridge-status 短轮询也能拿到）。
+    setup: setupStateOf(relayDir),
     // 连接阶段（登录后自动闭环：环境 → bridge 进程 → 设备已在中继注册）：
     // 面板用它显示「正在准备运行环境…/正在启动 Bridge…/正在连接中继…/已连接 ✅」，
     // 并用 /dsh-remote/bridge-status 以 2~3s 短轮询自动推进（无需用户点按钮或刷新页面）。
@@ -4447,6 +4756,10 @@ function uninstallSelf(relayDir, profileDir, patchFile, pkgFile) {
       rmSync(join(profileDir, `${id}-plugin`), { recursive: true, force: true });
       rmSync(join(profileDir, "node_modules", id), { recursive: true, force: true });
     }
+    // 第二份配对备份住在 profile 的独立数据目录（2026-10-17 双份加固）：里面是账号密码/设备私钥，
+    // 「彻底卸载」必须一起清掉 —— 否则卸载后仍留着凭据副本，且重装后还会提示恢复一个
+    // 用户已经明确不要了的旧账号配对。
+    rmSync(join(profileDir, PROFILE_DATA_DIR), { recursive: true, force: true });
     out.removedDir = true;
   } catch { /* ignore */ }
   return out;
@@ -4897,6 +5210,13 @@ async function composeConnect(relayDir, opts = {}) {
   const elapsed = book.lastAttemptAt ? now - book.lastAttemptAt : wait;
   const autoRetrying = phase !== "online" && phase !== "no_account" && retryable !== false;
   const nextRetryInMs = autoRetrying ? Math.max(0, wait - elapsed) : 0;
+  // 【2026-10-17 事故】把「安装/配对自检」结论作为独立字段下发：`~/.dsh-remote` 被误删后，
+  // 面板以前只能显示模糊的「未运行/准备中」，用户不知道该重装还是该重新登录。
+  // 只在**需要用户动手**的状态把结论前置到 detail（运行时缺失但插件正在自动补装时仍由既有
+  // no_runtime/installing 文案说明进度，不制造"需要重装"的误导）。
+  const setup = setupStateOf(relayDir);
+  const setupNeedsUser = setup.kind === "all_missing" || setup.kind === "pairing_missing";
+  if (setupNeedsUser) detail = detail ? setup.text + "\n" + detail : setup.text;
   const conn = {
     phase,
     online: phase === "online",
@@ -4941,6 +5261,10 @@ async function composeConnect(relayDir, opts = {}) {
     nextRetryInMs,
     error,
     bindError: bindFresh && bindError ? { code: bindError.code || "", message: bindError.message || "" } : null,
+    // 安装/配对自检（2026-10-17）：kind/text/backup.action 见 setupStateOf 的长注释。
+    // 面板据此显示「运行环境缺失：需要重新安装…」「未配对：需要在面板里登录一次…」
+    // 以及「检测到历史配对备份（时间），可一键恢复」。
+    setup,
     logPath: join(relayDir, BRIDGE_LOG_FILE),
     installLogPath: join(relayDir, AUTO_INSTALL_LOG),
   };
@@ -5179,7 +5503,21 @@ function ensureConnection(relayDir, opts = {}) {
   const now = Date.now();
   if (!opts.force && book.lastAttemptAt && now - book.lastAttemptAt < connectBackoffMs(book.attempts)) return null;
   const cfg = loadConfig(relayDir);
-  if (!hasAccountCreds(cfg)) return null; // 未登录：不补装也不拉服务，先让用户登录
+  if (!hasAccountCreds(cfg)) {
+    // 【2026-10-17 事故】旧规则「未登录 → 不补装也不拉服务」在**运行时**上必须放宽：
+    // 运行时与配对信息都住在 ~/.dsh-remote 里，用户整目录被删后，登录前 ensureRuntime 一次都不会跑，
+    // 于是「登录后自动完成剩余步骤」的第一步就永远缺失。现在：运行时缺失就先复用既有 ensureRuntime
+    // 从插件自带 runtime/ 本地补齐（零网络）；**配对信息仍然只能由用户登录重建**，
+    // 绝不自动填入任何账号/密码（安全边界），也绝不因为有备份就自动恢复旧配对。
+    if (!runtimeReady(relayDir)) {
+      if (installStateOf(relayDir).stale) clearStaleInstallMarker(relayDir);
+      book.lastAttemptAt = now;
+      book.attempts += 1;
+      ensureRuntime(relayDir);
+      return { action: "provision" };
+    }
+    return null; // 运行时已就绪但未登录：不拉服务，先让用户登录
+  }
   if (!runtimeReady(relayDir)) {
     if (installStateOf(relayDir).stale) clearStaleInstallMarker(relayDir);
     book.lastAttemptAt = now;
@@ -6412,17 +6750,9 @@ export function localRequestBlocked(req) {
 }
 
 function registerRoutes(ctx, relayDir) {
-  // 本插件所在 profile(由插件自身文件位置推导,覆盖市场 git 安装与本地 include 两种形态)
-  let profileDir = join(homedir(), ".dsh", "profiles", "web");
-  try {
-    const here = fileURLToPath(import.meta.url);
-    // 依次尝试两种安装布局（当前名优先，历史名兜底）；split()[0] 未命中时返回原串，需显式判断后再试下一种
-    let m = here.split("/dsh-remote-web-plugin/")[0];
-    if (m === here) m = here.split("/node_modules/dsh-remote-web/")[0];
-    if (m === here) m = here.split("/dsh-remote-ui-plugin/")[0];
-    if (m === here) m = here.split("/node_modules/dsh-remote-ui/")[0];
-    if (m !== here) profileDir = m;
-  } catch { /* 保持默认 */ }
+  // 本插件所在 profile：与配对备份的持久数据目录共用同一份推导（pluginProfileDir），
+  // 避免"卸载删的目录"和"备份写的目录"各算各的（2026-10-17 双份备份加固时抽出）。
+  const profileDir = pluginProfileDir();
   const routes = [
     // 自管理：版本信息 / 检查更新 / 一键更新 / 更新日志 / 彻底卸载
     {
@@ -6900,12 +7230,52 @@ function registerRoutes(ctx, relayDir) {
         // 账号/模式变化 → 先停掉旧 bridge 并作废它的注册证据，否则新账号永远等不到这台设备
         const accountFpBefore = accountFingerprintOf(loadConfig(relayDir));
         saveConfig(relayDir, cfg);
+        // 配对成功即备份（2026-10-17 事故）：.dsh-config.json 里是账号配对+设备密钥，
+        // 一旦被误删/写坏，用户可以一键恢复最近一份（不自动恢复，见 setupStateOf）。
+        backupConfigFile(relayDir);
         invalidateRelayToken(relayDir); // 账号可能变了：丢弃旧 token 缓存，立即用新账号认证
         if (accountFingerprintOf(cfg) !== accountFpBefore) resetBridgeForAccountChange(relayDir, "账号/模式已变更");
         const bridgeRestart = startBridge(relayDir);
         // 登录成功即上报本机安装信息（企业端用于「升级插件后刷新版本号」约定）；失败静默。
         maybeReportInstall(relayDir, { force: true });
         sendJson(res, 200, { ok: true, bridgeRestart, ...(await composeStatus(relayDir)) });
+      },
+    },
+    {
+      /**
+       * 一键恢复历史配对备份（2026-10-17 事故）。
+       *
+       * 只在用户**显式点击**时调用：绝不自动恢复 —— 旧备份可能是别人的账号/已失效的凭据，
+       * 自动套用会把这台设备绑到错误账号（比"未配对"更糟）。恢复前 restoreConfigBackup 会先把
+       * 当前配置再备份一份（若存在），所以这一步随时可回滚。
+       * body = {} → 恢复最新一份；body = { backup: "<文件名>" } → 恢复指定一份。
+       */
+      method: "POST",
+      path: "/dsh-remote/config/restore",
+      handler: async (req, res) => {
+        const body = await readJsonBody(req);
+        if (body.__parseError) return sendJson(res, 400, { ok: false, error: "JSON 解析失败" });
+        const backupName = typeof body.backup === "string" ? body.backup : "";
+        const restored = restoreConfigBackup(relayDir, backupName);
+        if (!restored.ok) {
+          const msg = restored.reason === "no-backup" || restored.reason === "no-such-backup"
+            ? "没有可恢复的配对备份（备份目录为空或文件名不存在）"
+            : "恢复配对备份失败（磁盘不可写/文件损坏），请重新登录一次";
+          return sendJson(res, restored.reason === "failed" ? 500 : 404, { ok: false, code: restored.reason, error: msg });
+        }
+        // 恢复的可能是旧账号的配对：与"登录"同一套收尾 —— 旧 token 作废、旧 bridge 停掉重拉。
+        invalidateRelayToken(relayDir);
+        resetBridgeForAccountChange(relayDir, "从历史备份恢复配对信息");
+        const bridgeRestart = startBridge(relayDir);
+        // 恢复成功本身就是一次配对状态写入 → 让最新备份也指向它（保留时间线）
+        backupConfigFile(relayDir);
+        sendJson(res, 200, {
+          ok: true,
+          restored: restored.restored,
+          restoredAt: restored.at,
+          bridgeRestart,
+          ...(await composeStatus(relayDir)),
+        });
       },
     },
     {
@@ -7531,4 +7901,16 @@ export { pinBrowseDirectoryPicker as __pinBrowseDirectoryPicker, schedulePickerP
   linuxSystemdUnitState as __linuxSystemdUnitState,
   selfhealRestartGate as __selfhealRestartGate, noteSelfhealRestart as __noteSelfhealRestart,
   noteSelfhealBlocked as __noteSelfhealBlocked, resetSelfhealGuard as __resetSelfhealGuard,
-  selfhealGuardOf as __selfhealGuardOf, SELFHEAL_MAX_RESTARTS as __SELFHEAL_MAX_RESTARTS };
+  selfhealGuardOf as __selfhealGuardOf, SELFHEAL_MAX_RESTARTS as __SELFHEAL_MAX_RESTARTS,
+  // 2026-10-17 事故：安装/配对自检 + 配对备份/恢复。见 test/repair-backup.test.mjs
+  // （用例必须把 relayDir 指向 mkdtemp 临时目录、HOME 指向假目录，绝不能在真实
+  //   ~/.dsh-remote 或真实 ~/.dsh 上做写入测试）。
+  setupStateOf as __setupStateOf, ensureConnection as __ensureConnection,
+  backupConfigFile as __backupConfigFile, listConfigBackups as __listConfigBackups,
+  restoreConfigBackup as __restoreConfigBackup, runtimeDirPresent as __runtimeDirPresent,
+  CONFIG_BACKUP_KEEP as __CONFIG_BACKUP_KEEP, CONFIG_BACKUP_DIR as __CONFIG_BACKUP_DIR,
+  pruneConfigBackups as __pruneConfigBackups,
+  // 双份备份（relayDir + profile 独立数据目录）的落点/推导/卸载清理都要能被行为级单测钉住
+  configBackupDirOf as __configBackupDirOf, pluginProfileDir as __pluginProfileDir,
+  listConfigBackupsIn as __listConfigBackupsIn, uninstallSelf as __uninstallSelf,
+  PROFILE_DATA_DIR as __PROFILE_DATA_DIR, PROFILE_BACKUP_SUBDIR as __PROFILE_BACKUP_SUBDIR };

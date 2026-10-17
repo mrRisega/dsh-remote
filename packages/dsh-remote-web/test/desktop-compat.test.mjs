@@ -167,14 +167,20 @@ test("桌面端：面板不得自动倒计时重启，且不摆点了必然失�
     "自动倒计时重启必须在桌面端短路（Host 由 Electron 托管，不能替用户重启）");
   assert.match(CLIENT_SRC, /\(desktopHost && !isRefreshOnly\) \? null : h\("button"/,
     "桌面端且非'刷新即可'时不得渲染重启按钮");
-  // 旧版 host 不下发该字段 → undefined → 行为必须与改动前一致
-  assert.match(CLIENT_SRC, /\? "🔄 插件已更新：重启 dsh web 后生效"[\s\S]{0,40}: "🔄 插件已更新：刷新页面即可生效"\);/,
-    "非桌面端文案必须保留原有判据 isRestartHard（不得顺手改发布版文案）");
+  // 2026-10-17（业主）：桌面端**不再**出现"重启 DeepSeek Harness"这类引导，
+  // 统一只说「刷新页面即可生效」；非桌面端保留原有 isRestartHard 判据（发布版文案不变）。
+  assert.doesNotMatch(CLIENT_SRC, /退出并重新打开 DeepSeek Harness/,
+    "桌面端不得再引导用户重启应用（运行环境由应用托管、更新自动热加载）");
+  assert.match(CLIENT_SRC, /插件已更新：刷新页面即可生效/);
 });
 
-test("桌面端：面板文案改为引导'退出并重开应用'，且不影响 Web 版", () => {
-  assert.match(CLIENT_SRC, /退出并重新打开 DeepSeek Harness 后生效/, "桌面端要有明确引导");
-  assert.match(CLIENT_SRC, /桌面端由应用本身托管运行环境/, "底部常驻按钮位置要有桌面端说明");
+test("桌面端：删除「重启 DeepSeek Harness」整段说明（2026-10-17 业主约定）", () => {
+  // 原因：桌面端运行环境由应用本身托管、插件安装/更新自动热加载 —— 让用户"退出并重开应用"
+  // 既没必要也增加负担。底部常驻重启区在桌面端整块不渲染（非桌面端才保留重启入口）。
+  assert.doesNotMatch(CLIENT_SRC, /桌面端由应用本身托管运行环境/, "整段重启说明必须删除");
+  assert.doesNotMatch(CLIENT_SRC, /请直接退出并重新打开应用/, "不得再引导重启应用");
+  assert.match(CLIENT_SRC, /desktopHost \? null : h\("div", \{ className: "dru-restart-foot" \}/,
+    "桌面端不渲染底部重启区（非桌面端保留）");
 });
 
 // ─────────────── ④ 安装：--profile desktop 必须真的生效 ───────────────

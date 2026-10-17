@@ -246,7 +246,12 @@ window.__ModuleLoader__.load({
       ".dru-captcha .dru-input{flex:1;min-width:0}",
       ".dru-captcha-box{width:118px;height:44px;flex:none;border-radius:8px;border:1px solid var(--dru-border-ctl);cursor:pointer;background:var(--dru-surface);display:flex;align-items:center;justify-content:center;font-size:12px;color:var(--dru-fg-muted);overflow:hidden}",
       ".dru-captcha-box svg{display:block;width:100%;height:100%}",
-      ".dru-user{display:flex;align-items:center;gap:10px;margin-bottom:12px}",
+      ".dru-user{display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap}",
+      // 退出登录：跟着账号行走（业主 2026-10-17），右侧对齐、次要视觉（不抢主行动）：
+      // 触控目标 ≥40px、与账号信息 8px 间距；危险色但不用实底（它不是主行动）。
+      ".dru-user-logout{margin-left:auto;flex:none;min-height:40px;padding:8px 12px;border:1px solid var(--dru-border-ctl);border-radius:8px;background:transparent;color:var(--dru-danger);font:500 12.5px/1.2 inherit;font-family:inherit;cursor:pointer;white-space:nowrap}",
+      ".dru-user-logout:hover:not(:disabled){background:var(--dru-danger-soft);border-color:var(--dru-danger-border)}",
+      ".dru-user-logout:disabled{opacity:.55;cursor:default}",
       ".dru-avatar{width:40px;height:40px;border-radius:50%;background:var(--dru-accent-fill);color:var(--dru-on-accent);display:flex;align-items:center;justify-content:center;font-size:17px;font-weight:700;flex-shrink:0}",
       ".dru-user .mail{font-size:14px;font-weight:600;color:var(--dru-fg);word-break:break-all}",
       ".dru-user .plan{font-size:12px;color:var(--dru-fg-muted);margin-top:2px}",
@@ -1367,16 +1372,6 @@ window.__ModuleLoader__.load({
     /** 已读上报（点击/关闭 = 同一次上报：现契约只有 /click，没有 /read）。 */
     function annReportClick(id) {
       try { post("/dsh-remote/announcements/click", { id: id }).catch(function () { /* 静默：服务端才是权威 */ }); } catch (e) { /* 忽略 */ }
-    }
-    /** 本地把某条标记为已读（只为了让徽标/标签立刻更新；真正的已读在服务端）。 */
-    function annMarkReadLocal(id) {
-      var hit = false;
-      annState.items = annState.items.map(function (x) {
-        if (x.id !== id || !x.unread) return x;
-        hit = true;
-        return Object.assign({}, x, { unread: false });
-      });
-      if (hit) { annState.unread = Math.max(0, annState.unread - 1); annEmit(); }
     }
 
     // ── 🤖 微信机器人「命令帮助」镜像 ─────────────────────────────────────────
@@ -2894,7 +2889,7 @@ window.__ModuleLoader__.load({
       var restartPending = !!restartInfo.pending;
       // 宿主形态（node 半下发）：桌面端（Electron）Host 由桌面应用托管，重启这个动作
       // 在那边**做不到也不该做**（强行退出会弹原生致命错误）。面板据此：
-      //   ① 不自动倒计时重启；② 保留提醒但改文案，引导"退出并重开桌面应用"。
+      //   ① 不自动倒计时重启；② 桌面端只提示「刷新页面即可」，不引导重启/重开应用（2026-10-17）。
       // 旧版 host 的响应里没有该字段 → false，行为与改动前完全一致。
       // 🔴 2026-10-11 修：node 半把该字段下在 **connect** 里（`connect.desktopHost`），
       // 这里以前读顶层 `st.desktopHost` → **永远 false** → 桌面端被当成 Web 版：
@@ -3988,6 +3983,55 @@ window.__ModuleLoader__.load({
       // 「更多」里只留下面那两个**折叠的营销入口**（升级 PRO / 带新用户换会员），用户仍要它们收在这里。
       // 🔒 顺带更强的一条不变量：整个面板从此不渲染任何 Mbps / GB / 价格数字
       //    （「已限速 / 不限速」仍由服务端 quota.limit_enabled / quota.max_mbps 驱动，但只给定性措辞）。
+      /**
+       * 🔧 安装/配对自检提示（2026-10-17）：node 半在 /dsh-remote/status 的 `setup` 里下发
+       * `{ kind: ok|runtime_missing|pairing_missing|all_missing, text, detail, backup? }`。
+       *
+       * 由来：真机事故 —— 用户本机 `~/.dsh-remote` 被误删后，面板只显示模糊的"未运行"，
+       * 用户不知道是"运行环境没了"还是"没登录"，最后手机端干等 47 秒才报错。
+       * 所以这里**必须说清结论 + 给出下一步动作**，但绝不阻塞面板其它功能。
+       */
+      function renderSetupAlert() {
+        var setup = (st && (st.setup || (st.connect && st.connect.setup))) || null;
+        if (!setup || !setup.kind || setup.kind === "ok") return null;
+        var backup = setup.backup && setup.backup.available ? setup.backup : null;
+        return h("div", { className: "dru-restart-alert", role: "status", style: { marginBottom: 12 } },
+          h("span", { className: "dru-restart-alert-icon" }, "🔧"),
+          h("div", { style: { flex: "1" } },
+            h("div", { className: "dru-restart-alert-title" }, setup.text || "运行环境需要处理"),
+            setup.detail ? h("div", { className: "dru-restart-alert-sub" }, setup.detail) : null,
+            backup ? h("div", { className: "dru-restart-alert-sub" }, backup.text || "检测到历史配对备份，可一键恢复") : null,
+            h("div", { className: "dru-actions", style: { marginTop: 10 } },
+              backup
+                ? h("button", {
+                    type: "button",
+                    className: "dru-btn dru-btn-primary",
+                    disabled: busy !== "",
+                    onClick: function () {
+                      var action = backup.action || {};
+                      setBusy("setup");
+                      post(action.path || "/dsh-remote/config/restore", action.body || {})
+                        .then(function (body) {
+                          if (body && body.ok) setMessage({ kind: "ok", text: "已恢复历史配对，正在重新启动 bridge…" });
+                          else setMessage({ kind: "err", text: (body && body.error && body.error.message) || "恢复失败，请重试" });
+                          if (body && body.connect) setSt(body); else refresh();
+                        })
+                        .catch(function (e) { setMessage({ kind: "err", text: "恢复失败: " + e.message }); })
+                        .finally(function () { setBusy(""); });
+                    }
+                  }, busy === "setup" ? "恢复中…" : "恢复历史配对")
+                : null,
+              h("button", {
+                type: "button",
+                className: "dru-btn dru-btn-ghost",
+                disabled: busy !== "",
+                onClick: function () { refresh(); }
+              }, "刷新状态")
+            )
+          )
+        );
+      }
+
       function renderAccount() {
         var a = account;
         var plan = a ? a.plan : "free";
@@ -4038,17 +4082,11 @@ window.__ModuleLoader__.load({
         var invTipOn = !invOff && !inviteTipDismissed;
         var invTipRule = invTipOn ? inviteRuleOf() : null;
         // 【0.6.10】营销入口「在哪一层」的四个开关（约定：新用户第一次看得见，用户关掉后收进「更多」）：
-        //   · 没关过（mktFolded=false）→ 「升级 PRO」与「带新用户换会员」摆在账号卡正面（与今天一致）
-        //   · 关过（mktFolded=true）   → 正面只留一个「更多」，两条入口搬进「更多」里
-        // 两个边界：
-        //   · invOff（运营关掉拉新）→ 拉新入口**整体不渲染**，收纳前后都不出现
-        //     （老注释：否则会点进一个没有内容的邀请页）
-        //   · 付费用户的按钮是「续费 / 转正式 PRO」—— 那是账号维护、不是营销露出，收纳后仍留在正面：
-        //     把付费用户的续费入口藏进「更多」是真实风险（续费靠它，:3096-3098 的到期日也靠它提醒）
-        var showUpsellOnFace = !mktFolded || isMember;
-        var showInviteOnFace = !invOff && !mktFolded;
-        var showUpsellInMore = mktFolded && !isMember;
-        var showInviteInMore = mktFolded && !invOff;
+        // 2026-10-17 版式简化（业主：按钮太多、换行逻辑太多）：
+        //   正面**只留一行三个按钮** —— 主行动（升级/续费）+ 用户反馈 + 「更多」；
+        //   「带新用户换会员 / 修改密码 / 加入交流群」全部收进「更多」。
+        // 位置稳定 > 首次曝光：入口永远在同一个地方，用户不用记"上次在哪"，也不再需要
+        // mktFolded 那套"先摆正面、关过才收纳"的两层逻辑（气泡仍会提示一次，见 renderInviteTip）。
         return h("div", null,
           h("div", { className: "dru-user" },
             h("div", { className: "dru-avatar" }, (st.config.phone || "D").charAt(0).toUpperCase()),
@@ -4060,7 +4098,16 @@ window.__ModuleLoader__.load({
               // （「PRO 会员 · 到期 …」）讲的是**功能性**的到期时间，不是营销。
               // 免费用户这里什么都不显示 —— 把「免费档」当标签挂在脸上，正是要减少的营销露出。
               isMember ? h("div", { className: "plan" }, plan === "pro_max" ? "Pro Max" : "PRO") : null
-            )
+            ),
+            // 2026-10-17（业主）：退出登录从按钮行挪到**账号行右侧** —— 它属于"账号维护"，
+            // 与账号信息同一行动线；主按钮行也因此少一个按钮。
+            h("button", {
+              type: "button",
+              className: "dru-user-logout",
+              disabled: busy !== "",
+              title: "退出登录（电脑端后台服务与手机端连接不受影响）",
+              onClick: function () { doLogout(false); }
+            }, "退出登录")
           ),
           // 额度状态：不限量说明 / 剩余额度百分比 / 会员到期日。
           // 首屏只说「还剩多少」，不提档位名、不写带宽数值（数值在下面「更多」里）。
@@ -4069,90 +4116,57 @@ window.__ModuleLoader__.load({
             h("span", null, planText)
           ),
           h("div", { className: "dru-actions", style: { marginTop: 10 } },
-            // 升级/续费：免费用户这条是**营销入口**，用户关掉引导后搬进「更多」；
-            // 付费用户的续费/转正入口始终留在正面（账号维护，不是营销露出）。
-            showUpsellOnFace
-              ? h("button", { type: "button", className: "dru-btn dru-btn-primary", style: { display: "inline-flex", alignItems: "center" }, disabled: busy !== "", title: "升级/续费（带登录态打开）", onClick: openUpgradeAuth },
-                  busy === "upgrade" ? "生成链接中…" : (!isMember ? "🚀 升级 PRO" : source === "trial" ? "🚀 转正式 PRO" : "🔄 续费会员"))
-              : null,
-            // 拉新入口：invOff（运营关掉拉新）整体隐藏，收纳前后都不出现（否则会点进一个没有内容的邀请页）；
-            // 用户收纳过后搬进「更多」。
-            // 按钮文字自带可访问名称；气泡在屏时用 aria-describedby 把「能得多少」也读出来。
-            showInviteOnFace ? h("button", {
-              type: "button",
-              className: "dru-btn dru-btn-ghost",
-              disabled: busy !== "",
-              title: invTipRule ? "带 " + invTipRule.n + " 位新用户可得 " + invTipRule.days + " 天 PRO 会员" : "带新用户换会员",
-              "aria-describedby": invTipOn ? INVITE_TIP_ID : undefined,
-              onClick: function () { setView("invite"); loadInvite(); }
-            }, "🎁 带新用户换会员") : null,
+            // 主行动：免费=升级入口，会员=续费/转正（账号维护，永远在正面第一位）
+            h("button", {
+              type: "button", className: "dru-btn dru-btn-primary",
+              style: { display: "inline-flex", alignItems: "center" }, disabled: busy !== "",
+              onClick: openUpgradeAuth
+            },
+              busy === "upgrade" ? "生成链接中…" : (!isMember ? "🚀 升级 PRO" : source === "trial" ? "🚀 转正式 PRO" : "🔄 续费会员")),
+            // 次要：用户反馈（"联系我们"的高频入口，留在正面）
             h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "", onClick: function () { setView("feedback"); } }, "💬 用户反馈"),
-            // 💬 加入交流群（0.6.18 从「关于」卡搬到这里）：它和「用户反馈」是同一类东西 ——
-            // 「跟我们联系」的两个入口。原来它躺在最底下的「关于 dsh-remote」里，用户要读完
-            // 六段技术说明才找得到，而那时的位置离"有事想找人问"的场景已经很远了。
-            // 未配置二维码（后台上传才有）→ 整体不渲染，不留空壳按钮。
-            community && community.qrcode
-              ? h("button", {
-                  type: "button",
-                  className: "dru-btn dru-btn-ghost",
-                  disabled: busy !== "",
-                  onClick: function () { setCommOpen(true); }
-                }, "💬 加入交流群")
-              : null,
-            h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "", onClick: togglePwdForm }, pwdOpen ? "收起修改密码" : "🔒 修改密码"),
-            h("button", { type: "button", className: "dru-btn dru-btn-danger", disabled: busy !== "", onClick: function () { doLogout(false); } }, "退出登录")
+            // 「更多」变成同一行里的普通按钮（原来是一条整宽披露条，视觉重量和按钮完全不匹配）。
+            // 无障碍不变：id / aria-expanded / aria-controls 保持原样（用例按它们定位）。
+            h("button", {
+              type: "button",
+              id: MKT_MORE_TOGGLE_ID,
+              className: "dru-btn dru-btn-ghost dru-disclose-inline",
+              "aria-expanded": moreOpen ? "true" : "false",
+              "aria-controls": MKT_MORE_BODY_ID,
+              onClick: function () { setMoreOpen(!moreOpen); }
+            },
+              h("span", null, "更多"),
+              h("span", { className: "dru-disclose-caret", "aria-hidden": "true" }, moreOpen ? "▲" : "▼")
+            )
           ),
-          // 🎁 邀请收益引导气泡：紧贴上面那排按钮（不遮挡按钮、窄屏独占一行）。
-          // 它的 ✕ 同时是「营销入口收纳」的触发信号（0.6.10）：点过之后两个入口搬进下面的「更多」。
+          // 🎁 邀请引导气泡：紧跟按钮行（不遮挡按钮）。点 ✕ 只做"不再提示"，不再改变入口位置。
           renderInviteTip(),
-          h("div", { className: "dru-hint", style: { marginTop: 8 } },
-            "升级/续费以带登录态方式打开：点击后生成一次性访问链接并直接跳转，无需重新登录。" +
-            (endsAt && isMember ? "到期后如需继续使用会员权益，请在到期前续费。" : "")),
-          // 🧰 「更多」：主界面上唯一常驻的那一个营销入口（0.6.10）—— 收纳态下正面不再摆按钮行的一部分。
-          // 折叠时它就是一个 .dru-disclose 按钮：命中区 ≥44px、键盘可聚焦（焦点环见样式表末尾的
-          // :focus-visible 基线），开合状态用「展开 ▼ / 收起 ▲」**文字**加箭头表达，不靠颜色区分。
-          // 无障碍：aria-expanded 表达开合，aria-controls 指向下面的内容体（内容体始终在 DOM 里、
-          // 收起时 hidden，所以 aria-controls 永远指向一个真实存在的元素，不指向空气）。
-          // 【0.6.18】加 .dru-disclose-inline：原来它继承 .dru-disclose 的 width:100%，
-          //   在账号卡里被撑成一条横贯整卡的宽条，和上面那排按钮完全不是一个视觉重量（用户："宽而丑"）。
-          //   ⚠️ 变体只加在**这一处**：邀请页的「活动规则」披露仍是整行，那是对的（它是那一屏的主折叠）。
-          //   id / aria-controls / aria-expanded 一个都不能动 —— remote-access-ui.test.mjs 按它们定位。
-          h("button", {
-            type: "button",
-            id: MKT_MORE_TOGGLE_ID,
-            className: "dru-disclose dru-disclose-inline",
-            style: { marginTop: 10 },
-            "aria-expanded": moreOpen ? "true" : "false",
-            "aria-controls": MKT_MORE_BODY_ID,
-            onClick: function () { setMoreOpen(!moreOpen); }
-          },
-            h("span", null, "更多"),
-            h("span", { className: "dru-disclose-caret", "aria-hidden": "true" }, moreOpen ? "收起 ▲" : "展开 ▼")
-          ),
+          // 🧰 「更多」折叠体：带新用户 / 修改密码 / 加入交流群 + 修改密码表单
           h("div", {
             id: MKT_MORE_BODY_ID,
             className: "dru-more-body",
             hidden: !moreOpen
           },
-            // 【0.6.11】这里**不再**有「套餐与额度」标题与档位明细（renderPlanDetail 已删）：
-            // 用户约定 —— 本地面板不展示 PRO 的带宽/流量/价格数字。「更多」只剩下面两个折叠入口。
-            // 用户收纳过之后，两条营销入口就住在这里（正面不再摆它们）
-            (showUpsellInMore || showInviteInMore)
-              ? h("div", { className: "dru-more-actions" },
-                  showUpsellInMore
-                    ? h("button", { type: "button", className: "dru-btn dru-btn-primary", disabled: busy !== "", title: "升级/续费（带登录态打开）", onClick: openUpgradeAuth },
-                        busy === "upgrade" ? "生成链接中…" : "🚀 升级 PRO")
-                    : null,
-                  showInviteInMore
-                    ? h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "", title: "带新用户换会员", onClick: function () { setView("invite"); loadInvite(); } }, "🎁 带新用户换会员")
-                    : null)
-              : null
+            h("div", { className: "dru-more-actions" },
+              invOff ? null : h("button", {
+                type: "button",
+                className: "dru-btn dru-btn-ghost",
+                disabled: busy !== "",
+                title: invTipRule ? "带 " + invTipRule.n + " 位新用户可得 " + invTipRule.days + " 天 PRO 会员" : "带新用户换会员",
+                onClick: function () { setView("invite"); loadInvite(); }
+              }, "🎁 带新用户换会员"),
+              h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "", onClick: togglePwdForm }, pwdOpen ? "收起修改密码" : "🔒 修改密码"),
+              community && community.qrcode
+                ? h("button", {
+                    type: "button",
+                    className: "dru-btn dru-btn-ghost",
+                    disabled: busy !== "",
+                    onClick: function () { setCommOpen(true); }
+                  }, "💬 加入交流群")
+                : null
+            ),
+            pwdOpen ? renderResetPwdForm(false) : null
           ),
-          // 额度将尽 / 已被限速 → 🔀 双路块：升级套餐（转化）or 带新用户换会员时长（拉新）。
-          // 用户收纳过（mktFolded）时 renderDualPath 自己返回 null —— 那两条路这时都在「更多」里，
-          // 这里不再重复摆一遍（也不留一个没有按钮的空壳块）。
-          quotaTight ? renderDualPath("quota") : null,
-          pwdOpen ? renderResetPwdForm(false) : null
         );
       }
 
@@ -5021,7 +5035,7 @@ window.__ModuleLoader__.load({
       // 在线更新成功后出现,若照旧 15 秒自动重启,等于"更新完必定打断用户正在做的事"。
       useEffect(function () {
         // ⚠️ desktopHost 时**不自动重启**：桌面端重启 Host 由 Electron 托管，插件无权也不该做
-        // （见 node 半 restartHarness 的说明）。此时只保留文案提醒，动作交给用户「退出并重开应用」。
+        // （见 node 半 restartHarness 的说明）。此时只提示刷新页面，不再引导重开应用。
         if (!restartPending || isRefreshOnly || isRestartHard || desktopHost || busy !== "" || restartCancelled) { setRestartCountdown(null); return undefined; }
         var at = restartInfo.at || 0;
         if (autoRestartCancelled(at)) { setRestartCountdown(null); return undefined; }
@@ -5094,10 +5108,10 @@ window.__ModuleLoader__.load({
       function openAnnItem(it) {
         if (!it) return;
         setAnnOpenId(it.id);
-        if (it.unread) {
-          annReportClick(it.id);
-          annMarkReadLocal(it.id);
-        }
+        // 2026-10-17 业主约定：**点开不等于已读** —— 点开只上报「点击」，不动「已读」。
+        // 「已读」由服务端在列表/弹窗下发时记（shown），后台把已读与点击分开统计；
+        // 客户端也不在本地改 unread（下一次拉取以服务端为准，避免客户端自造已读口径）。
+        if (it.unread) annReportClick(it.id);
       }
       /**
        * 📣 公告卡：插在「🔑 账号」卡**之前**（运营要用户看到的东西，与"远程访问/账号"同属首屏）。
@@ -5130,14 +5144,6 @@ window.__ModuleLoader__.load({
               h("span", { className: "dru-ann-item-time" }, it.created_at ? fmtDate(it.created_at) : "")
             );
           })),
-          h("div", { className: "dru-hint", style: { marginTop: 8 } },
-            "点开即视为已读（后台按已读与点击分别统计）；公告顺序由后台设定。"),
-          h("div", { className: "dru-actions", style: { marginTop: 8 } },
-            h("button", {
-              type: "button",
-              className: "dru-btn dru-btn-ghost",
-              onClick: function () { annFetch({ openPopup: false }); }   // 主动刷新：只更新列表，不弹窗
-            }, "刷新公告"))
         ]);
       }
       /** 公告详情（复用 .dru-popup 视觉；点遮罩/关闭即收起）。正文按**纯文本**渲染（一期不做富文本）。 */
@@ -5155,7 +5161,6 @@ window.__ModuleLoader__.load({
               it.image ? h("img", { className: "dru-ann-img", src: it.image, alt: "公告图片" }) : null
             ),
             h("div", { className: "dru-popup-foot" },
-              h("span", null, "已读状态已同步到后台"),
               h("button", { type: "button", onClick: close }, "关闭")
             )
           )
@@ -5181,17 +5186,15 @@ window.__ModuleLoader__.load({
         if (restartPending) {
           // 桌面端：刷新类照旧（刷新页面即可）；需要重启 Host 的那一类**不给「立即重启」按钮** ——
           // 桌面端 Host 由 Electron 托管，插件点了也做不到，给个点不动的按钮只会让人以为是 bug。
-          // 改成如实引导：退出并重开 DeepSeek Harness。
+          // 改成只提示刷新页面（2026-10-17：不再引导重开应用）。
           // ⚠️ 非桌面端必须保持**原有判据 isRestartHard**：改成 isRefreshOnly 会让"历史遗留 kind"
           // 的文案从"刷新页面即可生效"变成"重启 dsh web 后生效" —— 属于发布版用户可见的文案变更，
           // 不该混在桌面端适配里顺手做掉。桌面端才走新文案。
-          var restartRowText = desktopHost
-            ? (isRefreshOnly
-              ? "🔄 插件已更新：刷新页面即可生效"
-              : "🔄 插件已更新：退出并重新打开 DeepSeek Harness 后生效")
-            : (isRestartHard
-              ? "🔄 插件已更新：重启 dsh web 后生效"
-              : "🔄 插件已更新：刷新页面即可生效");
+          // 2026-10-17（业主）：桌面端运行环境由应用托管、更新自动热加载 ——
+          // **不再引导用户重启 DeepSeek Harness**，统一只说「刷新页面即可生效」。
+          var restartRowText = (desktopHost || !isRestartHard)
+            ? "🔄 插件已更新：刷新页面即可生效"
+            : "🔄 插件已更新：重启 dsh web 后生效";
           rows.push(h("div", { className: "dru-access-tip-row", key: "restart" },
             h("span", null, restartRowText),
             (isRefreshOnly || !desktopHost) ? h("button", {
@@ -5228,6 +5231,7 @@ window.__ModuleLoader__.load({
           )
         ),
         h("div", { className: "dru-settings-body" },
+          renderSetupAlert(),
           restartPending
             // 【0.6.18】三种"待用户动一下"的情形，文案与主按钮**按 kind 一一对应**：
             //   · refresh（插件文件在运行中被改写）→ 软提示 + 主按钮「刷新页面」（零风险动作）
@@ -5238,28 +5242,25 @@ window.__ModuleLoader__.load({
                 className: "dru-restart-alert" + (isRestartHard ? " dru-restart-alert-strong" : ""),
                 role: isRestartHard ? "alert" : "status"
               },
-                h("span", { className: "dru-restart-alert-icon" }, isRestartHard ? "⚠️" : "🔔"),
+                h("span", { className: "dru-restart-alert-icon" }, (!desktopHost && isRestartHard) ? "⚠️" : "🔔"),
                 h("div", { style: { flex: "1" } },
                   h("div", { className: "dru-restart-alert-title" },
-                    // 插件已改为 patch 热加载:装插件/在线更新都不再需要重启 harness,
-                    // 唯一要用户动一下的情形是"插件文件在运行中被改写"→ 刷新页面即可。
-                    // 桌面端：需要换 Host 进程的那一类改为引导「退出并重开应用」（插件无权重启 Host）。
-                    isRestartHard
-                      ? (desktopHost ? "插件已更新，退出并重新打开 DeepSeek Harness 后生效"
-                        : "插件已更新，重启 dsh web 后生效")
-                      : isRefreshOnly ? "插件已更新，刷新页面即可生效"
-                        : (desktopHost ? "需要重新打开 DeepSeek Harness 才能载入新插件"
-                          : "需要重启 dsh web 才能载入新插件")),
+                    // 2026-10-17（业主）：桌面端运行环境由应用托管、插件安装/更新自动热加载 ——
+                    // **任何情况都不再引导"重启/退出重开应用"**，只说「刷新页面即可生效」。
+                    // 非桌面端（自建 dsh web）保留原有 isRestartHard 判据，文案不变。
+                    desktopHost
+                      ? "插件已更新：刷新页面即可生效"
+                      : (isRestartHard
+                        ? "插件已更新，重启 dsh web 后生效"
+                        : (isRefreshOnly ? "插件已更新，刷新页面即可生效" : "需要重启 dsh web 才能载入新插件"))),
                   h("div", { className: "dru-restart-alert-sub" },
-                    isRestartHard
-                      ? (desktopHost
-                        ? "新版本已经装到这台电脑上，但当前运行的 DeepSeek Harness 还是旧代码（新的后台路由与面板要等它重新载入）。桌面端的运行环境由应用本身托管，插件不能单独重启它 —— 请退出并重新打开 DeepSeek Harness 应用。手机端连接与已登录状态都不受影响。"
-                        : "新版本已经装到这台电脑上，但当前运行的 dsh web 还是旧代码（新的后台路由与面板要等它重新载入）。手机端连接与已登录状态都不受影响；重启期间页面会短暂断开，然后自动恢复。")
-                      : isRefreshOnly
-                        ? "刚装好/刚更新的插件已在磁盘上，浏览器里的面板还是旧版本。刷新一下这个页面即可（手机端连接与已登录状态都不受影响）。"
-                        : (desktopHost
-                          ? "当前运行中的 DeepSeek Harness 里还没有载入这个插件。先刷新页面；如果刷新后仍然看不到面板，请退出并重新打开 DeepSeek Harness 应用。"
-                          : "当前运行中的 dsh web 里还没有载入这个插件。先刷新页面；如果刷新后仍然看不到面板，再重启一次 dsh web。")),
+                    desktopHost
+                      ? "新插件已经在磁盘上，刷新一下这个页面即可载入（手机端连接与已登录状态都不受影响）。如果刷新后仍看不到面板，在应用内「插件」页重新安装一次即可。"
+                      : (isRestartHard
+                        ? "新版本已经装到这台电脑上，但当前运行的 dsh web 还是旧代码（新的后台路由与面板要等它重新载入）。手机端连接与已登录状态都不受影响；重启期间页面会短暂断开，然后自动恢复。"
+                        : (isRefreshOnly
+                          ? "刚装好/刚更新的插件已在磁盘上，浏览器里的面板还是旧版本。刷新一下这个页面即可（手机端连接与已登录状态都不受影响）。"
+                          : "当前运行中的 dsh web 里还没有载入这个插件。先刷新页面；如果刷新后仍然看不到面板，再重启一次 dsh web。"))),
                   // 【自动化】待重启时自动倒计时重启(用户零操作);倒计时期间可一键取消
                   restartCountdown !== null && restartCountdown > 0
                     ? h("div", { className: "dru-restart-auto", role: "status" },
@@ -5311,21 +5312,17 @@ window.__ModuleLoader__.load({
             : view === "invite" ? renderInvite()
             : renderHome()
         ),
-        // 常驻入口最底部：「重启 DeepSeek harness」按钮始终可达（首次安装/更新/排查都用它）
-        // 桌面端：Host 由 Electron 托管，重启这个动作不存在 → 不摆一个点了必然失败的按钮，
-        // 改为如实说明「退出并重开桌面应用」。后台服务与手机端连接在两种形态下都不受影响。
-        h("div", { className: "dru-restart-foot" },
-          h("div", { className: "dru-hint" }, desktopHost
-            ? "重启 DeepSeek Harness：桌面端由应用本身托管运行环境，请直接退出并重新打开应用（无需其他操作）。日常安装/更新插件已自动热加载，装完刷新页面即可；重启不影响后台服务与手机端连接。"
-            : "重启 dsh web：仅在「刷新页面后仍看不到面板」时才需要。日常安装/更新插件已自动热加载，装完刷新页面即可；重启只影响 dsh web 本身，不影响后台服务与手机端连接。"),
-          desktopHost
-            ? null
-            : h("button", {
-              type: "button",
-              className: "dru-btn " + (restartPending ? "dru-btn-primary" : "dru-btn-ghost"),
-              disabled: busy !== "",
-              onClick: function () { restartHarness(); }
-            }, busy === "restart" ? "重启中…" : "🔄 重启 dsh web")
+        // 2026-10-17（业主）：删除「重启 DeepSeek Harness」整段说明 ——
+        // 桌面端运行环境由应用本身托管、插件安装/更新自动热加载，刷新页面即可；
+        // 只有非桌面端（自建 dsh web）才保留重启入口，且文案只讲这一种场景。
+        desktopHost ? null : h("div", { className: "dru-restart-foot" },
+          h("div", { className: "dru-hint" }, "刷新页面后仍看不到面板时，才需要重启 dsh web；日常安装/更新插件会自动热加载。"),
+          h("button", {
+            type: "button",
+            className: "dru-btn " + (restartPending ? "dru-btn-primary" : "dru-btn-ghost"),
+            disabled: busy !== "",
+            onClick: function () { restartHarness(); }
+          }, busy === "restart" ? "重启中…" : "🔄 重启 dsh web")
         ),
         renderCommunityModal(),
         // 📣 公告详情弹窗（与交流群弹窗同一层：都挂在面板根上，点遮罩即收起）
