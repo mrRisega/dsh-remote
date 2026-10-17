@@ -1245,6 +1245,12 @@ export async function handleWsOpen(dchOrSend, frame) {
     console.log(`[bridge] ws-error ${path} (id=${id}): ${e.message || ""}`);
     if (!session.opened) {
       wsSessions.delete(id);
+      // ★ 上游可能已经换端口（桌面端 App 重启会换本地端口，生产日志里抓到过
+      //   `upstream_ws_open_failed ... ECONNREFUSED 127.0.0.1:19387`）。
+      //   HTTP 失败路径早就会触发重新发现，**WS 失败路径之前漏了** —— 而镜像页常常
+      //   先开 WS（控制通道/数据通道），于是端口变了以后一直 502、页面白屏，直到用户
+      //   手动重开。这里补上：本次失败照旧回 502，但立即触发重新发现，下一次重试就命中新端口。
+      void refreshUpstream("ws-open 上游连接失败");
       send({ id, type: "ws-open", ok: false, code: 502, reason: String(e.message || "ws error") });
     }
   });
