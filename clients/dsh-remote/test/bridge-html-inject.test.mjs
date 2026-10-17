@@ -70,16 +70,50 @@ const decode = (reply) => {
 };
 
 test("集成:官方特征 html 经 doHttp 回传时注入适配层", async () => {
-  const reply = await request({ id: "h1", method: "GET", path: "/page", headers: { "accept-encoding": "gzip", "user-agent": "phone" } });
-  assert.equal(reply.status, 200);
-  const text = decode(reply);
-  assert.ok(text.includes('data-dsh-mobile-adapter'), "应注入 style/script");
-  const headIdx = text.toLowerCase().lastIndexOf("</head>");
-  assert.ok(text.indexOf("dsh-mobile-adapter-css") < headIdx, "注入块应位于 </head> 前");
-  // 原文其余部分保持(仅 splice)
-  const oi = OFFICIAL_HTML.toLowerCase().lastIndexOf("</head>");
-  assert.ok(text.startsWith(OFFICIAL_HTML.slice(0, oi)));
-  assert.ok(text.endsWith(OFFICIAL_HTML.slice(oi)));
+  // 2026-10-17 起还有一份**独立的**故障采集器注入（与 mobile-adapter 无关）；
+  // 本用例只验适配层，用 DSH_MIRROR_DIAG=0 把它关掉，保证这里断言的是"仅 splice、原文不动"。
+  process.env.DSH_MIRROR_DIAG = "0";
+  try {
+    const reply = await request({ id: "h1", method: "GET", path: "/page", headers: { "accept-encoding": "gzip", "user-agent": "phone" } });
+    assert.equal(reply.status, 200);
+    const text = decode(reply);
+    assert.ok(text.includes('data-dsh-mobile-adapter'), "应注入 style/script");
+    const headIdx = text.toLowerCase().lastIndexOf("</head>");
+    assert.ok(text.indexOf("dsh-mobile-adapter-css") < headIdx, "注入块应位于 </head> 前");
+    // 原文其余部分保持(仅 splice)
+    const oi = OFFICIAL_HTML.toLowerCase().lastIndexOf("</head>");
+    assert.ok(text.startsWith(OFFICIAL_HTML.slice(0, oi)));
+    assert.ok(text.endsWith(OFFICIAL_HTML.slice(oi)));
+  } finally {
+    delete process.env.DSH_MIRROR_DIAG;
+    delete process.env.DSH_MOBILE_ADAPTER;
+  }
+});
+
+test("★ 集成:故障采集器**无条件**注入（不依赖 e2ee，也不依赖 mobile-adapter 开关）", async () => {
+  // 出问题的用户往往没开 E2EE、也可能被关了适配层 —— 采集器必须仍然在场，否则又变成"猜"。
+  process.env.DSH_MOBILE_ADAPTER = "0";
+  try {
+    const reply = await request({ id: "h1b", method: "GET", path: "/page", headers: { "user-agent": "phone" } });
+    const text = decode(reply);
+    assert.ok(text.includes("data-dsh-mirror-diag"), "mobile-adapter 关掉时采集器仍要注入");
+    assert.ok(text.indexOf("data-dsh-mirror-diag") < text.indexOf("__ModuleLoader__"), "必须在页面自身脚本之前");
+    assert.ok(!text.includes("data-dsh-mobile-adapter"), "适配层确实关着");
+  } finally {
+    delete process.env.DSH_MOBILE_ADAPTER;
+  }
+  // 逃生口：DSH_MIRROR_DIAG=0 → 一个字节都不注入，严格原样
+  process.env.DSH_MIRROR_DIAG = "0";
+  process.env.DSH_MOBILE_ADAPTER = "0"; // 适配层也要关，否则"原样"的基准不是 OFFICIAL_HTML
+  try {
+    const reply = await request({ id: "h1c", method: "GET", path: "/page", headers: { "user-agent": "phone" } });
+    const text = decode(reply);
+    assert.equal(text, OFFICIAL_HTML);
+    assert.ok(!text.includes("data-dsh-mirror-diag"));
+  } finally {
+    delete process.env.DSH_MIRROR_DIAG;
+    delete process.env.DSH_MOBILE_ADAPTER;
+  }
 });
 
 test("集成:注入在 gzip 前发生,回包仍可 gzip 解压且含注入块", async () => {
@@ -91,6 +125,7 @@ test("集成:注入在 gzip 前发生,回包仍可 gzip 解压且含注入块", 
 
 test("集成:DSH_MOBILE_ADAPTER=0 关闭注入,原样回传", async () => {
   process.env.DSH_MOBILE_ADAPTER = "0";
+  process.env.DSH_MIRROR_DIAG = "0"; // 两个注入器都关，才叫"原样"
   try {
     const reply = await request({ id: "h3", method: "GET", path: "/page", headers: { "user-agent": "phone" } });
     const text = decode(reply);
@@ -98,6 +133,7 @@ test("集成:DSH_MOBILE_ADAPTER=0 关闭注入,原样回传", async () => {
     assert.equal(text, OFFICIAL_HTML);
   } finally {
     delete process.env.DSH_MOBILE_ADAPTER;
+    delete process.env.DSH_MIRROR_DIAG;
   }
 });
 

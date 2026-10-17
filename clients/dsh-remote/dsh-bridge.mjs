@@ -76,6 +76,7 @@ import { promisify } from "node:util";
 import { gzip as gzipCb } from "node:zlib";
 // 移动端适配层(经隧道访问的官方 dsh web 窄屏注入;DSH_MOBILE_ADAPTER=0 可关闭,默认开启)
 import { maybeInjectMobileAdapter } from "./mobile-adapter.mjs";
+import { maybeInjectMirrorDiag } from "./mirror-diag.mjs";
 import { discoverUpstream, resolveUpstreamHint, FALLBACK_UPSTREAM } from "./upstream-discovery.mjs";
 // 镜像页 E2EE 加密 shim(Phase-4):text/html 注入;DSH_E2EE_SHIM=0 可关闭,叠加 e2ee.enabled 灰度门
 import { maybeInjectE2eeShim } from "./e2ee-shim.mjs";
@@ -861,6 +862,15 @@ async function doHttp(method, path, reqHeaders, body, isB64) {
       console.log(`[bridge] mobile-adapter 注入 ${path}: ${(buf.length / 1024).toFixed(0)}KB → ${(m.buf.length / 1024).toFixed(0)}KB`);
       buf = m.buf;
       armMirrorLoadWatch(path);
+    }
+    // 镜像页加载故障采集器（2026-10-17，**与 e2ee 无关**）：出问题的用户往往没开 E2EE，
+    // 所以无条件注入。只在失败时上报（见 mirror-diag-script.js），零 DOM 改动。
+    {
+      const d = maybeInjectMirrorDiag({ buf, contentType });
+      if (d.injected) {
+        console.log(`[bridge] mirror-diag 注入 ${path}: ${(buf.length / 1024).toFixed(0)}KB → ${(d.buf.length / 1024).toFixed(0)}KB`);
+        buf = d.buf;
+      }
     }
     // E2EE 镜像页加密 shim(Phase-4):仅桥端 e2ee 启用时注入(e2ee.enabled=false → 零注入零行为)
     if (e2ee.enabled) {
