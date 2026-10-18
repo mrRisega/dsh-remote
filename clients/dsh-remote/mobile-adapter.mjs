@@ -554,6 +554,40 @@ div.dsh-ma-menu .dsh-ma-load-warn[hidden] { display: none !important; }
 div.dsh-ma-menu .dsh-ma-load-warn .ico { flex: none; }
 div.dsh-ma-menu .dsh-ma-load-warn .txt { min-width: 0; overflow-wrap: anywhere; }
 
+/* ===== 旧浏览器兼容提示条（2026-10-18 真机事故）=====
+   事故：iOS 16.1 / 17.3 的 Safari 打不开镜像页（缺 Promise.withResolvers / AbortSignal.any /
+   甚至不支持新语法）。补不了的 API 已在注入体最前面尽量补齐；补不了的（语法级）用这条**顶部轻量条**
+   明确告诉用户"升级系统或换浏览器"，而不是让他干等。
+   安全边界：只占顶部一条、限高可滚、可关闭、不覆盖整屏、z-index 低于 FAB（400）—— 
+   和「加载卡住」底部条同一套安全方向：判断错最坏只是多一条可关的提示，绝不遮挡主界面。 */
+div.dsh-ma-compatbar {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 398;
+  box-sizing: border-box;
+  padding: calc(10px + env(safe-area-inset-top, 0px)) 14px 10px;
+  max-height: min(42vh, 300px); overflow: auto;
+  background: #fff8e6; color: #6b4a00;
+  border-bottom: 1px solid rgba(154, 103, 0, .35);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, .12);
+  font: 400 12.5px/1.65 -apple-system, system-ui, sans-serif;
+  text-align: left;
+}
+div.dsh-ma-compatbar[hidden] { display: none !important; }
+div.dsh-ma-compatbar .dsh-ma-compatbar-title { font-weight: 700; font-size: 13.5px; margin-bottom: 4px; }
+div.dsh-ma-compatbar .dsh-ma-compatbar-detail { color: #7a5a10; word-break: break-word; }
+div.dsh-ma-compatbar .dsh-ma-compatbar-hint { margin-top: 4px; color: #7a5a10; }
+div.dsh-ma-compatbar .dsh-ma-compatbar-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+div.dsh-ma-compatbar button {
+  min-height: 40px; padding: 8px 12px; border-radius: 8px;
+  border: .5px solid rgba(154, 103, 0, .45); background: #fffdf5; color: #6b4a00;
+  font: 600 12.5px/1 -apple-system, system-ui, sans-serif; cursor: pointer;
+}
+div.dsh-ma-compatbar button.primary { background: #9a6700; border-color: #9a6700; color: #fff; }
+div.dsh-ma-compatbar button.dsh-ma-compatbar-x {
+  position: absolute; top: calc(6px + env(safe-area-inset-top, 0px)); right: 8px;
+  min-height: 32px; min-width: 36px; padding: 4px 8px; border: none; background: transparent;
+  color: #7a5a10; font-size: 14px;
+}
+
 /* ===== 加载疑似卡住时的**可操作**底部提示条（2026-10-17 事故新增） =====
    事故现场：用户本机 ~/.dsh-remote（bridge 运行时 + 账号配对信息/设备密钥）被误删 → bridge 起不来、
    手机端镜像页第一次加载**干等 47 秒**才报错；页面上只有悬浮菜单里一行"已等 N 秒…复制给客服"，
@@ -663,6 +697,112 @@ const FAB_PHONE_SVG =
 const SCRIPT = `(() => {
   "use strict";
 
+  /* ===DSH-MA-COMPAT-START===
+     旧浏览器兼容层（2026-10-18 真机事故）。
+     事故：iPhone iOS 16.1 / 17.3 的 Safari 打开镜像页永远卡住、出不来对话界面 ——
+     诊断上报抓到真实错误（mirror_diag）：
+       · TypeError: Promise.withResolvers is not a function   （Safari 17.4+ 才有）
+       · AbortSignal.any is not a function                    （Safari 17.4+ 才有）
+       · SyntaxError: Unexpected token '{'（iOS 16.1 连新语法都解析不了 → 只能提示升级）
+     DSH web 前端按现代浏览器构建；镜像页在**它的模块执行之前**补齐缺失的运行时 API，
+     能让 iOS 17.x / 老 Safari 直接可用；补不了的（语法级不支持）明确提示用户升级/换浏览器。
+     注入体纪律：本段不得出现反引号；只用 ES5 语法（老 Safari 也要能解析这段）。 */
+
+  // ① 运行时 API 补齐（全部有 typeof 守卫，绝不覆盖已有实现）
+  (function () {
+    try {
+      if (typeof Promise !== "undefined" && typeof Promise.withResolvers !== "function") {
+        Object.defineProperty(Promise, "withResolvers", {
+          configurable: true, writable: true,
+          value: function () {
+            var resolve, reject;
+            var promise = new Promise(function (res, rej) { resolve = res; reject = rej; });
+            return { promise: promise, resolve: resolve, reject: reject };
+          }
+        });
+      }
+    } catch (e) { /* 补齐失败不影响页面 */ }
+    try {
+      if (typeof AbortSignal !== "undefined" && typeof AbortSignal.any !== "function") {
+        AbortSignal.any = function (signals) {
+          var ctrl = new AbortController();
+          var list = [];
+          try { list = Array.prototype.slice.call(signals || []); } catch (e2) { list = []; }
+          for (var i = 0; i < list.length; i++) {
+            try { if (list[i] && list[i].aborted) { ctrl.abort(list[i].reason); return ctrl.signal; } } catch (e3) { /* 忽略 */ }
+          }
+          function onAbort(e) {
+            var sig = e && e.target;
+            try { ctrl.abort(sig && sig.reason); } catch (e4) { try { ctrl.abort(); } catch (e5) { /* 忽略 */ } }
+          }
+          for (var j = 0; j < list.length; j++) {
+            try {
+              if (list[j] && typeof list[j].addEventListener === "function") {
+                list[j].addEventListener("abort", onAbort, { once: true });
+              }
+            } catch (e6) { /* 忽略 */ }
+          }
+          return ctrl.signal;
+        };
+      }
+    } catch (e) { /* 同上 */ }
+    try {
+      if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout !== "function") {
+        AbortSignal.timeout = function (ms) {
+          var ctrl = new AbortController();
+          setTimeout(function () {
+            try { ctrl.abort(new Error("TimeoutError")); } catch (e2) { try { ctrl.abort(); } catch (e3) { /* 忽略 */ } }
+          }, Number(ms) || 0);
+          return ctrl.signal;
+        };
+      }
+    } catch (e) { /* 同上 */ }
+    try {
+      if (typeof Array.prototype.findLast !== "function") {
+        Array.prototype.findLast = function (fn, thisArg) {
+          for (var i = this.length - 1; i >= 0; i--) {
+            if (fn.call(thisArg, this[i], i, this)) return this[i];
+          }
+          return undefined;
+        };
+      }
+      if (typeof Array.prototype.findLastIndex !== "function") {
+        Array.prototype.findLastIndex = function (fn, thisArg) {
+          for (var i = this.length - 1; i >= 0; i--) {
+            if (fn.call(thisArg, this[i], i, this)) return i;
+          }
+          return -1;
+        };
+      }
+      if (typeof Array.prototype.toSorted !== "function") {
+        Array.prototype.toSorted = function (cmp) { return this.slice().sort(cmp); };
+      }
+      if (typeof Array.prototype.toReversed !== "function") {
+        Array.prototype.toReversed = function () { return this.slice().reverse(); };
+      }
+      if (typeof Object.hasOwn !== "function") {
+        Object.hasOwn = function (o, k) { return Object.prototype.hasOwnProperty.call(o, k); };
+      }
+    } catch (e) { /* 同上 */ }
+  })();
+
+  // ② 探测"补不了的"：语法级不支持（老 Safari 解析不到新版构建）→ 只能提示升级/换浏览器
+  var maCompat = (function () {
+    var why = "";
+    try {
+      // 静态块（Safari 16.4+）。CSP 禁 eval 时抛的是 EvalError 而非 SyntaxError —— 不能误判
+      new Function("class __DshCompatProbe { static { this.ok = 1; } }");
+    } catch (e) {
+      if (e && e.name === "SyntaxError") why = "系统版本过旧（不支持现代 JavaScript 语法）";
+    }
+    var missing = [];
+    try { if (typeof Promise.withResolvers !== "function") missing.push("Promise.withResolvers"); } catch (e2) { /* 忽略 */ }
+    try { if (typeof AbortSignal !== "undefined" && typeof AbortSignal.any !== "function") missing.push("AbortSignal.any"); } catch (e3) { /* 忽略 */ }
+    if (!why && missing.length) why = "缺少浏览器能力：" + missing.join(" / ");
+    return { ok: !why, why: why };
+  })();
+  /* ===DSH-MA-COMPAT-END=== */
+
   /* ===== 【0.6.16 已删除】首屏加载提示层（0.6.14 引入，0.6.15 仍在）=====
      为什么删掉（用户实测，2026-09-25）：「界面都已经加载完了，十几秒就把插件的接口加载好了，
      但这个遮罩一直不消失」—— 截图里官方 UI 就在下面透出来，秒表走到 187 秒。
@@ -738,10 +878,121 @@ const SCRIPT = `(() => {
      ⚠️ 12 秒是"开始提示"的阈值，不是"判定失败"：限速放开后正常首屏 1~3 秒，
         12 秒既能及时帮到用户，也不至于刚打开就吓人（宁可晚一点，也别误报）。
      ⚠️ 注入体是模板字符串：本段注释/文案**一律用「」**，不得出现反引号。 */
+  try {
+    maWireCompatErrors();
+    if (maCompat && maCompat.ok === false) {
+      var maCompatKick = function () { setTimeout(function () { maShowCompatBar(); }, 800); };
+      if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", maCompatKick);
+      else maCompatKick();
+    }
+  } catch (e) { /* 兼容提示失败绝不影响主功能 */ }
+
   var maLoadWatch = { startedAt: Date.now(), slow: false, wired: false, bound: false, warnEl: null, warnTxt: null,
                       reported: false, reportMs: 0,
                       // 2026-10-17：底部可操作提示条（barEl = 懒创建的节点；barTimer = 秒数刷新）
                       barEl: null, barTxt: null, barTimer: 0, dismissed: false };
+  /* ===== 旧浏览器兼容提示条（2026-10-18）=====
+     只有两种触发：① 注入体最前面的 maCompat 探测到"补不了的"（语法级不支持）；
+     ② 页面脚本报出 SyntaxError / is not a function 这类典型兼容错误且界面还没就绪。
+     只显示一条、可关闭、不遮挡整屏；提供「返回设备列表」与「复制诊断信息」两个出口。 */
+  var maCompatBar = { el: null, txt: null, detail: null, dismissed: false, wired: false };
+  function maCompatReason(msg) {
+    var why = "";
+    try { why = String(msg ? msg : (maCompat && maCompat.why) || "").slice(0, 200); } catch (e) { why = ""; }
+    return why;
+  }
+  function maMountCompatBar(reason) {
+    try {
+      if (maCompatBar.dismissed) return;
+      if (maCompatBar.el && maCompatBar.el.parentNode) { maCompatRender(reason); return; }
+      if (!document.body) return;
+      var bar = document.createElement("div");
+      bar.className = "dsh-ma-compatbar";
+      bar.setAttribute("role", "alert");
+
+      var title = document.createElement("div");
+      title.className = "dsh-ma-compatbar-title";
+      title.textContent = "浏览器版本过旧，远程界面可能无法打开";
+
+      var detail = document.createElement("div");
+      detail.className = "dsh-ma-compatbar-detail";
+
+      var hint = document.createElement("div");
+      hint.className = "dsh-ma-compatbar-hint";
+      hint.textContent = "建议：把系统/浏览器升级到最新（iOS 17.4 及以上），或改用 Chrome、电脑端访问。";
+
+      var row = document.createElement("div");
+      row.className = "dsh-ma-compatbar-row";
+      var back = document.createElement("button");
+      back.className = "primary";
+      back.textContent = "返回设备列表";
+      back.addEventListener("click", function () {
+        try { location.href = "/app/"; } catch (e) { try { location.assign("/app/"); } catch (e2) { /* 忽略 */ } }
+      });
+      var copy = document.createElement("button");
+      copy.textContent = "复制诊断信息";
+      copy.addEventListener("click", function () {
+        var line = "";
+        try {
+          var ua = String((navigator && navigator.userAgent) || "").slice(0, 120);
+          line = "dsh-remote 浏览器兼容问题：缺少能力 = " + maCompatReason(reason) + "；UA=" + ua + "；页面=" + String(location.href || "").slice(0, 120);
+        } catch (e) { line = "dsh-remote 浏览器兼容问题（无法读取 UA）"; }
+        try {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(line).then(function () { hint.textContent = "已复制诊断信息，可直接发给客服。"; }, function () { hint.textContent = line; });
+            return;
+          }
+        } catch (e2) { /* 落到下面 */ }
+        hint.textContent = line;
+      });
+      var x = document.createElement("button");
+      x.className = "dsh-ma-compatbar-x";
+      x.setAttribute("aria-label", "关闭提示");
+      x.textContent = "✕";
+      x.addEventListener("click", function () { maCompatBar.dismissed = true; try { bar.hidden = true; } catch (e) { /* 忽略 */ } });
+
+      row.appendChild(back);
+      row.appendChild(copy);
+      bar.appendChild(x);
+      bar.appendChild(title);
+      bar.appendChild(detail);
+      bar.appendChild(hint);
+      bar.appendChild(row);
+      document.body.appendChild(bar);
+      maCompatBar.el = bar; maCompatBar.txt = title; maCompatBar.detail = detail;
+      maCompatRender(reason);
+    } catch (e) { /* 提示失败绝不影响主功能 */ }
+  }
+  function maCompatRender(reason) {
+    try {
+      if (!maCompatBar.el) return;
+      var why = maCompatReason(reason);
+      if (why && maCompatBar.detail) maCompatBar.detail.textContent = "检测到：" + why;
+      maCompatBar.el.hidden = !!maCompatBar.dismissed;
+    } catch (e) { /* 忽略 */ }
+  }
+  /** 显示兼容提示（带就绪保护：界面已经能用了就不再打扰）。 */
+  function maShowCompatBar(reason) {
+    try {
+      if (maCompatBar.dismissed) return;
+      if (maLoadReadyNow()) return; // 页面其实正常 → 不吓人
+      maMountCompatBar(reason);
+    } catch (e) { /* 忽略 */ }
+  }
+  /** 页面脚本报出"典型兼容错误"时也要提示（有些内联报错早于我们的探测）。 */
+  function maWireCompatErrors() {
+    try {
+      window.addEventListener("error", function (e) {
+        try {
+          var msg = String((e && e.message) || "");
+          if (!/SyntaxError|Unexpected token|is not a function|Cannot read propert/i.test(msg)) return;
+          if (!/(withResolvers|AbortSignal|Promise|assets\\/|plugins\\/)/i.test(msg + " " + String((e.target && (e.target.src || e.target.href)) || ""))) return;
+          maShowCompatBar(msg.slice(0, 200));
+        } catch (e2) { /* 忽略 */ }
+      }, true);
+    } catch (e) { /* 忽略 */ }
+  }
+
   /** 看门狗阈值（毫秒）：12 秒仍认不出官方界面就开始提示。测试按常量断言，不要散落魔法数。 */
   var MA_LOAD_WATCH_MS = 12 * 1000;
   /** 官方界面是否已经可用（只看最强信号；只用于决定"要不要多显示一行字"）。 */
