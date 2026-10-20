@@ -159,6 +159,15 @@ function harness({ width = 390, height = 844 } = {}) {
 
   const frame = new El("div", { class: "pI_x6G_frame" });
   frame.setAttribute("data-sidebar-collapsed", "true");
+  /* C6（2026-10-20）：适配层启动时会先比对官方 DOM 锚点（frame / 侧栏列 / 开合驱动），
+     认不出就进入 compat-official（**不建**抽屉与 scrim）。官方 frame 一挂载就带着三列，
+     所以这里给最小列结构（侧栏可识别 + 中央列 + 第三列），让用例测的仍是"迟到挂载"而不是"锚点缺失"。
+     ⚠️ 如果哪天真实官方 DOM 变成"frame 挂上但列还没渲染"，适配层会 return pending（不降级），
+        下一拍再看 —— 那时这几条用例仍然成立。 */
+  const sidebarCol = new El("div"); sidebarCol.className = "pI_x6G_sidebarCol";
+  const centerCol = new El("div"); centerCol.className = "pI_x6G_centerCol";
+  const detailsCol = new El("div"); detailsCol.className = "pI_x6G_detailsCol";
+  frame.appendChild(sidebarCol); frame.appendChild(centerCol); frame.appendChild(detailsCol);
   frame.querySelector = () => null;      // 本用例不涉及第三列/overlay 识别
 
   doc.readyState = "complete";

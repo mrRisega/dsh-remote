@@ -248,6 +248,9 @@ function harness({
   // ⚠️ 用 null 表示"官方不写这个属性"（undefined 会命中默认值，测不出"属性缺失"的场景）
   collapsedAttr = "true", detailsAttr = "true", rightbarAttr = null, variant = "rc1",
   width = 390, height = 844, withComposer = true, withToggle = true,
+  /* C6（2026-10-20）：alien = 官方锚点整组改名/被插件换掉（frame 还在，但侧栏列认不出、
+     折叠属性没了、开合按钮也没了）—— 正是"装了 dsh web all 之后"的现场。 */
+  alien = false,
 } = {}) {
   MutationObserverStub.reset();
   const intervals = [];
@@ -256,13 +259,14 @@ function harness({
     + "<title>DeepSeek Harness</title></head><body></body></html>";
   const body = new El("body");
   const frame = new El("div", { class: "pI_x6G_frame" });
-  if (collapsedAttr !== null) frame.setAttribute("data-sidebar-collapsed", collapsedAttr);
-  if (detailsAttr !== null) frame.setAttribute("data-details-collapsed", detailsAttr);
-  if (variant === "rc2" && rightbarAttr !== null) frame.setAttribute("data-rightbar-collapsed", rightbarAttr);
+  if (!alien && collapsedAttr !== null) frame.setAttribute("data-sidebar-collapsed", collapsedAttr);
+  if (!alien && detailsAttr !== null) frame.setAttribute("data-details-collapsed", detailsAttr);
+  if (!alien && variant === "rc2" && rightbarAttr !== null) frame.setAttribute("data-rightbar-collapsed", rightbarAttr);
 
-  const sidebar = new El("div", { class: variant === "rc2" ? "pI_x6G_sidebarCol" : "pI_x6G_sidebarCol" });
-  const center = new El("div", { class: "pI_x6G_centerCol" });
-  const third = new El("div", { class: variant === "rc2" ? "pI_x6G_rightbarCol" : "pI_x6G_detailsCol" });
+  /* alien：列类名也换掉（官方重新打包换前缀 / 插件自绘了侧栏）—— 适配层应当**认不出**它们。 */
+  const sidebar = new El("div", { class: alien ? "Qa1_side" : "pI_x6G_sidebarCol" });
+  const center = new El("div", { class: alien ? "Qa1_main" : "pI_x6G_centerCol" });
+  const third = new El("div", { class: alien ? "Qa1_extra" : (variant === "rc2" ? "pI_x6G_rightbarCol" : "pI_x6G_detailsCol") });
   const overlay = new El("div", { class: "pI_x6G_overlayLayer", "data-shell-overlay": "true" });
   const row = new El("div", { role: "treeitem", "aria-selected": "false", class: "hHd-Xa_sessionRow YDXeBa_sessionRow" });
   // 抽屉里一条历史会话行的实测位置（侧栏 0..328，避开左上角的汉堡按钮）
@@ -962,7 +966,9 @@ test("★ 加载疑似失败时的提示：菜单里一行 + **底部可操作�
 
   // 阈值 12 秒：25 秒太晚（用户实测干等 47 秒才看到任何东西）
   assert.match(script, /if \(maLoadReadyNow\(\)\) return;/, "认出官方界面就不该提示");
-  assert.match(script, /var MA_LOAD_WATCH_MS = 12 \* 1000;/, "看门狗阈值常量应为 12 秒");
+  /* 2026-10-20（C4）：阈值 12s → **20s** —— 12 秒比真实 p90（15.3s）还短，17.6% 的正常加载
+     会被误报成"电脑端可能未连接"（03 报告 §2.3）；20 秒在 p90 之上留余量、又远低于不可忍耐的 40 秒级。 */
+  assert.match(script, /var MA_LOAD_WATCH_MS = 20 \* 1000;/, "看门狗阈值常量应为 20 秒（旧 12 秒低于真实 p90）");
   assert.match(script, /\}, MA_LOAD_WATCH_MS\);/, "setTimeout 必须用该常量");
   assert.ok(!/25 \* 1000/.test(script), "不得残留 25 秒阈值");
   // 一句话要能直接发给客服
@@ -1131,4 +1137,77 @@ test("护栏：延迟角标必须是 FAB 内的子元素（不得新增 body 级
   assert.ok(!/\.dsh-ma-fab-rtt\s*\{[^}]*position:\s*fixed/.test(css), "角标不得是 fixed 浮层");
   assert.ok(!/\.dsh-ma-fab-rtt\s*\{[^}]*z-index/.test(css), "角标不得自带 z-index（它活在 FAB 的层叠上下文里）");
   void js;
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// C6（2026-10-20 诊断，00 §6.2 / 04 §V-4）：UI 插件兼容降级（compat-official）
+//
+// 现场：用户装了 `dsh web all`（或官方重新打包）后，我们自绘的抽屉/全屏 scrim 依赖的一组官方
+// 锚点（.pI_x6G_frame、.pI_x6G_sidebarCol、.hHd-Xa_*、data-sidebar-collapsed / data-details-collapsed）
+// 整组失效，但适配层仍然按旧假设建抽屉 + 遮罩 → 「点哪都没反应」。
+// 契约：锚点缺失/异常 → compat-official：**不建自绘抽屉、不建 scrim、不代替用户点官方入口**，
+//       只保留字号/E2EE 徽标（FAB + 菜单）；锚点齐全 → 原行为完全不变。
+// ══════════════════════════════════════════════════════════════════════════════
+
+const findFabIn = (env) => env.body.children.find((c) => c._cls.has("dsh-ma-fab"));
+
+test("★ C6：官方锚点缺失/异常 → 进入 compat-official，不建自绘抽屉与 scrim", () => {
+  const { js } = injected();
+  const env = run(harness({ alien: true, collapsedAttr: null, detailsAttr: null, withToggle: false }), js);
+  assert.equal(findScrim(env) || null, null,
+    "★ 锚点认不出时绝不建自绘遮罩 —— 最坏结局必须是「没有手势」，不能是「点哪都没反应」");
+  assert.equal(findHamburger(env) || null, null, "也不建自绘抽屉按钮（它只会变成一个点不动的死按钮）");
+  assert.ok(env.html.classList.contains("dsh-ma-compat-official"), "必须留下 compat-official 标记（现场诊断/客服上报用）");
+  assert.equal(env.frame.classList.contains("dsh-ma-frame"), false,
+    "★ 不得给官方 frame 打我们的布局类（CSS 会把三列轨道改成 0/1fr/0，用错的锚点改坏官方布局）");
+  assert.ok(findFabIn(env), "字号 / E2EE 徽标这些纯悬浮件必须保留（compat 只关抽屉与 scrim）");
+  const diag = env.win.__dshMaDiag;
+  assert.equal(diag.compatOfficial.on, true, "诊断里必须能看出当前处于 compat-official");
+  /* 跨 realm 数组不能用 deepEqual 直接比（vm 里构造的 Array 原型不同），用字符串比较。 */
+  assert.equal(diag.compatOfficial.reasons.slice().sort().join(","), "sidebar_anchor_missing,sidebar_toggle_missing",
+    "原因要能说清是哪组锚点认不出（便于按官方新版补识别）");
+});
+
+test("★ C6：锚点齐全时原行为不变（抽屉 + 遮罩照旧创建，不进 compat）", () => {
+  const { js } = injected();
+  const env = run(harness({}), js);
+  assert.ok(findScrim(env), "锚点齐全 → 遮罩照旧创建");
+  assert.ok(findHamburger(env), "锚点齐全 → 抽屉按钮照旧创建");
+  assert.equal(env.html.classList.contains("dsh-ma-compat-official"), false, "不得误进降级模式");
+  assert.equal(env.win.__dshMaDiag.compatOfficial.on, false);
+  assert.ok(env.frame.classList.contains("dsh-ma-frame"), "锚点齐全时布局适配照旧生效");
+});
+
+test("★ C6：官方 frame 挂上但列还没渲染（瞬时状态）→ 不降级、也不建假入口（等下一拍）", () => {
+  const { js } = injected();
+  const env = harness({});
+  env.frame.children = [];                     // frame 已挂载、但 React 子列还没渲染
+  const run2 = run(env, js);
+  assert.equal(run2.win.__dshMaDiag.compatOfficial.on, false,
+    "子列还没渲染不是「锚点变了」——不能据此永久降级（官方渲染完就正常了）");
+  assert.equal(findScrim(run2) || null, null, "但也绝不能凭一个空 frame 就建遮罩/抽屉");
+  assert.equal(findHamburger(run2) || null, null);
+});
+
+test("★ C6：不代替用户点官方入口 —— 开关关掉后点遮罩也不许点官方 toggle", () => {
+  const { js } = injected();
+  const env = run(harness({ collapsedAttr: "" }), js);   // 官方说展开 → 遮罩在拦
+  const clicks = toggleClicks(env);
+  const scrim = findScrim(env);
+  assert.ok(scrim, "前提：遮罩存在");
+  env.win.__dshMaOfficialClicks = false;                 // 真机排查开关：完全停手
+  scrim.dispatchEvent(new Ev("click", {}));
+  assert.equal(clicks(), 0, "★ 开关关闭时绝不代替用户点官方侧栏按钮（但仍要摘掉我们自己的遮挡类）");
+  assert.equal(env.html.classList.contains("dsh-ma-sidebar-open"), false, "点遮罩必须仍能自救（摘掉展开类）");
+});
+
+test("★ C6：scrim 不变量与下闸次数必须进诊断（用户报「又点不动了」时的第一手证据）", () => {
+  const { js } = injected();
+  const env = run(harness({ collapsedAttr: "" }), js);   // 抽屉展开、遮罩下闸
+  assert.ok(env.win.__dshMaDiag.scrim.activations >= 1, "遮罩实际下闸过 → 计数必须 ≥1");
+  // 模拟"抽屉消失但遮罩还在拦" → 不变量摘除并计数
+  env.sidebar.getBoundingClientRect = () => ({ left: -400, right: -80, top: 0, bottom: 844, width: 320, height: 844 });
+  env.tickTimers();                                      // 800ms 看门狗那一拍
+  assert.equal(env.html.classList.contains("dsh-ma-scrim-on"), false, "不变量必须摘掉遮罩");
+  assert.ok(env.win.__dshMaDiag.scrim.invariantHits >= 1, "摘除次数必须计数（区分「遮罩在拦」与「遮罩早被摘了」）");
 });

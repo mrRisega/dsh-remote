@@ -80,3 +80,78 @@ test("★ 采集器源码自身：不含 </script>、不写 DOM、只在失败�
   assert.match(src, /Failed to load plugins/, "必须识别首页启动失败文案");
   assert.match(src, /mirror_diag|DSH_MIRROR_DIAG|pagehide/, "必须有无痕静默路径");
 });
+
+// ══════════════════════════════════════════════════════════════════════════════
+// C4/C6（2026-10-20 诊断）：把适配层的「自动重试 / compat-official / scrim」计数带进上报
+//
+// 理由：服务端只有 nginx + mirror_diag 两层时，分不清"失败后是自愈了还是永久坏了"。
+// 适配层把这几个计数挂在 window.__dshMaRetryStats / __dshMaDiag 上（只读），
+// 采集器在**有**这些全局时把它们作为可选字段 ui 带回去；没有时整体缺省（不改变既有 payload 形状）。
+// ══════════════════════════════════════════════════════════════════════════════
+
+import vm from "node:vm";
+
+/** 在 vm 里跑真实采集器脚本，返回 { payloads, fire, runTimers }。 */
+function runDiagScript(winExtra = {}) {
+  const SRC = fs.readFileSync(DIAG_SCRIPT_PATH, "utf8");
+  const listeners = new Map();
+  const fetches = [];
+  const timers = [];
+  const win = {
+    location: { href: "https://n.risegao.cn:13443/remote/dev-x/", origin: "https://n.risegao.cn:13443", pathname: "/remote/dev-x/" },
+    navigator: { userAgent: "iPhone Safari (mirror-diag test)" },
+    localStorage: { getItem: (k) => (k === "dsh_token" ? "tk-test" : null) },
+    addEventListener: (type, fn) => { const arr = listeners.get(type) || []; arr.push(fn); listeners.set(type, arr); },
+    MutationObserver: undefined,
+    PerformanceObserver: undefined,
+    ...winExtra,
+  };
+  const doc = { cookie: "", body: { innerText: "" }, documentElement: {} };
+  const ctx = vm.createContext({
+    window: win, document: doc, W: win, D: doc,
+    navigator: win.navigator, localStorage: win.localStorage,
+    fetch: (url, init) => { fetches.push({ url: String(url), init }); return Promise.resolve(); },
+    setTimeout: (fn) => { timers.push(fn); return timers.length; },
+    clearTimeout: () => {},
+    URL, Date, Math, JSON, Object, Array, String, Number, RegExp, Boolean, Promise, Error,
+  });
+  ctx.globalThis = ctx;
+  vm.runInContext(SRC, ctx, { timeout: 5000 });
+  return {
+    win,
+    payloads: () => fetches.map((f) => { try { return JSON.parse(f.init.body); } catch { return null; } }).filter(Boolean),
+    /** 触发采集器登记的 window 事件（资源 error 在捕获阶段被接住）。 */
+    fire(type, ev) { for (const fn of listeners.get(type) || []) fn(ev); },
+    /** 走完所有已登记的 setTimeout（flush 延迟 2500ms）。 */
+    runTimers() { const q = timers.splice(0); for (const fn of q) fn(); },
+  };
+}
+
+test("★ C4/C6：适配层在场时，上报里带可选字段 ui（retry / compat / scrim）", () => {
+  const env = runDiagScript({
+    __dshMaRetryStats: { page: 2, res: 1, lastKind: "page:boot_failed", at: 1 },
+    __dshMaDiag: { compatOfficial: { on: true }, scrim: { activations: 3, invariantHits: 1 } },
+  });
+  // 一条真实会触发上报的失败：/plugins/ 聚合包加载失败
+  env.fire("error", { target: { src: "https://n.risegao.cn:13443/plugins/??@deepseek-ai/x.js", tagName: "SCRIPT" } });
+  env.runTimers();
+  const [payload] = env.payloads();
+  assert.ok(payload, "有失败资源时必须上报");
+  assert.equal(payload.items.length, 1, "既有 items 契约不变");
+  assert.equal(payload.items[0].t, "res");
+  assert.deepEqual(payload.ui.retry, { page: 2, res: 1, kind: "page:boot_failed" },
+    "★ 自动重试次数必须带回去 —— 否则服务端分不清「自愈了」和「永久坏了」");
+  assert.equal(payload.ui.compat, 1, "compat-official 降级也要能被服务端看见（UI 插件兼容问题的规模）");
+  assert.deepEqual(payload.ui.scrim, { on: 3, fix: 1 }, "scrim 下闸/不变量摘除计数（「又点不动了」的现场证据）");
+});
+
+test("适配层不在场（旧版本/宽屏/未注入）时：payload 形状不变、不出现 ui 字段", () => {
+  const env = runDiagScript();
+  env.fire("error", { target: { src: "https://n.risegao.cn:13443/assets/index.js", tagName: "SCRIPT" } });
+  env.runTimers();
+  const [payload] = env.payloads();
+  assert.ok(payload, "有失败资源时必须上报");
+  assert.equal("ui" in payload, false, "没有适配层诊断时不得新增字段（老服务端/老页面兼容）");
+  assert.deepEqual(Object.keys(payload).sort(), ["at", "boot_failed", "items", "kind", "page", "ua", "v"],
+    "既有 payload 字段一个不多一个不少");
+});

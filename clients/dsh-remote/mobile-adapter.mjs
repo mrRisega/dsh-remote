@@ -890,7 +890,11 @@ const SCRIPT = `(() => {
   var maLoadWatch = { startedAt: Date.now(), slow: false, wired: false, bound: false, warnEl: null, warnTxt: null,
                       reported: false, reportMs: 0,
                       // 2026-10-17：底部可操作提示条（barEl = 懒创建的节点；barTimer = 秒数刷新）
-                      barEl: null, barTxt: null, barTimer: 0, dismissed: false };
+                      barEl: null, barTxt: null, barTimer: 0, dismissed: false,
+                      // 2026-10-20（C4）：镜像页里**唯一**可靠的"电脑端不可达"信号 ——
+                      // 受保护的 /api/* 请求被回 5xx 或直接网络错误（presence 不在镜像页这条链路上；
+                      // E2EE 死会话的 502 另带 x-dsh-e2ee-error，不算离线，见 maInstallNetSampler）。
+                      apiFails: 0, apiFailAt: 0, lastApiStatus: 0 };
   /* ===== 旧浏览器兼容提示条（2026-10-18）=====
      只有两种触发：① 注入体最前面的 maCompat 探测到"补不了的"（语法级不支持）；
      ② 页面脚本报出 SyntaxError / is not a function 这类典型兼容错误且界面还没就绪。
@@ -993,8 +997,435 @@ const SCRIPT = `(() => {
     } catch (e) { /* 忽略 */ }
   }
 
-  /** 看门狗阈值（毫秒）：12 秒仍认不出官方界面就开始提示。测试按常量断言，不要散落魔法数。 */
-  var MA_LOAD_WATCH_MS = 12 * 1000;
+  /** 看门狗阈值（毫秒）：**20 秒**仍认不出官方界面才开始提示。
+   *  为什么 12→20（2026-10-20 诊断 C4，03 报告 §2.3）：mirror_load 当天 858 样本 p50 2682ms、
+   *  **p90 15285ms**、≥12s 占 **17.6%** —— 12 秒阈值比真实 p90 还短，1/10 的正常加载会被贴上
+   *  "电脑端可能未连接"，与代码里"宁可晚一点也别误报"的意图正好相反。20 秒在 p90 之上留了余量，
+   *  又远低于用户无法忍耐的 40 秒级。测试按常量断言，不要散落魔法数。 */
+  var MA_LOAD_WATCH_MS = 20 * 1000;
+
+  /* ===== C4：首屏关键资源失败 → 自动重试（2026-10-20 诊断，03 报告 §2.3） =====
+     现场：文档 / assets/*.js / plugins 聚合包只要失败一次就**永远卡住** —— 旧实现只弹
+     "已等 N 秒 + 重试"，页面不会自愈；而用户按「重试」会 abort 掉仍在传输的资源 → nginx 499，
+     反复点就是 499 风暴（当天文档导航 22.3% 失败/中断，499 集中在 3 台设备 = 人肉重试的指纹）。
+     现在分两层重试，都不打扰用户：
+       ① **就地重建**：首屏关键资源（/assets/、/plugins/、manifest）加载失败一次 → 2s/4s 指数退避
+          重建那一个 <script>/<link>（同一 URL 最多 2 次）。页面里已经跑起来的东西完全不动。
+       ② **受控整页重试**：出现官方启动失败文案（Failed to load plugins / did not activate，实测
+          22:01:44 的现场）且界面还没就绪 → 整页刷新一次（同一标签页最多 2 次，sessionStorage 计数，
+          90 秒后自动过期）。这才是"重新拉一次首屏"。
+       ③ 「重试」按钮：先取消在途请求与排队中的自动重试，再刷新（不再制造新的 499）。
+     所有阈值都是常量（测试按常量断言）；任何异常都吞掉，绝不影响页面。 */
+  var MA_RES_RETRY_MAX = 2;          // 同一个 URL 最多就地重试 2 次
+  var MA_RES_RETRY_BASE_MS = 2000;   // 退避基数：2s → 4s（指数）
+  var MA_PAGE_RETRY_MAX = 2;         // 整页自动重试上限（同一标签页）
+  var MA_PAGE_RETRY_KEY = "dsh-ma-firstscreen-retry";
+  var MA_PAGE_RETRY_TTL_MS = 90 * 1000; // 计数过期：90 秒后算"一次新的打开页面"
+  var maRetry = {
+    page: 0,            // 本标签页已整页重试次数（从 sessionStorage 恢复）
+    resFails: [],       // 已观测到的关键资源失败（诊断 + 文案分档用）
+    perUrl: {},         // url -> 已就地重试次数
+    resRetries: 0,      // 已发出的就地重试次数
+    bootFail: false,    // 是否看到官方启动失败文案
+    pageTimer: 0,       // 排队中的整页重试
+    lastRetryClickAt: 0,
+    manual: false,      // 用户点过「重试」→ 不再自动排队（避免刚重载又自己重载）
+    exhausted: false
+  };
+  var maRetryTimers = [];  // 排队中的就地重试（「重试」按钮先清掉它们）
+  var maInflight = [];     // 我们跟踪到的在途 fetch（AbortController）——「重试」前取消，避免 499
+  var maRetryStats = { page: 0, res: 0, lastKind: "", at: 0 }; // 对外只读诊断（mirror-diag 会带上）
+  /* C6 诊断计数：用户报"又点不动了"时，要能区分「遮罩在拦」与「遮罩早被摘了」。 */
+  var maScrimStats = { activations: 0, invariantHits: 0, lastActivationAt: 0 };
+  var maCompatOfficial = { on: false, reasons: [] };
+
+  /** 诊断出口：这些计数不参与任何判定，只为了让用户上报现场时能说清楚。 */
+  function maPublishDiag() {
+    try {
+      if (typeof window === "undefined" || !window) return;
+      window.__dshMaRetryStats = maRetryStats;
+      window.__dshMaDiag = {
+        compatOfficial: maCompatOfficial,
+        scrim: maScrimStats,
+        retry: maRetryStats,
+        load: { slow: maLoadWatch.slow, apiFails: maLoadWatch.apiFails, lastApiStatus: maLoadWatch.lastApiStatus }
+      };
+    } catch (e) { /* 诊断失败绝不影响页面 */ }
+  }
+
+  /** 首屏关键资源：文档主干 JS（/assets/）、插件聚合包（/plugins/）、manifest。
+   *  设备作用域形态 /remote/<dev>/assets/... 先归一（与 e2ee-shim 的 seUpstreamPathOf 同向）。
+   *  文档本身（HTML）失败时注入脚本根本不会执行 —— 那种情况只能靠服务端修复，
+   *  不在本层职责内；这里覆盖的是"页面起来了、资源没起来"。 */
+  function maIsBootCriticalPath(urlStr) {
+    try {
+      var p = String(urlStr || "");
+      /* 用字符串切分而不是正则字面量：本文件是**模板字符串**，注入体里的「\/」会被吃掉一层，
+         正则一旦少一层转义就变成语法错误（整段脚本不执行，页面直接裸奔）。 */
+      var schemeAt = p.indexOf("://");
+      if (schemeAt >= 0) {
+        var pathAt = p.indexOf("/", schemeAt + 3);
+        p = pathAt >= 0 ? p.slice(pathAt) : "/";
+      }
+      p = p.split("?")[0].split("#")[0];
+      /* 设备作用域归一：/remote/<dev>/assets/… → /assets/…（与 e2ee-shim 的 seUpstreamPathOf 同向） */
+      if (p.indexOf("/remote/") === 0) {
+        var rest = p.slice("/remote/".length);
+        var slashAt = rest.indexOf("/");
+        p = slashAt >= 0 ? rest.slice(slashAt) : "/";
+      }
+      if (p.indexOf("/assets/") === 0 || p.indexOf("/plugins/") === 0) return true;
+      if (p === "/manifest.json") return true;
+      return false;
+    } catch (e) { return false; }
+  }
+
+  /** 排队一个重试（统一登记，便于「重试」按钮一键取消）。unref：不拖住测试进程。 */
+  function maSchedule(fn, ms) {
+    try {
+      var id = setTimeout(function () { try { fn(); } catch (e) { /* 重试失败绝不影响页面 */ } }, ms);
+      try { if (id && id.unref) id.unref(); } catch (eU) { /* 忽略 */ }
+      maRetryTimers.push(id);
+      return id;
+    } catch (e) { return 0; }
+  }
+
+  /** 取消所有排队中的自动重试（用户点了「重试」= 他自己要重来）。 */
+  function maCancelPendingRetries() {
+    try {
+      for (var i = 0; i < maRetryTimers.length; i++) { try { clearTimeout(maRetryTimers[i]); } catch (e) { /* 忽略 */ } }
+      maRetryTimers.length = 0;
+      if (maRetry.pageTimer) { try { clearTimeout(maRetry.pageTimer); } catch (e2) { /* 忽略 */ } }
+      maRetry.pageTimer = 0;
+    } catch (e3) { /* 忽略 */ }
+  }
+
+  /** 取消我们跟踪到的在途 fetch：先取消再 reload，别让上一轮请求被浏览器 abort 成 499。 */
+  function maAbortInflight() {
+    var n = 0;
+    try {
+      while (maInflight.length) {
+        var it = maInflight.pop();
+        try { if (it && it.ac && it.ac.abort) { it.ac.abort(); n += 1; } } catch (e) { /* 忽略 */ }
+      }
+    } catch (e2) { /* 忽略 */ }
+    return n;
+  }
+
+  /** 本标签页的存储（sessionStorage 优先，退化 localStorage；都不可用返回 null）。 */
+  function maTabStore() {
+    try {
+      var w = typeof window !== "undefined" ? window : null;
+      if (w && w.sessionStorage) return w.sessionStorage;
+      if (w && w.localStorage) return w.localStorage;
+    } catch (e) { /* 无痕模式等 */ }
+    return null;
+  }
+  /** 读"本标签页已整页重试次数"（90 秒后过期 → 算一次新的打开页面）。 */
+  function maPageRetryRead() {
+    try {
+      var st = maTabStore();
+      if (!st) return 0;
+      var raw = st.getItem(MA_PAGE_RETRY_KEY);
+      if (!raw) return 0;
+      var o = JSON.parse(raw);
+      if (!o || typeof o.n !== "number") return 0;
+      if (Date.now() - Number(o.at || 0) > MA_PAGE_RETRY_TTL_MS) return 0;
+      return Math.max(0, Math.min(MA_PAGE_RETRY_MAX, o.n));
+    } catch (e) { return 0; }
+  }
+  function maPageRetrySave(n) {
+    try {
+      var st = maTabStore();
+      if (st) st.setItem(MA_PAGE_RETRY_KEY, JSON.stringify({ n: n, at: Date.now() }));
+    } catch (e) { /* 存不了就算了（最坏是少一次防重保护） */ }
+  }
+  /* 启动时恢复"本标签页已自动重试过几次"（90 秒内有效）。必须在这里读：同一标签页刷新后
+     计数要接着走，否则"每页最多 2 次"每次刷新都重新开始（又能刷 2 次 = reload 风暴）。 */
+  try { maRetry.page = maPageRetryRead(); } catch (eR) { maRetry.page = 0; }
+
+  /** 就地重建一个失败的首屏资源元素（只认 <script>/<link>，其余跳过）。 */
+  function maRetryBootResource(el, url, tag) {
+    try {
+      var t = String(tag || (el && el.tagName) || "").toLowerCase();
+      if (t !== "script" && t !== "link") return false;
+      var clone = document.createElement(t);
+      var attr = t === "script" ? "src" : "href";
+      clone.setAttribute(attr, url);
+      /* ⚠️ 模块类型必须保留（官方 SPA 是 type=module 的队列加载），否则重建出来的脚本不执行；
+         integrity 刻意**不**沿用：同一个坏响应带 integrity 重建只会再失败一次，白费这 2 秒。 */
+      if (t === "script") {
+        var ty = el && el.getAttribute ? el.getAttribute("type") : null;
+        if (ty) clone.setAttribute("type", ty);
+      } else {
+        clone.setAttribute("rel", "stylesheet");
+      }
+      clone.setAttribute("data-dsh-ma-retry", "1");
+      var host = (el && el.parentNode) || document.head || document.body || document.documentElement;
+      if (!host) return false;
+      host.appendChild(clone);
+      maRetry.resRetries += 1;
+      maBumpRetryStats("res:" + t);
+      return true;
+    } catch (e) { return false; }
+  }
+
+  function maBumpRetryStats(kind) {
+    try {
+      maRetryStats.page = maRetry.page;
+      maRetryStats.res = maRetry.resRetries;
+      maRetryStats.lastKind = String(kind || "");
+      maRetryStats.at = Date.now();
+      maPublishDiag();
+    } catch (e) { /* 忽略 */ }
+  }
+
+  /**
+   * 观测到首屏关键资源失败：登记 + 排队一次就地重建（同一 URL 最多 2 次，2s→4s）。
+   * 为什么"就地重建"而不是直接刷新：官方 SPA 的模块加载器是队列模式（__ModuleLoader__ mode=queue），
+   * 单个聚合包失败时重建那一个 <script> 就够；整页刷新成本高得多，还可能把已渲染的界面清掉。
+   */
+  function maNoteResourceFail(url, tag, el) {
+    try {
+      var key = String(url || "");
+      if (!key) return false;
+      var n = maRetry.perUrl[key] || 0;
+      maRetry.resFails.push({ url: key, tag: String(tag || ""), at: Date.now() });
+      if (maRetry.resFails.length > 12) maRetry.resFails.shift();
+      /* 界面已经就绪 = 这次失败没有卡住首屏。此时重建元素可能让模块/插件**再执行一遍**
+         （官方模块加载器是队列式），风险大于收益 —— 只记录、不重试。 */
+      if (maLoadReadyNow()) return false;
+      if (n >= MA_RES_RETRY_MAX) { maRetry.exhausted = true; return false; }
+      maRetry.perUrl[key] = n + 1;
+      var delay = MA_RES_RETRY_BASE_MS * Math.pow(2, n); // 2s → 4s（指数退避）
+      maSchedule(function () { maRetryBootResource(el, key, tag); }, delay);
+      return true;
+    } catch (e) { return false; }
+  }
+
+  /** 整页受控重试：仅当"官方界面还没就绪 + 没被用户手动接管 + 每标签页额度没用完"。 */
+  function maSchedulePageRetry(why) {
+    try {
+      if (maRetry.manual) return false;          // 用户已点过「重试」→ 我们不替他再刷
+      if (maRetry.pageTimer) return false;       // 已经排了一个
+      if (maCompat && maCompat.ok === false) return false; // 语法级不兼容：刷新也起不来
+      if (maLoadReadyNow()) return false;        // 界面其实好了 → 绝不打扰
+      if (maRetry.page >= MA_PAGE_RETRY_MAX) { maRetry.exhausted = true; return false; }
+      var delay = MA_RES_RETRY_BASE_MS * Math.pow(2, maRetry.page); // 2s → 4s
+      maRetry.page += 1;
+      maPageRetrySave(maRetry.page);
+      maRetry.pageTimer = setTimeout(function () {
+        maRetry.pageTimer = 0;
+        maRetryHardReload(why);
+      }, delay);
+      try { if (maRetry.pageTimer && maRetry.pageTimer.unref) maRetry.pageTimer.unref(); } catch (eU) { /* 忽略 */ }
+      maBumpRetryStats("page:" + String(why || ""));
+      return true;
+    } catch (e) { return false; }
+  }
+
+  /** 取消在途请求 + 清排队重试，然后真正刷新页面。 */
+  function maRetryHardReload(why) {
+    try {
+      maCancelPendingRetries();
+      maAbortInflight();
+      maBumpRetryStats("reload:" + String(why || ""));
+      try { window.location.reload(); return; } catch (e) { /* 落到下面 */ }
+      try { location.reload(); } catch (e2) { /* 忽略 */ }
+    } catch (e3) { /* 忽略 */ }
+  }
+
+  /**
+   * 「重试」按钮：**先取消在途请求与排队中的自动重试，再刷新**（2026-10-20 C4 第 3 条）。
+   * 为什么（03 报告 §2.3）：旧实现直接 location.reload() —— 上一轮还在传输的文档/JS/插件包
+   * 被浏览器 abort → nginx 499；用户连点几次就是 499 风暴，把瞬时故障放大成"永久打不开"。
+   * 现在：① 2 秒冷却（连点不再叠加，人肉风暴的机械成因被掐掉）；
+   *       ② abort 我们跟踪到的在途 fetch + 清掉排队的自动重试；
+   *       ③ 再刷新（留 120ms 让浏览器真的取消，而不是同一拍里直接跳走）。
+   * @returns {boolean} 是否受理了这次点击
+   */
+  function maRetryNow() {
+    try {
+      var now = Date.now();
+      if (maRetry.lastRetryClickAt && now - maRetry.lastRetryClickAt < 2000) return false;
+      maRetry.lastRetryClickAt = now;
+      maRetry.manual = true;
+      maCancelPendingRetries();
+      maAbortInflight();
+      var doReload = function () { try { window.location.reload(); } catch (e) { try { location.reload(); } catch (e2) { /* 忽略 */ } } };
+      try { setTimeout(doReload, 120); } catch (e3) { doReload(); }
+      return true;
+    } catch (e) { return false; }
+  }
+
+  /**
+   * 首次打开页面时的"官方启动失败文案"探测（Failed to load plugins / did not activate）。
+   * 为什么只在 3 个时间点扫、不挂 MutationObserver：body.innerText 是重操作，
+   * 官方流式输出时每帧扫一次会把主线程拖死（mirror-diag 是服务端采集器，代价模型不同）。
+   */
+  function maScanBootFailure() {
+    try {
+      if (maRetry.manual) return false;
+      var b = document.body;
+      var txt = String((b && b.innerText) || "");
+      if (!txt) return false;
+      if (txt.indexOf("Failed to load plugins") < 0 && txt.indexOf("did not activate") < 0) return false;
+      maRetry.bootFail = true;
+      return maSchedulePageRetry("boot_failed");
+    } catch (e) { return false; }
+  }
+
+  /** 底部提示条"原因分档"：offline（电脑端不可达）/ resource（首屏资源失败）/ slow（网络慢）。 */
+  function maLoadReason() {
+    try {
+      var now = Date.now();
+      /* 10 秒内的不可达证据才算：过期的失败不能把文案一直钉在"未连接"上（那正是 03 报告
+         说的"文案归因错误"——截图 09 面板同时显示 95ms 顺畅）。 */
+      if ((maLoadWatch.apiFails || 0) > 0 && now - (maLoadWatch.apiFailAt || 0) < 10000) return "offline";
+      if (maRetry.resFails.length > 0) return "resource";
+    } catch (e) { /* 落到 slow */ }
+    return "slow";
+  }
+
+  /** 响应带 x-dsh-e2ee-error = 桥端在说"这个加密会话我不认"，不是"电脑端离线"。 */
+  function maResHasE2eeError(res) {
+    try {
+      var h = res && res.headers;
+      if (!h || typeof h.get !== "function") return false;
+      return !!h.get("x-dsh-e2ee-error");
+    } catch (e) { return false; }
+  }
+
+  /**
+   * 受保护 API 请求失败（5xx/网络错误）—— 镜像页里**唯一**可靠的"电脑端不可达"信号。
+   * 为什么不用 presence：presence 不在镜像页这条链路上（镜像页只有一个隧道 + 官方客户端），
+   * 而 03 报告里所有"电脑端未连接"的现场同时都伴随着 /api 的 502/504。
+   * 只做计数与文案分档，绝不据此做任何重试/跳转。
+   */
+  function maNotePresenceFail(status) {
+    try {
+      maLoadWatch.apiFails = (maLoadWatch.apiFails || 0) + 1;
+      maLoadWatch.apiFailAt = Date.now();
+      maLoadWatch.lastApiStatus = Number(status) || 0;
+      maPublishDiag();
+      if (maLoadWatch.slow) maLoadRenderBar(); // 提示条已经出来了 → 立刻按新原因换文案
+    } catch (e) { /* 纯诊断，失败忽略 */ }
+  }
+
+  /* ===== C6：官方 UI 锚点探测 → compat-official 降级（2026-10-20 诊断，00 §6.2 C6 / 04 §V-4） =====
+     故障形态：装了「dsh web all」（或官方重新打包）后，我们的自绘抽屉/全屏 scrim 依赖的一组官方锚点
+     可能整组失效：「.pI_x6G_frame」外壳、「.pI_x6G_sidebarCol」/「.hHd-Xa_root」侧栏列、
+     侧栏开合按钮（aria-label / .hHd-Xa_toggle）、折叠态「data-sidebar-collapsed / data-sidebar-open」
+     （以及 0.1.5 起改名的「data-details-collapsed / data-rightbar-collapsed」）。
+     认不出这些锚点时的**最坏结局不是"没有手势"，而是"自绘抽屉盖住官方界面 + scrim 常亮 → 点哪都没反应"**。
+     所以启动时一次性判定：
+       锚点齐全 → 原行为（不变量看门狗照旧，见 enforceScrimInvariant）；
+       锚点缺失/异常 → 「compat-official」模式：**不建自绘抽屉、不建 scrim、不代替用户点官方 toggle**，
+       只保留字号 + E2EE 徽标这些纯悬浮件（FAB/菜单在上一步已经建好），侧栏完全交还官方。
+     ⚠️ 一次性判定（不是每拍重算）：官方重新打包时整页锚点是一齐变的，反复探测只会反复误判。
+     @param {Element} frameEl boot 里用官方特征选择器找到的 frame
+     @returns {{on: boolean, reasons: string[]}} reasons 只作诊断（进 __dshMaDiag / 客服话术） */
+  /** 读元素类名：className 优先，空则退回 class 属性（真实 DOM 两者等价，但假 DOM/合成节点不一定同步）。 */
+  function maClassOf(el) {
+    try {
+      var c = (el && typeof el.className === "string") ? el.className : "";
+      if (c) return c;
+      if (el && typeof el.getAttribute === "function") return String(el.getAttribute("class") || "");
+    } catch (e) { /* 忽略 */ }
+    return "";
+  }
+
+  function maProbeOfficialAnchors(frameEl) {
+    var reasons = [];
+    try {
+      if (!frameEl) return { on: true, reasons: ["no_frame"] };
+      var cls = maClassOf(frameEl);
+      var sidebarAttrs = ["data-sidebar-collapsed", "data-sidebar-open"];
+      var shellAttrs = sidebarAttrs.concat(["data-details-collapsed", "data-rightbar-collapsed", "data-shell-overlay"]);
+      var hasSidebarAttr = false, hasShellAttr = false;
+      for (var i = 0; i < shellAttrs.length; i++) {
+        var has = false;
+        try { has = !!(frameEl.hasAttribute && frameEl.hasAttribute(shellAttrs[i])); } catch (eH) { has = false; }
+        if (has) { hasShellAttr = true; if (i < sidebarAttrs.length) hasSidebarAttr = true; }
+      }
+      var isOfficialFrame = /pI_x6G_frame/.test(cls) || hasShellAttr;
+      if (!isOfficialFrame) reasons.push("frame_anchor_missing");
+      /* 侧栏列：类名含 sidebar（排除第三列 rightbar/details、拖拽把手、overlay 层），
+         或结构上真的有官方侧栏组件根 .hHd-Xa_root。 */
+      var cols = [];
+      try { cols = [].slice.call((frameEl && frameEl.children) || []); } catch (eC) { cols = []; }
+      /* frame 已挂载但**一个子列都没有** = 官方 React 子树还没渲染完（或正在重渲染）。
+         这不是"锚点变了"，不能据此永久降级 —— 交给 pump 下一拍再看（return pending）。 */
+      if (cols.length === 0) return { on: false, pending: true, reasons: [] };
+      var sidebarCol = null;
+      for (var k = 0; k < cols.length; k++) {
+        var c = cols[k];
+        var ccls = maClassOf(c);
+        if (/rightbar|right-bar|details|handle|resizer|overlaylayer/i.test(ccls)) continue;
+        if (/sidebar/i.test(ccls)) { sidebarCol = c; break; }
+        try { if (c && c.querySelector && c.querySelector(".hHd-Xa_root")) { sidebarCol = c; break; } } catch (eQ) { /* 忽略 */ }
+      }
+      if (!sidebarCol) reasons.push("sidebar_anchor_missing");
+      /* 能不能**驱动**官方侧栏：官方开合按钮，或官方折叠态属性。
+         两者都没有 = 我们的汉堡按钮点了也不会动官方状态 → 自绘抽屉只会变成一个死按钮 + 可能的遮罩死局。 */
+      var drive = null;
+      try {
+        drive = document.querySelector('[aria-label="Open sidebar"], [aria-label="Close sidebar"], [aria-label="Collapse sidebar"], [aria-label="Expand sidebar"], [aria-label="打开侧边栏"], [aria-label="关闭侧边栏"], [aria-label="收起侧边栏"], [aria-label="展开侧边栏"], .hHd-Xa_toggle');
+      } catch (eD) { drive = null; }
+      if (!drive && !hasSidebarAttr) reasons.push("sidebar_toggle_missing");
+      return { on: reasons.length > 0, reasons: reasons };
+    } catch (e) { return { on: true, reasons: ["probe_threw"] }; }
+  }
+
+  /** 进入 compat-official 模式：只记诊断 + 一条**可见**的 console 说明；不碰官方 DOM 结构。
+   *  为什么不加页面提示条：护栏禁止适配层引入覆盖层，而"少一组手势"用户其实感觉得到
+   *  （官方自己的侧栏按钮就在），不需要再弹一条打扰。 */
+  function maEnterCompatOfficial(reasons) {
+    try {
+      maCompatOfficial.on = true;
+      maCompatOfficial.reasons = [].slice.call(reasons || []);
+      var html = document.documentElement;
+      if (html && html.classList) html.classList.add("dsh-ma-compat-official");
+      try {
+        if (window && window.console && window.console.warn) {
+          window.console.warn("[dsh-mobile-adapter] 官方界面锚点缺失/异常(" + maCompatOfficial.reasons.join(",")
+            + ") → 进入 compat-official 模式：不自绘抽屉/scrim，不代替用户点官方入口，侧栏完全交还官方。");
+        }
+      } catch (eW) { /* 诊断出不来也不能影响主功能 */ }
+      maPublishDiag();
+    } catch (e) { /* 降级本身失败 = 维持现状（至少不比旧行为更糟） */ }
+  }
+
+  /* C6：能不能**代替用户**点官方侧栏 toggle。点失败过一次就永久停手 —— 最坏退化成
+     "没有手势"（用户还能用官方自己的入口），而不是把官方状态点乱后两态互相打架（点哪都没反应）。
+     「window.__dshMaOfficialClicks = false」是给真机排查用的开关（不占 UI）。 */
+  var maOfficialClickOK = true;
+  function maClickOfficialToggle(el) {
+    if (!el || !maOfficialClickOK) return false;
+    try { if (typeof window !== "undefined" && window && window.__dshMaOfficialClicks === false) return false; } catch (e0) { /* 忽略 */ }
+    try { el.click(); return true; } catch (e) { maOfficialClickOK = false; return false; }
+  }
+
+  /* ---- C4 接线：资源失败捕获（捕获阶段才能拿到 <script>/<link> 的 error target）---- */
+  try {
+    window.addEventListener("error", function (ev) {
+      try {
+        var t = ev && ev.target;
+        if (!t || t === window) return;               // 脚本运行期错误不是资源失败
+        var url = String(t.src || t.href || "");
+        if (!maIsBootCriticalPath(url)) return;
+        maNoteResourceFail(url, String(t.tagName || ""), t);
+      } catch (e2) { /* 采集失败绝不影响页面 */ }
+    }, true);
+  } catch (e0) { /* 老浏览器:忽略 */ }
+  /* 启动失败文案：6s/14s/18s 三个时间点（刻意避开 12s/20s 这两个既有定时器，
+     免得测试与真机上"哪一路先到"变得不可预测）。 */
+  try {
+    maSchedule(maScanBootFailure, 6000);
+    maSchedule(maScanBootFailure, 14000);
+    maSchedule(maScanBootFailure, 18000);
+  } catch (e1) { /* 忽略 */ }
+  maPublishDiag();
   /** 官方界面是否已经可用（只看最强信号；只用于决定"要不要多显示一行字"）。 */
   function maLoadReadyNow() {
     try {
@@ -1047,6 +1478,11 @@ const SCRIPT = `(() => {
   function maReportMirrorLoad(outcome) {
     if (maLoadWatch.reported) return;
     maLoadWatch.reported = true;
+    /* 首屏成功就绪 = 这次打开是好的 → 把"整页自动重试"额度清零，别让一次偶发失败
+       把接下来 90 秒的额度一起吃掉（额度只该限制**连续失败**，不该跨页面累计）。 */
+    if (outcome !== "slow") {
+      try { maRetry.page = 0; maPageRetrySave(0); } catch (eReset) { /* 忽略 */ }
+    }
     try {
       var ms = Math.round(maLoadElapsedMs());
       if (!isFinite(ms) || ms < 0) ms = 0;
@@ -1070,7 +1506,10 @@ const SCRIPT = `(() => {
   function maLoadCopyLine() {
     let ua = "";
     try { ua = String((navigator && navigator.userAgent) || "").slice(0, 120); } catch (e) { /* 忽略 */ }
-    return "dsh-remote 手机端加载疑似卡住：等待 " + maLoadWaitedSec() + " 秒后仍未出现对话界面。UA=" + ua;
+    return "dsh-remote 手机端加载疑似卡住：等待 " + maLoadWaitedSec() + " 秒后仍未出现对话界面。"
+      + "原因=" + maLoadReason() + "，首屏资源失败=" + maRetry.resFails.length + "，自动重试="
+      + (maRetry.page + maRetry.resRetries) + " 次；scrim 拦截=" + maScrimStats.activations
+      + " 次/不变量摘除=" + maScrimStats.invariantHits + " 次。UA=" + ua;
   }
 
   /* ===== 底部可操作提示条（2026-10-17，见上方看门狗注释）=====
@@ -1079,9 +1518,22 @@ const SCRIPT = `(() => {
        · **绝不阻塞**：只占底部一条（CSS 限高），浮层外照常可点；按钮动作全部就地完成；
        · **任何异常都吞掉**：提示层坏掉也绝不影响页面（每个入口都有 try/catch）；
        · **只提示一次**：用户点 ✕ 后 dismissed=true，本页不再弹（不骚扰）。 */
-  /** 提示条主文案：电脑端未连接/加载慢 + 已等待秒数（秒数由 barTimer 每秒刷新）。 */
+  /** 提示条主文案：**按原因分档** + 已等待秒数（秒数由 barTimer 每秒刷新）。
+   *  为什么分档（2026-10-20 诊断 C4，03 报告 §2.3「文案归因错误」）：旧实现把
+   *  HTML 502 / JS 500 / 插件包失败 / E2EE 会话未建立 / nginx 连接打满**统统**说成
+   *  "电脑端可能未连接"；截图 09 的反证最强 —— 面板同时显示「网络延迟 95ms·顺畅」。
+   *  现在：· 电脑端不可达（受保护 API 请求 5xx/网络错误）→「电脑端可能未连接」；
+   *        · 首屏关键资源失败 →「页面资源加载失败，正在重试…」（重试用尽时如实说明）；
+   *        · 其余 →「网络较慢」+ 已等待秒数（不再替用户猜原因）。 */
   function maLoadBarText() {
-    return "电脑端可能未连接 / 页面加载较慢（已等待 " + maLoadWaitedSec() + " 秒）";
+    var sec = maLoadWaitedSec();
+    var reason = maLoadReason();
+    if (reason === "offline") return "电脑端可能未连接（已等待 " + sec + " 秒）";
+    if (reason === "resource") {
+      if (maRetry.exhausted) return "页面资源加载失败，自动重试已用尽（已等待 " + sec + " 秒）";
+      return "页面资源加载失败，正在重试…（已等待 " + sec + " 秒）";
+    }
+    return "网络较慢（已等待 " + sec + " 秒）";
   }
   /** 收起提示条并停掉秒数刷新（不改变 dismissed：用于"认出界面后自动收起"这类临时收起）。 */
   function maLoadHideBar() {
@@ -1161,7 +1613,7 @@ const SCRIPT = `(() => {
             t = t.parentNode || null;
           }
           if (role === "loadbar-retry") {
-            try { window.location.reload(); } catch (e2) { /* 忽略 */ }
+            maRetryNow();
           } else if (role === "loadbar-back") {
             maLoadGoto("/app/"); // 绝对路径：镜像页当前路径可能是 /remote/<deviceId>/…
           } else if (role === "loadbar-copy") {
@@ -1777,7 +2229,36 @@ const SCRIPT = `(() => {
           let url = "";
           try { url = typeof input === "string" ? input : (input && input.url) || ""; } catch (eU) { url = ""; }
           const t0 = maNowMs();
-          const p = orig.apply(this, arguments);
+          /* C4 第 3 条（2026-10-20）：给每个在途请求挂一个**我们自己的** AbortController，
+             用户点「重试」时先 abort 再刷新 —— 旧实现直接 reload，浏览器在那一拍把在途请求
+             全 abort 成 nginx 499（当天文档导航 22.3% 失败/中断的主要成因）。 */
+          let ac = null;
+          let args = [input, init];
+          try {
+            if (typeof AbortController === "function") {
+              ac = new AbortController();
+              let merged = ac.signal;
+              try {
+                const origSignal = init && init.signal;
+                if (origSignal && typeof AbortSignal !== "undefined" && AbortSignal && typeof AbortSignal.any === "function") {
+                  merged = AbortSignal.any([origSignal, ac.signal]); // 与调用方自己的取消语义合并
+                } else if (origSignal) {
+                  merged = origSignal;  // 老浏览器没有 AbortSignal.any：不自作主张，保留调用方语义
+                }
+              } catch (eM) { merged = ac.signal; }
+              args = [input, Object.assign({}, init || {}, { signal: merged })];
+              maInflight.push({ ac: ac, url: url, at: t0 });
+              if (maInflight.length > 200) maInflight.shift(); // 有界：绝不因为跟踪而泄漏
+            }
+          } catch (eAC) { ac = null; }
+          const p = orig.apply(this, args);
+          const drop = () => {
+            try {
+              for (let i = maInflight.length - 1; i >= 0; i -= 1) {
+                if (maInflight[i] && maInflight[i].ac === ac) { maInflight.splice(i, 1); break; }
+              }
+            } catch (eD) { /* 忽略 */ }
+          };
           try {
             const abs = url.slice(0, 8).toLowerCase();
             const absolute = abs.indexOf("http://") === 0 || abs.indexOf("https://") === 0;
@@ -1785,9 +2266,31 @@ const SCRIPT = `(() => {
             const apiish = url.indexOf("/api/") >= 0 || url.indexOf("/remote/") >= 0
               || url.indexOf("_devices") >= 0 || url.indexOf("_quota") >= 0;
             if (sameOrigin && apiish && p && typeof p.then === "function") {
-              p.then(() => { maNoteRtt(maNowMs() - t0, url); }, () => { /* 网络错误不算延迟 */ });
+              p.then((res) => {
+                drop();
+                try {
+                  const st = res && typeof res.status === "number" ? res.status : 0;
+                  /* 5xx 且**没有** x-dsh-e2ee-error = 电脑端/隧道不可达；
+                     E2EE 死会话的 502 另带那个头，它属于"会话失效"（C3 修的就是它），
+                     和"电脑端离线"是两回事 —— 混在一起就又变成文案归因错误。 */
+                  if (st >= 500 && !maResHasE2eeError(res)) maNotePresenceFail(st);
+                  else maNoteRtt(maNowMs() - t0, url);
+                } catch (eS) { maNoteRtt(maNowMs() - t0, url); }
+              }, (err) => {
+                drop();
+                try {
+                  /* 自己/调用方主动取消的请求不是"不可达" —— 官方客户端在切会话时本来就会 abort，
+                     把它算成离线会让文案长期钉在"电脑端可能未连接"（正是要修的那个误导）。 */
+                  const selfAborted = !!(ac && ac.signal && ac.signal.aborted);
+                  const callerAborted = !!(init && init.signal && init.signal.aborted);
+                  const abortErr = !!(err && (err.name === "AbortError" || err.code === 20));
+                  if (!selfAborted && !callerAborted && !abortErr) maNotePresenceFail(0);
+                } catch (eF) { /* 忽略 */ }
+              });
+            } else if (p && typeof p.then === "function") {
+              p.then(drop, drop);
             }
-          } catch (eW) { /* 忽略 */ }
+          } catch (eW) { drop(); }
           return p;
         };
         wrapped.__dshMaNetSampler = true;   // 只作记号便于人造排查（**不作**幂等判据）
@@ -1878,7 +2381,14 @@ const SCRIPT = `(() => {
           '<span class="ico">⚠</span>' +
           '<span class="txt" data-role="load-warn-txt"></span>' +
         '</div>' +
-        '<div class="dsh-ma-menu-note">返回后可重新选择设备；端到端加密需在设备列表页重新解锁（会话密钥只存在本机内存里，刷新即失效）。</div>';
+        /* C9（2026-10-20 诊断，03 报告 §2.4 D3「文案与实现不一致」）：旧文案说「密钥只在内存、刷新就没了」，
+           已经**不成立** —— 实现会把派生 MK 写 localStorage、交接单同时写 sessionStorage +
+           localStorage（native.html:5143-5160 / :5204，镜像页 _boot 从 localStorage 恢复）。
+           照着旧文案，客服和用户会做出错误动作（以为刷新必丢密钥）。现在如实说清三件事：
+           ① 已记住本机，刷新自动恢复加密；② 提示「加密会话已失效」才需要回列表重新解锁；
+           ③ 明文模式功能可用、但不加密（避免用户以为"没加密=没得用"）。 */
+        '<div class="dsh-ma-menu-note">返回后可重新选择设备。端到端加密已记住本机：刷新页面会自动恢复加密；'
+        + '若提示「加密会话已失效」，需返回设备列表重新解锁；明文模式下功能可用，但数据不经端到端加密。</div>';
       document.body.appendChild(menu);
       maWireLoadWarn(menu); // 加载疑似失败时，在这一行里说明白（点一下可复制）
 
@@ -2283,6 +2793,19 @@ const SCRIPT = `(() => {
       if (done || !NARROW()) return;
       const frame = document.querySelector(".pI_x6G_frame, [data-sidebar-collapsed], [data-details-collapsed], [data-rightbar-collapsed]");
       if (!frame || !frame.querySelector) return;
+      /* ==== C6（2026-10-20 诊断）：先探测官方锚点，认不出就整段降级 ====
+         为什么必须在**打标记/建节点之前**判：compat-official 模式下我们一个 class 都不给官方加
+         （否则 CSS 会把三列轨道改成 0/1fr/0，等于用错的锚点把官方布局也一起改了）。
+         认不出来时的正确退路是"没有手势"，不是"自绘抽屉 + scrim 盖住官方界面"。 */
+      const anchors = maProbeOfficialAnchors(frame);
+      /* 官方 frame 已挂载、但子列还没渲染出来 → 只是"还没长好"，不是锚点缺失：
+         不降级、不置 done，交给 pump 下一拍再看（一次性降级只应该发生在"结构稳定但认不出"时）。 */
+      if (anchors.pending) return;
+      if (anchors.on) {
+        maEnterCompatOfficial(anchors.reasons);
+        done = true;   // 不再重试：官方锚点是一齐变的，反复探测只会反复误判（还会让 pump 每拍全量扫 DOM）
+        return;
+      }
       done = true;
       frame.classList.add("dsh-ma-frame");
 
@@ -2411,7 +2934,9 @@ const SCRIPT = `(() => {
         e.stopPropagation();
         userWantsOpen = false;                    // 用户明确要关(遮罩的作用就是关抽屉)
         const t = toggleOf();
-        if (t) { t.click(); }
+        /* C6：代替用户点官方 toggle 一律走 maClickOfficialToggle（失败即停手/可被开关关闭），
+           绝不让"点官方入口"变成把官方状态点乱的来源。 */
+        maClickOfficialToggle(t);
         /* 兜底 + 保险:无论官方 toggle 在不在,都确保"点空白处"能关掉/不再拦截 */
         document.documentElement.classList.remove("dsh-ma-sidebar-open", "dsh-ma-scrim-on");
       });
@@ -2436,7 +2961,7 @@ const SCRIPT = `(() => {
            这一点会把官方**推回展开**，而我们的 class 被摘掉 → 抽屉隐形；再点一次又反过来，
            两态互相打架、白柱反复重现。现在只在**官方当前态 ≠ 期望态**时才点官方 toggle：
            状态一致时点它只会把官方推到相反方向。 */
-        if (t && expanded() !== desired) { t.click(); }
+        if (t && expanded() !== desired) { maClickOfficialToggle(t); }
         sync();                                   // 立刻按意图生效(不依赖官方属性回调)
       });
 
@@ -2555,9 +3080,17 @@ const SCRIPT = `(() => {
         if (html.classList.contains("dsh-ma-sidebar-open") && sidebarInView()) return true;
         return false;
       };
+      /* C6 诊断：scrim 的"实际下闸"与"不变量摘除"都计数（「window.__dshMaDiag」/ 复制诊断时带出）。
+         为什么需要：用户报「又点不动了」时，只靠肉眼分不清"遮罩在拦"和"遮罩早被摘了"，
+         这两类问题的修法完全不同 —— 计数就是现场的第一手证据。 */
+      let maScrimWasOn = false;
       const applyScrim = () => {
-        try { document.documentElement.classList.toggle("dsh-ma-scrim-on", scrimShouldBeOn()); }
-        catch (e2) { /* 忽略 */ }
+        try {
+          const want = scrimShouldBeOn();
+          document.documentElement.classList.toggle("dsh-ma-scrim-on", want);
+          if (want && !maScrimWasOn) { maScrimStats.activations += 1; maScrimStats.lastActivationAt = Date.now(); maPublishDiag(); }
+          maScrimWasOn = want;
+        } catch (e2) { /* 忽略 */ }
       };
       /* 🔒 不变量(硬要求):遮罩只要在拦截点击,视口内就必须**存在**至少一层可交互抽屉;
          否则立刻摘掉遮罩。它不看任何判定链(属性/几何/class)的自洽性,只认"实际在拦 + 实际没有抽屉"
@@ -2569,6 +3102,9 @@ const SCRIPT = `(() => {
           if (!scrimBlocks()) return false;
           if (anyDrawerInView()) return false;
           document.documentElement.classList.remove("dsh-ma-scrim-on");
+          maScrimWasOn = false;
+          maScrimStats.invariantHits += 1;   // C6 诊断：不变量真的救过一次场
+          maPublishDiag();
           return true;
         } catch (e2) { return false; }
       };
@@ -2707,7 +3243,7 @@ const SCRIPT = `(() => {
             if (!t.closest(AUTO_CLOSE_SEL)) return;          // 只认"导航/切换"类,就地操作不收起
             userWantsOpen = false;
             const togg = toggleOf();
-            if (togg) setTimeout(() => { try { togg.click(); } catch (e5) { /* ignore */ } }, 0);
+            if (togg) setTimeout(() => { maClickOfficialToggle(togg); }, 0);
             setTimeout(sync, 0);
           } catch (e6) { /* 忽略 */ }
         });

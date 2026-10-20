@@ -438,6 +438,8 @@
         明文过境(见 :39 的策略表),那是安全红线。 */
   var seStaleSessionHook = null;
   var seLastStaleCode = "";
+  /** 「每页最多一次受控 reload」的闸门键(sessionStorage:同一标签页刷新后仍在 → 最多一次)。 */
+  var SE_RELOAD_GUARD_KEY = "dsh-e2ee-dead-reload";
   /** 清掉本机保存的 E2EE 交接单(sessionStorage 一次性 + localStorage 持久)。node 测试无 storage → 静默跳过。 */
   function seForgetHandoverStores() {
     try { if (typeof sessionStorage !== "undefined" && sessionStorage && sessionStorage.removeItem) sessionStorage.removeItem(DSH_E2EE_HANDOVER_KEY); } catch (e) { /* ignore */ }
@@ -447,34 +449,91 @@
   function seE2eeErrorOf(res) {
     try { return String((res && res.headers && res.headers.get && res.headers.get("x-dsh-e2ee-error")) || ""); } catch (e) { return ""; }
   }
-  /** 收到带 x-dsh-e2ee-error 的响应 → 清失效会话 + 上报(同一个码只报一次,避免刷屏)。 */
-  function seNoteE2eeError(res) {
+  /**
+   * 收到带 x-dsh-e2ee-error 的响应 → 清失效会话 + 上报(同一个码只报一次,避免刷屏)。
+   *
+   * 🔴 C3(2026-10-20 诊断,03 报告 §2.4 D1 的真缺陷):旧实现**只清 storage**,
+   *    本页内存里的 `_ctx.sess` 一直是那张死票 —— 全文只有 `_install()` 一处给它赋值,
+   *    之后再没有任何地方置空。于是这个页面的**后续每一个** HTTP/WS 仍然继续带死 sessId:
+   *      · WS 被桥端 `1008 e2ee_session_locked` 拒 → 官方客户端安静重连 → 再拒…… 无限循环;
+   *      · 该页每个受保护请求全 502,但页面"看起来在、其实全死"。
+   *    实测规模:dev-08b73ba9de67 单设备一天 nginx 009 8997 次、同时 4064 个 HTTP 200。
+   *    所以清 storage 只解决"**下次**进页面",清 `ctx.sess` 才解决"**这一页**别再送死票"。
+   *    @param {Response} res
+   *    @param {{sess: *}|null} [ctx] 本页上下文(有就给,给了就同时置空内存会话)
+   *    @returns {string} 桥端错误码(没有则 "")
+   */
+  function seNoteE2eeError(res, ctx) {
     var code = seE2eeErrorOf(res);
     if (!code) return "";
+    var dropped = false;
+    try { if (ctx && ctx.sess) { ctx.sess = null; dropped = true; } } catch (e) { /* ignore */ }
     seForgetHandoverStores();
     if (code !== seLastStaleCode) {
       seLastStaleCode = code;
-      try { if (typeof seStaleSessionHook === "function") seStaleSessionHook(code); } catch (e) { /* ignore */ }
+      try { if (typeof seStaleSessionHook === "function") seStaleSessionHook(code, dropped); } catch (e) { /* ignore */ }
       seNotifyFail("加密会话已失效(" + code + "):本机保存的会话已不可用,需要重新解锁。");
     }
     return code;
   }
 
+  /**
+   * 「每页最多一次」受控 reload(C3 第 3 条;防止修好"死循环"却换来"reload 风暴")。
+   *
+   * 只在这种场合用:桥端**明确**回了 unknown_session(它不认识这张交接单,这张票 100% 是死的),
+   * 而本页刚才真的挂着一张死会话(dropped=true)。此时本页所有受保护请求都会 502,
+   * 官方客户端也可能已经卡在自己的错误态里 —— 一次刷新能让它从干净的明文态重新起步
+   * (没有交接单 → 走"未解锁/明文"分支,功能可用,也不再送死 sessId)。
+   * 闸门放 sessionStorage:同一标签页刷新后仍在 → **最多 reload 一次**,不会变成新的 499 来源。
+   * node 测试没有 sessionStorage/location → 直接返回 false(纯逻辑不依赖 DOM)。
+   * @returns {boolean} 是否真的发起了 reload
+   */
+  function seReloadOnceForDeadSession() {
+    try {
+      if (typeof sessionStorage === "undefined" || !sessionStorage) return false;
+      if (sessionStorage.getItem(SE_RELOAD_GUARD_KEY)) return false;
+      sessionStorage.setItem(SE_RELOAD_GUARD_KEY, String(Date.now()));
+    } catch (e) { return false; }
+    try {
+      if (typeof location === "undefined" || !location || typeof location.reload !== "function") return false;
+      location.reload();
+      return true;
+    } catch (e2) { return false; }
+  }
+
   /* ---- 数据 WS 握手失败上报(2026-09-26:线上 mux 握手 404/009 → 用户只看到"什么都没发生") ----
      mux WS 是镜像页与电脑端之间**唯一**的实时数据通道;它连不上时页面不报错,只是所有数据都停住。
-     这里只做**可观测**:把"没连上"作为明确原因交给徽标(区分"会话未建立/设备离线/网络中断"),
-     绝不在这里做重连 —— 官方客户端自己会重连,我们再加一层只会变成"静默无限重连"。 */
+     这里只做**可观测 + 死会话自愈**:把"没连上"作为明确原因交给徽标(区分"会话未建立/设备离线/网络中断"),
+     连续握手失败 ≥3 次且本页还挂着会话时,判定桥端已不认这张交接单(C3,同 seNoteE2eeError 的处置:
+     清交接单 + 清内存 ctx.sess + 徽标「加密会话已失效，需要重新解锁」)。
+     仍然**绝不在这里重连** —— 官方客户端自己会重连,我们再加一层只会变成"静默无限重连"。 */
   var seWsFailHook = null;
-  var seWsFailCount = 0;
+  var seWsFailCount = 0;      // 累计失败次数(徽标展示"第 N 次")
+  var seWsFailStreak = 0;     // **连续**失败次数(握手成功一次即清零) —— 死会话判定只看它
   var seWsFailReported = false;
-  function seNoteWsHandshakeFail(label, detail) {
+  /** 连续握手失败到这个次数 → 判定桥端已不认本页的加密会话(2026-10-20 C3)。 */
+  var SE_WS_FAIL_INVALIDATE = 3;
+  /**
+   * @param {string} label  WS 标签(日志/徽标用,不含密钥)
+   * @param {string} detail "error" 或关闭码/原因
+   * @param {{sess: *}|null} [ctx] 本页上下文;给了才可能清会话(没有会话就只上报)
+   */
+  function seNoteWsHandshakeFail(label, detail, ctx) {
     seWsFailCount++;
-    if (seWsFailReported) return;
+    seWsFailStreak++;
+    var dropped = false;
+    if (ctx && ctx.sess && seWsFailStreak >= SE_WS_FAIL_INVALIDATE) {
+      /* 桥端连"握手"都不认(1008 e2ee_session_locked / 升级被拒),而本页还挂着会话:
+         这张交接单在桥端已经不存在(bridge 重启 / 24h TTL / CAP=32 挤出),留着只会无限重连。 */
+      try { ctx.sess = null; dropped = true; } catch (e) { /* ignore */ }
+      seForgetHandoverStores();
+    }
+    if (seWsFailReported && !dropped) return;
     seWsFailReported = true;
-    try { if (typeof seWsFailHook === "function") seWsFailHook(String(label || ""), String(detail || ""), seWsFailCount); } catch (e) { /* ignore */ }
+    try { if (typeof seWsFailHook === "function") seWsFailHook(String(label || ""), String(detail || ""), seWsFailCount, dropped); } catch (e) { /* ignore */ }
   }
-  /** 握手成功后复位(下一次再断时还能再报一次;不清 count,用于展示"重试了几次")。 */
-  function seNoteWsOpened() { seWsFailReported = false; }
+  /** 握手成功后复位(下一次再断时还能再报一次;连续计数清零,累计 count 保留用于展示"重试了几次")。 */
+  function seNoteWsOpened() { seWsFailReported = false; seWsFailStreak = 0; }
 
   /* ---- HTTP 信封传输包装(与 native e2eeFetchEnveloped 同构;输入/输出为 fetch 语义) ---- */
   var SE_OUTER_STRIP = {
@@ -558,7 +617,7 @@
     } catch (e) { throw e; }
     /* router/桥端明文错误页 → 原样透传(零行为)，但**先看一眼**是不是桥端在说"会话我不认识"
        (x-dsh-e2ee-error)——是的话清掉本机失效交接单并给出明确原因(见 seNoteE2eeError)。 */
-    if (!seIsEnvelopeResponse(res)) { seNoteE2eeError(res); return res; }
+    if (!seIsEnvelopeResponse(res)) { seNoteE2eeError(res, ctx); return res; }
     var envResp = null;
     try { envResp = await res.json(); } catch (e) {
       seNotifyFail("响应信封非法");
@@ -606,12 +665,12 @@
       /* 握手上就失败(error 早于任何 open)→ 让用户知道"加密数据通道没建立"。
          这是 2026-09-26 故障里最缺的一条信号:mux 被 404 掐掉时页面**一声不响**,
          用户只看到所有数据都停住。 */
-      if (!self._opened) seNoteWsHandshakeFail(self._meta && self._meta.wsLabel, "error");
+      if (!self._opened) seNoteWsHandshakeFail(self._meta && self._meta.wsLabel, "error", self._meta && self._meta.ctx);
       if (typeof self._onerror === "function") self._onerror(ev || { type: "error", target: self });
     };
     inner.onclose = function (ev) {
       self._state = 3;
-      if (!self._opened) seNoteWsHandshakeFail(self._meta && self._meta.wsLabel, (ev && (ev.code || ev.reason)) || "close");
+      if (!self._opened) seNoteWsHandshakeFail(self._meta && self._meta.wsLabel, (ev && (ev.code || ev.reason)) || "close", self._meta && self._meta.ctx);
       if (typeof self._onclose === "function") self._onclose(ev || { type: "close", target: self });
     };
     inner.onmessage = function (ev) { self._enqueueInbound(ev); };
@@ -740,7 +799,7 @@
       if (!should) return new NativeWS(passUrl, protocols);
       var target = seBuildWsTarget(scoped, ctx.sess.sessId, seRandomHex(8), base);
       if (!target) return new NativeWS(passUrl, protocols);
-      return new SeE2eeWs(NativeWS, target.href, protocols, { sess: ctx.sess, wsLabel: target.wsLabel });
+      return new SeE2eeWs(NativeWS, target.href, protocols, { sess: ctx.sess, wsLabel: target.wsLabel, ctx: ctx });
     }
     SeWs.OPEN = 1; SeWs.CONNECTING = 0; SeWs.CLOSING = 2; SeWs.CLOSED = 3;
     return SeWs;
@@ -865,14 +924,35 @@
     bad_envelope: "响应信封非法。",
     bad_plain: "响应明文非法。"
   };
-  function _reportStaleSession(code) {
+  /**
+   * @param {string} code 桥端错误码
+   * @param {boolean} [dropped] 刚才是否真的清掉了一张**本页正挂着的**死会话
+   */
+  function _reportStaleSession(code, dropped) {
     var hint = _STALE_HINT[String(code || "")] || ("电脑端返回:" + String(code || "") + "。");
     _badge("warn", "加密会话已失效，需要重新解锁", hint + " 已清除本机保存的会话；返回设备列表重新点选设备解锁即可恢复加密。");
+    /* C3 第 3 条：只有"刚才真的扔掉了一张本页死会话"时才做**一次**受控刷新。
+       为什么只在这个分支刷：HTTP 的 x-dsh-e2ee-error 是桥端**主动回答**"我不认识这个会话"
+       （这张票是确定的死票），而 WS 握手失败还可能只是电脑端暂时离线 —— 那种情况清了会话就够了，
+       刷新只会打断用户。刷新后页面没有交接单 → 走未解锁明文态，明文可用，也不再送死 sessId
+       （每标签页最多一次）。 */
+    if (dropped) seReloadOnceForDeadSession();
   }
   /* 加密数据 WS（mux）**握手就没成功**：官方客户端只会安静地重连，页面不报错、数据全停。
      这里把原因分档说清楚（会话/设备/网络），但**不做任何重连**（重连是官方的事，
-     我们再叠一层就变成"静默无限重连"——正是这次要修掉的形态）。 */
-  function _reportWsFail(label, detail, count) {
+     我们再叠一层就变成"静默无限重连"——正是这次要修掉的形态）。
+     @param {boolean} [dropped] 连续失败 ≥3 次且刚才清掉了本页死会话（C3 自愈分支） */
+  function _reportWsFail(label, detail, count, dropped) {
+    if (dropped) {
+      /* 徽标文案按 C3 验收口径固定为「加密会话已失效，需要重新解锁」——
+         用户据此只有一个动作：回设备列表重新解锁。 */
+      _badge("warn", "加密会话已失效，需要重新解锁",
+        "与电脑端的加密数据通道连续 " + (Number(count) || SE_WS_FAIL_INVALIDATE) + " 次握手失败，"
+        + "电脑端已不认这个加密会话（通常是电脑端重启过，或会话太多被挤掉）。"
+        + "已清除本机保存的会话，本页数据改为明文继续（功能可用，但不再加密）；"
+        + "返回设备列表重新点选设备解锁即可恢复加密。");
+      return;
+    }
     var n = Number(count) || 1;
     var why = String(detail || "") === "error"
       ? "电脑端可能未连接(设备离线)、网络中断，或加密会话已失效。"

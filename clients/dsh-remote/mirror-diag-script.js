@@ -124,6 +124,23 @@
     } catch (e) { return ""; }
   }
 
+  /** 适配层（mobile-adapter）暴露的只读诊断：首屏自动重试次数 / compat-official 降级 / scrim 计数。
+   *  为什么从这里带出去（2026-10-20 C4/C6）：服务端只有 nginx/mirror_diag 两层时，
+   *  分不清"失败后是自愈了还是永久坏了" —— 这三个计数就是"自愈有没有发生"的第一手证据。
+   *  没有适配层（宽屏/未注入/旧版本）时返回 undefined：字段整体缺省，不改变既有 payload 形状。 */
+  function uiDiag() {
+    try {
+      var r = W.__dshMaRetryStats;
+      var d = W.__dshMaDiag;
+      if (!r && !d) return undefined;
+      var out = {};
+      if (r) out.retry = { page: Number(r.page) || 0, res: Number(r.res) || 0, kind: clip(r.kind || r.lastKind || "", 40) };
+      if (d && d.compatOfficial) out.compat = d.compatOfficial.on ? 1 : 0;
+      if (d && d.scrim) out.scrim = { on: Number(d.scrim.activations) || 0, fix: Number(d.scrim.invariantHits) || 0 };
+      return out;
+    } catch (e) { return undefined; }
+  }
+
   function flush() {
     timer = null;
     if (sent || (items.length === 0 && bootFailed.length === 0)) return;
@@ -138,6 +155,8 @@
       boot_failed: bootFailed.slice(0, 10),
       at: now()
     };
+    var ui = uiDiag();
+    if (ui) payload.ui = ui;   // 可选字段：老服务端无视即可
     try {
       fetch(ENDPOINT, {
         method: "POST",

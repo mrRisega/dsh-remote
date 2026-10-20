@@ -117,7 +117,19 @@ const DEFAULT_CONFIG = path.join(
 const CONFIG_PATH = process.env.DSH_BRIDGE_CONFIG || DEFAULT_CONFIG;
 // 隧道模式(唯一):bridge 主动 WS 连 relay-router 的 /_bridge
 const TUNNEL_URL = (process.env.DSH_BRIDGE_TUNNEL_URL || "").replace(/\/+$/, "");
-const TUNNEL_HEARTBEAT_MS = Math.max(100, Number(process.env.DSH_BRIDGE_HEARTBEAT_MS) || 15_000);
+/**
+ * 隧道心跳间隔（C5）。
+ *
+ * 为什么从 15s 调到 20s：生产上"30 秒级断连、75% 的隧道会话活不过 60s"（诊断报告 R2），
+ * 15s 的心跳 + "丢一次 pong 就断" 让弱网（丢包 5%）下的正常抖动被当成故障，
+ * 每次误断都会重连重建隧道 + 打断在途请求。20s 与中继/nginx 的 3600s read timeout 无关，
+ * 只影响"多久发现半开连接"：最坏 3 个心跳周期（≈60s）发现真死的连接，仍远小于移动网络
+ * 常见的 NAT 空闲超时（通常 2~5 分钟）。
+ */
+export const TUNNEL_HEARTBEAT_DEFAULT_MS = 20_000;
+/** 连续丢多少个 pong 才判定隧道已死（C5：旧实现丢 1 次就 terminate，弱网误判率过高）。 */
+export const HEARTBEAT_MAX_MISSED_PONGS = 2;
+const TUNNEL_HEARTBEAT_MS = Math.max(100, Number(process.env.DSH_BRIDGE_HEARTBEAT_MS) || TUNNEL_HEARTBEAT_DEFAULT_MS);
 /**
  * 上游 dsh web 的地址。
  *
@@ -1402,6 +1414,61 @@ async function resolveToken(refresh = false) {
 // ============================================================
 
 let tunnelRetry = 0;
+/** C2：连续收到 close code=4000 的次数（跨 connectTunnel 保留；非 4000 的断开清零）。 */
+let consecutive4000 = 0;
+
+/* ── 重连策略（C2 + C5）────────────────────────────────────────────────────────
+ *
+ * code=4000 的语义（中继 relay-router/src/index.mjs 唯一用途）：**同 deviceId 的新连接
+ * 把本条连接顶掉了**（replaced by new connection）。所以对被踢的一方，"重连"的唯一效果
+ * 是把对方再顶一次 —— 两个实例就这么以 2~3.5s 的周期乒乓（生产日志 dev-a50dced9cc19
+ * 327 次/10min、win32 持续互踢 6 台里 3 台全 0.7.2）。
+ *
+ * 修法（诊断报告 04 §4.4.2 的 P0-1）：
+ *   · 第 1 次 4000 → 长退避 30~60s（是原来 2s 的 15~30 倍），让"新连接"先站稳；
+ *   · 连续第 2 次 4000 → 直接优雅退出（退出码 4），把设备让给对方。watcher 收到 code=4
+ *     会暂停 5 分钟再拉，避免继续对新实例发起第 3 次顶撞。
+ *   · 非 4000 的普通断线保持原有指数退避，但上限 30s→10s 并加 0~3s 抖动（C5）：
+ *     30s 上限会让"一次瞬时断网"恢复得比必要慢得多；抖动则避免多台设备同秒重连造成
+ *     中继/nginx 连接尖峰（诊断 R1 的连接耗尽与重连风暴互相放大）。
+ *     抖动只加在 base ≥4s 的档位：第一档（2s）保持确定值，测试里"5 秒内必须重连"的
+ *     硬期限才不会被随机数撞破。
+ */
+export const DUPLICATE_CLOSE_CODE = 4000;
+/** bridge 判定"本机已有另一个同 deviceId 实例"后的退出码（必须与 dsh-setup.mjs 的常量一致）。 */
+export const DUPLICATE_INSTANCE_EXIT_CODE = 4;
+export const DUPLICATE_RECONNECT_BASE_MS = 30_000;
+export const MAX_RECONNECT_DELAY_MS = 10_000;
+export const RECONNECT_JITTER_MS = 3_000;
+export const RECONNECT_JITTER_MIN_BASE_MS = 4_000;
+
+/**
+ * 算下一次重连：返回 { exit, delayMs, consecutive4000, reason }。
+ * @param {{ code?: number, retry?: number, consecutive4000?: number, rand?: () => number }} args
+ */
+export function reconnectPlan({ code, retry = 0, consecutive4000: prev = 0, rand = Math.random } = {}) {
+  if (code === DUPLICATE_CLOSE_CODE) {
+    const next = Math.max(0, prev) + 1;
+    if (next >= 2) return { exit: true, delayMs: 0, consecutive4000: next, reason: "duplicate-exit" };
+    const delayMs = DUPLICATE_RECONNECT_BASE_MS + Math.floor(rand() * DUPLICATE_RECONNECT_BASE_MS);
+    return { exit: false, delayMs, consecutive4000: next, reason: "duplicate-backoff" };
+  }
+  const n = Math.max(0, retry);
+  const base = Math.min(MAX_RECONNECT_DELAY_MS, 2_000 * 2 ** n);
+  const jitter = base >= RECONNECT_JITTER_MIN_BASE_MS ? Math.floor(rand() * RECONNECT_JITTER_MS) : 0;
+  return { exit: false, delayMs: base + jitter, consecutive4000: 0, reason: "normal" };
+}
+
+/**
+ * 心跳一拍（C5）：连续丢 HEARTBEAT_MAX_MISSED_PONGS 次 pong 才判定隧道已死。
+ * 纯函数，便于单测（"丢 1 次就断"是这次要改掉的旧契约）。
+ */
+export function heartbeatStep({ pongReceived, missedPongs = 0 }) {
+  if (pongReceived) return { missedPongs: 0, terminate: false, ping: true };
+  const missed = Math.max(0, missedPongs) + 1;
+  const terminate = missed >= HEARTBEAT_MAX_MISSED_PONGS;
+  return { missedPongs: missed, terminate, ping: !terminate };
+}
 
 /** 把 DSH_BRIDGE_TUNNEL_URL 归一化为 router 注册端点(缺省补 / _bridge)。 */
 function tunnelEndpoint(raw) {
@@ -1473,6 +1540,7 @@ function connectTunnel(token) {
   const send = makeChunkedSender((s) => { if (ws.readyState === WebSocket.OPEN) ws.send(s); });
   let heartbeat;
   let pongReceived = true;
+  let missedPongs = 0;
 
   ws.on("open", () => {
     tunnelRetry = 0;
@@ -1483,16 +1551,21 @@ function connectTunnel(token) {
       ws.send(JSON.stringify({ type: "tunnel-register", deviceId: DEVICE_ID, token, name: os.hostname() || "dsh-bridge", caps: e2ee.caps() }));
     } catch (e) { console.log(`[bridge] 注册发送失败: ${e.message}`); }
     heartbeat = setInterval(() => {
-      if (!pongReceived) {
-        console.log("[bridge] 隧道心跳超时,主动重连...");
-        ws.terminate();
+      // C5：连续 2 次没收到 pong 才判定半开（旧实现丢 1 次就断 → 弱网下正常的单次丢包
+      // 也会被当成故障重连，直接贡献了"75% 的隧道会话活不过 60s"）。
+      const step = heartbeatStep({ pongReceived, missedPongs });
+      missedPongs = step.missedPongs;
+      pongReceived = false;
+      if (step.terminate) {
+        console.log(`[bridge] 隧道连续 ${missedPongs} 次心跳无响应,主动重连...`);
+        try { ws.terminate(); } catch { /* 已关闭 */ }
         return;
       }
-      pongReceived = false;
+      if (missedPongs > 0) console.log(`[bridge] 隧道心跳无响应(${missedPongs}/${HEARTBEAT_MAX_MISSED_PONGS}),继续探测...`);
       try { ws.ping(); } catch { ws.terminate(); }
     }, TUNNEL_HEARTBEAT_MS);
   });
-  ws.on("pong", () => { pongReceived = true; });
+  ws.on("pong", () => { pongReceived = true; missedPongs = 0; });
   ws.on("message", (raw) => {
     const receive = makeFrameReceiver();
     try {
@@ -1520,10 +1593,24 @@ function connectTunnel(token) {
     clearInterval(heartbeat);
     console.log(`[bridge] 隧道断开(code=${code}${reason ? ", " + reason : ""})`);
     closeAllWsSessions();
-    const delay = Math.min(30_000, 2_000 * 2 ** tunnelRetry);
+    // C2 + C5：4000（被同 deviceId 的新连接顶掉）走长退避/退出；其余走 2/4/8/10s + 抖动。
+    const plan = reconnectPlan({ code, retry: tunnelRetry, consecutive4000 });
+    consecutive4000 = plan.consecutive4000;
     tunnelRetry += 1;
-    console.log(`[bridge] ${Math.round(delay / 1000)}s 后重连...`);
-    setTimeout(async () => connectTunnel(code === 4003 ? await resolveToken(true) : token), delay);
+    if (plan.exit) {
+      // 连续两次被顶 = 本机确实还有另一个 bridge 在同一 deviceId 上活着。再重连只会把它再顶一次，
+      // 所以让位：用专用退出码退出，watcher 据此暂停拉起（见 dsh-setup.mjs 的 DUPLICATE_INSTANCE_EXIT_CODE）。
+      console.error("[bridge] 检测到同 deviceId 的另一个 bridge，本实例退出（连续 2 次被顶，不再重连以免互踢）。");
+      console.error("[bridge] 若这是升级/重装留下的旧实例：重启一次 dsh web（或运行 dsh-remote doctor）即可只保留一个。");
+      try { closeAllWsSessions(); } catch { /* 已关闭 */ }
+      process.exit(DUPLICATE_INSTANCE_EXIT_CODE);
+    }
+    if (plan.reason === "duplicate-backoff") {
+      console.log(`[bridge] 本实例被同 deviceId 的新连接顶替，${Math.round(plan.delayMs / 1000)}s 后再试（期间不重连，避免互踢）...`);
+    } else {
+      console.log(`[bridge] ${Math.round(plan.delayMs / 1000)}s 后重连...`);
+    }
+    setTimeout(async () => connectTunnel(code === 4003 ? await resolveToken(true) : token), plan.delayMs);
   });
   ws.on("error", (e) => console.log(`[bridge] 隧道错误: ${e.message || ""}`));
 }
@@ -1757,6 +1844,112 @@ function redactText(e) {
   return String(e && e.message ? e.message : e).slice(0, 200);
 }
 
+/* ── C2：同机单实例保护（lock 文件 + PID/命令行校验，失败安全）────────────────────
+ *
+ * 为什么需要（诊断报告 04 §4.4）：同机两个 bridge 用同一个 deviceId 连中继会**互相顶号**
+ *（router close(4000)），周期 2~3.5s 的乒乓。来源有孤儿进程（watcher 被 TerminateProcess
+ * 收掉、bridge 漏成孤儿）、升级后旧进程未退、插件自愈与任务计划同时拉。watcher 层的 pid 文件
+ * 管不住这几种，所以 bridge 自己再上一把"本配置目录内只允许一个实例"的锁。
+ *
+ * 判定纪律（误杀/误挡的代价不对称）：
+ *   · pid 死了 / pid 被系统回收给**无关进程** → 抢锁（陈旧锁绝不能把 bridge 永久挡在门外）；
+ *   · pid 活着且命令行确认是 `dsh-bridge.mjs` → 判定"已有实例"，本实例退出（退出码 4，
+ *     watcher 会暂停 5 分钟，见 dsh-setup.mjs）；
+ *   · 取不到命令行（ps/PowerShell 不可用）→ **放行**（fail-safe 方向）：宁可冒着多开的风险也
+ *     不能让"锁检查失败"变成"bridge 永远起不来"，多开由上面的 4000 长退避/退出兜底。
+ */
+const INSTANCE_LOCK_FILE = ".dsh-bridge-instance.lock";
+/**
+ * 是否启用单实例锁：生产形态（配置目录运行时 / npm 安装）恒启用；
+ * 仓库里直接 `node clients/dsh-remote/dsh-bridge.mjs` 调试时不落锁，避免把锁文件写进工作区。
+ */
+const INSTANCE_GUARD_ENABLED = Boolean(process.env.DSH_BRIDGE_CONFIG) || ROOT.includes(`${path.sep}node_modules${path.sep}`);
+
+/** 该 pid 的完整命令行（取不到返回空串 —— 调用方据此走 fail-safe）。 */
+function commandLineOfPid(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return "";
+  if (process.platform === "win32") {
+    const script = `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CommandLine`;
+    const encoded = Buffer.from(script, "utf16le").toString("base64");
+    try {
+      return String(spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+        { encoding: "utf8", timeout: 8000, windowsHide: true }).stdout || "").trim();
+    } catch { return ""; }
+  }
+  try {
+    return String(execSync(`ps -p ${pid} -o command=`, { encoding: "utf8", timeout: 3000, windowsHide: true }) || "").trim();
+  } catch { return ""; }
+}
+
+function isOurBridgeCommand(cmd) {
+  const c = String(cmd || "");
+  return /dsh-bridge\.mjs/.test(c) && /clients[\\/]dsh-remote/.test(c);
+}
+
+/**
+ * 锁归属判定（纯函数，便于单测）：steal=可以抢锁；blocked=已有真实例；unknown=看不住但别阻塞。
+ * @returns {"steal"|"blocked"|"unknown"}
+ */
+export function instanceLockVerdict({ selfPid = 0, pid = 0, alive = false, isOurBridge = false, commandKnown = true } = {}) {
+  if (!Number.isInteger(pid) || pid <= 0) return "steal";
+  if (pid === selfPid) return "steal";
+  if (!alive) return "steal";
+  if (isOurBridge) return "blocked";
+  if (!commandKnown) return "unknown";
+  return "steal"; // pid 被系统回收给了无关进程
+}
+
+/** 抢单实例锁。返回 { ok, pid?, degraded? }；ok=false 表示确实有另一个实例。 */
+function acquireInstanceLock() {
+  if (!INSTANCE_GUARD_ENABLED) return { ok: true, skipped: true };
+  const file = path.join(RELAY_DIR, INSTANCE_LOCK_FILE);
+  const payload = JSON.stringify({ pid: process.pid, at: Date.now(), script: "dsh-bridge.mjs" });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      fs.mkdirSync(RELAY_DIR, { recursive: true });
+      const fd = fs.openSync(file, "wx"); // 排他创建：要么拿到，要么 EEXIST
+      fs.writeSync(fd, payload);
+      fs.closeSync(fd);
+      return { ok: true };
+    } catch (e) {
+      if (e && e.code !== "EEXIST") return { ok: true, degraded: true }; // 写不了锁 → 失败安全：照常启动
+      let info = null;
+      try { info = JSON.parse(fs.readFileSync(file, "utf8")); } catch { info = null; }
+      const pid = Number(info && info.pid);
+      const alive = Number.isInteger(pid) && pid > 0 ? isPidAlive(pid) : false;
+      const cmd = alive ? commandLineOfPid(pid) : "";
+      const verdict = instanceLockVerdict({
+        selfPid: process.pid, pid, alive,
+        isOurBridge: isOurBridgeCommand(cmd),
+        commandKnown: Boolean(cmd)
+      });
+      if (verdict === "blocked") return { ok: false, pid };
+      if (verdict === "unknown") {
+        // 看不住：不删别人的锁，也不阻塞自己（多开由 4000 处理兜底）。
+        return { ok: true, degraded: true, pid };
+      }
+      try { fs.rmSync(file, { force: true }); } catch { /* 抢不到就算了，下一轮 */ }
+    }
+  }
+  return { ok: true, degraded: true };
+}
+
+/** 释放自己那把锁（只删 owner === 本进程 的锁，绝不删别人的）。 */
+function releaseInstanceLock() {
+  if (!INSTANCE_GUARD_ENABLED) return;
+  const file = path.join(RELAY_DIR, INSTANCE_LOCK_FILE);
+  try {
+    const info = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (Number(info && info.pid) === process.pid) fs.rmSync(file, { force: true });
+  } catch { /* 没锁/已被抢 → 忽略 */ }
+}
+
+/** 本进程 pid 是否活着（不影响别的进程；EPERM 视为活着）。 */
+function isPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; }
+}
+
 async function runTunnel() {
   // 先动态确定上游再连隧道：上游端口不是 3080 时（DSH Desktop 默认 43120）这一步是关键 ——
   // 否则 bridge 会连上中继、手机也能打开页面，但每个请求都打到一个没人听的端口。
@@ -1834,6 +2027,18 @@ async function main() {
   process.on("message", (m) => {
     if (m && m.type === "shutdown") shutdown("IPC shutdown");
   });
+  // C2：同机单实例锁（理由/判定纪律见 acquireInstanceLock 上方的长注释）。
+  // 放在认证之前：被挡下的第二个实例**不消耗一次 device-login**（登录接口按出口 IP 限流）。
+  const lock = acquireInstanceLock();
+  if (!lock.ok) {
+    console.error(`[bridge] 本机已有另一个 bridge 实例在运行（pid=${lock.pid}，同一配置目录），本实例退出以免两个实例互踢。`);
+    console.error("[bridge] 若这来自升级/重装留下的旧实例：结束该进程后重启一次 dsh web 即可。");
+    process.exit(DUPLICATE_INSTANCE_EXIT_CODE); // watcher 据此暂停 5 分钟再拉，避免继续顶撞
+  }
+  if (lock.degraded) {
+    console.log("[bridge] 单实例锁检查降级（取不到进程命令行或锁不可写）——照常启动；若出现 code=4000 互踢，本实例会自动让位。");
+  }
+  process.on("exit", releaseInstanceLock);
   return runTunnel();
 }
 

@@ -63,6 +63,17 @@ const WIN_TASK_NAME = "dsh-remote-bridge";
  */
 const WATCHER_PID_FILE = ".dsh-watcher.pid";
 const BRIDGE_PID_FILE = ".dsh-bridge.pid";
+/**
+ * C2 互踢根治：bridge 判定"本机已有同 deviceId 的另一个 bridge"时的退出码（必须与
+ * dsh-bridge.mjs 里的 DUPLICATE_INSTANCE_EXIT_CODE 一致），以及 watcher 收到它之后的暂停时长。
+ *
+ * 为什么 watcher 要暂停而不是照常 10s 重拉：互踢的本质是"两个实例抢同一个 deviceId"，
+ * 重拉的唯一效果是**把对方也顶掉**（对方同样重连），形成 2~3.5s 周期的乒乓（生产日志实测
+ * dev-a50dced9cc19 327 次/10min）。本机已有实例在跑时，让位才是对的；5 分钟后若对方已经
+ * 退出（用户重装/升级收尾），本守护自然恢复。
+ */
+const DUPLICATE_INSTANCE_EXIT_CODE = 4;
+const DUPLICATE_BRIDGE_BACKOFF_MS = 5 * 60 * 1000;
 
 // ---------- 运行时自物化（npm/npx 安装 → 固化到配置目录，脱离 npx 缓存） ----------
 // npx 每次安装的缓存目录（~/.npm/_npx/<hash>）不固定：缓存一旦清理，指向它的自启动服务
@@ -232,7 +243,8 @@ function runtimeSetupPath() {
 
 function sh(cmd, timeoutMs = 15000, cwd = undefined) {
   try {
-    const stdout = execSync(cmd, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: timeoutMs, ...(cwd ? { cwd } : {}) });
+    // windowsHide：POSIX 上被忽略；Windows 上避免 execSync 经 cmd.exe 执行控制台程序时闪窗/弹窗。
+    const stdout = execSync(cmd, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: timeoutMs, windowsHide: true, ...(cwd ? { cwd } : {}) });
     return { ok: true, stdout: String(stdout ?? ""), stderr: "", code: 0 };
   } catch (e) {
     return { ok: false, stdout: String(e.stdout ?? ""), stderr: String(e.stderr ?? ""), code: e.status ?? -1 };
@@ -411,13 +423,50 @@ function hardenFile(file) {
 }
 
 // ---------- 配置读写 ----------
+/** 配置读失败只报一次（每 10s 一轮的 ensureBridge 会把同一行刷成噪音）。 */
+let configReadWarned = false;
 function loadConfig() {
-  try { return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8")); }
-  catch { return {}; }
+  try {
+    return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+  } catch (e) {
+    // ⚠️ 静默返回 {} 是历史行为（首次安装时文件确实不存在）。但**读失败不能与"没登录"混淆**：
+    // 配置文件存在却读不出来（杀软占用 / OneDrive 同步中 / EPERM / 半写）时，指纹会瞬间变成
+    // `saas|||`，旧逻辑据此按"账号变了"停掉 bridge → 下一轮再拉起 → 反复重启（诊断报告 04 §4.3）。
+    // 这里只补"可观测"（写一次原因），重启抑制由 accountFingerprint 的连续确认负责。
+    if (e && e.code !== "ENOENT" && !configReadWarned) {
+      configReadWarned = true;
+      console.warn(`⚠️ 读取配置失败（${e.code || e.message}）：${CONFIG_PATH} —— 本轮按空配置处理，但不据此重启 bridge。`);
+    }
+    return {};
+  }
 }
+/**
+ * 保存配置。
+ *
+ * 【C8 原子写】旧实现是"先截断再写"（writeFileSync 直接覆盖）：saas 模式**每 10 秒**重写一次，
+ * 而插件半（设置页/切账号/备份）也在写同一个文件 —— Windows 上被杀软扫描/OneDrive 同步放大成
+ * "读到半截 JSON" → loadConfig 静默 {} → 指纹抖动 → bridge 反复重启。
+ *
+ * 现在写成 `<config>.<pid>.tmp` 再 rename 覆盖（rename 在同一目录内是原子的）：
+ * 读的一方要么看到旧内容、要么看到新内容，永远读不到半截。
+ * 失败安全：Windows 上目标文件被杀软/备份工具持有句柄时 rename 可能 EBUSY/EPERM ——
+ * 先短暂重试，仍失败就退回直接写（宁可丢原子性，也绝不写不进去把配置搞丢）。
+ */
 function saveConfig(cfg) {
   fs.mkdirSync(CONFIG_DIR, { recursive: true });
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2), { mode: 0o600 });
+  const body = JSON.stringify(cfg, null, 2);
+  const tmp = `${CONFIG_PATH}.${process.pid}.tmp`;
+  let renamed = false;
+  try {
+    fs.writeFileSync(tmp, body, { mode: 0o600 });
+    for (let i = 0; i < 3 && !renamed; i += 1) {
+      try { fs.renameSync(tmp, CONFIG_PATH); renamed = true; }
+      catch (e) { if (i === 2) throw e; sleepSync(30); }
+    }
+  } catch {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* 临时文件删不掉不致命 */ }
+    fs.writeFileSync(CONFIG_PATH, body, { mode: 0o600 }); // 兜底：绝不让保存失败
+  }
   hardenFile(CONFIG_PATH); // Windows 上 mode 是空操作 → 必须显式收紧 ACL（内含明文账号密码）
 }
 
@@ -582,6 +631,83 @@ function dedupDecision({ existingPid = null, selfPid = 0, supervisor = "" } = {}
 function pidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; }
+}
+
+/* ── C2：孤儿 bridge 清扫（命令行校验，绝不误杀）─────────────────────────────────
+ *
+ * 为什么 pid 文件回收（上面的 shouldReapLeftoverBridge）还不够：pid 文件只覆盖"上一任 watcher
+ * 写过的那个 pid"。真实场景里还有两类抓不到的孤儿（诊断报告 04 §4.4）：
+ *   ① watcher 被 TerminateProcess / 关闭控制台收掉时，bridge 子进程被 reparent 成孤儿继续持有隧道；
+ *   ② 0.7.2 的升级覆盖写运行时**不停旧进程**，旧 bridge 继续用旧脚本跑。
+ * 两种孤儿都与新 bridge 同 deviceId → 中继 close(4000) 互踢（生产上 3 台 Win 设备长期乒乓，全 0.7.2）。
+ *
+ * 安全边界（误杀无关进程是不可接受的）：
+ *   · 只认**命令行同时包含** `dsh-bridge.mjs` 与**本运行时** `clients/dsh-remote` 路径的进程
+ *     （与 looksLikeBridge 同一套纪律；还额外要求是本 THIS_DIR 的运行时，避免碰到另一个配置目录/用户）；
+ *   · 取不到命令行（ps/PowerShell 不可用）→ 一个都不杀。失败方向必须是"漏杀"而不是"误杀"。
+ */
+function isThisRuntimeBridgeCmd(cmd) {
+  const c = String(cmd || "");
+  if (!/dsh-bridge\.mjs/.test(c)) return false;
+  const needle = path.join(THIS_DIR, "clients", "dsh-remote");
+  // 命令行里的分隔符可能与本机 path.sep 不同（Windows 上两者都可能出现）→ 归一化后比较
+  const norm = (v) => v.replace(/[\\/]+/g, "/").toLowerCase();
+  return norm(c).includes(norm(needle));
+}
+
+/** 列出本机属于**本运行时**的 bridge 进程 pid（命令行校验；取不到命令行 → 空数组）。 */
+function listRuntimeBridgePids() {
+  const pids = [];
+  if (IS_WIN) {
+    // 一次性 PowerShell CIM 枚举（逐个 windowsProcessCommandLine 会起 N 个进程，太贵）
+    const script = [
+      "try { $p = Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" }",
+      "catch { $p = Get-WmiObject Win32_Process -Filter \"Name='node.exe'\" }",
+      "$p | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress",
+    ].join("; ");
+    const encoded = Buffer.from(script, "utf16le").toString("base64");
+    try {
+      const r = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+        { encoding: "utf8", timeout: 8000, windowsHide: true, maxBuffer: 8 * 1024 * 1024 });
+      const raw = String(r.stdout || "").trim();
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        for (const p of Array.isArray(parsed) ? parsed : [parsed]) {
+          const pid = Number(p && p.ProcessId);
+          if (Number.isInteger(pid) && pid > 0 && isThisRuntimeBridgeCmd(p.CommandLine)) pids.push(pid);
+        }
+      }
+    } catch { /* 无 PowerShell / 解析失败 → 不杀任何进程 */ }
+    return pids;
+  }
+  const r = sh("pgrep -fl 'dsh-bridge\\.mjs'");
+  if (!r.ok) return pids;
+  for (const line of String(r.stdout || "").split("\n")) {
+    const m = /^(\d+)\s+(.+)$/.exec(line.trim());
+    if (!m) continue;
+    if (isThisRuntimeBridgeCmd(m[2])) pids.push(Number(m[1]));
+  }
+  return pids;
+}
+
+/**
+ * 清扫孤儿 bridge（接管/退出时调用）。返回被结束的 pid 列表。
+ * @param {{ fast?: boolean }} opts fast=true 时不等待（退出钩子里只剩 3s 预算）
+ */
+function sweepStrayBridges({ fast = false } = {}) {
+  const strays = listRuntimeBridgePids().filter((pid) => pid !== process.pid);
+  const killed = [];
+  for (const pid of strays) {
+    try { process.kill(pid, "SIGTERM"); killed.push(pid); } catch { /* 已退出 */ }
+  }
+  if (!fast) {
+    for (const pid of strays) {
+      const dl = Date.now() + 3000;
+      while (Date.now() < dl && pidAlive(pid)) sleepSync(100);
+      if (pidAlive(pid)) { try { process.kill(pid, "SIGKILL"); } catch { /* 已退出 */ } }
+    }
+  }
+  return killed;
 }
 
 /**
@@ -1435,6 +1561,32 @@ function accountFingerprint(cfg) {
   return [c.local_key ? "local" : "saas", c.phone || c.email || "", String(c.device_id || ""), String(c.local_key || "")].join("|");
 }
 
+/* ── 账号指纹"变化确认"（C8）────────────────────────────────────────────────────
+ *
+ * 🔴 为什么不能"指纹一变就重启 bridge"（诊断报告 04 §4.3）：
+ *   `loadConfig()` 读失败会静默返回 `{}`，此时指纹 = `saas|||`，与真实值不等 ——
+ *   旧逻辑据此按"账号变了"停 bridge，下一轮再拉起，于是每 10~20s 重启一次；
+ *   Windows 上被杀软扫描/OneDrive 同步/文件占用放大的"读抖动"就是这样变成重启循环的。
+ *
+ * 修法：指纹变化必须**连续 2 轮**（ensureBridge 每 10s 一轮）看到同一个新值，
+ * 或该新值已持续 ≥5s，才认为"真的变了"。单轮的 `{}` 抖动会被下一轮复位清掉。
+ * 抽成纯函数是因为这条判断的代价很实在（每误判一次就断一次隧道），必须能被直接测。
+ */
+const FINGERPRINT_CONFIRM_ROUNDS = 2;
+const FINGERPRINT_CONFIRM_MS = 5000;
+
+/** 记一次"疑似新指纹"：同一个 fp 连击计数，换值则重新从 1 开始。 */
+function noteFingerprintCandidate(prev, fp, now = Date.now()) {
+  if (!prev || prev.value !== fp) return { value: fp, rounds: 1, since: now };
+  return { value: fp, rounds: prev.rounds + 1, since: prev.since };
+}
+
+/** 这个"疑似变化"是否已经确认（连续 2 轮，或持续 ≥5s）。 */
+function fingerprintChangeConfirmed(cand, now = Date.now()) {
+  if (!cand || !cand.value) return false;
+  return cand.rounds >= FINGERPRINT_CONFIRM_ROUNDS || now - cand.since >= FINGERPRINT_CONFIRM_MS;
+}
+
 /**
  * 服务端登录限流的"最早可重试时刻"（bridge 在收到 429 时落盘）。
  * 为什么需要：限流窗口是 15 分钟，而 watcher 每 10 秒就会重新拉起 bridge ——
@@ -1590,11 +1742,30 @@ async function runBridge() {
         removePidFile(BRIDGE_PID_FILE);
       }
     }
+    // ── C2：清扫「pid 文件之外的孤儿 bridge」（命令行校验，绝不误杀）──────────────
+    //
+    // pid 文件只能覆盖"上一任 watcher 写过的那个 pid"。真实世界里还有两类抓不到的孤儿：
+    //   ① watcher 被 TerminateProcess / 关闭控制台收掉 → bridge 被 reparent 成孤儿继续持有隧道；
+    //   ② 0.7.2 升级覆盖运行时**不停旧进程** → 旧 bridge 继续用旧脚本跑。
+    // 它们与新 bridge 共用同一 deviceId → 中继 close(4000) 互踢（生产 3 台 Win 设备长期乒乓，全 0.7.2）。
+    // 走到这里说明**本机此刻只有本守护**（去重已通过），所以任何"本运行时的 bridge"都是上一代的遗留。
+    {
+      const strays = sweepStrayBridges();
+      if (strays.length) {
+        console.log(`[dsh-remote] 已清扫 ${strays.length} 个孤儿 bridge 进程（pid ${strays.join(", ")}）——避免与新实例互踢。`);
+      }
+    }
   }
   let cfg = loadConfig();
   let warnedNoLogin = false;
   /** 当前 bridge 子进程使用的账号指纹（账号/模式/设备身份任一变化 → 重启子进程）。 */
   let bridgeAccountFp = "";
+  /** C8：疑似变化但还没确认的新指纹（连续 2 轮/≥5s 才确认，防 loadConfig 静默 {} 抖动）。 */
+  let pendingFp = null;
+  /** C2：bridge 判为「本机已有另一个实例」后的暂停拉起截止时刻。 */
+  let duplicateBridgeBackoffUntil = 0;
+  /** 暂停提示只打一次，避免每 10s 刷屏。 */
+  let warnedDuplicateBridge = false;
   /** 限流提示只打一次，避免刷屏。 */
   let warnedRateLimit = false;
 
@@ -1642,11 +1813,25 @@ async function runBridge() {
     //（2026-09-19 实测故障）。
     const fp = accountFingerprint(cfg);
     if (!childStopped(bridgeProc) && bridgeAccountFp && bridgeAccountFp !== fp) {
+      // C8：**连续确认**才重启（理由见 noteFingerprintCandidate 上方的长注释）。
+      // 单独一次读到 `{}`（文件被占用/半写/杀软扫描）不构成"账号变了"，下一轮自然复位。
+      pendingFp = noteFingerprintCandidate(pendingFp, fp);
+      if (!fingerprintChangeConfirmed(pendingFp)) {
+        if (pendingFp.rounds === 1) {
+          // 不打印指纹内容：它含手机号/设备 id（日志会被用户复制到群里）
+          console.log("[dsh-remote] 账号配置疑似变化，先观察一轮再决定是否重启 bridge（防配置读抖动）。");
+        }
+        return;
+      }
+      pendingFp = null;
       console.log("[dsh-remote] 账号配置已变化 → 重启 bridge 让新账号生效...");
       await stopChildGracefully(bridgeProc); // 先请它优雅退出，跑完微信通道下线通知
       bridgeAccountFp = "";
+      duplicateBridgeBackoffUntil = 0; // 用户明确换了账号：清掉"让位"暂停，立即用新凭据拉起
       return; // 下一轮（10s 内）用新配置重新拉起
     }
+    // 指纹又回到一致（或本来就没变）→ 之前的"疑似变化"作废，绝不让它跨轮累积。
+    pendingFp = null;
 
     // 服务端登录限流窗口内不反复拉起 bridge（凭据没错，改了也没用）
     const rlUntil = loginRateLimitUntil();
@@ -1658,6 +1843,18 @@ async function runBridge() {
       return;
     }
     warnedRateLimit = false;
+
+    // C2：bridge 连续 2 次收到 code=4000 已判定"本机还有另一个同 deviceId 的实例"并退出（code=4）。
+    // 那段时间内本守护**不再拉起**：拉起只会把对方顶掉，继续乒乓互踢。
+    if (Date.now() < duplicateBridgeBackoffUntil) {
+      if (!warnedDuplicateBridge) {
+        warnedDuplicateBridge = true;
+        console.log(`[dsh-remote] 本机已有另一个同 deviceId 的 bridge（互踢保护）→ 本守护暂停拉起约 ${Math.ceil((duplicateBridgeBackoffUntil - Date.now()) / 60000)} 分钟。`);
+        console.log("   若这是升级/重装留下的旧实例，可执行 `dsh-remote doctor` 或重启一次 dsh web 让它退出。");
+      }
+      return;
+    }
+    warnedDuplicateBridge = false;
 
     const alive = await checkUpstream();
     if (alive && childStopped(bridgeProc)) {
@@ -1685,9 +1882,28 @@ async function runBridge() {
       // 只有它能让我们在停 bridge 之前请它跑完退出钩子（notifystop）—— 见 stopChildGracefully。
       bridgeProc = spawn(NODE_BIN,
         [path.join(THIS_DIR, "clients/dsh-remote/dsh-bridge.mjs")],
-        { env: nodeEnv(childEnv), stdio: ["inherit", "inherit", "inherit", "ipc"] });
-      bridgeProc.on("exit", () => {
+        {
+          env: nodeEnv(childEnv),
+          stdio: ["inherit", "inherit", "inherit", "ipc"],
+          // 🔴 C1 黑窗根治（2026-10-20 诊断 W1，生产截图 04）：这里**必须**带 windowsHide。
+          // 原理同 spawnDetachedBridge 的注释：watcher 自己常以"无控制台"方式被拉起
+          //（launchd / 任务计划里的 wscript / 插件的 detached spawn）。无控制台的父进程
+          // spawn 一个控制台程序（node.exe）却不给 CREATE_NO_WINDOW 时，Windows 会**为子进程
+          // 新分配一个可见控制台窗口**；而 bridge 的 stdout/stderr 又被 watcher 指向日志文件，
+          // 于是用户看到的就是一个**空白黑窗**。bridge 崩溃 → watcher 每 10s 重拉 → 每 10s 弹一个。
+          // POSIX 上该选项被忽略。
+          windowsHide: true
+        });
+      bridgeProc.on("exit", (code) => {
         removePidFile(BRIDGE_PID_FILE);
+        // C2 互踢根治的 watcher 半边：bridge 连续 2 次收到 code=4000（= 本机已有同 deviceId 的
+        // 另一个 bridge 把本连接顶掉）后会以"重复实例"退出码优雅退出（见 dsh-bridge.mjs）。
+        // 这种退出**绝不能**照常 10s 重拉：本机已经有另一个实例在跑，重拉只会继续乒乓互踢。
+        if (code === DUPLICATE_INSTANCE_EXIT_CODE) {
+          duplicateBridgeBackoffUntil = Date.now() + DUPLICATE_BRIDGE_BACKOFF_MS;
+          console.log(`[dsh-remote] bridge 检测到同 deviceId 的另一个实例并退出（code=${code}）——本守护暂停 ${Math.round(DUPLICATE_BRIDGE_BACKOFF_MS / 60000)} 分钟后再试，避免两个实例反复互踢。`);
+          return;
+        }
         console.log("[dsh-remote] bridge 退出，等待重启...");
       });
       // Windows：落 pid 文件，供插件半发现进程（Windows 没有 pgrep/ps）。
@@ -1728,6 +1944,9 @@ async function runBridge() {
             if (bridgeProc && bridgeProc.exitCode === null) {
               try { bridgeProc.kill("SIGKILL"); } catch { /* 已退出 */ }
             }
+            // C2：退出时顺手清掉本运行时的全部 bridge 残留（fast：不等待）。
+            // 否则 Windows 上 watcher 被收掉后 bridge 可能成孤儿、继续与新实例互踢。
+            try { sweepStrayBridges({ fast: true }); } catch { /* 清扫失败不影响退出 */ }
             process.exit(0);
           }, 3000);
         });

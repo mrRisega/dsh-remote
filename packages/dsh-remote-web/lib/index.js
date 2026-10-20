@@ -317,7 +317,10 @@ function hardenFile(file) {
 /** 执行 shell 命令，不抛异常，返回 { ok, stdout, stderr, code }。 */
 function sh(cmd) {
   try {
-    const stdout = execSync(cmd, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 15000 });
+    // windowsHide（C1 黑窗不变量）：Windows 上 execSync 经 cmd.exe 起控制台程序时，
+    // 若宿主（dsh web / 桌面端）没有控制台，系统会给子进程分配一个可见窗口。
+    // POSIX 上该选项被忽略。
+    const stdout = execSync(cmd, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 15000, windowsHide: true });
     return { ok: true, stdout: String(stdout ?? ""), stderr: "", code: 0 };
   } catch (e) {
     return { ok: false, stdout: String(e.stdout ?? ""), stderr: String(e.stderr ?? ""), code: e.status ?? -1 };
@@ -532,7 +535,9 @@ function safeSpawn(command, args, opts = {}) {
   const { onError, ...spawnOpts } = opts;
   let child;
   try {
-    child = spawn(command, args, spawnOpts);
+    // C1：默认 windowsHide（调用方显式传 false 才会覆盖）。插件派生的每一个子进程都是
+    // "后台辅助进程"，Windows 上绝不该出现可见控制台窗口（诊断报告 04 的 W1 黑窗）。
+    child = spawn(command, args, { windowsHide: true, ...spawnOpts });
   } catch (e) {
     return { child: null, error: e };
   }
@@ -553,7 +558,8 @@ function spawnAndConfirm(command, args, opts = {}) {
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawn(command, args, opts);
+      // C1：同 safeSpawn，默认 windowsHide（Windows 上不弹控制台）。
+      child = spawn(command, args, { windowsHide: true, ...opts });
     } catch (e) {
       resolve({ child: null, error: e });
       return;
@@ -2325,6 +2331,12 @@ function startBridgeDetached(relayDir, fallbackReason = "") {
       // 上游端口**必须**透传：watcher 用它判断「dsh web 在线吗」，bridge 用它做转发目标。
       // 不传的话两边都回落到写死的 3080 —— dsh web 不在默认端口时 bridge 永远不启动（0.6.12 修）。
       DSH_BRIDGE_UPSTREAM: upstreamUrl(),
+      // C7：**必须显式**把 relayDir 传给 watcher。
+      // 旧实现只靠 spawnEnv 继承宿主的 DSH_RELAY_DIR（第 7800+ 行：relayDir 也可能来自
+      // config.relayDir），于是"relayDir 来自配置、宿主环境没有该变量"时，watcher/bridge 会
+      // 回落到 ~/.dsh-remote —— 面板看到的现象是「守护在跑、bridge 永远不出现」（1415 那类故障），
+      // 而且 pid 文件/日志也都写去了另一个目录。
+      DSH_RELAY_DIR: relayDir,
     }),
     stdio: ["ignore", out, out],
     windowsHide: true,
@@ -4220,6 +4232,93 @@ function spawnUpdater(relayDir, extraEnv, onError, spec = UPDATE_SPEC) {
   });
 }
 
+/* ── C8：升级/更新「覆盖运行时之前停旧进程 + 装完按命令行清残留」───────────────────
+ *
+ * 为什么必须停（诊断报告 04 §五 R1）：安装器的 ensureRuntimeCopy() 会把 clients/ 与
+ * node_modules/ws **覆盖式**拷进运行时目录，而旧 watcher/bridge 正在用这些文件跑。
+ * Windows 上杀软持有句柄 → 覆盖写失败 → 半装 → bridge `ERR_MODULE_NOT_FOUND: Cannot find
+ * package 'ws'`；同时旧 bridge 成孤儿、与新起的一份同 deviceId 互踢。
+ *
+ * 安全纪律（这套代码在**开发者的真机上**被测试执行，误杀/误停是不可接受的）：
+ *   · 只停「命令行里带**本 relayDir** 路径」的进程 —— 别的配置目录、别的用户的 bridge 一律不碰；
+ *   · 取不到命令行（ps/PowerShell 不可用）→ 不停（漏停由安装器自己接管处理，方向选安全侧）；
+ *   · 走 stopBridgeDetached/manualStatus 那条路（pid 文件 + 命令行扫描），**不碰 launchd/systemd**
+ *     —— 服务本身由安装器收尾时重写并重启，插件这一侧只负责"别让旧代码继续跑"。
+ */
+
+/** 该 pid 的完整命令行（Windows 复用带 TTL 缓存的 PowerShell 扫描；取不到返回空串）。 */
+function commandLineOfPid(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return "";
+  if (isWindows()) {
+    const hit = windowsNodeProcesses().find((p) => p.pid === pid);
+    return hit ? String(hit.commandLine || "") : "";
+  }
+  const r = sh(`ps -p ${pid} -o command=`);
+  return r.ok ? String(r.stdout || "").trim() : "";
+}
+
+/** 这个 pid 是否真的在跑**本 relayDir** 里的脚本（命令行校验；取不到 → false）。 */
+function pidRunsFrom(pid, relayDir) {
+  const cmd = commandLineOfPid(pid);
+  if (!cmd) return false; // 看不清就不动：误杀无关进程的代价远高于漏停
+  const norm = (v) => String(v).replace(/\\/g, "/").toLowerCase();
+  return norm(cmd).includes(norm(relayDir));
+}
+
+/** 收集本 relayDir 这套运行时的 watcher/bridge pid（pid 文件 + 命令行扫描）。 */
+function collectRuntimePids(relayDir) {
+  const pids = new Set();
+  for (const name of [WATCHER_PID_FILE, BRIDGE_PID_FILE]) {
+    const pid = readPidFile(relayDir, name);
+    if (Number.isInteger(pid) && pid > 0 && pid !== process.pid) pids.add(pid);
+  }
+  const ms = manualStatus(relayDir) || {};
+  for (const pid of [...(ms.watcher || []), ...(ms.bridge || []), ...(ms.allBridge || [])]) {
+    if (Number.isInteger(pid) && pid > 0 && pid !== process.pid) pids.add(pid);
+  }
+  return [...pids];
+}
+
+/**
+ * 覆盖运行时之前停掉本 relayDir 的旧 watcher/bridge（幂等）。
+ * @returns {{skipped: boolean, pids: number[]}}
+ */
+function stopBridgeForRuntimeReplace(relayDir) {
+  if (skipsSystemOps()) return { skipped: true, pids: [] };
+  const pids = collectRuntimePids(relayDir).filter((pid) => pidAlive(pid) !== false && pidRunsFrom(pid, relayDir));
+  for (const pid of pids) killPid(pid, "SIGKILL"); // Windows 上是 taskkill /T /F：连带子进程
+  for (const name of [WATCHER_PID_FILE, BRIDGE_PID_FILE]) {
+    try { rmSync(join(relayDir, name), { force: true }); } catch { /* 非关键 */ }
+  }
+  return { skipped: false, pids };
+}
+
+/**
+ * 装完清残留：只处理**本轮更新前就在跑**的那批 pid，且仍满足命令行校验。
+ * 为什么不用"扫所有本 relayDir 的 bridge"：npx 安装器的收尾会重启服务并拉起**新的** bridge，
+ * 那一个是新代码、必须留下；按"更新前的 pid 集合"点名清理才不会误杀新实例。
+ * @returns {number[]} 被结束的 pid
+ */
+function sweepBridgeAfterRuntimeReplace(relayDir, beforePids = []) {
+  if (skipsSystemOps() || !Array.isArray(beforePids) || !beforePids.length) return [];
+  const killed = [];
+  for (const pid of beforePids) {
+    if (pidAlive(pid) === false) continue;
+    if (!pidRunsFrom(pid, relayDir)) continue; // pid 可能已被系统回收 → 必须重新校验命令行
+    if (killPid(pid, "SIGKILL")) killed.push(pid);
+  }
+  return killed;
+}
+
+/** 更新失败/取消时把 bridge 恢复起来（否则用户会莫名失去远程访问）。只在本轮真停过进程时执行。 */
+function restoreBridgeAfterUpdate(relayDir, stoppedPids = []) {
+  if (skipsSystemOps() || !stoppedPids.length) return null;
+  try {
+    const r = startBridgeDetached(relayDir);
+    return r;
+  } catch { return null; }
+}
+
 /**
  * 后台执行在线一键更新：npx 按 dist-tag(默认 latest)（幂等自愈：补运行环境/更新 bridge/收敛 include）。
  * 稳健性：
@@ -4230,6 +4329,8 @@ function spawnUpdater(relayDir, extraEnv, onError, spec = UPDATE_SPEC) {
  *   - marker 记录 pid，子进程退出/出错即清理；宿主重启后由 sweepStaleMarkers 立即清掉死进程残留。
  */
 async function runOnlineUpdate(relayDir) {
+  /** C8：本轮更新前停掉的旧进程 pid（失败时要恢复；成功时要清残留）。 */
+  let stopInfo = { skipped: true, pids: [] };
   try {
     mkdirSync(relayDir, { recursive: true });
     const marker = join(relayDir, UPDATE_MARKER);
@@ -4256,6 +4357,30 @@ async function runOnlineUpdate(relayDir) {
       `[update] 开始在线更新 ${spec}（通道 ${UPDATE_TAG}；${target.why}）(${new Date().toISOString()})`);
     telemetryRecord(relayDir, "update_started"); // 匿名遥测：在线更新开始
 
+    // C8：**覆盖运行时之前**先停掉本 relayDir 的旧 watcher/bridge（幂等）。
+    // 安装器随后会覆盖写 clients/ 与 node_modules/ws —— 旧进程一边跑一边被覆盖，
+    // Windows 上极易半装（`Cannot find package 'ws'`）并留下孤儿进程新老互踢。
+    stopInfo = stopBridgeForRuntimeReplace(relayDir);
+    appendLogLine(relayDir, UPDATE_LOG, stopInfo.skipped
+      ? "[update] 测试隔离：跳过「停旧 bridge」（DSH_RELAY_SKIP_SERVICE=1）"
+      : (stopInfo.pids.length
+        ? `[update] 覆盖运行时前已停旧 bridge/watcher（pid ${stopInfo.pids.join(", ")}）`
+        : "[update] 覆盖运行时前检查：本 relayDir 没有旧 bridge/watcher 在跑"));
+    /** 失败/取消：把刚停掉的 bridge 拉回来（只在本轮真停过进程时执行，避免测试里碰真实服务）。 */
+    const restoreIfStopped = () => {
+      if (!stopInfo.pids.length) return;
+      const r = restoreBridgeAfterUpdate(relayDir, stopInfo.pids);
+      appendLogLine(relayDir, UPDATE_LOG,
+        `[update] 已重新拉起 bridge（${(r && r.status) || "unknown"}），远程访问不受影响`);
+    };
+    /** 成功：按"更新前那批 pid"点名清残留（保持命令行校验，绝不误杀安装器刚拉起的新实例）。 */
+    const sweepIfSucceeded = () => {
+      const killed = sweepBridgeAfterRuntimeReplace(relayDir, stopInfo.pids);
+      if (killed.length) {
+        appendLogLine(relayDir, UPDATE_LOG, `[update] 装完清残留：已结束旧 bridge 进程（pid ${killed.join(", ")}）`);
+      }
+    };
+
     let retried = false;
     let stalled = false; // 本轮是否因"长时间无输出"被判定卡住（决定失败归因与是否回退）
     const clear = () => {
@@ -4270,6 +4395,7 @@ async function runOnlineUpdate(relayDir) {
       const fc = telemetryFailCodeFromError(e);
       noteUpdateFailure(relayDir, e.message, fc); // ← 面板可查询，不再只躺在日志里
       telemetryRecord(relayDir, "update_failed", { fail_code: fc });
+      restoreIfStopped(); // C8：更新没起来 → 把刚停掉的 bridge 拉回来，别让用户失去远程访问
     };
     /**
      * 第三跳：离线通道（0.6.12）。
@@ -4319,6 +4445,7 @@ async function runOnlineUpdate(relayDir) {
         if (updateCancelledDirs.has(relayDir)) {
           updateCancelledDirs.delete(relayDir);
           appendLogLine(relayDir, UPDATE_LOG, "[update] 已取消：不再重试");
+          restoreIfStopped(); // C8：取消也要把 bridge 拉回来
           return;
         }
         appendLogLine(relayDir, UPDATE_LOG, `[update] 离线通道退出 code=${code ?? "?"}`);
@@ -4331,8 +4458,10 @@ async function runOnlineUpdate(relayDir) {
             ? "离线通道也长时间没有输出（已判定卡住并结束）：请检查本机能否访问 registry.npmjs.org"
             : (lastLine || `离线通道退出码 ${code}`), fc);
           telemetryRecord(relayDir, "update_failed", { fail_code: fc });
+          restoreIfStopped(); // C8
         } else {
           updateFailures.delete(String(relayDir));
+          sweepIfSucceeded(); // C8：装完清残留（按更新前的 pid 点名 + 命令行复核）
           // 更新成功 → 落一条「必须重启 dsh web」的强提醒（见 run() 成功分支的同款注释）
           markRestartPending(relayDir, "restart", "插件已更新，重启 dsh web 后生效");
         }
@@ -4373,6 +4502,7 @@ async function runOnlineUpdate(relayDir) {
         if (updateCancelledDirs.has(relayDir)) {
           updateCancelledDirs.delete(relayDir);
           appendLogLine(relayDir, UPDATE_LOG, "[update] 已取消：不再换源重试");
+          restoreIfStopped(); // C8：取消也要把 bridge 拉回来
           return;
         }
         if (!retried && (code !== 0 || stalled)) {
@@ -4407,8 +4537,10 @@ async function runOnlineUpdate(relayDir) {
             ? "更新进程长时间没有任何输出（已判定卡住并结束），通常是本机到 npm 官方源的链路不通"
             : (lastLine || `安装进程退出码 ${code}`), fc);
           telemetryRecord(relayDir, "update_failed", { fail_code: fc });
+          restoreIfStopped(); // C8：三次尝试都已失败 → 先把 bridge 拉回来（用户可以先继续用，再手动重试）
         } else {
           updateFailures.delete(String(relayDir)); // 成功即清掉旧失败
+          sweepIfSucceeded(); // C8：装完清残留（安装器可能又拉起一个新 bridge，只清更新前那批）
           // 【2026-09-26】更新成功 → 写一条 kind="restart" 的待重启标记。
           //
           // 修的是"文案与状态机不一致"：版本卡一直写「请重启 dsh web 后生效」（client.js 的
@@ -4438,6 +4570,11 @@ async function runOnlineUpdate(relayDir) {
   } catch (e) {
     try { rmSync(join(relayDir, UPDATE_MARKER), { force: true }); } catch { /* ignore */ }
     telemetryRecord(relayDir, "update_failed", { fail_code: telemetryFailCodeFromError(e) });
+    // C8：异常也要把停掉的 bridge 拉回来（否则"更新失败"= 远程访问直接没了）
+    if (stopInfo.pids.length && !skipsSystemOps()) {
+      const r = restoreBridgeAfterUpdate(relayDir, stopInfo.pids);
+      appendLogLine(relayDir, UPDATE_LOG, `[update] 响应异常，已重新拉起 bridge（${(r && r.status) || "unknown"}）`);
+    }
     return { ok: false, detail: String(e.message || e) };
   }
 }

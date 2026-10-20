@@ -38,6 +38,10 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const INDEX_SRC = readFileSync(path.join(HERE, "..", "lib", "index.js"), "utf8").replace(/\r\n/g, "\n"); // 本文件就是 Windows 专项：CRLF 检出时源码锚点必须仍然匹配
 const CLIENT_SRC = readFileSync(path.join(HERE, "..", "lib", "client.js"), "utf8").replace(/\r\n/g, "\n");
 const SETUP_SRC = readFileSync(path.join(HERE, "..", "..", "..", "dsh-setup.mjs"), "utf8").replace(/\r\n/g, "\n");
+// C1 黑窗不变量要覆盖"所有可能执行控制台程序的子进程"，所以 bridge / 上游探测也要读进来
+//（这两处正是 2026-10-20 诊断里漏掉 windowsHide 的两个真实回归点）。
+const BRIDGE_SRC = readFileSync(path.join(HERE, "..", "..", "..", "clients", "dsh-remote", "dsh-bridge.mjs"), "utf8").replace(/\r\n/g, "\n");
+const UPSTREAM_SRC = readFileSync(path.join(HERE, "..", "..", "..", "clients", "dsh-remote", "upstream-discovery.mjs"), "utf8").replace(/\r\n/g, "\n");
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -356,6 +360,33 @@ test("win32：启动 bridge 走 detached watcher（dsh-setup.mjs run），并落
   }
 });
 
+test("win32：插件拉起 watcher 时必须显式传 DSH_RELAY_DIR（否则守护落在 ~/.dsh-remote）", async () => {
+  // C7 / 诊断报告 00 §6.2 + 1415 那台设备：relayDir 可能来自 config.relayDir（设置里改过目录），
+  // 而 spawnEnv 只"继承"宿主的 DSH_RELAY_DIR —— 宿主环境没有该变量时，watcher 会回落到
+  // ~/.dsh-remote：面板表现为「守护在跑、bridge 永远不出现」，pid 文件/日志全写去了另一个目录。
+  // 这里用"假 dsh-setup.mjs 把收到的 env 落盘"来证明**真的传进去了**，而不是只看源码像不像。
+  const env = await makeEnv({ forceWin: true, skipService: false });
+  const dump = path.join(env.root, "watcher-env.json");
+  await writeFile(path.join(env.relayDir, "dsh-setup.mjs"),
+    `import fs from "node:fs";\nfs.writeFileSync(${JSON.stringify(dump)}, JSON.stringify(process.env));\n`);
+  const routes = boot(env.relayDir);
+  const srv = await serve(routes);
+  try {
+    await writeConfig(env.relayDir);
+    const r = await post(srv.base, "/dsh-remote/start");
+    assert.ok([200, 500].includes(r.status), `不得 5xx 崩溃：${r.status}`);
+    for (let i = 0; i < 80 && !existsSync(dump); i += 1) await sleep(50);
+    assert.ok(existsSync(dump), "假 dsh-setup.mjs 没有被拉起（watcher spawn 没发生）");
+    const spawned = JSON.parse(readFileSync(dump, "utf8"));
+    assert.equal(spawned.DSH_RELAY_DIR, env.relayDir,
+      "★watcher 的 env 必须显式带 DSH_RELAY_DIR=当前 relayDir（缺了它就会落到 ~/.dsh-remote）");
+  } finally {
+    await srv.close();
+    routes.dispose();
+    await env.restore();
+  }
+});
+
 test("win32：停止 bridge 只结束 pid 文件里的进程，不碰 launchctl/systemctl", async () => {
   const env = await makeEnv({ forceWin: true, skipService: true });
   const routes = boot(env.relayDir);
@@ -604,14 +635,48 @@ test("win32：注册的是 wscript，且隐藏方式不可用时回退直接启�
   assert.ok(/schtasks\(\["\/Delete", "\/TN", WIN_TASK_NAME, "\/F"\]\)/.test(fn), "必须先删旧任务（迁移可见任务）");
 });
 
-test("win32：所有 detached 子进程都必须带 windowsHide（否则必弹新的黑色窗口）", () => {
-  // 根因：Windows 上 detached 即 DETACHED_PROCESS —— 子进程**不继承父控制台**，
-  // 控制台程序（node.exe）于是拿到一个全新的可见窗口。只有 windowsHide（CREATE_NO_WINDOW）
-  // 能压掉它。做成全仓不变量检查，防止以后新增 detached spawn 时再犯同一个错。
-  const files = { "dsh-setup.mjs": SETUP_SRC, "lib/index.js": INDEX_SRC };
+test("win32：所有可能执行控制台程序的 spawn/execFileSync/spawnSync 都必须带 windowsHide", () => {
+  // 根因（2026-10-20 诊断 W1，生产截图 04）：
+  //   · detached 子进程（DETACHED_PROCESS）**不继承父控制台**；
+  //   · 非 detached 子进程，若**父进程本身没有控制台**（launchd/任务计划 wscript/插件的
+  //     detached spawn 拉起的 watcher 就是这种），Windows 也会给它**新分配一个可见控制台窗口**。
+  //   · execFileSync/spawnSync 跑 netstat/lsof/ps/powershell 这类控制台程序同理（闪现的黑窗）。
+  // 只有 windowsHide（CREATE_NO_WINDOW）能压掉它 → 必须**全量**扫描，不能只看 detached。
+  //
+  // 这正是之前测试漏掉的两个真实 bug：dsh-setup.mjs 的 bridge 子进程 spawn（非 detached）
+  // 与 upstream-discovery.mjs 的 tryExec（execFileSync）。本用例在旧代码上必须变红。
+  const files = {
+    "dsh-setup.mjs": SETUP_SRC,
+    "lib/index.js": INDEX_SRC,
+    "clients/dsh-remote/dsh-bridge.mjs": BRIDGE_SRC,
+    "clients/dsh-remote/upstream-discovery.mjs": UPSTREAM_SRC,
+  };
+  // POSIX 专属命令：Windows 上根本不会执行，不适用（sh/ps/pgrep/lsof/ioreg/ss/launchctl/systemctl）。
+  const POSIX_ONLY = /\/bin\/(sh|bash)|(^|[^\w/])(sh|ps|pgrep|lsof|ioreg|ss|launchctl|systemctl)\b/;
+  /** 把注释抹成空格（保留换行 → 行号不变）：注释里提到的 spawn("npx.cmd") 不该被当成真实调用。 */
+  const stripComments = (src) => {
+    let out = "";
+    let i = 0;
+    while (i < src.length) {
+      const ch = src[i];
+      if (ch === "/" && src[i + 1] === "/") {
+        while (i < src.length && src[i] !== "\n") { out += " "; i += 1; }
+        continue;
+      }
+      if (ch === "/" && src[i + 1] === "*") {
+        out += "  "; i += 2;
+        while (i < src.length && !(src[i] === "*" && src[i + 1] === "/")) { out += src[i] === "\n" ? "\n" : " "; i += 1; }
+        if (i < src.length) { out += "  "; i += 2; }
+        continue;
+      }
+      out += ch; i += 1;
+    }
+    return out;
+  };
   let checked = 0;
-  for (const [name, src] of Object.entries(files)) {
-    const re = /\b(spawn|spawnSync)\s*\(/g;
+  for (const [name, rawSrc] of Object.entries(files)) {
+    const src = stripComments(rawSrc);
+    const re = /\b(spawn|spawnSync|execFileSync|execSync|execFile)\s*\(/g;
     let m;
     while ((m = re.exec(src))) {
       let i = re.lastIndex - 1;
@@ -622,14 +687,19 @@ test("win32：所有 detached 子进程都必须带 windowsHide（否则必弹�
         else if (src[i] === ")") { depth -= 1; if (!depth) { end = i; break; } }
       }
       const call = src.slice(m.index, end + 1);
-      if (!/detached:\s*true/.test(call)) continue;
-      // POSIX 专属（/bin/sh、launchctl…）在 Windows 上根本不会执行，不适用
-      if (/\/bin\/sh|\/bin\/bash|launchctl|systemctl/.test(call)) continue;
+      if (POSIX_ONLY.test(call)) continue; // 只在 POSIX 上存在的命令
       checked += 1;
       const lineNo = src.slice(0, m.index).split("\n").length;
       assert.ok(/windowsHide:\s*true/.test(call),
-        `${name}:${lineNo} 的 detached spawn 缺 windowsHide → Windows 上会弹黑色窗口`);
+        `${name}:${lineNo} 的 ${m[1]} 缺 windowsHide → Windows 上会弹/闪黑色控制台窗口`);
     }
   }
-  assert.ok(checked >= 3, `至少应检查到 3 处 detached spawn，实际 ${checked}（切片/匹配可能失效）`);
+  // 回归点名（比上面的通用扫描给出更直白的失败信息）：这两处就是诊断报告里的 W1 根因
+  const bridgeSpawnAt = SETUP_SRC.indexOf('clients/dsh-remote/dsh-bridge.mjs"');
+  assert.ok(bridgeSpawnAt > 0, "dsh-setup.mjs 里应能定位到 bridge 子进程的 spawn");
+  const bridgeCall = SETUP_SRC.slice(SETUP_SRC.lastIndexOf("spawn(", bridgeSpawnAt), SETUP_SRC.indexOf(");", bridgeSpawnAt) + 2);
+  assert.match(bridgeCall, /windowsHide:\s*true/, "dsh-setup.mjs 的 bridge 子进程 spawn 必须带 windowsHide（空白黑窗根因）");
+  assert.match(UPSTREAM_SRC.replace(/\r\n/g, "\n"), /execFileSync\(cmd, args, \{[^}]*windowsHide:\s*true/,
+    "upstream-discovery.mjs 的 tryExec 必须带 windowsHide（netstat 闪窗根因）");
+  assert.ok(checked >= 12, `至少应检查到 12 处子进程调用，实际 ${checked}（切片/匹配可能失效）`);
 });

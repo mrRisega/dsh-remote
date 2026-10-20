@@ -142,13 +142,23 @@ function harness(opts = {}) {
   const timers = new Map();      // id -> { fn, ms }
   const intervals = new Map();   // id -> fn
   const fetches = [];
+  const signals = [];            // 被包装的 fetch 收到的 init.signal（C4：在途请求取消的断言入口）
+  const winListeners = new Map();// window 上登记的事件监听（C4：资源 error 捕获靠它）
   let timerSeq = 0;
   let intervalSeq = 0;
   const clicks = { reload: 0, assign: [], clipboard: [] };
 
   const html = new El("html");
-  html.outerHTML = "<html><head></head><body></body></html>"; // 无官方特征 → HOSTISH 为 false
+  /* hostFeature=true 模拟"官方文档已到、但界面还没挂载"的现场（HOSTISH 会读 outerHTML 找官方特征）。
+     默认 false = 连文档都没起来（bridge 挂了），此时适配层连采样器都不该装。 */
+  html.outerHTML = opts.hostFeature
+    /* ⚠️ 必须用 HOSTISH() 真正认的特征（RUNTIME_HOST_RE 里的 pI_x6G_frame / data-sidebar-collapsed），
+       而不是 __ModuleLoader__（那个只用于注入前的 HTML 门）：否则适配层连 boot 都提前 return，
+       采样器/菜单都不会装 —— 用例就测不到"官方文档已到、界面还没挂载"这个现场。 */
+    ? '<html><head><title>DeepSeek Harness</title></head><body><div class="pI_x6G_frame" data-sidebar-collapsed="true"></div></body></html>'
+    : "<html><head></head><body></body></html>";
   const body = new El("body");
+  if (opts.bootFailText) body.innerText = String(opts.bootFailText);
 
   const doc = new El("#document");
   doc.tagName = "#DOCUMENT";
@@ -174,9 +184,12 @@ function harness(opts = {}) {
     reload() { clicks.reload += 1; },
     assign(to) { clicks.assign.push(String(to)); },
   };
+  /* sessionStorage：C4 的"整页自动重试次数"闸门用它（每标签页最多 2 次）。 */
+  const store = opts.store || { _d: {}, getItem(k) { return k in this._d ? this._d[k] : null; }, setItem(k, v) { this._d[k] = String(v); }, removeItem(k) { delete this._d[k]; } };
   const win = {
     innerWidth: 390, innerHeight: 844, devicePixelRatio: 2,
-    localStorage: { _d: {}, getItem(k) { return k in this._d ? this._d[k] : null; }, setItem(k, v) { this._d[k] = String(v); }, removeItem(k) { delete this._d[k]; } },
+    localStorage: store,
+    sessionStorage: store,
     location: loc,
     MutationObserver: class { observe() {} disconnect() {} },
     ResizeObserver: class { observe() {} disconnect() {} },
@@ -185,22 +198,29 @@ function harness(opts = {}) {
     clearTimeout: (id) => timers.delete(id),
     setInterval: (fn) => { const id = ++intervalSeq; intervals.set(id, fn); return id; },
     clearInterval: (id) => intervals.delete(id),
-    addEventListener: () => {},
+    addEventListener: (type, fn) => { const arr = winListeners.get(type) || []; arr.push(fn); winListeners.set(type, arr); },
     removeEventListener: () => {},
     getComputedStyle: () => ({ getPropertyValue: () => "", pointerEvents: "auto", zIndex: "" }),
-    fetch: (input, init) => { fetches.push({ input: String(input), init }); return Promise.resolve({ ok: true, status: 200 }); },
+    fetch: opts.fetch || ((input, init) => {
+      fetches.push({ input: String(input), init });
+      return Promise.resolve({ ok: true, status: 200, headers: { get: () => null } });
+    }),
   };
   const navigator = { userAgent: opts.userAgent || "iPhone Safari (load-watch test)", maxTouchPoints: 5, platform: "iPhone" };
   if (opts.clipboard !== false) {
     navigator.clipboard = { writeText: (text) => { clicks.clipboard.push(String(text)); return Promise.resolve(); } };
   }
+  /* 包装：记录每个请求收到的 signal（用例用它断言"先取消在途请求再 reload"）。 */
+  const rawFetch = win.fetch;
+  win.fetch = (input, init) => { signals.push(init && init.signal); return rawFetch(input, init); };
   const ctx = vm.createContext({
     window: win, document: doc, console: { log() {}, warn() {}, error() {} },
-    navigator, location: loc, localStorage: win.localStorage,
+    navigator, location: loc, localStorage: store, sessionStorage: store,
     setTimeout: win.setTimeout, clearTimeout: win.clearTimeout,
     setInterval: win.setInterval, clearInterval: win.clearInterval,
     MutationObserver: win.MutationObserver, ResizeObserver: win.ResizeObserver,
     requestAnimationFrame: win.requestAnimationFrame,
+    AbortController, AbortSignal,
     fetch: win.fetch, performance: { now: () => Date.now() },
     URL, Date, Math, JSON, Object, Array, String, Number, RegExp, Boolean, Promise, Error, isNaN, parseInt, parseFloat,
     HTMLElement: El,
@@ -210,10 +230,23 @@ function harness(opts = {}) {
 
   const findBar = () => body.children.find((c) => c._cls.has("dsh-ma-loadbar")) || null;
   const barBtn = (role) => (findBar() ? findBar().querySelector('[data-role="' + role + '"]') : null);
-  const findWatchTimer = (ms) => [...timers.values()].find((t) => t.ms === ms) || null;
+  const timersByMs = (ms) => [...timers.values()].filter((t) => t.ms === ms);
+  const findWatchTimer = (ms) => timersByMs(ms)[0] || null;
   return {
-    ctx, win, doc, body, timers, intervals, fetches, clicks, navigator,
+    ctx, win, doc, body, timers, intervals, fetches, clicks, navigator, signals, store,
     findBar, barBtn, findWatchTimer,
+    countTimers: (ms) => timersByMs(ms).length,
+    /** 触发 window 上的事件（C4：资源 error 在**捕获阶段**被适配层接住）。 */
+    fireWindowEvent(type, ev) {
+      const arr = winListeners.get(type) || [];
+      for (const fn of arr) fn(ev);
+    },
+    /** 触发**所有**同毫秒的 setTimeout（页面里同毫秒的定时器不止一个时用它）。 */
+    fireTimers(ms) {
+      const list = timersByMs(ms);
+      assert.ok(list.length > 0, `应登记了 ${ms}ms 的定时器`);
+      for (const t of list) t.fn();
+    },
     /** 触发某个已登记的 setTimeout 回调（用例手工推进时间轴）。 */
     fireTimer(ms) {
       const t = findWatchTimer(ms);
@@ -234,10 +267,13 @@ function runScript(env) {
 // ① 阈值与注入体硬约束
 // ══════════════════════════════════════════════════════════════════════════════
 
-test("阈值常量 = 12 秒（25 秒太晚：用户实测干等 47 秒才看到任何东西）", () => {
+test("阈值常量 = 20 秒（12 秒低于真实 p90 15.3s → 17.6% 正常加载被误报）", () => {
   const script = adapterScript();
-  assert.match(script, /var MA_LOAD_WATCH_MS = 12 \* 1000;/, "看门狗阈值常量必须是 12 秒");
+  /* 2026-10-20 诊断 C4（03 报告 §2.3）：mirror_load 858 样本 p50 2682ms / p90 **15285ms** / ≥12s 17.6%
+     —— 12 秒阈值比真实 p90 还短，"电脑端可能未连接"成了日常误报。20 秒在 p90 之上留余量。 */
+  assert.match(script, /var MA_LOAD_WATCH_MS = 20 \* 1000;/, "看门狗阈值常量必须是 20 秒");
   assert.match(script, /\}, MA_LOAD_WATCH_MS\);/, "setTimeout 必须用该常量（不得再散落魔法数）");
+  assert.ok(!/MA_LOAD_WATCH_MS = 12 \* 1000/.test(script), "不得残留 12 秒阈值（会误报 1/10 的正常加载）");
   assert.ok(!/25 \* 1000/.test(script), "不得残留 25 秒阈值");
   // 语义保留：认出官方界面就不提示（宁可不提示也不要日常误报）
   assert.match(script, /if \(maLoadReadyNow\(\)\) return;/, "认出官方界面就不该提示");
@@ -259,7 +295,7 @@ test("注入体：不含 `</script>`、语法可编译、无 matchMedia 依赖�
 // ② 解析期不碰 DOM；slow 之后才懒创建、且只创建一次
 // ══════════════════════════════════════════════════════════════════════════════
 
-test("解析期绝不创建提示层：12 秒没到之前 body 里一个 dsh-ma-loadbar 都没有", () => {
+test("解析期绝不创建提示层：20 秒没到之前 body 里一个 dsh-ma-loadbar 都没有", () => {
   const env = runScript(harness());
   assert.equal(env.findBar(), null, "解析期就挂提示层 = 页面还没坏就可能挡住用户（历史事故根因），绝对不许");
   assert.equal(env.body.children.length, 0, "解析期不得往 body 塞任何适配层节点");
@@ -267,28 +303,30 @@ test("解析期绝不创建提示层：12 秒没到之前 body 里一个 dsh-ma-
 
 test("slow 之后才出现提示层，且只创建一次（重复触发不会插第二份）", () => {
   const env = runScript(harness());
-  env.fireTimer(12000);
+  env.fireTimer(20000);
   const bar = env.findBar();
-  assert.ok(bar, "12 秒仍认不出官方界面 → 必须出现底部可操作提示条");
+  assert.ok(bar, "20 秒仍认不出官方界面 → 必须出现底部可操作提示条");
   assert.equal(bar.hidden, false, "出现后应是可见状态");
+  /* 文案分档（C4）：没有 5xx / 没有首屏资源失败时，如实说"网络较慢"，
+     不再把什么都归因成"电脑端可能未连接"（截图 09 的反证：面板同时显示 95ms 顺畅）。 */
   assert.match(bar.textContent || bar.querySelector('[data-role="loadbar-txt"]').textContent,
-    /电脑端可能未连接 \/ 页面加载较慢/, "文案必须明确说明可能的原因");
+    /网络较慢（已等待 \d+ 秒）/, "无失败证据时文案应为「网络较慢」，不再替用户猜原因");
   assert.match(bar.querySelector('[data-role="loadbar-txt"]').textContent, /已等待 \d+ 秒/, "必须带已等待秒数");
   // 再触发一次（模拟重复路径/bfcache 恢复）→ 不得插第二份
-  env.fireTimer(12000);
+  env.fireTimer(20000);
   const bars = env.body.children.filter((c) => c._cls.has("dsh-ma-loadbar"));
   assert.equal(bars.length, 1, "提示层只能有一份（重复插入会叠字/叠按钮）");
 });
 
 test("已认出官方界面时看门狗不提示（宁可不提示，也不要在正常页面上打扰）", () => {
   const env = runScript(harness({ officialReady: true }));
-  env.fireTimer(12000);
+  env.fireTimer(20000);
   assert.equal(env.findBar(), null, "官方界面已就绪 → 不得出现任何提示层");
 });
 
 test("提示层创建过程中抛异常也不影响页面（吞掉，绝不把页面拖挂）", () => {
   const env = runScript(harness({ createElementThrows: true }));
-  assert.doesNotThrow(() => env.fireTimer(12000), "创建提示层失败必须被吞掉");
+  assert.doesNotThrow(() => env.fireTimer(20000), "创建提示层失败必须被吞掉");
   assert.equal(env.findBar(), null, "创建失败 → 页面保持原样（没有半成品节点）");
 });
 
@@ -296,23 +334,42 @@ test("提示层创建过程中抛异常也不影响页面（吞掉，绝不把�
 // ③ 三个按钮的点击行为（假 DOM + 桩）
 // ══════════════════════════════════════════════════════════════════════════════
 
-test("按钮「重试」= location.reload()", () => {
-  const env = runScript(harness());
-  env.fireTimer(12000);
+test("★ 按钮「重试」：先取消在途请求 + 排队中的自动重试，再 reload（不再制造 499 风暴）", () => {
+  /* 2026-10-20 C4 第 3 条：旧实现直接 location.reload() —— 上一轮仍在传输的资源被浏览器 abort，
+     nginx 记 499；用户连点几次就是 499 风暴（当天文档导航 22.3% 失败/中断的直接成因）。
+     现在必须先把我们跟踪到的在途请求取消，再刷新。 */
+  const env = runScript(harness({ hostFeature: true, fetch: () => new Promise(() => {}) })); // 永不返回 = 在途
+  env.win.fetch("/api/session/list");        // 制造一个在途请求（boot 已把 fetch 包上）
+  env.fireTimer(20000);                      // 看门狗把提示条拿出来
+  assert.ok(env.signals.length >= 1, "前提：有一个被包装的在途请求（含看门狗触发的遥测请求）");
   env.barBtn("loadbar-retry").click();
-  assert.equal(env.clicks.reload, 1, "点「重试」必须真的刷新页面");
+  assert.equal(env.clicks.reload, 0, "点击当下不得立刻 reload（先取消在途请求）");
+  assert.equal(env.signals[0].aborted, true, "★ 在途请求必须被取消（否则 reload 时它们就是 499）");
+  env.fireTimer(120);
+  assert.equal(env.clicks.reload, 1, "取消完在途请求后再 reload");
+});
+
+test("★ 按钮「重试」有 2 秒冷却：连点不会叠加出多次 reload（人肉重试风暴的机械成因）", () => {
+  const env = runScript(harness({ hostFeature: true, fetch: () => new Promise(() => {}) }));
+  env.fireTimer(20000);
+  env.barBtn("loadbar-retry").click();
+  const armed = env.countTimers(120);
+  assert.equal(armed, 1, "第一次点击排一个 reload");
+  env.barBtn("loadbar-retry").click();
+  env.barBtn("loadbar-retry").click();
+  assert.equal(env.countTimers(120), armed, "冷却期内连点不得再排 reload");
 });
 
 test("按钮「返回设备列表」= 导航回 /app/（用户在镜像页里唯一的主动退路）", () => {
   const env = runScript(harness());
-  env.fireTimer(12000);
+  env.fireTimer(20000);
   env.barBtn("loadbar-back").click();
   assert.deepEqual(env.clicks.assign, ["/app/"], "「返回设备列表」必须导航到 APP 外壳根路径");
 });
 
 test("按钮「复制诊断信息」= maLoadCopyLine（含 UA 与耗时）写进剪贴板", async () => {
   const env = runScript(harness());
-  env.fireTimer(12000);
+  env.fireTimer(20000);
   env.barBtn("loadbar-copy").click();
   await new Promise((r) => setImmediate(r));
   assert.equal(env.clicks.clipboard.length, 1, "点一次应复制一次");
@@ -325,7 +382,7 @@ test("按钮「复制诊断信息」= maLoadCopyLine（含 UA 与耗时）写进
 
 test("剪贴板不可用时，把整句诊断信息显示在提示条上（至少能截图）", async () => {
   const env = runScript(harness({ clipboard: false }));
-  env.fireTimer(12000);
+  env.fireTimer(20000);
   env.barBtn("loadbar-copy").click();
   await new Promise((r) => setImmediate(r));
   assert.equal(env.clicks.clipboard.length, 0, "前提：没有剪贴板");
@@ -339,13 +396,13 @@ test("剪贴板不可用时，把整句诊断信息显示在提示条上（至�
 
 test("点 ✕ 关闭后本页不再弹（不骚扰），且秒数刷新也停掉", () => {
   const env = runScript(harness());
-  env.fireTimer(12000);
+  env.fireTimer(20000);
   const bar = env.findBar();
   assert.equal(bar.hidden, false, "前提：提示条可见");
   env.barBtn("loadbar-close").click();
   assert.equal(bar.hidden, true, "点 ✕ 应收起");
   // 之后的重复触发（看门狗重入 / 秒数刷新）都不得再弹出来
-  env.fireTimer(12000);
+  env.fireTimer(20000);
   env.tickIntervals();
   assert.equal(bar.hidden, true, "关闭后本页不再弹（只提示一次）");
   assert.equal(env.body.children.filter((c) => c._cls.has("dsh-ma-loadbar")).length, 1, "也不得再创建新节点");
@@ -353,7 +410,7 @@ test("点 ✕ 关闭后本页不再弹（不骚扰），且秒数刷新也停掉
 
 test("用户一直没关、但页面后来加载出来了 → 提示条自动收起（判错也不会长期挂着）", () => {
   const env = runScript(harness());
-  env.fireTimer(12000);
+  env.fireTimer(20000);
   const bar = env.findBar();
   assert.equal(bar.hidden, false, "前提：提示条可见");
   // 模拟"页面其实已经好了"：让就绪判定命中官方 frame/输入框特征
@@ -395,7 +452,7 @@ test("提示层是**底部轻量条**：不是全屏覆盖层、限高、层级�
 
 test("slow 时照旧上报 mirror_load 兜底样本：字段 ms/outcome/at 不变、整页只报一次", () => {
   const env = runScript(harness());
-  env.fireTimer(12000);
+  env.fireTimer(20000);
   const posts = env.fetches.filter((f) => String(f.input).includes("/dsh-remote/telemetry/mirror-load"));
   assert.equal(posts.length, 1, "slow 兜底样本每次页面只发一条（reported 一次语义）");
   const body = JSON.parse(posts[0].init.body);
@@ -403,6 +460,154 @@ test("slow 时照旧上报 mirror_load 兜底样本：字段 ms/outcome/at 不�
   assert.equal(body.outcome, "slow", "看门狗兜底样本的 outcome 必须是 slow");
   assert.ok(Number.isFinite(body.ms) && body.ms >= 0 && body.ms <= 600000, "ms 必须被钳制在 [0,600000]");
   // 再触发一次：reported 已置位 → 不得重复上报
-  env.fireTimer(12000);
+  env.fireTimer(20000);
   assert.equal(env.fetches.filter((f) => String(f.input).includes("mirror-load")).length, 1, "同一页只报一次");
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ⑦ C4（2026-10-20 诊断）：首屏关键资源失败 → **自动重试**，而不是只弹提示
+//
+// 现场（03 报告 §2.3）：文档 / assets/*.js / plugins 聚合包只要失败一次就永远卡住；
+// 12s 看门狗只弹「已等 N 秒 + 重试」。数据：首屏关键资源失败 1347/18375（7.3%），
+// 高峰窗口 12.4%，涉 55 台设备 —— 全都没有自愈路径。
+// 本组用例锁三件事：① 就地重建失败资源（2s/4s 退避、同 URL 最多 2 次）；
+//                  ② 官方启动失败文案 → 受控整页重试（每标签页最多 2 次，跨刷新续计）；
+//                  ③ 文案按原因分档（电脑端不可达 / 资源失败 / 网络慢）。
+// ══════════════════════════════════════════════════════════════════════════════
+
+/** 造一个"加载失败的首屏资源元素"（真实 DOM 里属性会反射到 .src，假 DOM 手工补上）。 */
+function failingScript(src, type) {
+  const el = new El("script");
+  el.setAttribute("src", src);
+  if (type) el.setAttribute("type", type);
+  el.src = src;
+  return el;
+}
+/** 共享 store：模拟"整页刷新后 sessionStorage 仍在"（防 reload 风暴的闸门靠它跨刷新）。 */
+function makeStore() {
+  return { _d: {}, getItem(k) { return k in this._d ? this._d[k] : null; }, setItem(k, v) { this._d[k] = String(v); }, removeItem(k) { delete this._d[k]; } };
+}
+
+test("★ 首屏关键资源（/assets/*.js）失败一次 → 2 秒后自动重建该 <script>（不再只弹提示）", () => {
+  const env = runScript(harness());
+  const el = failingScript("/assets/index-abc.js", "module");
+  env.body.appendChild(el);
+  env.fireWindowEvent("error", { target: el });
+  assert.equal(env.countTimers(2000), 1, "失败一次 → 排一个 2 秒后的重试（不是干等用户点）");
+  env.fireTimer(2000);
+  const retried = env.body.children.filter((c) => c.tagName === "SCRIPT" && c.attrs["data-dsh-ma-retry"] === "1");
+  assert.equal(retried.length, 1, "★ 必须真的重建一个 <script>（旧实现只弹提示、页面永远卡住）");
+  assert.equal(retried[0].getAttribute("src"), "/assets/index-abc.js", "必须重试同一个 URL");
+  assert.equal(retried[0].getAttribute("type"), "module", "模块类型必须保留（否则重建出来的脚本不执行）");
+});
+
+test("★ 设备作用域形态（/remote/<dev>/plugins/…）与 manifest 也算首屏关键资源", () => {
+  const env = runScript(harness());
+  const p = failingScript("/remote/dev-abc123/plugins/??@deepseek-ai/x.js");
+  env.body.appendChild(p);
+  env.fireWindowEvent("error", { target: p });
+  assert.equal(env.countTimers(2000), 1, "设备作用域 URL 归一后仍应命中 /plugins/");
+  // 非关键资源（图片/字体等）不重试：不能因为一张图失败就反复打服务端
+  const img = new El("img");
+  img.src = "/avatars/u1.png";
+  env.body.appendChild(img);
+  env.fireWindowEvent("error", { target: img });
+  assert.equal(env.countTimers(2000), 1, "非首屏关键资源不得触发重试");
+});
+
+test("★ 同一个 URL 最多就地重试 2 次，退避 2s→4s（第三次不再排队）", () => {
+  const env = runScript(harness());
+  const el = failingScript("/plugins/??@deepseek-ai/x.js");
+  env.body.appendChild(el);
+  env.fireWindowEvent("error", { target: el });
+  assert.equal(env.countTimers(2000), 1, "第一次失败 → 2 秒后重试");
+  env.fireWindowEvent("error", { target: el });
+  assert.equal(env.countTimers(4000), 1, "第二次失败 → 指数退避到 4 秒");
+  env.fireWindowEvent("error", { target: el });
+  assert.equal(env.countTimers(2000) + env.countTimers(4000), 2, "★ 第三次不再排新重试（上限 2 次，防请求风暴）");
+  assert.equal(env.win.__dshMaDiag.retry.res, 0, "还没真正重建过 → 诊断里的 res 计数为 0（重建后才会涨）");
+});
+
+test("★ 出现「Failed to load plugins」且界面没就绪 → 2 秒后受控整页刷新（这就是 22:01:44 的现场）", () => {
+  const env = runScript(harness({ hostFeature: true, bootFailText: "Failed to load plugins（41 条目未激活）" }));
+  const before = env.countTimers(2000);                 // 菜单里本来就有 2000ms 的 E2EE 状态重绘
+  env.fireTimer(6000);                                  // 启动失败文案扫描（6s 那一拍）
+  assert.equal(env.countTimers(2000), before + 1, "看到启动失败文案 → 排一个 2 秒后的整页重试");
+  env.fireTimers(2000);
+  assert.equal(env.clicks.reload, 1, "★ 必须真的刷新一次首屏（旧实现永远卡在 Failed to load plugins）");
+  assert.equal(JSON.parse(env.store.getItem("dsh-ma-firstscreen-retry")).n, 1,
+    "重试次数必须记在 sessionStorage（刷新后仍然生效，否则每次刷新都又能刷）");
+});
+
+test("★ 整页自动重试上限 2 次/标签页，且跨刷新续计（防 reload 风暴）", () => {
+  const store = makeStore();
+  const bootFail = { hostFeature: true, bootFailText: "Failed to load plugins", store };
+  const env1 = runScript(harness(bootFail));
+  env1.fireTimer(6000); env1.fireTimers(2000);
+  assert.equal(env1.clicks.reload, 1, "第一次自动重试");
+  // 模拟整页刷新：新环境、**同一个 sessionStorage**
+  const env2 = runScript(harness(bootFail));
+  env2.fireTimer(6000);
+  assert.equal(env2.countTimers(4000), 1, "第二次自动重试退避到 4 秒（计数从 sessionStorage 恢复）");
+  env2.fireTimers(4000);
+  assert.equal(env2.clicks.reload, 1, "第二次自动重试");
+  // 第三次：额度已用完 → 不再刷新
+  const env3 = runScript(harness(bootFail));
+  const base2 = env3.countTimers(2000), base4 = env3.countTimers(4000);
+  env3.fireTimer(6000);
+  assert.equal(env3.countTimers(2000), base2, "★ 同一标签页最多 2 次自动整页重试（不再排 2s）");
+  assert.equal(env3.countTimers(4000), base4, "★ 也不再排 4s");
+});
+
+test("界面已经就绪时，看到启动失败文案也**不**自动刷新（宁可不救，也不要在正常页面上刷新）", () => {
+  const env = runScript(harness({ hostFeature: true, officialReady: true, bootFailText: "Failed to load plugins" }));
+  const before = env.countTimers(2000);
+  env.fireTimer(6000);
+  assert.equal(env.countTimers(2000), before, "官方界面已就绪 → 不得排整页重试");
+  assert.equal(env.clicks.reload, 0);
+});
+
+// ── 文案分档（03 报告 §2.3「文案归因错误」：不再把什么都归成"电脑端可能未连接"） ──────────
+
+test("★ 文案分档：受保护 API 5xx（电脑端不可达）→「电脑端可能未连接」", async () => {
+  const env = runScript(harness({
+    hostFeature: true,
+    fetch: () => Promise.resolve({ ok: false, status: 502, headers: { get: () => null } }),
+  }));
+  env.win.fetch("/api/session/list");
+  await new Promise((r) => setImmediate(r));
+  env.fireTimer(20000);
+  assert.match(env.findBar().querySelector('[data-role="loadbar-txt"]').textContent,
+    /电脑端可能未连接（已等待 \d+ 秒）/, "5xx = 电脑端/隧道不可达，这时说「电脑端可能未连接」才是对的");
+});
+
+test("★ 文案分档：E2EE 死会话的 502（带 x-dsh-e2ee-error）**不算**电脑端离线", async () => {
+  const env = runScript(harness({
+    hostFeature: true,
+    fetch: () => Promise.resolve({ ok: false, status: 502, headers: { get: (n) => (n === "x-dsh-e2ee-error" ? "unknown_session" : null) } }),
+  }));
+  env.win.fetch("/api/session/list");
+  await new Promise((r) => setImmediate(r));
+  env.fireTimer(20000);
+  assert.match(env.findBar().querySelector('[data-role="loadbar-txt"]').textContent,
+    /网络较慢（已等待 \d+ 秒）/, "桥端答「会话我不认识」不是网络/离线问题，不得误导用户");
+});
+
+test("★ 文案分档：首屏资源失败 →「页面资源加载失败，正在重试…」", () => {
+  const env = runScript(harness());
+  const el = failingScript("/assets/x.js");
+  env.body.appendChild(el);
+  env.fireWindowEvent("error", { target: el });
+  env.fireTimer(20000);
+  assert.match(env.findBar().querySelector('[data-role="loadbar-txt"]').textContent,
+    /页面资源加载失败，正在重试…（已等待 \d+ 秒）/, "有资源失败证据时要如实说资源失败（并且我们真的在重试）");
+});
+
+test("诊断出口：__dshMaDiag / __dshMaRetryStats 暴露 retry / scrim / compat 状态（用户上报现场用）", () => {
+  const env = runScript(harness());
+  assert.ok(env.win.__dshMaDiag, "必须暴露只读诊断对象");
+  assert.equal(typeof env.win.__dshMaDiag.retry.page, "number", "整页重试次数");
+  assert.equal(typeof env.win.__dshMaDiag.scrim.activations, "number", "scrim 下闸次数（C6 用户上报「又点不动了」时用）");
+  assert.equal(env.win.__dshMaDiag.compatOfficial.on, false, "锚点齐全的页面上不得误进 compat-official");
+  assert.equal(env.win.__dshMaRetryStats, env.win.__dshMaDiag.retry, "mirror-diag 直接读 __dshMaRetryStats");
 });

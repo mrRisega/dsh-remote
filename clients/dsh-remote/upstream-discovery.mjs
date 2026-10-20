@@ -103,7 +103,12 @@ export function resolveUpstreamHint({ relayDir = "", env = process.env } = {}) {
 
 function tryExec(cmd, args, timeoutMs = 4000) {
   try {
-    return String(execFileSync(cmd, args, { encoding: "utf8", timeout: timeoutMs, stdio: ["ignore", "pipe", "ignore"] }) || "");
+    // windowsHide（C1）：这里会跑 netstat/lsof/ps 这类**控制台程序**。watcher/bridge 常以
+    // 无控制台方式启动（launchd / 任务计划 wscript / 插件的 detached spawn），此时 Windows 会
+    // 为子进程新分配一个可见控制台窗口 → 用户看到"一闪而过"的黑窗（诊断报告 04 §3.2 第二条）。
+    // 上游探测在上游请求失败/ws-open 失败时每 15s 冷却反复触发（见 refreshUpstream），所以闪窗成串。
+    // POSIX 上该选项被忽略。
+    return String(execFileSync(cmd, args, { encoding: "utf8", timeout: timeoutMs, windowsHide: true, stdio: ["ignore", "pipe", "ignore"] }) || "");
   } catch {
     return "";
   }
