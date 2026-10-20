@@ -6,7 +6,7 @@ All notable changes to dsh-remote are documented here. This project follows
 > 写法约定：每条只写**用户能看到的变化**（1~8 行），分点陈述；
 > 不列 commit、不写排查过程、内部路径/标识/事件编号，也不写"我们怎么发现的"。
 
-## [0.7.3-beta.2] - 2026-10-20
+## [0.7.3-beta.3] - 2026-10-20
 
 **修今晚群反馈的「打不开 / 加载卡住 / 黑窗 / 连接时好时坏」——客户端侧集中修复。**
 
