@@ -484,6 +484,26 @@ const CHUNK_SIZE = 200 * 1024;
 // 单个 HTTP 请求的兜底超时(秒)。dsh 的 prompt 等操作可能跑很久,给足余量。
 const HTTP_TIMEOUT_MS = 120_000;
 
+/**
+ * 隧道 WS **接收**上限,与 relay-router 的 `WS_MAX_PAYLOAD`(256MB) 对齐。
+ *
+ * 【为什么要显式抬高】`ws` 的**客户端**默认 `maxPayload = 100MiB`;而 router → bridge
+ * 方向的帧**不分块**(router 的 `sendToBridge` 直接 `ws.send(JSON.stringify(frame))`),
+ * 最大的一帧来自上传:`/api/session/uploadFileBinary` 的请求体在 router 侧被
+ * `bodyBuf.toString("base64")` 后塞进帧里 —— router `MAX_BODY_BYTES = 64MiB`,
+ * 64MiB 的请求体 = 89.5MB 的 base64 字符串,离 100MiB 只剩 ~15% 余量。
+ * 一旦越界,`ws` 以 1009(message too big) 直接关闭:bridge 掉线 → router 对所有
+ * 后续请求回 502 `device_offline`(生产上"连续 502、怎么重试都失败"就是这个形态),
+ * 而**用户只看到"上传失败"**。对齐 256MB 后这一侧不再是瓶颈(内存风险仍由 router 的
+ * MAX_BODY_BYTES 兜住,这里只是不再替 router 提前掐线)。
+ */
+export const TUNNEL_WS_MAX_PAYLOAD = 256 * 1024 * 1024;
+/** 隧道 `new WebSocket` 的选项(导出给用例钉住 maxPayload,避免以后被"顺手删掉")。 */
+export const TUNNEL_WS_OPTIONS = Object.freeze({ followRedirects: false, maxPayload: TUNNEL_WS_MAX_PAYLOAD });
+
+/** 需要「长请求」可观测性的路径:大文件上传最典型(分钟级、几十 MB、失败无解释)。 */
+const LONG_REQUEST_PATH_RE = /^\/api\/session\/uploadFileBinary(?:\?|$)/;
+
 // ---------- E2EE 运行时(默认禁用;main() 启动时按配置/服务端开关初始化) ----------
 
 /**
@@ -737,6 +757,125 @@ export async function maybeCompressResponse({ buf, contentType, contentEncoding,
 }
 
 /**
+ * 帧里请求体的**字节数**(http 帧一律 base64;旧协议是原始文本按 UTF-8 计)。
+ * 只用于日志/错误回包里的 `bytes`,算错不影响转发。
+ */
+export function requestBodyBytes(body, isB64) {
+  if (body === undefined || body === null || body === "") return 0;
+  const s = String(body);
+  if (!isB64) return Buffer.byteLength(s, "utf8");
+  // base64 → 字节数 = 去掉 padding 后的长度 * 3/4(避免为了记日志再解一遍几十 MB)
+  const pad = s.endsWith("==") ? 2 : s.endsWith("=") ? 1 : 0;
+  return Math.max(0, Math.floor((s.length * 3) / 4) - pad);
+}
+
+/**
+ * 把「上游 fetch 失败」翻译成**用户能懂、客服能查**的 code + message。
+ *
+ * 背景(生产 2026-10-20~22):上传接口的 22 次 502 里有 24 字节的 `{"error":"fetch failed"}`
+ * —— 手机端只看到"上传失败",客服拿到的日志也只有一句 undici 的 `fetch failed`,
+ * 既分不清"上游没起来"和"请求太大超时",也没法告诉用户该做什么。分类后:
+ *   - `upstream_timeout`     本机 dsh web 120s 没响应(大文件/上游卡住);
+ *   - `upstream_unreachable` 连不上本机 dsh web(退出/换端口/连接被重置);
+ *   - `upstream_error`       其余(带原始 message 与 cause code)。
+ * 纯函数、无 IO —— 502 回包与日志共用同一份结论,导出给用例钉住 code。
+ *
+ * @param {any} e fetch 抛出的错误(可能带 undici 的 `cause.code`)
+ * @returns {{code:string,message:string,detail:string}}
+ */
+export function classifyUpstreamError(e) {
+  const name = String((e && e.name) || "");
+  const msg = String((e && e.message) || e || "");
+  const cause = e && typeof e.cause === "object" && e.cause ? e.cause : null;
+  const causeCode = String((cause && cause.code) || (e && e.code) || "").toUpperCase();
+  if (name === "TimeoutError" || name === "AbortError" || /timed out|timeout|aborted due to timeout/i.test(msg)) {
+    return {
+      code: "upstream_timeout",
+      message: `本机 dsh web 在 ${Math.round(HTTP_TIMEOUT_MS / 1000)} 秒内没有响应(文件太大或电脑端卡住),请稍后重试;反复失败请确认电脑端 DSH 仍在运行。`,
+      detail: causeCode || name || "timeout"
+    };
+  }
+  if (/ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|ENETUNREACH|EPIPE|UND_ERR|socket hang up|fetch failed|other side closed|terminated/i.test(causeCode + " " + msg)) {
+    return {
+      code: "upstream_unreachable",
+      message: "连不上电脑端的 dsh web(可能已退出或换了端口);bridge 会自动重新发现,请稍后重试。",
+      detail: causeCode || msg.slice(0, 80)
+    };
+  }
+  return {
+    code: "upstream_error",
+    message: `转发到本机 dsh web 失败: ${msg || "未知错误"}`,
+    detail: causeCode
+  };
+}
+
+/** 在 `/api/file?path=...` 的 path 参数里取文件名(取最后一段;非法输入回落 download)。 */
+export function downloadFilenameOf(filePath) {
+  const raw = String(filePath || "").replace(/[\x00-\x1f\x7f]/g, "");
+  const cleaned = raw.replace(/\\/g, "/").replace(/\/+$/, "");
+  const base = cleaned.split("/").filter(Boolean).pop() || "";
+  return base && base !== "." && base !== ".." ? base : "download";
+}
+
+/**
+ * 下载语义(C):给 `/api/file` 的**导航**请求补 `Content-Disposition: attachment`。
+ *
+ * 【为什么需要】上游 dsh web 的 `/api/file` 只给 `Content-Type`,**没有** Content-Disposition
+ * (dsh-api-session-controller 的 serveFile)。iOS Safari 于是把 PDF/大图**内联**打开;
+ * 而上游同时带 `Content-Security-Policy: sandbox; default-src 'none'`,内联页经常直接空白 ——
+ * 用户看到的正是"下载只能在电脑端查看"。加 attachment 让手机浏览器落到下载管理器。
+ *
+ * 【为什么只对导航加】同一个 `/api/file` 也被官方前端当 `<img src>` 用(聊天里的绝对路径图片),
+ * 无差别加 attachment 有把图片预览打成下载的风险。判定顺序:
+ *   1. 方法必须是 GET,路径必须是 `/api/file`;
+ *   2. 响应必须是 2xx 且**有实体**(200/206):4xx/5xx 是错误页,加了 attachment 会
+ *      让浏览器把「登录失效/文件太大」的报错正文**下载成文件**,比原来更糟;
+ *   3. 上游**已经**给了 content-disposition(attachment 或 inline)→ 一律不覆盖(上游语义优先);
+ *   4. `?download=1/0` 显式指定:1 强制加、0 强制不加;
+ *   5. 没有显式参数时看导航特征:有 `sec-fetch-dest` 就只认 `document`;
+ *      没有(老浏览器)则要求 Accept 含 `text/html`(导航)。
+ *      `image`/`empty`(fetch/XHR)/`iframe` 一律不动 —— 子资源加载本来就不受 attachment 影响,
+ *      但没必要冒任何风险。
+ *
+ * @param {{method?:string,path?:string,status?:number,reqHeaders?:object,resHeaders?:object}} args
+ * @returns {string|null} 需要附加的 Content-Disposition 值;null = 不附加
+ */
+export function downloadDispositionOf({ method = "GET", path = "", status = 200, reqHeaders = {}, resHeaders = {} } = {}) {
+  if (String(method || "").toUpperCase() !== "GET") return null;
+  if (status !== 200 && status !== 206) return null; // 错误页不伪装成下载
+  const raw = String(path || "");
+  const q = raw.indexOf("?");
+  const pathname = q === -1 ? raw : raw.slice(0, q);
+  const search = q === -1 ? "" : raw.slice(q + 1);
+  if (pathname !== "/api/file") return null;
+  if (headerValue(resHeaders, "content-disposition")) return null; // 上游已有 → 不覆盖
+  let params = null;
+  try {
+    params = new URLSearchParams(search);
+  } catch {
+    params = null;
+  }
+  const explicit = params ? params.get("download") : null;
+  if (explicit === "0" || explicit === "false") return null;
+  if (explicit !== "1" && explicit !== "true") {
+    const dest = headerValue(reqHeaders, "sec-fetch-dest").toLowerCase();
+    if (dest) {
+      if (dest !== "document") return null;
+    } else if (!headerValue(reqHeaders, "accept").toLowerCase().includes("text/html")) {
+      return null; // 没有导航特征(老浏览器) → 保守不动
+    }
+  }
+  const name = downloadFilenameOf(params ? params.get("path") : "");
+  // RFC 5987 的 ext-value:Safari/Chrome/Firefox 都认 filename*;同时给一个 ASCII 回退,
+  // 免得只认 filename= 的老客户端把文件存成 URL 里的 "file"(连带丢扩展名)。
+  // 非 ASCII 名(中文等)的 ASCII 回退统一成 download.<ext> —— 比一串下划线可读。
+  const encoded = encodeURIComponent(name).replace(/['()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase());
+  const ext = (/\.([A-Za-z0-9]{1,8})$/.exec(name) || [""])[0];
+  const ascii = /[^\x20-\x7e]/.test(name) ? `download${ext}` : name.replace(/["\\]/g, "_") || "download";
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encoded}`;
+}
+
+/**
  * 进行中的 SSE 流:frameId → AbortController。
  * 手机侧断开时,中继会发 `http-abort`,这里据此掐掉上游(否则电脑上会留一条永不结束的连接)。
  */
@@ -868,6 +1007,13 @@ async function doHttp(method, path, reqHeaders, body, isB64) {
   // 若我们自行 gzip,必须在 sanitize 之后把 content-encoding: gzip 补回,手机才能正确解压。
   const headers = sanitizeResponseHeaders(Object.fromEntries(res.headers.entries()));
   const contentType = res.headers.get("content-type") || "";
+  // 下载语义(C):`/api/file` 的**导航**响应补 Content-Disposition: attachment。
+  // 上游只给 Content-Type(iOS 会内联打开 PDF/大图,叠加 sandbox CSP 后常常一片空白),
+  // 手机浏览器就不会落到下载管理器 —— 判据见 downloadDispositionOf(子资源/图片不动)。
+  {
+    const disposition = downloadDispositionOf({ method, path: safe, status: res.status, reqHeaders, resHeaders: headers });
+    if (disposition) headers["content-disposition"] = disposition;
+  }
   if (!contentType.includes("text/event-stream")) { // SSE 长连不缓冲不注入(见模块注释)
     const m = maybeInjectMobileAdapter({ buf, contentType });
     if (m.injected) {
@@ -980,6 +1126,9 @@ export async function handleHttpFrame(dchOrSend, frame) {
   const send = toSender(dchOrSend);
   const { id, method = "GET", path = "/", headers = {}, body, bodyBase64: isB64 } = frame;
   const t0 = Date.now();
+  // 长请求(大文件上传)的可观测性:上行字节与耗时都要进日志/错误回包,见 B 段注释。
+  const bytesIn = requestBodyBytes(body, !!isB64);
+  const isLongRequest = LONG_REQUEST_PATH_RE.test(String(path));
   // 页面还活着：任何后续请求都撤掉「镜像页加载」看门狗（见 armMirrorLoadWatch）
   if (mirrorLoadWatch) { mirrorLoadWatch = null; }
   // 桌面授权引导(方案A):POST /_e2ee/intro(device/channel 形态归一)—— 本地应答,不连上游
@@ -1036,15 +1185,65 @@ export async function handleHttpFrame(dchOrSend, frame) {
     const reply = await doHttp(method, path, headers, body, !!isB64);
     reply.id = id;
     reply.type = "http";
-    send(reply);
-    console.log(`[bridge] ${method} ${path} → ${reply.status} (${Date.now() - t0}ms, ${(reply.body.length * 3 / 4 / 1024).toFixed(0)}KB)`);
+    const sent = send(reply);
+    const ms = Date.now() - t0;
+    const outBytes = Math.floor((reply.body.length * 3) / 4);
+    if (isLongRequest) {
+      // 长请求(大文件上传)单独记:上行字节、总耗时、状态码 —— 客服排查"上传失败"最需要这三样。
+      console.log(`[bridge] ${method} ${path} → ${reply.status} (${ms}ms, 上行 ${(bytesIn / 1024 / 1024).toFixed(2)}MB, 下行 ${(outBytes / 1024).toFixed(0)}KB)`);
+    } else {
+      console.log(`[bridge] ${method} ${path} → ${reply.status} (${ms}ms, ${(outBytes / 1024).toFixed(0)}KB)`);
+    }
+    reportUndelivered(sent, { method, path, phase: "reply", ms, bytesIn, outBytes });
   } catch (e) {
     // 上游不可达是「端口可能变了」的最强信号（Desktop 换端口 / dsh web 重启到别的端口）：
     // 触发一次带冷却的重新发现，后续请求自动跟上，不必重启 bridge。
     void refreshUpstream("上游请求失败");
-    console.log(`[bridge] ${method} ${path} 上游错误: ${e.message}`);
-    send({ id, type: "http", status: 502, headers: { "content-type": "application/json" }, body: Buffer.from(JSON.stringify({ error: String(e.message || e) })).toString("base64"), bodyBase64: true });
+    const ms = Date.now() - t0;
+    const info = classifyUpstreamError(e);
+    const detail = info.detail ? `, detail=${info.detail}` : "";
+    const tag = isLongRequest ? "长请求" : "普通请求";
+    const line = `[bridge] ${method} ${path} 上游错误(${info.code}): ${info.message}（${tag}, ${ms}ms, 上行 ${bytesIn}B${detail}）`;
+    if (isLongRequest || info.code !== "upstream_error") console.error(line);
+    else console.log(line);
+    // 502 body:从 `{"error":"fetch failed"}`(24 字节、用户与客服都看不懂)改成
+    // `{error:{code,message,...}}` —— 与 bridge/router 其它错误回包同一形态。
+    // 兼容:保留顶层 code/message,老读取方从 error 字符串改读这两个即可。
+    const payload = {
+      error: {
+        code: info.code,
+        message: info.message,
+        method,
+        path,
+        bytes: bytesIn,
+        durationMs: ms,
+        ...(info.detail ? { detail: info.detail } : {})
+      },
+      code: info.code,
+      message: info.message
+    };
+    const sent = send({
+      id,
+      type: "http",
+      status: 502,
+      headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
+      body: Buffer.from(JSON.stringify(payload)).toString("base64"),
+      bodyBase64: true
+    });
+    reportUndelivered(sent, { method, path, phase: "502", ms, bytesIn, outBytes: 0 });
   }
+}
+
+/**
+ * 回包没送进隧道(ws 已断/缓冲写失败)时的**唯一在线证据**。
+ *
+ * 中继侧对"bridge 断开"只会回一句 `502 device_offline`,bridge 这边如果静默吞掉,
+ * 事后就分不清是"桥没收到请求"还是"桥回了但没送出去"。这里只在 send 明确返回 false
+ * (makeChunkedSender 捕获到 ws.send 抛错)时记一行 —— 不改变任何行为。
+ */
+function reportUndelivered(sent, { method, path, phase, ms, bytesIn, outBytes }) {
+  if (sent !== false) return;
+  console.error(`[bridge] ${method} ${path} ${phase} 回包未能送入中继(tunnel_closed): ${ms}ms, 上行 ${bytesIn}B, 下行 ${outBytes}B`);
 }
 
 /** 桌面授权引导(方案A):POST /_e2ee/intro —— 桥端本地应答,不连上游。
@@ -1536,7 +1735,9 @@ async function registerDeviceInAccount(token) {
 
 function connectTunnel(token) {
   const endpoint = tunnelEndpoint(TUNNEL_URL);
-  const ws = new WebSocket(endpoint, { followRedirects: false });
+  // maxPayload 必须显式给:ws 客户端默认 100MiB,而 router→bridge 的单帧不分块,
+  // 大文件上传的 base64 请求体可以顶到 89.5MB(见 TUNNEL_WS_MAX_PAYLOAD 注释)。
+  const ws = new WebSocket(endpoint, TUNNEL_WS_OPTIONS);
   const send = makeChunkedSender((s) => { if (ws.readyState === WebSocket.OPEN) ws.send(s); });
   let heartbeat;
   let pongReceived = true;

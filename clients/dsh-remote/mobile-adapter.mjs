@@ -1048,7 +1048,18 @@ const SCRIPT = `(() => {
         compatOfficial: maCompatOfficial,
         scrim: maScrimStats,
         retry: maRetryStats,
-        load: { slow: maLoadWatch.slow, apiFails: maLoadWatch.apiFails, lastApiStatus: maLoadWatch.lastApiStatus }
+        load: { slow: maLoadWatch.slow, apiFails: maLoadWatch.apiFails, lastApiStatus: maLoadWatch.lastApiStatus },
+        // E2EE 死会话自动恢复 / 回前台重连（2026-10-23）：只作诊断，不参与任何判定。
+        // var 提升在此处可能尚未赋值（maPublishDiag 在恢复层定义之前就会被调用一次）→ 用 typeof 兜住。
+        resume: (typeof maResumeState !== "undefined" && maResumeState)
+          ? {
+              armed: !!maResumeState.armed, done: !!maResumeState.done,
+              reason: maResumeState.reason, lastAt: maResumeState.lastAt,
+              fg: (typeof maFgState !== "undefined" && maFgState)
+                ? { count: maFgState.count, lastAt: maFgState.lastAt, src: maFgState.lastSrc, probing: !!maFgState.probing }
+                : null
+            }
+          : null
       };
     } catch (e) { /* 诊断失败绝不影响页面 */ }
   }
@@ -1703,6 +1714,445 @@ const SCRIPT = `(() => {
       maReportMirrorLoad("slow");
     } catch (e) { /* 忽略 */ }
   }, MA_LOAD_WATCH_MS);
+
+  /* ============================================================================
+   * E2EE 死会话自动恢复 + 回到前台重连（2026-10-23，iOS 断线重连体验）
+   *
+   * 现场（iOS 用户反馈）：退出 Safari / 切到别的 App 一两分钟再回来，镜像页几乎必然重载；
+   * 而桥端 E2EE 会话表是**进程内存**（24h TTL + CAP 32 LRU，电脑端重启即丢）—— 重载后
+   * 常撞上「加密会话已失效，需要重新解锁」，旧行为只能回设备列表手动重新解锁。
+   * 本段只做两件事，都**只读**状态（window.__dshE2eeBadge + dsh-e2ee-badge 事件），
+   * 不碰任何加解密逻辑、不重建会话、不自己重连 WS：
+   *
+   *   ① 死会话 → 自动回 /app/?resume=<deviceId>&from=mirror，由 native.html 用
+   *      「记住本机」的派生 MK 静默解锁再回镜像页（全程无手势、无密码输入）；
+   *   ② 从后台恢复（pageshow persisted / visibilitychange）→ 一次轻量探针确认隧道还在；
+   *      失败则唤醒官方客户端（online 事件）并再探一次，仍失败只给**可见**提示
+   *      （复用底部提示条的「重试 / 返回设备列表 / 复制诊断」出口），绝不做静默无限重连。
+   *
+   * 触发条件极窄（业主验收口径：只有"确认 E2EE 不可用"才触发）：
+   *   · 只认镜像页路径 /remote/<deviceId>/(不是镜像页直接什么都不做)；
+   *   · 只认桥端明确答复的「加密会话已失效 / 需要重新解锁」；
+   *   · 纯明文（「未加密」「未解锁」「明文」）默认**绝不**打扰 —— 用户可能主动选了「暂不加密」。
+   *     唯一例外：本页是为了甩掉死会话才被 shim 重载过（sessionStorage 里有它的重载闸门），
+   *     且本机还留着「记住本机」的派生 MK —— 那才是"本该加密、却被自动降级成明文"。
+   * 闸门：本页最多一次 + 60 秒冷却 + 60 秒窗口内最多 2 次（sessionStorage，跨重载仍有效）。
+   *
+   * 注入体纪律：本段不得出现反引号；字符串里不得出现反斜杠转义（模板字符串会先吃一层）。
+   * ========================================================================= */
+
+  /* ===DSH-MA-RESUME-ENGINE-START=== */
+  /* ===DSH-MA-RESUME-PURE-START=== */
+  /** 镜像页设备 id：/remote/<deviceId>/… → deviceId（纯函数；不是镜像页返回空串）。
+   *  设备 id 之后要拼进跳转地址，所以只接受 URL 安全字符，其它一律当没有。 */
+  function maDeviceIdOfMirrorPath(pathname) {
+    try {
+      var parts = String(pathname || "").split("/").filter(Boolean);
+      if (parts[0] !== "remote" || !parts[1]) return "";
+      var id = "";
+      try { id = decodeURIComponent(parts[1]); } catch (e) { id = ""; }
+      return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(id) ? id : "";
+    } catch (e) { return ""; }
+  }
+
+  /**
+   * 是否该自动恢复（纯函数，便于单测）。输入 E2EE 徽标状态 + 本机上下文。
+   * @param {{mode?:string,text?:string}|null} st  __dshE2eeBadge.state()
+   * @param {{mk?:boolean,deadReloadAt?:number,now?:number}} ctx  mk=有派生 MK;deadReloadAt=死会话重载闸门时间戳
+   * @returns {string} "" 不恢复；"dead_session" 桥端明确说不认这张票；"plaintext_after_dead" 抢修降级后的明文
+   */
+  function maE2eeResumeDecision(st, ctx) {
+    try {
+      if (!st || typeof st !== "object") return "";
+      var mode = String(st.mode || "");
+      var text = String(st.text || "");
+      if (mode === "ok" || !text) return "";
+      var c = ctx && typeof ctx === "object" ? ctx : {};
+      /* ① 桥端明确答复：会话没了 / 需要重新解锁。这是**唯一**的确定信号。 */
+      if (/加密会话已失效|会话已失效|需要重新解锁/.test(text)) return "dead_session";
+      /* ② 明文/未解锁：默认绝不打扰。仅当"本页刚为甩掉死会话被重载过 + 本机有记住的 MK"才抢修 ——
+            这两个条件同时成立时，用户本来应该是加密的，现在只是被自动降级成了明文。 */
+      if (/未加密|未解锁|明文/.test(text)) {
+        var reloadAt = Number(c.deadReloadAt) || 0;
+        var now = Number(c.now) || 0;
+        if (c.mk === true && reloadAt > 0 && now > reloadAt && now - reloadAt < 90 * 1000) {
+          return "plaintext_after_dead";
+        }
+        return "";
+      }
+      return "";
+    } catch (e) { return ""; }
+  }
+  /* ===DSH-MA-RESUME-PURE-END=== */
+
+  var MA_RESUME_DELAY_MS = 400;          // 认出死会话后 400ms 才跳（让 shim 自己的收尾先跑完，避免两路导航抢）
+  var MA_RESUME_COOLDOWN_MS = 60 * 1000; // 两次恢复之间的冷却
+  var MA_RESUME_WINDOW_MS = 60 * 1000;   // 时间窗
+  var MA_RESUME_MAX_IN_WINDOW = 2;       // 窗口内最多 2 次（与 native.html 闸门一致，双层兜底）
+  var MA_RESUME_KEY = "dsh-ma-e2ee-resume";
+  var MA_DEAD_RELOAD_KEY = "dsh-e2ee-dead-reload"; // e2ee-shim 的"每页只重载一次"闸门（只读）
+  var MA_MK_KEY = "dsh-e2ee-mk-v1";                // native.html「记住本机」的派生 MK（只读）
+  var MA_FG_MIN_BG_MS = 8000;            // 后台停留 <8s 不算"断线场景"，不打扰
+  var MA_FG_COOLDOWN_MS = 60 * 1000;     // 回前台恢复的冷却
+  var MA_FG_MAX_PER_PAGE = 3;            // 本页最多 3 次（防抖动/循环）
+  var MA_PROBE_TIMEOUT_MS = 4000;        // 探针超时
+  var MA_PROBE_RETRY_MS = 2500;          // 唤醒官方客户端后再探的间隔
+
+  var maResumeState = { done: false, redirecting: false, lastAt: 0, reason: "", armed: false };
+  var maFgState = { hiddenAt: 0, lastAt: 0, count: 0, probing: false, lastSrc: "" };
+
+  /** 读 E2EE 徽标状态（shim 未注入 → null，全程不动作）。 */
+  function maE2eeStateNow() {
+    try {
+      return window.__dshE2eeBadge && typeof window.__dshE2eeBadge.state === "function"
+        ? window.__dshE2eeBadge.state() : null;
+    } catch (e) { return null; }
+  }
+
+  /** 本机上下文：有没有「记住本机」的 MK、shim 是否刚为死会话重载过（都只读）。 */
+  function maResumeContext() {
+    var mk = false, reloadAt = 0;
+    try { mk = !!(window.localStorage && window.localStorage.getItem(MA_MK_KEY)); } catch (e) { mk = false; }
+    try { reloadAt = Number((window.sessionStorage && window.sessionStorage.getItem(MA_DEAD_RELOAD_KEY)) || 0) || 0; } catch (e2) { reloadAt = 0; }
+    return { mk: mk, deadReloadAt: reloadAt, now: Date.now() };
+  }
+
+  /** 闸门：本页一次 + 冷却 + 时间窗内限次（sessionStorage 跨重载仍有效）。 */
+  function maResumeGatePass(now) {
+    try {
+      if (maResumeState.done || maResumeState.redirecting) return false;
+      if (maResumeState.lastAt && now - maResumeState.lastAt < MA_RESUME_COOLDOWN_MS) return false;
+      var raw = null;
+      try { raw = window.sessionStorage && window.sessionStorage.getItem(MA_RESUME_KEY); } catch (e0) { raw = null; }
+      var hits = null;
+      try { hits = JSON.parse(raw || "[]"); } catch (e1) { hits = []; }
+      if (!Array.isArray(hits)) hits = [];
+      var kept = [];
+      for (var i = 0; i < hits.length; i++) {
+        var t = Number(hits[i]);
+        if (isFinite(t) && now - t >= 0 && now - t < MA_RESUME_WINDOW_MS) kept.push(t);
+      }
+      if (kept.length >= MA_RESUME_MAX_IN_WINDOW) return false;
+      kept.push(now);
+      try { window.sessionStorage && window.sessionStorage.setItem(MA_RESUME_KEY, JSON.stringify(kept.slice(-8))); } catch (e2) { /* 存不下不构成"永不恢复" */ }
+      return true;
+    } catch (e) { return true; }
+  }
+
+  /** 自动回设备列表入口（由 /app/ 用「记住本机」的 MK 静默解锁后回镜像页）。 */
+  function maE2eeTryResume(reason) {
+    try {
+      var dev = maDeviceIdOfMirrorPath(window.location.pathname);
+      if (!dev) return false;
+      var now = Date.now();
+      if (!maResumeGatePass(now)) { maPublishDiag(); return false; }
+      maResumeState.done = true;
+      maResumeState.redirecting = true;
+      maResumeState.lastAt = now;
+      maResumeState.reason = String(reason || "");
+      maPublishDiag();
+      var to = "/app/?resume=" + encodeURIComponent(dev) + "&from=mirror";
+      setTimeout(function () {
+        try { window.location.replace(to); return; } catch (e1) { /* 继续 */ }
+        try { window.location.assign(to); } catch (e2) { /* 继续 */ }
+        try { window.location.href = to; } catch (e3) { /* 放弃（例如沙箱里没有 location） */ }
+      }, MA_RESUME_DELAY_MS);
+      return true;
+    } catch (e) { return false; }
+  }
+
+  function maDelay(ms) {
+    return new Promise(function (resolve) {
+      try { setTimeout(resolve, Number(ms) || 0); } catch (e) { resolve(); }
+    });
+  }
+
+  /** 底部提示条的**临时**用途：回前台重连失败时给一条可见说明（复用既有重试/返回出口）。
+   *  优先级让给首屏慢加载（那条有更高价值，别抢它的文案）；用户关过一次就不再打扰。 */
+  function maShowFgHint(text) {
+    try {
+      if (maLoadWatch.dismissed || maLoadWatch.slow) return;
+      var bar = maLoadWatch.barEl || maLoadMountBar();
+      if (!bar) return;
+      maLoadWatch.fgHint = true;
+      if (maLoadWatch.barTxt) maLoadWatch.barTxt.textContent = String(text || "");
+      bar.hidden = false;
+    } catch (e) { /* 提示失败不影响恢复本身 */ }
+  }
+  function maHideFgHint() {
+    try {
+      if (!maLoadWatch.fgHint) return;
+      maLoadWatch.fgHint = false;
+      maLoadHideBar();
+    } catch (e) { /* 忽略 */ }
+  }
+
+  /** 唤醒官方客户端：派发一次 online 事件（它自己按"网络恢复"重连）—— 只派发，不替它重连。 */
+  function maNudgeOnline() {
+    try {
+      var ev = null;
+      try { ev = new Event("online"); } catch (e0) { ev = null; }
+      if (ev) window.dispatchEvent(ev);
+    } catch (e) { /* 忽略 */ }
+  }
+
+  /**
+   * 轻量探针：**必须过桥**才算数（业主 2026-10-23 指正）。
+   *
+   * 为什么不能用 manifest：relay-router 的设备无关静态资源兜底（serveDeviceFreeAsset）会**本地直出**
+   * manifest.webmanifest / favicon.svg —— 打这些路径只能证明"手机能连上中继"，证明不了
+   * "这台电脑的隧道还活着"，而 iOS 回前台的真实故障恰恰是后者。
+   *
+   * 现在打 「HEAD /remote/<deviceId>/」：走 resolveRoute → authorizeRemote → bridge 的 http 帧 →
+   * 电脑端 dsh 返回 200（HEAD 无 body，成本最低）。判定按业主口径：
+   *   OK   = 拿到响应且 status 不是 502/504（502/504 = 隧道/上游不可达，这才是失败）
+   *          401/403/404 都算"有回应"（cookie 过期或路径不存在不等于隧道断了，加密状态另判）
+   *   FAIL = 网络错误 / 超时 / 502 / 504
+   * 兜底：HEAD 被中间代理/旧环境拒绝时（第一次探针 reject），第二次退化为
+   *   「GET /remote/<deviceId>/favicon.ico」（同样过桥；不在 DEVICE_FREE_ASSETS 白名单里）。
+   *
+   * @param {string} deviceId
+   * @param {boolean} [useGet] true = 走 favicon.ico 的 GET 退化路径
+   */
+  function maProbeMirrorOnce(deviceId, useGet) {
+    var tail = useGet ? "/favicon.ico" : "/";
+    var url = "/remote/" + encodeURIComponent(deviceId) + tail + "?dshProbe=" + Date.now();
+    var ctrl = null;
+    try { ctrl = typeof AbortController === "function" ? new AbortController() : null; } catch (e0) { ctrl = null; }
+    /* accept 用 json 而不是 html：router 的 isDocNavigation 在缺少 sec-fetch-* 的老浏览器上
+       会回落到 accept 判定 —— 带上 html 会被当成"页面导航"，设备离线时改走 302 引导页，
+       探针就永远看不到 502 了（这是这条探针最容易踩的坑）。 */
+    var opts = { method: useGet ? "GET" : "HEAD", cache: "no-store", headers: { accept: "application/json" } };
+    if (ctrl) opts.signal = ctrl.signal;
+    return new Promise(function (resolve) {
+      var settled = false;
+      var timer = 0;
+      var done = function (r) {
+        if (settled) return;
+        settled = true;
+        try { if (timer) clearTimeout(timer); } catch (e1) { /* 忽略 */ }
+        resolve(r);
+      };
+      try {
+        timer = setTimeout(function () {
+          try { if (ctrl) ctrl.abort(); } catch (e2) { /* 忽略 */ }
+          done({ ok: false, why: "timeout" });
+        }, MA_PROBE_TIMEOUT_MS);
+      } catch (e3) { /* 忽略 */ }
+      var p = null;
+      try { p = typeof window.fetch === "function" ? window.fetch(url, opts) : null; } catch (e4) { p = null; }
+      if (!p || typeof p.then !== "function") { done({ ok: false, why: "nocall" }); return; }
+      p.then(function (res) {
+        var status = 0;
+        try { status = Number(res && res.status) || 0; } catch (e5) { status = 0; }
+        // 502/504 = router 或上游明确"这台的隧道不可达"；其余状态码都说明"有回应"
+        done({ ok: status > 0 && status !== 502 && status !== 504, status: status });
+      }, function () { done({ ok: false, why: "reject" }); });
+    });
+  }
+
+  /** 回到前台：确认加密状态 + 一次轻量探针 → 原地重连（online）→ 再探一次 → 可见提示。 */
+  function maForegroundResume(src) {
+    try {
+      if (!maResumeState.armed) return;
+      var dev = maDeviceIdOfMirrorPath(window.location.pathname);
+      if (!dev) return;
+      var now = Date.now();
+      var gap = maFgState.hiddenAt ? now - maFgState.hiddenAt : 0;
+      maFgState.hiddenAt = 0;
+      if (gap < MA_FG_MIN_BG_MS) return;                 // 短切走不算断线
+      if (maFgState.probing) return;                     // 不叠并发
+      if (maFgState.count >= MA_FG_MAX_PER_PAGE) return;  // 本页额度用完就不再自动碰
+      if (maFgState.lastAt && now - maFgState.lastAt < MA_FG_COOLDOWN_MS) return;
+      var st = maE2eeStateNow();
+      if (!st) return;   // shim 未注入（旧 bridge/关闭 E2EE）→ 加密与本次恢复无关，官方客户端自己处理
+      var decision = maE2eeResumeDecision(st, maResumeContext());
+      if (decision) { maE2eeTryResume(decision); return; }  // 确认不可用 → 直接自动恢复（无手势）
+      maFgState.count += 1;
+      maFgState.lastAt = now;
+      maFgState.probing = true;
+      maFgState.lastSrc = String(src || "");
+      var settle = function () { try { maFgState.probing = false; } catch (e0) { /* 忽略 */ } };
+      maProbeMirrorOnce(dev).then(function (r1) {
+        if (r1 && r1.ok) { maHideFgHint(); settle(); return; }
+        maShowFgHint("网络似乎断开了，正在重新连接…");
+        maNudgeOnline();
+        // 第二次探针换 GET favicon.ico：既验证"隧道是否真的断了"，也顺手覆盖 HEAD 不被支持的旧环境
+        return maDelay(MA_PROBE_RETRY_MS).then(function () { return maProbeMirrorOnce(dev, true); }).then(function (r2) {
+          if (r2 && r2.ok) { maHideFgHint(); settle(); return; }
+          maShowFgHint("连接没有恢复。点「重试」重新加载本页，或点「返回设备列表」重新进入。");
+          settle();
+        });
+      }).then(function () { settle(); }, function () { settle(); });
+    } catch (e) { try { maFgState.probing = false; } catch (e2) { /* 忽略 */ } }
+  }
+
+  /** 徽标状态一变就看一眼（纯读，不做别的）。 */
+  function maE2eeOnBadge() {
+    try {
+      var st = maE2eeStateNow();
+      if (!st) return;
+      var decision = maE2eeResumeDecision(st, maResumeContext());
+      if (decision) maE2eeTryResume(decision);
+    } catch (e) { /* 忽略 */ }
+  }
+
+  /** 安装监听（幂等）。**只**在镜像页 /remote/<deviceId>/ 上生效。 */
+  function maArmE2eeResume() {
+    try {
+      if (maResumeState.armed) return;
+      var dev = maDeviceIdOfMirrorPath(window.location.pathname);
+      if (!dev) return;
+      maResumeState.armed = true;
+      var onBadge = function () { maE2eeOnBadge(); };
+      try { document.addEventListener("dsh-e2ee-badge", onBadge); } catch (e1) { /* 忽略 */ }
+      try { window.addEventListener("dsh-e2ee-badge", onBadge); } catch (e2) { /* 忽略 */ }
+      // shim 可能在本层挂牌前就发布了状态（注入顺序：adapter 先、shim 后，通常不会；这里兜底两次）
+      setTimeout(function () { try { maE2eeOnBadge(); } catch (e3) { /* 忽略 */ } }, 800);
+      setTimeout(function () { try { maE2eeOnBadge(); } catch (e4) { /* 忽略 */ } }, 3000);
+      // 回前台：bfcache 恢复走 pageshow(persisted)；普通切后台走 visibilitychange
+      try {
+        window.addEventListener("pageshow", function (ev) {
+          try { if (ev && ev.persisted) maForegroundResume("pageshow"); } catch (e5) { /* 忽略 */ }
+        });
+      } catch (e6) { /* 忽略 */ }
+      try {
+        document.addEventListener("visibilitychange", function () {
+          try {
+            if (document.visibilityState === "hidden") { maFgState.hiddenAt = Date.now(); return; }
+            maForegroundResume("visibilitychange");
+          } catch (e7) { /* 忽略 */ }
+        });
+      } catch (e8) { /* 忽略 */ }
+      maPublishDiag();
+    } catch (e) { /* 恢复层装不上也不能影响页面 */ }
+  }
+
+  try { maArmE2eeResume(); } catch (eResumeArm) { /* 忽略 */ }
+
+  /* ===DSH-MA-RESUME-ENGINE-END=== */
+
+  /* ============================================================================
+   * 上传失败「可读提示」（2026-10-23，文件上传反馈）
+   *
+   * 现场（生产反馈 fb_930b950aed94 + nginx 日志 22 次 502 / 12 次 413）：手机上传失败只看到
+   *   「上传失败，点击重试」。根因在 dsh 上游客户端：dsh-client-file-upload/lib/client.js
+   *   在 status !== 200 时直接抛错并**丢弃响应体**；而中继/桥端本轮已能给出可读原因
+   *   （>64MB 的 413 JSON、上游不可达的分类 502 JSON），这些文字却到不了用户。
+   *
+   * 本层只做一件事：**旁听** dsh 上传 Worker 的完成消息（{kind:"complete",status,body}），
+   * 非 200 时补一条人话提示。不改协议、不拦请求、不重试、不碰 E2EE（Worker 独立作用域，
+   * 上传内容本来就不经 shim —— 那是另案）。
+   * 触发面收窄：只接管 new Worker(..., { name: "dsh-file-upload" })，其它 Worker 原样返回；
+   * 任何异常都退回原生 Worker（上传功能绝不受本层影响）。
+   * ========================================================================= */
+  /* ===DSH-MA-UPLOAD-HINT-PURE-START=== */
+  /** 上传失败状态码 + 响应体 → 人话（纯函数）。空串 = 不提示（成功/交给 dsh 自己）。 */
+  function maUploadFailureHint(status, body) {
+    var s = Number(status) || 0;
+    if (!s || s === 200 || s === 201) return "";
+    var b = String(body == null ? "" : body);
+    if (s === 413 || /payload_too_large|body_too_large|too large|exceeds? byte limit/i.test(b)) {
+      return "上传失败：文件超过 64MB 上限，请压缩后重试，或改用电脑端上传。";
+    }
+    if (s === 502 || s === 504) return "上传失败：与电脑端的连接中断了。请重试；反复失败请确认电脑端 DSH 仍在运行。";
+    if (s === 401 || s === 403) return "上传失败：登录状态已过期，请返回设备列表重新进入后再试。";
+    var m = null;
+    try { m = JSON.parse(b); } catch (e) { m = null; }
+    var msg = "";
+    try { if (m && m.error) msg = String(m.error.message || m.error.code || ""); } catch (e2) { msg = ""; }
+    return "上传失败（HTTP " + s + "）" + (msg ? "：" + msg : "，请重试。");
+  }
+  /* ===DSH-MA-UPLOAD-HINT-PURE-END=== */
+
+  /* ===DSH-MA-UPLOAD-HINT-ENGINE-START=== */
+  var MA_UPLOAD_FAIL_KEY = "dsh-ma-upload-fail";
+  /** 底部一次性提示（自绘、6 秒自动消失、不挡点击；同一批失败只提示一次）。 */
+  function maUploadToast(text) {
+    try {
+      var now = Date.now();
+      var last = 0;
+      try { last = Number(sessionStorage.getItem(MA_UPLOAD_FAIL_KEY)) || 0; } catch (eLast) { last = 0; }
+      if (last && now - last < 4000) return;
+      try { sessionStorage.setItem(MA_UPLOAD_FAIL_KEY, String(now)); } catch (eSet) { /* 忽略 */ }
+      var doc = document;
+      var el = doc.getElementById("dsh-ma-upload-toast");
+      if (el && el.parentNode) el.parentNode.removeChild(el);
+      el = doc.createElement("div");
+      el.id = "dsh-ma-upload-toast";
+      el.setAttribute("role", "status");
+      el.textContent = String(text || "");
+      el.style.cssText = "position:fixed;left:12px;right:12px;bottom:calc(18px + env(safe-area-inset-bottom));z-index:2147483001;"
+        + "padding:10px 14px;border-radius:12px;background:rgba(32,32,32,.94);color:#fff;"
+        + "font:13px/1.5 -apple-system,BlinkMacSystemFont,'PingFang SC','Segoe UI',Roboto,sans-serif;"
+        + "box-shadow:0 6px 24px rgba(0,0,0,.35);pointer-events:none;opacity:0;transition:opacity .2s ease;";
+      (doc.body || doc.documentElement).appendChild(el);
+      setTimeout(function () { try { el.style.opacity = "1"; } catch (eF) { /* 忽略 */ } }, 16);
+      setTimeout(function () {
+        try { el.style.opacity = "0"; } catch (eO) { /* 忽略 */ }
+        setTimeout(function () { try { if (el.parentNode) el.parentNode.removeChild(el); } catch (eR) { /* 忽略 */ } }, 260);
+      }, 6000);
+    } catch (e) { /* 提示失败不影响上传本身 */ }
+  }
+  /** 旁听上传 Worker：只包 onmessage/onerror，其余成员透传（方法绑定到原生对象）。 */
+  function maTapUploadWorker(w) {
+    var proxy = null;
+    var userMsg = null;
+    var userErr = null;
+    var onMsg = function (ev) {
+      try {
+        var d = ev && ev.data;
+        if (d && d.kind === "complete") {
+          var hint = maUploadFailureHint(d.status, d.body);
+          if (hint) maUploadToast(hint);
+        }
+      } catch (eObs) { /* 忽略 */ }
+      if (typeof userMsg === "function") return userMsg.call(proxy, ev);
+      return undefined;
+    };
+    var onErr = function (ev) {
+      if (typeof userErr === "function") return userErr.call(proxy, ev);
+      return undefined;
+    };
+    proxy = new Proxy(w, {
+      get: function (t, k) {
+        if (k === "onmessage") return userMsg || undefined;
+        if (k === "onerror") return userErr || undefined;
+        var v = t[k];
+        return typeof v === "function" ? v.bind(t) : v;
+      },
+      set: function (t, k, v) {
+        if (k === "onmessage") { userMsg = v; t.onmessage = onMsg; return true; }
+        if (k === "onerror") { userErr = v; t.onerror = onErr; return true; }
+        t[k] = v;
+        return true;
+      }
+    });
+    return proxy;
+  }
+  /** 安装（幂等、可在看门狗里重复调用）：只接管 name=dsh-file-upload 的 Worker。 */
+  function maInstallUploadTap() {
+    try {
+      if (typeof window === "undefined" || typeof window.Worker !== "function") return false;
+      var Native = window.Worker;
+      if (Native && Native.__dshMaUploadTap) return true;
+      var Wrapped = new Proxy(Native, {
+        construct: function (Target, args) {
+          var w = Reflect.construct(Target, args);
+          try {
+            var opts = args && args[1];
+            var name = opts && typeof opts === "object" ? String(opts.name || "") : "";
+            if (name !== "dsh-file-upload") return w;
+            return maTapUploadWorker(w);
+          } catch (eTap) { return w; }
+        }
+      });
+      try { Wrapped.__dshMaUploadTap = true; } catch (eMark) { /* 忽略 */ }
+      window.Worker = Wrapped;
+      return true;
+    } catch (e) { return false; }
+  }
+  /* ===DSH-MA-UPLOAD-HINT-ENGINE-END=== */
 
   try {
     const HOST_RE = new RegExp(${JSON.stringify(RUNTIME_HOST_RE.source)});
@@ -2787,6 +3237,8 @@ const SCRIPT = `(() => {
          旧实现把包装写在 buildRemoteMenu 内部的一次性分支里，那正是"请求明明在打、
          界面却永远测速中"的结构性原因。 */
       try { maInstallNetSampler(); } catch (eSampler0) { /* 忽略 */ }
+      /* 上传失败可读提示（2026-10-23）：与采样器同样"越早越好"，且幂等 —— 看门狗每拍调用无副作用。 */
+      try { maInstallUploadTap(); } catch (eUploadTap0) { /* 忽略 */ }
       /* 悬浮按钮/菜单：任何宽度都要有（电脑端访问镜像页时同样需要返回设备列表的出口）。
          失败也不影响手机端布局适配 —— 两条链路各自独立。 */
       if (!fabDone) { fabDone = true; try { buildRemoteMenu(); } catch (eFabDone) { /* 忽略 */ } }
@@ -3285,6 +3737,7 @@ const SCRIPT = `(() => {
          官方若在运行期替换 fetch 同理），下一拍就会把采样器重新挂回去 —— 幂等，已挂上时零开销。
          同时顺手重绘一次：官方 SPA 换掉菜单子树后，数字不必等下一次请求才回来。 */
       try { maInstallNetSampler(); } catch (eSampler) { /* 忽略 */ }
+      try { maInstallUploadTap(); } catch (eUploadTap) { /* 忽略 */ }
       try { if (maNetRender) maNetRender(); } catch (eNetRender) { /* 忽略 */ }
       try { ensureDrawerChrome(); } catch (eChrome2) { /* 忽略 */ }
       /* 镜像页就绪探测（mirror_load 的量测终点）：pump 本来就被 MutationObserver(子树) + 1s 兜底表

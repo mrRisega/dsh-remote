@@ -571,9 +571,56 @@
     var noBody = status === 204 || status === 205 || status === 304 || bodyU8.length === 0;
     return new Response(noBody ? null : bodyU8, { status: status, headers: hdrs });
   }
+  /* ---- 网络层失败的一次极短重试(D,2026-10-23) ----------------------------------
+   * 为什么:大文件读(`/api/workspaceFiles/readBytes`)、会话历史(`/api/session/page`)、
+   * Office/PDF 渲染(`/api/officeToPdf/`)在弱网/中继限速下经常"读到一半断"——浏览器只
+   * 看到一次 fetch reject 或空响应,上层(文档预览/会话列表)直接落到失败态,用户得手点
+   * 「重新读取文件」。这些都是**幂等读**,重发一次几乎无副作用,却能吃掉大部分瞬时断流。
+   * 边界:
+   *   - 只白名单幂等读路径;上传/写入路径永不重试;
+   *   - 最多 1 次,间隔 300ms;
+   *   - 只有**网络层失败**(fetch reject / 信封响应体为空或非 JSON)才重试;
+   *     已有响应体的 4xx/5xx(明文错误页)一律不重试;解封/解压失败(密钥问题)不重试;
+   *   - 每次重试都重新封**新 nonce 的信封**:桥端 http 防重放是 5 分钟 nonce 滑动窗口,
+   *     复用同一个信封会被判 replay;
+   *   - 调用方已 abort(切页/锁屏)→ 不再重试。
+   */
+  var SE_RETRY_PATH_PREFIXES = ["/api/workspaceFiles/", "/api/session/page", "/api/officeToPdf/"];
+  var SE_RETRY_DELAY_MS = 300;
+  /**
+   * 路径是否命中幂等读白名单。
+   *
+   * ⚠️ 必须用 `seUpstreamPathOf()` 归一后再匹配 —— 与加密策略(seShouldEncryptHttp)
+   * **同一口径**:device 形态下客户端会把路径改写成 `/remote/<deviceId>/api/...`,
+   * 直接拿 `urlObj.pathname` 匹配会漏掉这类请求(同样是被加密的读,失败同样该重试)。
+   * 匹配规则:目录式前缀(以 "/" 结尾)按前缀;其余(如 `/api/session/page`)要求**精确相等** ——
+   * 这样 `/api/session/pages`、`/api/session/page/extra` 都不会被误命中。
+   */
+  function seRetryableReadPath(fullPath) {
+    var up = "";
+    try { up = seUpstreamPathOf(fullPath); } catch (e) { return false; }
+    var p = String(up || "");
+    var q = p.indexOf("?");
+    if (q !== -1) p = p.slice(0, q);
+    for (var i = 0; i < SE_RETRY_PATH_PREFIXES.length; i++) {
+      var pre = SE_RETRY_PATH_PREFIXES[i];
+      if (pre.charAt(pre.length - 1) === "/") {
+        if (p.indexOf(pre) === 0) return true; // 目录式前缀(/api/workspaceFiles/、/api/officeToPdf/)
+      } else if (p === pre) {
+        return true; // 精确路径(/api/session/page)
+      }
+    }
+    return false;
+  }
+  function seDelay(ms) { return new Promise(function (resolve) { setTimeout(resolve, ms); }); }
+  /** 与 fetch 的 abort 语义一致(调用方已 abort 时不该再重试,直接抛 AbortError)。 */
+  function seAbortSignalError() {
+    try { return new DOMException("The operation was aborted.", "AbortError"); } catch (e) { var err = new Error("The operation was aborted."); err.name = "AbortError"; return err; }
+  }
   /**
    * fetch 包装核心:命中策略 → 密封→发→响应信封解密→重建 Response;
    * 未命中/跨源/无法读取 body/明文响应 → 原样透传(零行为)。
+   * 幂等读路径的网络层失败最多重试一次(见上面 SE_RETRY_* 注释)。
    * @param {function} origFetch
    * @param {{sess: SeSession, origin: string}} ctx
    */
@@ -599,50 +646,69 @@
     }
     var upstream = seUpstreamPathOf(fullPath);
     var plain = seEncodeHttpReqPlain({ method: req.method, path: upstream, headers: seHeadersForEnvelope(req.headers), bodyBytes: bodyBytes });
-    var n = seRandomBytes(SE_NONCE_BYTES);
-    var nonceB64 = seBytesToB64(n);
-    var env = await ctx.sess.seal({ kind: "http", dir: SE_DIR_P2B, counter: 0, data: plain, nonceBytes: n });
-    var outerHeaders = seEnvelopeHeaders(ctx.sess.sessId);
-    var cookieH = seHeaderValueOf(req.headers, "cookie");
-    if (cookieH && req.credentials !== "omit") outerHeaders.cookie = cookieH; // node 测试显式 cookie;浏览器同源自动带
-    var res;
-    try {
-      res = await origFetch(urlObj.href, {
-        method: "POST",
-        headers: outerHeaders,
-        body: JSON.stringify(env),
-        credentials: req.credentials,
-        signal: req.signal
-      });
-    } catch (e) { throw e; }
-    /* router/桥端明文错误页 → 原样透传(零行为)，但**先看一眼**是不是桥端在说"会话我不认识"
-       (x-dsh-e2ee-error)——是的话清掉本机失效交接单并给出明确原因(见 seNoteE2eeError)。 */
-    if (!seIsEnvelopeResponse(res)) { seNoteE2eeError(res, ctx); return res; }
-    var envResp = null;
-    try { envResp = await res.json(); } catch (e) {
-      seNotifyFail("响应信封非法");
-      return seErrorResponse("bad_envelope", "⚠ 无法解密:响应信封非法");
+    var attempts = seRetryableReadPath(fullPath) ? 2 : 1;
+    var lastErr = null;
+    for (var attempt = 0; attempt < attempts; attempt++) {
+      if (attempt > 0) {
+        if (req.signal && req.signal.aborted) throw seAbortSignalError();
+        await seDelay(SE_RETRY_DELAY_MS);
+        if (req.signal && req.signal.aborted) throw seAbortSignalError();
+      }
+      var n = seRandomBytes(SE_NONCE_BYTES);
+      var nonceB64 = seBytesToB64(n);
+      var env = await ctx.sess.seal({ kind: "http", dir: SE_DIR_P2B, counter: 0, data: plain, nonceBytes: n });
+      var outerHeaders = seEnvelopeHeaders(ctx.sess.sessId);
+      var cookieH = seHeaderValueOf(req.headers, "cookie");
+      if (cookieH && req.credentials !== "omit") outerHeaders.cookie = cookieH; // node 测试显式 cookie;浏览器同源自动带
+      var res;
+      try {
+        res = await origFetch(urlObj.href, {
+          method: "POST",
+          headers: outerHeaders,
+          body: JSON.stringify(env),
+          credentials: req.credentials,
+          signal: req.signal
+        });
+      } catch (e) {
+        lastErr = e;
+        if (attempt + 1 < attempts) continue; // 网络层失败 → 白名单读路径再来一次
+        throw e; // 与改动前一致:不吞 fetch 异常(调用方按网络错误处理)
+      }
+      /* router/桥端明文错误页 → 原样透传(零行为)，但**先看一眼**是不是桥端在说"会话我不认识"
+         (x-dsh-e2ee-error)——是的话清掉本机失效交接单并给出明确原因(见 seNoteE2eeError)。
+         注意:这里已经有完整响应体,4xx/5xx 也**不重试**。 */
+      if (!seIsEnvelopeResponse(res)) { seNoteE2eeError(res, ctx); return res; }
+      var envResp = null;
+      try { envResp = await res.json(); } catch (e) {
+        // 信封响应体为空/被截断(网络层) → 白名单读路径再来一次
+        if (attempt + 1 < attempts) continue;
+        seNotifyFail("响应信封非法");
+        return seErrorResponse("bad_envelope", "⚠ 无法解密:响应信封非法");
+      }
+      var opened = null;
+      try {
+        opened = await ctx.sess.open({ kind: "http-resp", dir: SE_DIR_B2P, env: envResp, counter: envResp.c == null ? 0 : envResp.c, reqNonceB64: nonceB64 });
+      } catch (e) {
+        // 密钥不一致/被篡改/会话过期:重试解决不了,保持原有显式失败
+        var code = e && e.code ? e.code : "auth_failed";
+        seNotifyFail("响应解封失败: " + (e && e.message || code));
+        return seErrorResponse(code, "⚠ 无法解密(" + code + "):密钥不一致、传输被篡改或会话已过期。请返回设备列表重新解锁。");
+      }
+      var rp = null;
+      try { rp = seDecodeHttpRespPlain(opened.data); } catch (e) {
+        seNotifyFail("响应明文非法");
+        return seErrorResponse("bad_plain", "⚠ 无法解密:响应明文非法");
+      }
+      var bodyU8 = rp.bodyBytes instanceof Uint8Array ? rp.bodyBytes : (rp.bodyB64 ? seB64ToBytes(rp.bodyB64) : new Uint8Array(0));
+      if (rp.enc === "gzip" && bodyU8.length) {
+        var un = await seGunzip(bodyU8);
+        if (!un) return seErrorResponse("gunzip", "⚠ 无法解压:响应 gzip 解压失败");
+        bodyU8 = un;
+      }
+      return seBuildResponse(rp.status, rp.headers, bodyU8);
     }
-    var opened = null;
-    try {
-      opened = await ctx.sess.open({ kind: "http-resp", dir: SE_DIR_B2P, env: envResp, counter: envResp.c == null ? 0 : envResp.c, reqNonceB64: nonceB64 });
-    } catch (e) {
-      var code = e && e.code ? e.code : "auth_failed";
-      seNotifyFail("响应解封失败: " + (e && e.message || code));
-      return seErrorResponse(code, "⚠ 无法解密(" + code + "):密钥不一致、传输被篡改或会话已过期。请返回设备列表重新解锁。");
-    }
-    var rp = null;
-    try { rp = seDecodeHttpRespPlain(opened.data); } catch (e) {
-      seNotifyFail("响应明文非法");
-      return seErrorResponse("bad_plain", "⚠ 无法解密:响应明文非法");
-    }
-    var bodyU8 = rp.bodyBytes instanceof Uint8Array ? rp.bodyBytes : (rp.bodyB64 ? seB64ToBytes(rp.bodyB64) : new Uint8Array(0));
-    if (rp.enc === "gzip" && bodyU8.length) {
-      var un = await seGunzip(bodyU8);
-      if (!un) return seErrorResponse("gunzip", "⚠ 无法解压:响应 gzip 解压失败");
-      bodyU8 = un;
-    }
-    return seBuildResponse(rp.status, rp.headers, bodyU8);
+    /* 每轮都以 return/throw 收尾,这里只是兜底(避免静态检查报"可能不返回") */
+    throw lastErr || seErr("e2ee_failed", "e2ee: fetch 包装未产生结果");
   }
 
   /* ---- 数据 WS 代理(逐消息信封;上层看到的是解密后的原文) ---- */

@@ -42,6 +42,7 @@ export const SHIM_EXPORTS = [
   "seEncodeHttpReqPlain", "seDecodeHttpRespPlain", "seEnvelopeHeaders", "seIsEnvelopeResponse", "seGunzip",
   "seUpstreamPathOf", "seShouldEncryptHttp", "seShouldEncryptWs", "seWsLabelParts", "seBuildWsTarget",
   "seHandoverDecode", "seSessionOfHandover",
+  "SE_RETRY_PATH_PREFIXES", "SE_RETRY_DELAY_MS", "seRetryableReadPath",
   "seFetchWrapper", "SeE2eeWs", "seMakeWsCtor", "seBuildResponse", "seErrorResponse"
 ];
 
