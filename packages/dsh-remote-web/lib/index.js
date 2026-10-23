@@ -3417,6 +3417,51 @@ async function communityInfo(relayDir) {
   return data;
 }
 
+// ---------- 📄 会员服务购买协议 URL（购买入口的《会员服务购买协议》链接） ----------
+
+/**
+ * 购买入口必须带《会员服务购买协议》链接（业主要求，2026-10-23 客户端 0.7.5-beta.1）。
+ *
+ * URL 来源优先级：
+ *   1) 企业端 `public-config` 的 `agreement_url`（**新字段**；企业端还没上线时没有 → 忽略）；
+ *   2) 固定兜底 `DEFAULT_PURCHASE_AGREEMENT_URL`（正式协议由企业端提供，未就绪也能点开）。
+ *
+ * 安全：只允许 **http(s) 绝对地址**；`javascript:` / `data:` / 协议相对（`//host`）/ 相对路径
+ * 一律回兜底 —— 这个值最终会进 `<a href>`，绝不能吃进可执行协议（与 qr_url 同一套纪律）。
+ *
+ * 软着陆：public-config 不可达 / 非对象 / 字段缺失全部回兜底并 `ok:true`。
+ * 协议链接**永远不该**成为购买流程的故障点（打不开也不影响旁边的「升级 / 续费」按钮）。
+ */
+export const DEFAULT_PURCHASE_AGREEMENT_URL = "https://n.risegao.cn:13443/relay-api/api/purchase-agreement";
+
+/** 从 public-config 解析协议 URL（纯函数，便于单测：优先级 + 安全过滤 + 降级一次看完）。 */
+export function purchaseAgreementUrlFrom(publicConfig) {
+  const raw = publicConfig && typeof publicConfig === "object"
+    ? String(publicConfig.agreement_url == null ? "" : publicConfig.agreement_url).trim()
+    : "";
+  if (/^https?:\/\/[^\s]+$/i.test(raw)) return raw;
+  return DEFAULT_PURCHASE_AGREEMENT_URL;
+}
+
+/** GET /dsh-remote/purchase-agreement 的实现：读公开配置 → 安全过滤 → 兜底。 */
+async function purchaseAgreementInfo(relayDir) {
+  let body = null;
+  try {
+    const r = await relayFetch(relayDir, "/api/public-config");
+    body = r && r.ok && r.body && typeof r.body === "object" ? r.body : null;
+  } catch {
+    body = null; // relayFetch 本身不抛；这里只是防御（协议链接不能把面板打挂）
+  }
+  const raw = body && typeof body === "object" ? String(body.agreement_url == null ? "" : body.agreement_url).trim() : "";
+  const url = purchaseAgreementUrlFrom(body);
+  return {
+    ok: true,
+    url,
+    // 便于排障：这个 URL 是服务端配的，还是走兜底（面板不展示，只出现在响应里）
+    source: url !== DEFAULT_PURCHASE_AGREEMENT_URL ? "public_config" : (raw ? "public_config_invalid" : "fallback"),
+  };
+}
+
 // ---------- 一次性访问密钥 / 已授权设备代理（E1 企业端新增 auth-key / mobile-sessions） ----------
 
 /** 从 relay 响应里尽量提取人类可读错误信息（兼容 {error:{message}} / {error:".."} / {message} / 纯文本）。 */
@@ -7361,6 +7406,15 @@ function registerRoutes(ctx, relayDir) {
       path: "/dsh-remote/community",
       handler: async (_req, res) => {
         sendJson(res, 200, { ok: true, ...(await communityInfo(relayDir)) });
+      },
+    },
+    // 📄 会员服务购买协议 URL（购买入口的《会员服务购买协议》链接；public-config.agreement_url → 兜底）
+    //    永远 200 ok:true + 一个可点 URL：协议链接不得成为购买流程的故障点。
+    {
+      method: "GET",
+      path: "/dsh-remote/purchase-agreement",
+      handler: async (_req, res) => {
+        sendJson(res, 200, await purchaseAgreementInfo(relayDir));
       },
     },
     // 一次性访问密钥（📱 远程访问卡）：GET 即创建新 key，企业端 POST /api/auth-key（Bearer）

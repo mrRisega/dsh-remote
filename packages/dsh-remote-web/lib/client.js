@@ -265,6 +265,11 @@ window.__ModuleLoader__.load({
       ".dru-msg-err{color:var(--dru-danger)}",
       ".dru-msg-warn{color:var(--dru-warn)}",
       ".dru-hint{font-size:12px;color:var(--dru-fg-muted);line-height:1.6}",
+      // 📄 购买入口的《会员服务购买协议》小字链接（购买/升级按钮旁边，不抢眼；只用既有设计令牌）
+      ".dru-legal{font-size:12px;color:var(--dru-fg-muted);line-height:1.6;margin-top:8px}",
+      ".dru-legal a{color:var(--dru-accent);text-decoration:underline;text-underline-offset:2px;border-radius:4px}",
+      ".dru-legal a:hover{color:var(--dru-accent-fg)}",
+      ".dru-legal a:focus-visible{outline:2px solid var(--dru-focus);outline-offset:2px}",
       // ── 重启 DeepSeek harness（首次安装/更新后置顶提醒 + 底部常驻按钮） ──
       ".dru-restart-alert{display:flex;gap:10px;align-items:flex-start;background:var(--dru-warn-soft);border:1px solid var(--dru-warn-border-2);border-radius:10px;padding:12px 14px;margin-bottom:12px}",
       ".dru-restart-alert-icon{font-size:18px;line-height:1.2}",
@@ -2799,6 +2804,43 @@ window.__ModuleLoader__.load({
         .catch(function () { return null; }); // 静默：接口/网络/字段异常一律不弹
     }
 
+    // ══ 📄 会员服务购买协议（购买/升级入口的《会员服务购买协议》链接）════════════════
+    //
+    // 业主要求：购买入口必须能看到协议链接（客户端 0.7.5-beta.1）。正式协议由企业端提供：
+    //   · 优先用 node 半 `GET /dsh-remote/purchase-agreement` 下发的 URL ——
+    //     它读企业端 public-config 的 `agreement_url`（新字段，没有就忽略）；
+    //   · 兜底常量（企业端还没上线/读不到时也永远可点）。
+    //
+    // 纪律：
+    // ① **只允许 http(s) 绝对地址**：这个值最终进 `<a href>`，`javascript:`/`data:`/协议相对
+    //    一律丢弃回兜底（服务端字段被改坏也不能变成 XSS 面）。
+    // ② **失败不影响购买**：取不到就用兜底；链接打不开也不影响旁边的「升级/续费」按钮 ——
+    //    这里没有任何会阻塞购买流程的 await/分支。
+    // ③ 30 分钟模块级缓存：协议地址不会频繁变，面板反复打开不重复打本机 node 半。
+    var PURCHASE_AGREEMENT_FALLBACK = "https://n.risegao.cn:13443/relay-api/api/purchase-agreement";
+    var PURCHASE_AGREEMENT_TTL_MS = 30 * 60 * 1000;
+    var purchaseAgreementCache = { at: 0, url: "" };
+    /** 只认 http(s) 绝对地址；其余（含空串/相对路径/协议相对）一律返回空串。 */
+    function purchaseAgreementUrlSafe(raw) {
+      var s = String(raw == null ? "" : raw).trim();
+      return /^https?:\/\/[^\s]+$/i.test(s) ? s : "";
+    }
+    /** 取协议 URL（永不 reject；失败/非法 → 兜底常量）。 */
+    function loadPurchaseAgreementUrl() {
+      var now = Date.now();
+      if (purchaseAgreementCache.url && now - purchaseAgreementCache.at < PURCHASE_AGREEMENT_TTL_MS) {
+        return Promise.resolve(purchaseAgreementCache.url);
+      }
+      return api("/dsh-remote/purchase-agreement").then(function (b) {
+        var url = purchaseAgreementUrlSafe(b && b.url) || PURCHASE_AGREEMENT_FALLBACK;
+        purchaseAgreementCache = { at: Date.now(), url: url };
+        return url;
+      }).catch(function () {
+        // 失败不缓存：下次进面板还能拿到服务端后来配好的地址；这次先用兜底。
+        return PURCHASE_AGREEMENT_FALLBACK;
+      });
+    }
+
     // ── 面板主体（渲染于设置页 settings.section 栏目内） ─────────────────────
     // 匿名装机统计的「面板打开」只上报一次/每页（node 半还会每进程去重）。
     var panelOpenedSent = false;
@@ -3253,6 +3295,27 @@ window.__ModuleLoader__.load({
           setMsg("err", "打开升级/续费页失败：" + e.message);
         }).finally(function () { setBusy(""); });
       };
+
+      /**
+       * 📄 购买入口的《会员服务购买协议》小字链接（新标签打开；不抢眼、不阻塞购买）。
+       *
+       * 用**原生 `<a href target=_blank rel=noopener noreferrer>`** 而不是 button+window.open：
+       *   · 语义正确（用户可复制链接/中键打开），且与 Electron 的 window.open 拦截走同一条路径；
+       *   · 纯 HTML 无 JS，链接打不开/被拦截也不会抛错、更不会影响旁边的「升级 / 续费」按钮。
+       * href 永远有值：node 半取不到时用兜底常量（见 loadPurchaseAgreementUrl）。
+       */
+      function renderAgreementLink() {
+        return h("div", { className: "dru-legal" },
+          "购买即表示同意",
+          h("a", {
+            className: "dru-legal-a",
+            href: agreementUrl,
+            target: "_blank",
+            rel: "noopener noreferrer",
+            title: "《会员服务购买协议》（在新标签打开）"
+          }, "《会员服务购买协议》")
+        );
+      }
 
       // 停留主视图（home）时：轮询连接状态(15s,审计降频) + 每秒刷新倒计时;隐藏暂停、回前台立即刷新
       useEffect(function () {
@@ -4020,6 +4083,8 @@ window.__ModuleLoader__.load({
                   onClick: function () { setView("invite"); loadInvite(); }
                 }, inviteLabel)
               : null),
+          // 📄 有购买（升级）这条路时，同一块里给协议链接（拉新-only 态不摆购买协议，避免误导）
+          up ? renderAgreementLink() : null,
           // 交换说明只在拉新可用时出现（关闭态或纯升级态不该再讲拉新）
           inviteOk
             ? h("div", { className: "dru-dual-note" },
@@ -4199,6 +4264,8 @@ window.__ModuleLoader__.load({
               h("span", { className: "dru-disclose-caret", "aria-hidden": "true" }, moreOpen ? "▲" : "▼")
             )
           ),
+          // 📄 购买入口的协议链接（紧贴主行动按钮下方；小字、不抢眼，业主要求购买入口必须可见）
+          renderAgreementLink(),
           // 🎁 邀请引导气泡：紧跟按钮行（不遮挡按钮）。点 ✕ 只做"不再提示"，不再改变入口位置。
           renderInviteTip(),
           // 🧰 「更多」折叠体：带新用户 / 修改密码 / 加入交流群 + 修改密码表单
@@ -5141,6 +5208,19 @@ window.__ModuleLoader__.load({
         });
         return function () { alive = false; };
       }, [loggedIn, mode, phoneKey]);
+
+      // ── 📄 会员服务购买协议 URL：hook 同样追加在**最后一个既有 hook 之后** ─────────────
+      // 初值直接用兜底常量 → 购买入口第一帧就有可点链接（不闪、不等待）。
+      // 登录后才去问 node 半（企业端 public-config 可能配了正式地址）；失败静默保持兜底。
+      var agrArr = useState(PURCHASE_AGREEMENT_FALLBACK); var agreementUrl = agrArr[0]; var setAgreementUrl = agrArr[1];
+      useEffect(function () {
+        if (!loggedIn) return undefined;
+        var alive = true;
+        loadPurchaseAgreementUrl().then(function (u) {
+          if (alive && u && u !== agreementUrl) setAgreementUrl(u);
+        });
+        return function () { alive = false; };
+      }, [loggedIn, phoneKey]);
 
       /** 取消本次自动重启(按事件持久化:同一 pending 事件不再自动重启)。 */
       var cancelAutoRestart = function () {
