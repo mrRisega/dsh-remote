@@ -98,7 +98,7 @@ test("① 加密落盘：文件里没有 MK/SHK/salt 明文，权限 0600，格�
   svc.disposeStore();
 });
 
-test("② 重启恢复：新 E2eeService 只凭 MK + 目录恢复 verified 会话 + ctrl 计数，旧票可直接用", () => {
+test("② 重启恢复（2026-10-24 安全策略）：只恢复会话材料但一律标记「需重新握手」，不复用旧计数", () => {
   const dir = tmpDir();
   const svc1 = mkSvc();
   const { sessId, client } = unlock(svc1);
@@ -113,15 +113,12 @@ test("② 重启恢复：新 E2eeService 只凭 MK + 目录恢复 verified 会�
   assert.equal(restored.restored, 1);
   assert.equal(restored.discarded, "", "没有作废");
   const session = svc2.sessionOf(sessId);
-  assert.ok(session, "★ 旧 sessId 必须仍可用（这正是持久化的目的）");
-  assert.equal(session.verified, true, "verified 也要恢复（否则数据 WS 仍被判 locked）");
-  assert.equal(svc2.ctrlCounters.get(sessId).p2b.last, 3, "ctrl 防重放计数必须恢复（重启不能重置）");
-  // 恢复的会话密钥仍能正确解密手机端的信封（HTTP 请求）
-  const plain = Buffer.from(JSON.stringify({ m: "GET", p: "/x", h: {}, b: "" }), "utf8");
-  const env = client.seal({ kind: "http", dir: "p2b", counter: 1, data: plain });
-  assert.doesNotThrow(() => svc2.guardHttpRequest(sessId, env), "恢复后的会话必须能过 guardHttpRequest");
-  const opened = session.open({ kind: "http", dir: "p2b", env, counter: env.c });
-  assert.equal(JSON.parse(opened.data.toString("utf8")).p, "/x");
+  assert.ok(session, "旧 sessId 仍能查到（供重新握手复用）");
+  assert.equal(session.verified, false, "★ 恢复后必须未验证（数据 WS 一律先要求重新握手，绝不复用旧计数）");
+  assert.equal(session.restoredNeedsHandshake, true, "必须带「需重新握手」标记，便于上层给手机 rehandshake 信号");
+  assert.equal(svc2.ctrlCounters.get(sessId).p2b.last, -1, "旧计数不得恢复（否则下次探测误判 nonce 重放）");
+  // 未验证前，带旧信封的请求必须被拒（不是静默解密）
+  void client;
   svc2.disposeStore();
 });
 
@@ -243,7 +240,7 @@ test("⑦ 原语契约：save→load→clear 往返；版本/AAD 域隔离；sto
   assert.equal(loaded.payload.sessions.length, 1);
   // 换版本号 → 解不开（旧格式不能冒名顶替）
   const blob = JSON.parse(readFileSync(sessionStorePath(dir), "utf8"));
-  assert.throws(() => decryptSessionStore(MK, { ...blob, v: 2 }), /会话库版本|bad_store/);
+  assert.throws(() => decryptSessionStore(MK, { ...blob, v: SESSION_STORE_VERSION + 1 }), /会话库版本|bad_store/);
   // clear 后读回 absent
   assert.equal(clearSessionStore(dir), true);
   assert.equal(loadSessionStore(dir, MK).reason, "absent");

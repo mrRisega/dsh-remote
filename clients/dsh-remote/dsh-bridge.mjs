@@ -2302,7 +2302,7 @@ async function initE2ee(token) {
     const storeEnabled = process.env.DSH_BRIDGE_E2EE_SESSIONS !== "0";
     const store = e2ee.attachStore(storeDir, { enabled: storeEnabled });
     if (store.restored > 0) {
-      console.log(`[bridge] 🔓 已恢复 ${store.restored} 个 E2EE 会话(加密落盘;手机重启/桥重启后免重新解锁)`);
+      console.log(`[bridge] 🔓 已恢复 ${store.restored} 个 E2EE 会话(加密落盘;安全策略=v2：全部标记「需重新握手」，不复用旧计数)`);
     }
     if (store.discarded) {
       // 丢弃 = 手机手里的旧票必然对不上：后续 ws-open/HTTP 会带 retryable 的 rehandshake 信号，

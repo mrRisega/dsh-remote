@@ -792,14 +792,17 @@ export class E2eeService {
           profile: String(row.profile || this.profile),
           epoch: Number(row.epoch) || 0
         });
-        session.verified = row.verified === true;
+        // ★ 2026-10-24 安全升级：从磁盘恢复的会话**一律标记未验证**，必须重新握手后才接受数据流。
+        //   原因：落盘的收发计数可能落后于手机侧（桥在 flush 与退出之间重启过），直接复用旧计数
+        //   会导致 nonce 重放/解不开 → 生产「无法解密」。宁可让手机自动重握手一次，也不冒错帧风险。
+        session.verified = false;
+        session.restoredNeedsHandshake = true;
         session.createdAt = Number(row.createdAt) || usedAt;
         session.usedAt = usedAt;
         this.sessions.set(sessId, session);
-        const guards = { p2b: new SequenceGuard(), b2p: new SequenceGuard() };
-        if (Number.isInteger(row.p2b)) guards.p2b.last = row.p2b;
-        if (Number.isInteger(row.b2p)) guards.b2p.last = row.b2p;
-        this.ctrlCounters.set(sessId, guards);
+        // ★ 计数同样**不恢复**：恢复的会话未验证，重新握手会从 0 重新计数；
+        //   继承旧计数只会在下一次探测时误判「nonce 重放」。
+        this.ctrlCounters.set(sessId, { p2b: new SequenceGuard(), b2p: new SequenceGuard() });
       } catch { /* 单条坏 → 跳过,不影响其它会话 */ }
     }
     this.prune();
@@ -932,7 +935,9 @@ export class E2eeService {
 // 会话持久化原语(2026-10-23;方案/信任边界见 E2eeService.attachStore 上方长注释)
 // ============================================================
 
-export const SESSION_STORE_VERSION = 1;
+// 2026-10-24 → 2：0.7.5 的 v1 库恢复后直接复用旧计数，生产出现「nonce 重放/无法解密」。
+// 升级到 v2 时**旧库一律作废**（restore 里版本不符会 clearSessionStore），手机重新握手一次。
+export const SESSION_STORE_VERSION = 2;
 export const SESSION_STORE_FILE = ".e2ee-sessions.enc";
 /** 会话库 AAD(域分隔;换格式/换用途必须改它,旧文件自动解不开 → 丢弃重握手)。 */
 export const SESSION_STORE_AAD = Buffer.from(`${E2EE_DOMAIN}\x00sessions-store-v1`, "utf8");
