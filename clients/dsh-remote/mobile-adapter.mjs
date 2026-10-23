@@ -3973,6 +3973,267 @@ const SCRIPT = `(() => {
         } catch (ePs) { /* 忽略 */ }
       });
     } catch (ePs2) { /* 忽略 */ }
+  /* ===DSH-MA-SINGLEPAGE-START===
+     同一设备只允许一个镜像页（2026-10-23，生产现场：手机端会出现同一 deviceId 的两个镜像页
+     并发，互相取消资源加载 → 两边都一直转圈）。
+
+     做法（同步优先，绝不拖慢首个页面）：
+       1. 只对 /remote/<deviceId>/ 形态的镜像页生效；设备列表/登录页不参与。
+       2. **同步租约**：localStorage 里一条 {id, at}，本页心跳每 2s 刷新。读到"别人的租约且新鲜
+          （<6s）"→ 立刻进 blocked 态（不依赖任何异步 API 就能把第二页按住）。
+       3. 再叠加 BroadcastChannel：新页 claim / takeover / release 实时互通，
+          老页收到 claim/takeover 立刻让路（显示"已切到另一窗口"）。
+       4. 有 Web Locks 时再拿一把同名锁兜底（双开竞态的最后仲裁者）。
+       5. blocked 态 = window.stop() + 拦掉 fetch/XHR send/WebSocket + 全屏提示（带"在本窗口继续"
+          按钮，点了通知旧页让路 → 本页重载接管）。同时每 2s 复查租约：旧页关掉/失联后自动恢复。
+       6. 老浏览器（没有 localStorage/BroadcastChannel，如部分隐私模式）→ 直接不启用，
+          保持既有行为（宁可不管，也绝不能把唯一页面锁死）。
+
+     注入体纪律：本段不得出现反引号，只用 ES5 语法。 */
+  function maSinglePageGuard() {
+    try {
+      var LS_KEY_PREFIX = "dsh-remote-mirror-page:";
+      var BC_PREFIX = "dsh-remote-mirror-page-bc:";
+      var LEASE_TTL_MS = 6000;
+      var BEAT_MS = 2000;
+      var LOCK_PREFIX = "dsh-remote-mirror-lock:";
+      var OVERLAY_ID = "dsh-ma-singlepage";
+      var BTN_ID = "dsh-ma-singlepage-takeover";
+
+      var loc = (typeof location !== "undefined" && location) ? location : (window.location || null);
+      if (!loc) return;
+      // 只认 /remote/<deviceId>/ 形态（用 split 解析：注入体是模板字符串，正则里的 \/ 会被吃掉）
+      var seg = String(loc.pathname || "").split("/").filter(Boolean);
+      if (seg[0] !== "remote" || !seg[1]) return;
+      var dev = "";
+      try { dev = decodeURIComponent(seg[1]); } catch (eDec) { dev = ""; }
+      if (!dev || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(dev)) return;
+      var key = LS_KEY_PREFIX + dev;
+      var takeoverKey = key + ":takeover";
+      var self = "p" + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+
+      var ls = null;
+      try { ls = window.localStorage || null; } catch (e0) { ls = null; }
+      var bc = null;
+      try {
+        if (typeof window.BroadcastChannel === "function") bc = new window.BroadcastChannel(BC_PREFIX + dev);
+      } catch (e1) { bc = null; }
+      if (!ls || !bc) return; // 老浏览器/隐私模式:不改变既有行为(不锁)
+
+      var state = "checking";
+      var beatTimer = 0;
+      var pollTimer = 0;
+      var claimedAt = 0;
+
+      function publish(s) {
+        state = s;
+        try {
+          window.__dshSinglePage = { state: s, device: dev };
+        } catch (eP) { /* 忽略 */ }
+      }
+
+      function readLease() {
+        try {
+          var raw = ls.getItem(key);
+          if (!raw) return null;
+          var v = JSON.parse(raw);
+          if (!v || typeof v.id !== "string") return null;
+          return { id: v.id, at: Number(v.at) || 0 };
+        } catch (eR) { return null; }
+      }
+      function writeLease() {
+        try { ls.setItem(key, JSON.stringify({ id: self, at: Date.now() })); } catch (eW) { /* 忽略 */ }
+      }
+      function releaseLease() {
+        try {
+          var cur = readLease();
+          if (cur && cur.id === self) ls.removeItem(key);
+        } catch (eL) { /* 忽略 */ }
+      }
+      function readTakeover() {
+        try { return Number(ls.getItem(takeoverKey)) || 0; } catch (eT) { return 0; }
+      }
+      function markTakeover() {
+        try { ls.setItem(takeoverKey, String(Date.now())); } catch (eM) { /* 忽略 */ }
+      }
+
+      function post(msg) {
+        try { bc.postMessage(msg); } catch (ePo) { /* 忽略 */ }
+      }
+
+      function reload() {
+        try {
+          if (typeof loc.reload === "function") { loc.reload(); return; }
+          loc.href = loc.href;
+        } catch (eRel) { /* 忽略 */ }
+      }
+
+      /* ---- 第二页：即刻停掉加载 + 全屏提示（唯一出口是「在本窗口继续」或回原窗口）---- */
+      function installNetworkStop() {
+        try { if (typeof window.stop === "function") window.stop(); } catch (eS) { /* 忽略 */ }
+        try {
+          if (typeof window.fetch === "function") {
+            window.fetch = function () {
+              return Promise.reject(new Error("dsh-single-page: 同一设备的镜像页已在另一个窗口打开，本页已停用"));
+            };
+          }
+        } catch (eF) { /* 忽略 */ }
+        try {
+          var proto = window.XMLHttpRequest && window.XMLHttpRequest.prototype;
+          if (proto && typeof proto.send === "function") {
+            proto.send = function () { try { this.abort(); } catch (eX) { /* 忽略 */ } };
+          }
+        } catch (eXhr) { /* 忽略 */ }
+        try {
+          if (typeof window.WebSocket === "function") {
+            var WsBlocked = function () {
+              throw new Error("dsh-single-page: 同一设备的镜像页已在另一个窗口打开，本页已停用");
+            };
+            WsBlocked.prototype = window.WebSocket.prototype;
+            window.WebSocket = WsBlocked;
+          }
+        } catch (eWs) { /* 忽略 */ }
+      }
+
+      function buildOverlay() {
+        try {
+          if (!document || !document.body) return;
+          if (document.getElementById && document.getElementById(OVERLAY_ID)) return;
+          var wrap = document.createElement("div");
+          wrap.id = OVERLAY_ID;
+          wrap.setAttribute("data-dsh-single-page", "blocked");
+          wrap.style.cssText = "position:fixed;left:0;top:0;right:0;bottom:0;z-index:2147483001;"
+            + "background:#0f1115;color:#e8eaed;display:flex;align-items:center;justify-content:center;"
+            + "padding:24px;box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;";
+          wrap.innerHTML = '<div style="max-width:420px;text-align:center;line-height:1.7">'
+            + '<div style="font-size:18px;font-weight:600;margin-bottom:10px">该设备已在本浏览器另一个窗口打开</div>'
+            + '<div style="font-size:14px;color:#9aa0a6;margin-bottom:18px">两个镜像页同时加载会互相取消资源加载，'
+            + '导致两边都卡住。请回到原来那个窗口继续使用。</div>'
+            + '<button id="' + BTN_ID + '" style="border:0;border-radius:10px;padding:12px 18px;'
+            + 'font-size:15px;background:#3b82f6;color:#fff;width:100%">在本窗口继续（切换到本页）</button>'
+            + '</div>';
+          document.body.appendChild(wrap);
+          var btn = document.getElementById ? document.getElementById(BTN_ID) : null;
+          if (btn && typeof btn.addEventListener === "function") btn.addEventListener("click", takeover, false);
+        } catch (eOv) { /* 提示失败也不影响"已停用"这个事实 */ }
+      }
+
+      function showOverlay() {
+        try {
+          if (document && document.body) buildOverlay();
+          else if (document && typeof document.addEventListener === "function") {
+            document.addEventListener("DOMContentLoaded", buildOverlay, false);
+          }
+        } catch (eShow) { /* 忽略 */ }
+      }
+
+      function becomeBlocked(why) {
+        if (state === "blocked") return;
+        publish("blocked");
+        try { if (beatTimer) { clearInterval(beatTimer); beatTimer = 0; } } catch (eB) { /* 忽略 */ }
+        releaseLease();
+        installNetworkStop();
+        showOverlay();
+        try {
+          if (!pollTimer) {
+            pollTimer = setInterval(function () {
+              var l = readLease();
+              var now = Date.now();
+              if (l && l.id !== self && now - l.at < LEASE_TTL_MS) return; // 人家还活着
+              // 原来的窗口关了/失联:允许自己接管(先打 takeover 标记,避免重载后又被自己挡住)
+              try { if (pollTimer) { clearInterval(pollTimer); pollTimer = 0; } } catch (eC) { /* 忽略 */ }
+              markTakeover();
+              reload();
+            }, 2000);
+          }
+        } catch (ePoll) { /* 忽略 */ }
+        if (window.console && console.info) console.info("[dsh-mobile-adapter] 单镜像页:第二页已停用(" + why + ")");
+      }
+
+      function takeover() {
+        post({ k: "takeover", id: self, at: Date.now() });
+        markTakeover();
+        // 给旧页 400ms 收消息、释放租约、让出资源，然后本页重载（重载后按 takeover 标记直接接管）
+        setTimeout(reload, 400);
+      }
+
+      function beat() {
+        writeLease();
+      }
+
+      function becomeActive() {
+        publish("active");
+        claimedAt = Date.now();
+        // takeover 标记只用于「重载后允许接管一次」：拿到租约后立刻消费掉，
+        // 否则它在 15s 有效期内会让第三个页面也以为自己可以接管（并发又回来了）。
+        try { ls.removeItem(takeoverKey); } catch (eCl) { /* 忽略 */ }
+        writeLease();
+        try {
+          if (!beatTimer) beatTimer = setInterval(beat, BEAT_MS);
+        } catch (eBt) { /* 忽略 */ }
+        post({ k: "claim", id: self, at: claimedAt });
+        // Web Locks 兜底（可用时）：并发双开时只有拿到锁的那个页面继续
+        try {
+          var nav = window.navigator;
+          if (nav && nav.locks && typeof nav.locks.request === "function") {
+            nav.locks.request(LOCK_PREFIX + dev, { ifAvailable: true }, function (lock) {
+              if (!lock) { becomeBlocked("web_locks_busy"); return undefined; }
+              return new Promise(function () { /* 持有到页面结束 */ });
+            }).catch(function () { /* 不支持 ifAvailable/被拒 → 租约已足够 */ });
+          }
+        } catch (eLocks) { /* 忽略 */ }
+        // 让路：另一页 claim（它后发/并发）或要求接管
+        try {
+          bc.onmessage = function (ev) {
+            var msg = ev && ev.data;
+            if (!msg || typeof msg !== "object") return;
+            if (msg.id === self) return;
+            if (msg.k === "takeover") {
+              becomeBlocked("takeover");
+              return;
+            }
+            if (msg.k === "claim" && Number(msg.at) >= claimedAt) {
+              // 同一时刻两个页面都认为自己是活跃页（同步租约竞态）→ 按 id 字典序让一个走
+              if (Number(msg.at) === claimedAt && String(msg.id) < String(self)) return;
+              becomeBlocked("other_claim");
+            }
+          };
+        } catch (eMsg) { /* 忽略 */ }
+        try {
+          window.addEventListener("pagehide", function () {
+            if (state !== "active") return;
+            // 进 bfcache / 切走：让出租约，别让另一个页面（或用户重开）被一张"僵尸租约"挡住
+            releaseLease();
+            post({ k: "release", id: self, at: Date.now() });
+            if (beatTimer) { try { clearInterval(beatTimer); } catch (eBt2) { /* 忽略 */ } beatTimer = 0; }
+            try { bc.onmessage = null; } catch (eBc2) { /* 忽略 */ } // 卸载旧监听，避免和 pageshow 后的新实例抢状态
+            publish("inactive");
+          });
+          // bfcache 回来：可能已经过了很久、也可能别的页面已经接管 → 重新判一次（幂等）
+          window.addEventListener("pageshow", function (ev) {
+            if (!ev || !ev.persisted) return;
+            if (state === "active") return;
+            try { maSinglePageGuard(); } catch (ePs) { /* 忽略 */ }
+          });
+        } catch (ePh) { /* 忽略 */ }
+      }
+
+      /* ---- 启动：同步租约判定（关键：不 await，第二页在网络请求发出前就被按住）---- */
+      var now = Date.now();
+      var lease = readLease();
+      var tko = readTakeover();
+      var takeoverFresh = tko > 0 && now - tko < 15000 && tko <= now + 60000;
+      var foreignFresh = lease && lease.id !== self && lease.at <= now + 60000 && now - lease.at < LEASE_TTL_MS;
+      if (foreignFresh && !takeoverFresh) {
+        becomeBlocked("lease_held");
+        return;
+      }
+      becomeActive();
+    } catch (e) { /* 守卫绝不能把页面拖挂 */ }
+  }
+  maSinglePageGuard();
+  /* ===DSH-MA-SINGLEPAGE-END=== */
+
   } catch (e) { if (window.console) console.warn("[dsh-mobile-adapter]", e && e.message); }
 })();`;
 

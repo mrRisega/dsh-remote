@@ -29,10 +29,16 @@
  *     REMOTE_STREAM_MUX_PATH)。线上未出问题是因为本文件对路径**透明透传**、由浏览器决定
  *     请求哪个路径;但错的注释会把后来者带沟里(微信通道订阅事件流时会照着它写)。
  *     → { "id", "type":"ws-open", "path", "headers":{...} }      ← { "id","type":"ws-open","ok":true|false,"code"?,"reason"? }
+ *       【2026-10-23 快速应答】校验通过立刻回 {ok:true,fast:true}，随后才连上游；上游建立期间手机发来的
+ *       ws-msg 先排队、open 后按序补发。上游最终失败 → 回 {type:"ws-close",code:1011,retryable:true}
+ *       （此时 router 已把手机 WS 交接给上层，不能再回 ws-open 失败帧）。E2EE 会话缺失/未验证仍先拒绝：
+ *       {ok:false,code:1008,retryable:true,action:"rehandshake"}（手机自动重握手，不逼用户重新解锁）。
  *     → { "id", "type":"ws-msg",  "data":<文本|base64>, "binary"? }
  *     ← { "id", "type":"ws-msg",  "data":<文本|base64>, "binary"? }
  *     → { "id", "type":"ws-close", "code"?, "reason"? }          ← { "id","type":"ws-close","code"?,"reason"? }
  *     ws 会话以帧 id 为 key;隧道断开时全部关闭。
+ *     发送侧有「控制帧快速通道」(ws-open/ws-close/http-end 等可在大响应分片之间插队，
+ *     发送缓冲超过高水位时暂停灌分块) —— 见 makePrioritySender 上方长注释。
  *
  * 环境:
  *   DSH_BRIDGE_TUNNEL_URL  必填:relay-router 地址(如 ws://127.0.0.1:13444 或 wss://relay.example.com)
@@ -44,7 +50,11 @@
  *   DSH_BRIDGE_TOKEN       JWT(直接给 token;优先级高于 手机号/邮箱+密码)
  *   DSH_BRIDGE_API         账号 API 地址(默认云端服务地址;自建模式无需设置)
  *   DSH_BRIDGE_LOCAL_KEY   开源自部署:访问密钥(设后经 router POST /_login 换本地 JWT,免账号体系)
- *   DSH_BRIDGE_HEARTBEAT_MS 隧道心跳间隔(默认 15000ms)
+ *   DSH_BRIDGE_HEARTBEAT_MS 隧道心跳间隔(默认 20000ms)
+ *   DSH_BRIDGE_HEARTBEAT_ADAPT=0        关闭心跳自适应(退回"固定窗口 2 拍"的旧契约)
+ *   DSH_BRIDGE_HEARTBEAT_MAX_MISSED    判定窗口上限拍数(默认 4,范围 1-8)
+ *   DSH_BRIDGE_TUNNEL_BULK_HWM_KB      发送缓冲高水位(默认 64KB;弱网可调低)
+ *   DSH_BRIDGE_TUNNEL_CHUNK_KB         大帧分片大小(默认 64KB)
  *   DSH_MOBILE_ADAPTER   经隧道访问的官方 dsh web 移动端适配注入开关:0 关闭(默认开启,仅 ≤820px 生效)
  *
  * E2EE(Phase-2,见 docs/e2ee-protocol.md):
@@ -52,6 +62,9 @@
  *     不落盘);服务端 /api/e2ee-params 返回 enabled=false / 401 / 无密码 / 派生失败 → 明文 v1 回退。
  *   - 开关与状态写入 <relayDir>/.e2ee-state.json {enabled, reason, profile, epoch, caps};
  *     DSH_BRIDGE_E2EE=0 或配置 e2ee:false 可本地关闭;DSH_BRIDGE_E2EE_STATE 可覆盖状态文件路径。
+ *   - 【2026-10-23】会话材料加密落盘 <relayDir>/.e2ee-sessions.enc(storeKey=HKDF(MK)、AES-256-GCM、
+ *     0600、原子写),bridge 重启后恢复(24h 滑动 TTL),手机旧票不再变死票;DSH_BRIDGE_E2EE_SESSIONS=0
+ *     可关闭持久化,DSH_BRIDGE_E2EE_STORE_DIR 可覆盖目录。方案/信任边界见 e2ee-client.mjs 同段注释。
  *   - 帧体带信封标记(content-type: application/vnd.dsh.e2ee-v2 或 x-dsh-e2ee)= 已加密:
  *     HTTP 解封→转发上游→响应封回;WS 逐消息封/解。任何解封失败显式
  *     502 + x-dsh-e2ee-error / ws-close 1008,绝不静默降级。
@@ -110,8 +123,10 @@ for (const k of ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_
 const THIS_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(THIS_DIR, "..", "..");
 // 配置路径:dsh-setup 总会显式传入 DSH_BRIDGE_CONFIG;npm 安装时默认落到 ~/.dsh-remote
+/** 是否是「受管安装」(npm 装到 node_modules / 安装器显式给配置):决定状态/会话库是否落盘。 */
+const IS_MANAGED_INSTALL = ROOT.includes(`${path.sep}node_modules${path.sep}`);
 const DEFAULT_CONFIG = path.join(
-  ROOT.includes(`${path.sep}node_modules${path.sep}`) ? path.join(os.homedir(), ".dsh-remote") : ROOT,
+  IS_MANAGED_INSTALL ? path.join(os.homedir(), ".dsh-remote") : ROOT,
   ".dsh-config.json"
 );
 const CONFIG_PATH = process.env.DSH_BRIDGE_CONFIG || DEFAULT_CONFIG;
@@ -123,8 +138,8 @@ const TUNNEL_URL = (process.env.DSH_BRIDGE_TUNNEL_URL || "").replace(/\/+$/, "")
  * 为什么从 15s 调到 20s：生产上"30 秒级断连、75% 的隧道会话活不过 60s"（诊断报告 R2），
  * 15s 的心跳 + "丢一次 pong 就断" 让弱网（丢包 5%）下的正常抖动被当成故障，
  * 每次误断都会重连重建隧道 + 打断在途请求。20s 与中继/nginx 的 3600s read timeout 无关，
- * 只影响"多久发现半开连接"：最坏 3 个心跳周期（≈60s）发现真死的连接，仍远小于移动网络
- * 常见的 NAT 空闲超时（通常 2~5 分钟）。
+ * 只影响"多久发现半开连接"：健康链路最坏 2 拍（≈40s）发现真死连接；自适应放宽后最多 4 拍
+ * （≈80s，见 adaptiveHeartbeat），仍远小于移动网络常见的 NAT 空闲超时（通常 2~5 分钟）。
  */
 export const TUNNEL_HEARTBEAT_DEFAULT_MS = 20_000;
 /** 连续丢多少个 pong 才判定隧道已死（C5：旧实现丢 1 次就 terminate，弱网误判率过高）。 */
@@ -598,6 +613,177 @@ export function makeChunkedSender(rawSend) {
 export function dcSend(dc, obj) {
   if (!dc || dc.readyState !== "open") return false;
   return makeChunkedSender((s) => dc.send(s))(obj);
+}
+
+// ============================================================
+// 发送侧：控制帧快速通道（2026-10-23，生产「手机连不上」主因链 #1）
+// ============================================================
+/* 【事故】手机端首屏要的 /plugins/?? 聚合包最大 16.33MB。旧实现把整包切成 82 个 200KB
+ *   分块后**在同一个 tick 里连续 ws.send**：内核发送缓冲一满，剩下的块全部堆进 ws 的
+ *   内存队列（手机弱网下这是十几秒的量）。router 在此期间发来的 `ws-open`，bridge 处理和
+ *   回包只需几毫秒，但**回包帧被排在 16MB 分块后面** → router 20s 超时
+ *   （日志 `bridge ws-open 应答超时` / `ws_open_timeout`），页面表现为「一直转圈/连不上」。
+ *
+ * 【WS 帧有序，无法真的插队到已入队分片之前】所以换思路：**不让队列堆起来**。
+ *   · 大帧分块进「批量车道」，一片一片发，每片之后让出事件循环（入站 ws-open 因此能被及时
+ *     处理，回包立刻进「控制车道」）；
+ *   · 每轮发送前先排空控制车道，并检查 `ws.bufferedAmount`：超过高水位就停手等它排空。
+ *     于是控制帧前面最多只有「高水位 + 一片」的待发字节 —— 默认 64KB + 64KB，手机 1Mbps
+ *     下 ≈1s，8Mbps 下 ≈0.13s，远小于 router 的 20s，也满足「大响应传输中 1s 内应答」目标。
+ *   · 小帧（交互消息 / SSE 块）单独一条车道，优先于大帧的下一片（交互不被整帧传输拖住）。
+ *   · 阈值 / 分片大小可用环境变量调（见 tunnelBulkOptionsFromEnv），弱网部署可再调低。
+ */
+export const TUNNEL_BULK_HWM_DEFAULT = 64 * 1024;    // 发送缓冲高水位（字节）
+export const TUNNEL_BULK_CHUNK_DEFAULT = 64 * 1024;  // 大帧分片大小（字节）
+export const TUNNEL_BULK_POLL_MS = 10;               // 高水位以上时的轮询间隔
+/** 必须能插队的控制帧类型（ws-open 回包是这次事故的正主；ws-close 决定页面多久知道断了）。 */
+export const CONTROL_FRAME_TYPES = Object.freeze(["ws-open", "ws-close", "http-abort", "http-end", "tunnel-register"]);
+const CONTROL_FRAME_SET = new Set(CONTROL_FRAME_TYPES);
+
+/** 该帧是否走控制车道（纯函数，发送器与用例共用）。 */
+export function isControlFrame(obj) {
+  return Boolean(obj && typeof obj === "object" && CONTROL_FRAME_SET.has(obj.type));
+}
+
+/** 从环境变量读批量车道参数（运维可调；非法值回默认）。 */
+export function tunnelBulkOptionsFromEnv(env = process.env) {
+  const kb = (name, dflt) => {
+    const n = Number(env?.[name]);
+    return Number.isFinite(n) && n > 0 ? n * 1024 : dflt;
+  };
+  return {
+    bulkHighWater: Math.round(kb("DSH_BRIDGE_TUNNEL_BULK_HWM_KB", TUNNEL_BULK_HWM_DEFAULT)),
+    chunkSize: Math.round(kb("DSH_BRIDGE_TUNNEL_CHUNK_KB", TUNNEL_BULK_CHUNK_DEFAULT))
+  };
+}
+
+/**
+ * 构造「控制帧优先」的隧道发送器。返回 { send, close, stats, hasBacklog }。
+ *
+ * send(obj) → boolean：控制帧立即入控制车道并尝试发；其余帧序列化后入批量车道。
+ *   `true` 表示已受理（与 makeChunkedSender 语义一致：只表达"入队阶段没失败"）。
+ * 依赖可注入（rawSend / bufferedAmount / schedule / setTimer），便于用假 socket + 可控调度
+ * 断言「大响应传输中 ws-open 回包能插队」这条契约（test/bridge-control-priority.test.mjs）。
+ */
+export function makePrioritySender({
+  rawSend,
+  bufferedAmount = () => 0,
+  bulkHighWater = TUNNEL_BULK_HWM_DEFAULT,
+  chunkSize = TUNNEL_BULK_CHUNK_DEFAULT,
+  pollMs = TUNNEL_BULK_POLL_MS,
+  schedule = (fn) => setImmediate(fn),
+  setTimer = (fn, ms) => setTimeout(fn, ms)
+} = {}) {
+  const controlQ = [];
+  let closed = false;
+  let pumping = false;
+  let scheduled = false;
+  let timerPending = false;
+  const smallQ = []; // 小帧（可整帧直发）：交互消息 / SSE 块 —— 优先于大帧的下一片
+  const bigQ = [];   // 大帧：{ frames: string[], i }
+  const stats = { controlSent: 0, smallSent: 0, bigFrames: 0, bigChunks: 0, waits: 0, dropped: 0 };
+
+  function enqueueBulk(text) {
+    if (text.length <= chunkSize) {
+      smallQ.push(text);
+      return;
+    }
+    const cid = `c${++chunkSeq}`;
+    const n = Math.ceil(text.length / chunkSize);
+    const frames = new Array(n);
+    for (let i = 0; i < n; i += 1) {
+      frames[i] = JSON.stringify({ __chunk: { id: cid, n, i, data: text.slice(i * chunkSize, (i + 1) * chunkSize) } });
+    }
+    stats.bigFrames += 1;
+    bigQ.push({ frames, i: 0 });
+  }
+
+  function scheduleNext(waitMs) {
+    if (closed) return;
+    if (waitMs > 0) {
+      if (timerPending) return;
+      timerPending = true;
+      setTimer(() => { timerPending = false; pump(); }, waitMs);
+      return;
+    }
+    if (scheduled) return;
+    scheduled = true;
+    schedule(() => { scheduled = false; pump(); });
+  }
+
+  function pump() {
+    if (pumping || closed) return;
+    pumping = true;
+    let yieldMode = ""; // ""=没有剩余，"schedule"=让出事件循环，"poll"=等缓冲排空
+    let budget = 32;    // 一轮最多发多少条小帧
+    try {
+      for (;;) {
+        // ① 控制车道永远先走：哪怕大帧正传着 16MB，控制帧也在**下一轮**第一时间出去。
+        while (controlQ.length > 0) {
+          const frame = controlQ.shift();
+          try { rawSend(frame); stats.controlSent += 1; } catch { closed = true; }
+        }
+        if (closed) { yieldMode = ""; break; }
+        // ② 小帧优先于大帧的下一片：大包传输期间，交互消息 / SSE 块不该排在它后面。
+        if (smallQ.length > 0 && budget > 0) {
+          try { rawSend(smallQ.shift()); stats.smallSent += 1; } catch { closed = true; break; }
+          budget -= 1;
+          continue; // 回环顶先查控制车道
+        }
+        if (smallQ.length > 0) { yieldMode = "schedule"; break; } // 一轮预算用完
+        if (bigQ.length === 0) { yieldMode = ""; break; }
+        // ③ 背压：已入队字节超过高水位 → 停手等排空，别把控制帧埋进几十秒的队列里。
+        let pending = 0;
+        try { pending = Number(bufferedAmount()) || 0; } catch { pending = 0; }
+        if (pending > bulkHighWater) { stats.waits += 1; yieldMode = "poll"; break; }
+        const item = bigQ[0];
+        try { rawSend(item.frames[item.i]); stats.bigChunks += 1; } catch { closed = true; break; }
+        item.i += 1;
+        if (item.i >= item.frames.length) bigQ.shift();
+        yieldMode = "schedule"; // 大帧：一片一让，给入站帧 / 控制帧 / 小帧机会
+        break;
+      }
+    } finally {
+      pumping = false;
+      if (closed) {
+        controlQ.length = 0;
+        smallQ.length = 0;
+        bigQ.length = 0;
+      } else if (yieldMode) {
+        scheduleNext(yieldMode === "poll" ? pollMs : 0);
+      }
+    }
+  }
+
+  function send(obj) {
+    let text;
+    try { text = JSON.stringify(obj); } catch { return false; }
+    if (closed) { stats.dropped += 1; return false; }
+    if (isControlFrame(obj)) controlQ.push(text);
+    else enqueueBulk(text);
+    pump();
+    return true;
+  }
+
+  /** 隧道断开：丢掉未发内容并停止调度（否则重连后旧分片会发到新连接上）。 */
+  function close() {
+    closed = true;
+    controlQ.length = 0;
+    smallQ.length = 0;
+    bigQ.length = 0;
+  }
+
+  return {
+    send,
+    close,
+    stats: () => ({
+      ...stats,
+      queued: smallQ.length + bigQ.length,
+      controlQueued: controlQ.length,
+      closed
+    }),
+    hasBacklog: () => smallQ.length > 0 || bigQ.length > 0 || controlQ.length > 0
+  };
 }
 
 /** 兼容两种调用:handleXxx(dch, frame)(WebRTC) 或 handleXxx(sendFn, frame)(隧道)。 */
@@ -1384,6 +1570,68 @@ function handleCtrlMessage(send, id, rawText) {
   // 其余控制消息忽略
 }
 
+/* ── ws-open 快速应答（2026-10-23，生产「手机连不上」主因链 #1 的另一半）────────────
+ *
+ * 旧契约：收到 ws-open → 连上游 WebSocket → **等上游 open** 才回 ok。
+ *   上游连不上时（桌面端换端口/宿主重启），手机要等到 router 的 20s 超时才看到失败；
+ *   而 bridge 发送队列被大响应占住时（另见 makePrioritySender），连"回 ok"都排不上。
+ *
+ * 新契约：校验通过 → **立刻回 ok** → 再连上游。
+ *   · 手机拿到 ok 后立刻发的消息（mux 订阅/首帧）进 pending 队列，上游 open 后按序补发，
+ *     上限 WS_OPEN_PENDING_MAX_FRAMES / BYTES（只是上游建立期间的过渡，正常是几十 ms）。
+ *   · 上游最终失败/超时 → 回 ``ws-close``(1011, retryable) —— 此时升级早已完成，
+ *     再回 ws-open 失败帧没有意义（router 已把手机 WS 交给上层）。
+ *   · 失败路径照旧触发 refreshUpstream（端口漂移自愈，见 test/bridge-upstream-refresh）。
+ *   · E2EE 语义不变：带 &e2ee= 的流仍然**先**校验会话（未验证/不存在 → 1008 + 可自动重握手
+ *     信号），校验通过才 ack，绝不在未验证的会话上转发任何数据（§4.6/§5.2）。
+ */
+export const WS_OPEN_UPSTREAM_TIMEOUT_MS = 10_000;
+export const WS_OPEN_PENDING_MAX_FRAMES = 512;
+export const WS_OPEN_PENDING_MAX_BYTES = 2 * 1024 * 1024;
+
+/** ws-open 拒绝帧；extra 里放机器可读信号（手机据此自动重握手，而不是让用户去解锁）。 */
+function sendWsOpenReject(send, id, code, reason, extra = {}) {
+  send({ id, type: "ws-open", ok: false, code, reason, at: Date.now(), ...extra });
+}
+
+/** 已 ack 之后的上游失败：只能换成 ws-close 收尾（升级已完成，不能再回 ws-open 失败帧）。 */
+function failAckedWs(send, id, phase, reason, extra = {}) {
+  send({ id, type: "ws-close", code: 1011, reason: `${phase}: ${reason}`, phase, at: Date.now(), ...extra });
+}
+
+/** 上游 open 前把消息排队；open 后按序补发。overflow 返回 false（调用方关流）。 */
+function enqueuePendingWsMsg(session, payload, binary) {
+  const bytes = Buffer.isBuffer(payload) ? payload.length : String(payload).length;
+  if (session.pending.length >= WS_OPEN_PENDING_MAX_FRAMES || session.pendingBytes + bytes > WS_OPEN_PENDING_MAX_BYTES) {
+    return false;
+  }
+  session.pending.push({ data: payload, binary });
+  session.pendingBytes += bytes;
+  return true;
+}
+
+/** 把一条消息发到上游；上游还没 open 就排队（见上方 ws-open 快速应答说明）。 */
+function forwardToUpstream(send, id, session, payload, binary) {
+  const ws = session.ws;
+  if (session.opened && ws && ws.readyState === WebSocket.OPEN) {
+    try {
+      if (binary) ws.send(payload);
+      else ws.send(String(payload));
+    } catch (e) {
+      console.log(`[bridge] ws-send err: ${e.message}`);
+    }
+    return true;
+  }
+  if (session.cancelled || session.failed) return false;
+  if (enqueuePendingWsMsg(session, payload, binary)) return true;
+  console.error(`[bridge] ws-open 待发队列溢出(id=${id}),关闭该流(上游建立过慢)`);
+  session.cancelled = true;
+  try { session.ws?.terminate?.(); } catch { /* 忽略 */ }
+  wsSessions.delete(id);
+  try { failAckedWs(send, id, "upstream_ws_open_slow", "上游连接建立过慢，待发消息超限"); } catch { /* 忽略 */ }
+  return false;
+}
+
 export async function handleWsOpen(dchOrSend, frame) {
   const send = toSender(dchOrSend);
   const { id, path = "/", headers = {} } = frame;
@@ -1395,32 +1643,91 @@ export async function handleWsOpen(dchOrSend, frame) {
   const tagged = parseWsE2eeParams(path);
   if (tagged) {
     if (!e2ee.enabled) {
-      send({ id, type: "ws-open", ok: false, code: 1008, reason: "e2ee_disabled:bridge 未启用端到端加密(请用明文连接)" });
+      sendWsOpenReject(send, id, 1008, "e2ee_disabled:bridge 未启用端到端加密(请用明文连接)");
       return;
     }
-    const session = e2ee.sessionOf(tagged.sessId);
-    if (!session || !session.verified) {
+    const esess = e2ee.sessionOf(tagged.sessId);
+    if (!esess || !esess.verified) {
+      // 会话可能刚被重启/被 LRU 挤掉：把「可自动重握手」写成机器可读信号，
+      // 手机侧据此自动重建会话，而不是弹「请重新解锁」让用户输密码（生产 3964 次/设备）。
       console.error(`[bridge] e2ee ws 拒绝(会话未解锁/未验证): ${path}`);
-      send({ id, type: "ws-open", ok: false, code: 1008, reason: "e2ee_session_locked:请先解锁完成握手(检查密码)" });
+      sendWsOpenReject(send, id, 1008, "e2ee_session_locked:加密会话已失效，需要重新握手", {
+        retryable: true,
+        action: "rehandshake"
+      });
       return;
     }
     // 探测前不转发任何数据(§4.6/§5.2:探测通过后数据流才可建);此时已验证 → 安全
   }
-  if (wsSessions.has(id)) { try { wsSessions.get(id).ws.terminate(); } catch {} wsSessions.delete(id); }
+  const previous = wsSessions.get(id);
+  if (previous) {
+    previous.cancelled = true;
+    try { previous.ws?.terminate?.(); } catch { /* 忽略 */ }
+    wsSessions.delete(id);
+  }
   const safe = safePath(tagged ? tagged.upstreamPath : path);
-  if (safe === null) { send({ id, type: "ws-open", ok: false, code: 400, reason: "非法路径" }); return; }
-  const url = `${UPSTREAM.replace(/^http/, "ws")}${safe}`;
-  const ws = new WebSocket(url, { headers: buildWsHeaders(headers), followRedirects: false });
-  const session = { ws, opened: false };
+  if (safe === null) { sendWsOpenReject(send, id, 400, "非法路径"); return; }
+
+  const session = { ws: null, opened: false, pending: [], pendingBytes: 0, cancelled: false, failed: false };
   if (tagged && e2ee.enabled) {
     // 会话必须已 verified(上面已校验),给该流独立的收发密钥与方向计数
     session.e2ee = { s: e2ee.sessionOf(tagged.sessId), wsLabel: tagged.wsLabel, p2bLast: -1, b2pLast: -1 };
   }
   wsSessions.set(id, session);
+  // ★ 快速应答：先回 ok，再连上游（理由见上方长注释）
+  const acked = send({ id, type: "ws-open", ok: true, fast: true });
+  if (acked === false) { wsSessions.delete(id); return; }
+
+  const url = `${UPSTREAM.replace(/^http/, "ws")}${safe}`;
+  let ws;
+  try {
+    ws = new WebSocket(url, { headers: buildWsHeaders(headers), followRedirects: false });
+  } catch (e) {
+    wsSessions.delete(id);
+    session.failed = true;
+    void refreshUpstream("ws-open 上游连接失败");
+    failAckedWs(send, id, "upstream_ws_open_failed", String(e?.message || e), { retryable: true });
+    return;
+  }
+  session.ws = ws;
+  /** 上游没建立就失败：统一收尾（只发一次）。 */
+  const failUpstream = (phase, reason) => {
+    if (session.opened || session.failed || session.cancelled) return;
+    session.failed = true;
+    try { clearTimeout(openTimer); } catch { /* 忽略 */ }
+    session.pending.length = 0;
+    session.pendingBytes = 0;
+    wsSessions.delete(id);
+    // ★ 上游可能已经换端口（桌面端 App 重启会换本地端口，生产日志里抓到过
+    //   `upstream_ws_open_failed ... ECONNREFUSED 127.0.0.1:19387`）。
+    //   HTTP 失败路径早就会触发重新发现，**WS 失败路径之前漏了** —— 而镜像页常常
+    //   先开 WS（控制通道/数据通道），于是端口变了以后一直失败、页面白屏，直到用户
+    //   手动重开。这里补上：本次失败照旧通知手机，但立即触发重新发现，下一次重试命中新端口。
+    void refreshUpstream("ws-open 上游连接失败");
+    // 已 ack → 用 ws-close 收尾（1011 + retryable），手机侧走正常重连，不必干等 20s 超时。
+    failAckedWs(send, id, phase, reason, { retryable: true });
+  };
+  let openTimer = null;
+  openTimer = setTimeout(() => {
+    failUpstream("upstream_ws_open_timeout", `上游 WebSocket ${Math.round(WS_OPEN_UPSTREAM_TIMEOUT_MS / 1000)}s 未建立`);
+  }, WS_OPEN_UPSTREAM_TIMEOUT_MS);
+  openTimer.unref?.();
   ws.on("open", () => {
+    if (session.cancelled || session.failed) { try { ws.terminate(); } catch { /* 忽略 */ } return; }
+    try { clearTimeout(openTimer); } catch { /* 忽略 */ }
     session.opened = true;
-    console.log(`[bridge] ws-open ${session.e2ee ? "(e2ee) " : ""}${safe} (id=${id})`);
-    send({ id, type: "ws-open", ok: true });
+    console.log(`[bridge] ws-open ${session.e2ee ? "(e2ee) " : ""}${safe} (id=${id}, 快速应答)`);
+    // 上游建立期间手机已经发来的消息按序补发
+    const pending = session.pending;
+    session.pending = [];
+    session.pendingBytes = 0;
+    for (const item of pending) {
+      try {
+        if (item.binary) ws.send(item.data);
+        else ws.send(String(item.data));
+      } catch { /* 上游立刻又出错 → close 路径收尾 */ }
+    }
+    if (pending.length > 0) console.log(`[bridge] ws-open 补发 ${pending.length} 条上游建立期间的消息(id=${id})`);
   });
   ws.on("message", (data, isBinary) => {
     // 上游 → 手机:加密流逐条封信封(b2p 独立计数);明文流原样透传
@@ -1447,7 +1754,12 @@ export async function handleWsOpen(dchOrSend, frame) {
     send({ id, type: "ws-msg", data: payload, binary: isBinary });
   });
   ws.on("close", (code, reason) => {
-    if (!session.opened) return; // 未建立成功的会话由 error 路径收尾
+    if (session.cancelled) return; // 手机侧已关 / 被新连接取代 / 队列溢出，已收尾
+    if (!session.opened) {
+      // 快速应答之后才断：走统一失败收尾（ws-close 1011 + 触发上游重发现）
+      failUpstream("upstream_ws_open_failed", `上游 WebSocket 未建立就关闭(code=${code}${reason ? ", " + reason : ""})`);
+      return;
+    }
     console.log(`[bridge] ws-close ${path} (id=${id}, code=${code})`);
     wsSessions.delete(id);
     send({ id, type: "ws-close", code: code ?? 1006, reason: reason?.toString() ?? "" });
@@ -1455,14 +1767,8 @@ export async function handleWsOpen(dchOrSend, frame) {
   ws.on("error", (e) => {
     console.log(`[bridge] ws-error ${path} (id=${id}): ${e.message || ""}`);
     if (!session.opened) {
-      wsSessions.delete(id);
-      // ★ 上游可能已经换端口（桌面端 App 重启会换本地端口，生产日志里抓到过
-      //   `upstream_ws_open_failed ... ECONNREFUSED 127.0.0.1:19387`）。
-      //   HTTP 失败路径早就会触发重新发现，**WS 失败路径之前漏了** —— 而镜像页常常
-      //   先开 WS（控制通道/数据通道），于是端口变了以后一直 502、页面白屏，直到用户
-      //   手动重开。这里补上：本次失败照旧回 502，但立即触发重新发现，下一次重试就命中新端口。
-      void refreshUpstream("ws-open 上游连接失败");
-      send({ id, type: "ws-open", ok: false, code: 502, reason: String(e.message || "ws error") });
+      // ★ 未建立就失败：触发上游重新发现（端口漂移自愈，见 failUpstream 内注释）。
+      failUpstream("upstream_ws_open_failed", String(e.message || "ws error"));
     }
   });
 }
@@ -1480,7 +1786,8 @@ export function handleWsMessage(_dchOrSend, frame) {
     return;
   }
   const session = wsSessions.get(id);
-  if (!session || !session.opened || session.ws.readyState !== WebSocket.OPEN) return;
+  if (!session) return;
+  const send = toSender(_dchOrSend);
   if (session.e2ee) {
     // 加密流:逐条解封 → 原文转发上游;AEAD 失败 → 1008 关闭并回告(不静默降级)
     try {
@@ -1490,20 +1797,18 @@ export function handleWsMessage(_dchOrSend, frame) {
       if (!Number.isInteger(env.c) || env.c <= e2.p2bLast) throw new E2eeError("replay", `e2ee ws 计数重放/乱序 ${env.c}`);
       const opened = e2.s.open({ kind: "w", dir: "p2b", env, counter: env.c, wsLabel: e2.wsLabel });
       e2.p2bLast = env.c;
-      if (opened.t === 1) session.ws.send(opened.data);
-      else session.ws.send(opened.data.toString("utf8"));
+      // 上游可能还在建立(ws-open 快速应答)：forwardToUpstream 会排队、open 后补发
+      forwardToUpstream(send, id, session, opened.t === 1 ? opened.data : opened.data.toString("utf8"), opened.t === 1);
     } catch (e) {
       console.error(`[bridge] e2ee ws 解封失败(id=${id}): ${e.message || e}(不回退明文,1008 关闭)`);
-      try { session.ws.close(1008, "⚠ e2ee 消息无法解密"); } catch {}
+      const ws = session.ws;
+      try { ws?.close?.(1008, "⚠ e2ee 消息无法解密"); } catch { /* 忽略 */ }
       wsSessions.delete(id);
-      try { toSender(_dchOrSend)({ id, type: "ws-close", code: 1008, reason: "⚠ e2ee 消息无法解密" }); } catch {}
+      try { send({ id, type: "ws-close", code: 1008, reason: "⚠ e2ee 消息无法解密" }); } catch { /* 忽略 */ }
     }
     return;
   }
-  try {
-    if (binary) session.ws.send(Buffer.from(data, "base64"));
-    else session.ws.send(String(data));
-  } catch (e) { console.log(`[bridge] ws-send err: ${e.message}`); }
+  forwardToUpstream(send, id, session, binary ? Buffer.from(data, "base64") : String(data), Boolean(binary));
 }
 
 export function handleWsClose(_dchOrSend, frame) {
@@ -1515,13 +1820,16 @@ export function handleWsClose(_dchOrSend, frame) {
   }
   const session = wsSessions.get(id);
   if (!session) return;
-  try { session.ws.close(code && typeof code === "number" ? code : 1000, reason || ""); } catch {}
+  session.cancelled = true; // 手机侧主动关：不要再补发 pending / 不要再回 ws-close
+  wsSessions.delete(id);
+  try { session.ws?.close?.(code && typeof code === "number" ? code : 1000, reason || ""); } catch { /* 忽略 */ }
 }
 
 /** DataChannel 断开:关闭所有 ws 会话与控制通道。 */
 export function closeAllWsSessions() {
   for (const session of wsSessions.values()) {
-    try { session.ws.terminate(); } catch {}
+    session.cancelled = true;
+    try { session.ws?.terminate?.(); } catch { /* 忽略 */ }
   }
   wsSessions.clear();
   ctrlConns.clear();
@@ -1669,6 +1977,116 @@ export function heartbeatStep({ pongReceived, missedPongs = 0 }) {
   return { missedPongs: missed, terminate, ping: !terminate };
 }
 
+/* ── 心跳自适应（2026-10-23，生产「DSH 主线程卡顿 → 自杀式重连」）──────────────
+ *
+ * 【问题】固定 20s 心跳 + 固定"丢 2 个 pong 就断"：DSH 主线程被大任务/大响应占住时
+ *   （pong 由 ws 库在 socket 事件里回，但事件循环被占就排不上队），连续两拍收不到 pong
+ *   就 terminate → 重建隧道 → 手机侧所有在途请求断掉、页面重连，而卡顿本来几十 ms~几秒
+ *   就过去了。生产 13706 次/天 bridge 断开里有一大批是这么来的。
+ *
+ * 【做法】判定窗口按「链路 RTT + 本地事件循环延迟」动态放宽，ping 间隔按 RTT 略微拉长：
+ *   · rtt ≥ 1s          → 判定窗口 +1 拍（慢链路多给一拍），ping 间隔同时拉长到 1.5x（≤60s）
+ *   · 事件循环延迟 ≥500ms → 判定窗口 +1 拍（本机忙，pong 不是"没回来"而是"没轮到处理"）
+ *   健康链路（rtt 低、不忙）下窗口仍是 2 拍 —— 与旧契约完全一致，不快也不慢。
+ *   上限 4 拍可配（DSH_BRIDGE_HEARTBEAT_MAX_MISSED），DSH_BRIDGE_HEARTBEAT_ADAPT=0 可退回旧契约。
+ *   最坏发现"真死"的耗时 = 4 拍 ≈ 80s，仍远小于移动网络 NAT 空闲超时（2~5 分钟）。
+ *
+ * 纯函数，便于单测（test/bridge-heartbeat-adaptive.test.mjs）。
+ */
+export const HEARTBEAT_RTT_SLOW_MS = 1000;      // RTT 超过它视为慢链路
+export const HEARTBEAT_LAG_BUSY_MS = 500;       // 事件循环延迟超过它视为本机繁忙
+export const HEARTBEAT_MAX_MISSED_CAP_DEFAULT = 4;
+export const HEARTBEAT_MAX_INTERVAL_MS = 60_000;
+/** 自适应开关/上限（环境变量；测试与运维可覆盖）。 */
+export const HEARTBEAT_ADAPTIVE = process.env.DSH_BRIDGE_HEARTBEAT_ADAPT !== "0";
+export const HEARTBEAT_MAX_MISSED_CAP = (() => {
+  const n = Number(process.env.DSH_BRIDGE_HEARTBEAT_MAX_MISSED);
+  return Number.isFinite(n) && n >= 1 ? Math.min(8, Math.floor(n)) : HEARTBEAT_MAX_MISSED_CAP_DEFAULT;
+})();
+
+/**
+ * 心跳一拍（自适应版）。
+ * @param {object} o
+ * @param {boolean} [o.pongReceived] 上一拍发出后是否收到 pong
+ * @param {number} [o.missedPongs] 此前连续丢了几拍
+ * @param {number|null} [o.rttMs] 最近 RTT（null=还没测到）
+ * @param {number} [o.eventLoopLagMs] 本机事件循环延迟
+ * @param {number} [o.baseIntervalMs] ping 间隔基准
+ * @param {number} [o.baseMaxMissed] 判定窗口基准（旧契约 2）
+ * @param {number} [o.maxMissedCap] 判定窗口上限
+ * @param {boolean} [o.adaptive] false = 完全退回旧契约（interval 不变、窗口=baseMaxMissed）
+ * @returns {{intervalMs:number, maxMissed:number, missedPongs:number, terminate:boolean, ping:boolean, degraded:boolean, reasons:string[]}}
+ */
+export function adaptiveHeartbeat({
+  pongReceived = false,
+  missedPongs = 0,
+  rttMs = null,
+  eventLoopLagMs = 0,
+  baseIntervalMs = TUNNEL_HEARTBEAT_DEFAULT_MS,
+  baseMaxMissed = HEARTBEAT_MAX_MISSED_PONGS,
+  maxMissedCap = HEARTBEAT_MAX_MISSED_CAP_DEFAULT,
+  adaptive = true
+} = {}) {
+  const base = Math.max(100, Number(baseIntervalMs) || TUNNEL_HEARTBEAT_DEFAULT_MS);
+  const baseMax = Math.max(1, Number(baseMaxMissed) || HEARTBEAT_MAX_MISSED_PONGS);
+  const cap = Math.max(baseMax, Math.min(8, Number(maxMissedCap) || HEARTBEAT_MAX_MISSED_CAP_DEFAULT));
+  const missed = pongReceived ? 0 : Math.max(0, missedPongs) + 1;
+  if (!adaptive) {
+    return {
+      intervalMs: base,
+      maxMissed: baseMax,
+      missedPongs: missed,
+      terminate: !pongReceived && missed >= baseMax,
+      ping: !(!pongReceived && missed >= baseMax),
+      degraded: false,
+      reasons: []
+    };
+  }
+  const reasons = [];
+  let maxMissed = baseMax;
+  let intervalMs = base;
+  const lag = Math.max(0, Number(eventLoopLagMs) || 0);
+  const rtt = rttMs === null || rttMs === undefined ? null : Math.max(0, Number(rttMs) || 0);
+  if (lag >= HEARTBEAT_LAG_BUSY_MS) {
+    maxMissed += 1;
+    reasons.push("event_loop_busy");
+  }
+  if (rtt !== null && rtt >= HEARTBEAT_RTT_SLOW_MS) {
+    maxMissed += 1;
+    intervalMs = Math.min(HEARTBEAT_MAX_INTERVAL_MS, Math.round(base * 1.5));
+    reasons.push("rtt_slow");
+  }
+  maxMissed = Math.min(cap, Math.max(1, maxMissed));
+  const terminate = !pongReceived && missed >= maxMissed;
+  return { intervalMs, maxMissed, missedPongs: missed, terminate, ping: !terminate, degraded: reasons.length > 0, reasons };
+}
+
+/**
+ * 事件循环延迟探针（本进程）。1s 一拍，记"实际触发时刻比预期晚多少"。
+ * 只是给心跳判定的输入，不做任何业务动作；unref 不阻塞退出。
+ */
+let eventLoopLagMs = 0;
+let eventLoopLagTimer = null;
+export function startEventLoopLagMonitor({ intervalMs = 1000 } = {}) {
+  if (eventLoopLagTimer) return () => {};
+  const tick = Math.max(100, Number(intervalMs) || 1000);
+  let expected = Date.now() + tick;
+  eventLoopLagTimer = setInterval(() => {
+    const now = Date.now();
+    eventLoopLagMs = Math.max(0, now - expected);
+    expected = now + tick;
+  }, tick);
+  eventLoopLagTimer.unref?.();
+  return () => {
+    if (eventLoopLagTimer) { try { clearInterval(eventLoopLagTimer); } catch { /* 忽略 */ } }
+    eventLoopLagTimer = null;
+    eventLoopLagMs = 0;
+  };
+}
+/** 当前事件循环延迟（毫秒；未启用探针时为 0）。 */
+export function currentEventLoopLagMs() { return eventLoopLagMs; }
+/** 测试钩子：直接设定延迟读数。 */
+export function __setEventLoopLagForTest(ms) { eventLoopLagMs = Math.max(0, Number(ms) || 0); }
 /** 把 DSH_BRIDGE_TUNNEL_URL 归一化为 router 注册端点(缺省补 / _bridge)。 */
 function tunnelEndpoint(raw) {
   try {
@@ -1738,10 +2156,20 @@ function connectTunnel(token) {
   // maxPayload 必须显式给:ws 客户端默认 100MiB,而 router→bridge 的单帧不分块,
   // 大文件上传的 base64 请求体可以顶到 89.5MB(见 TUNNEL_WS_MAX_PAYLOAD 注释)。
   const ws = new WebSocket(endpoint, TUNNEL_WS_OPTIONS);
-  const send = makeChunkedSender((s) => { if (ws.readyState === WebSocket.OPEN) ws.send(s); });
+  // 控制帧优先(见 makePrioritySender 上方长注释):旧实现把 16MB 响应在同一个 tick 里
+  // 全灌进 ws 队列,ws-open 回包被埋在后面 → router 20s 超时。新发送器给控制帧留快车道,
+  // 并用 bufferedAmount 高水位限制"已入队未发送"的字节量。
+  const sender = makePrioritySender({
+    rawSend: (s) => { if (ws.readyState === WebSocket.OPEN) ws.send(s); },
+    bufferedAmount: () => ws.bufferedAmount,
+    ...tunnelBulkOptionsFromEnv()
+  });
+  const send = sender.send;
   let heartbeat;
   let pongReceived = true;
   let missedPongs = 0;
+  let pingSentAt = 0;
+  let rttEma = null;
 
   ws.on("open", () => {
     tunnelRetry = 0;
@@ -1751,22 +2179,45 @@ function connectTunnel(token) {
       // caps:bridge E2EE 能力上报(§6.2/§7.1;router 纯透传)。enabled=false → 空数组(明文回退)
       ws.send(JSON.stringify({ type: "tunnel-register", deviceId: DEVICE_ID, token, name: os.hostname() || "dsh-bridge", caps: e2ee.caps() }));
     } catch (e) { console.log(`[bridge] 注册发送失败: ${e.message}`); }
-    heartbeat = setInterval(() => {
-      // C5：连续 2 次没收到 pong 才判定半开（旧实现丢 1 次就断 → 弱网下正常的单次丢包
-      // 也会被当成故障重连，直接贡献了"75% 的隧道会话活不过 60s"）。
-      const step = heartbeatStep({ pongReceived, missedPongs });
-      missedPongs = step.missedPongs;
+    // 心跳用「可重排的 setTimeout 链」，而不是 setInterval：间隔与判定窗口都要按 RTT /
+    // 事件循环延迟逐拍自适应（见 adaptiveHeartbeat 长注释）。
+    const beat = () => {
+      heartbeat = null;
+      const plan = adaptiveHeartbeat({
+        pongReceived,
+        missedPongs,
+        rttMs: rttEma,
+        eventLoopLagMs: currentEventLoopLagMs(),
+        baseIntervalMs: TUNNEL_HEARTBEAT_MS,
+        baseMaxMissed: HEARTBEAT_MAX_MISSED_PONGS,
+        maxMissedCap: HEARTBEAT_MAX_MISSED_CAP,
+        adaptive: HEARTBEAT_ADAPTIVE
+      });
+      missedPongs = plan.missedPongs;
       pongReceived = false;
-      if (step.terminate) {
-        console.log(`[bridge] 隧道连续 ${missedPongs} 次心跳无响应,主动重连...`);
+      if (plan.terminate) {
+        console.log(`[bridge] 隧道连续 ${missedPongs} 次心跳无响应(窗口 ${plan.maxMissed} 拍${plan.reasons.length ? ", " + plan.reasons.join("+") : ""}),主动重连...`);
         try { ws.terminate(); } catch { /* 已关闭 */ }
         return;
       }
-      if (missedPongs > 0) console.log(`[bridge] 隧道心跳无响应(${missedPongs}/${HEARTBEAT_MAX_MISSED_PONGS}),继续探测...`);
-      try { ws.ping(); } catch { ws.terminate(); }
-    }, TUNNEL_HEARTBEAT_MS);
+      if (missedPongs > 0) {
+        console.log(`[bridge] 隧道心跳无响应(${missedPongs}/${plan.maxMissed}${plan.reasons.length ? ", " + plan.reasons.join("+") : ""}),继续探测...`);
+      }
+      pingSentAt = Date.now();
+      try { ws.ping(); } catch { try { ws.terminate(); } catch { /* 已关闭 */ } return; }
+      heartbeat = setTimeout(beat, plan.intervalMs);
+    };
+    heartbeat = setTimeout(beat, TUNNEL_HEARTBEAT_MS);
   });
-  ws.on("pong", () => { pongReceived = true; missedPongs = 0; });
+  ws.on("pong", () => {
+    pongReceived = true;
+    missedPongs = 0;
+    if (pingSentAt > 0) {
+      const rtt = Date.now() - pingSentAt;
+      pingSentAt = 0;
+      rttEma = rttEma === null ? rtt : Math.round(rttEma * 0.7 + rtt * 0.3);
+    }
+  });
   ws.on("message", (raw) => {
     const receive = makeFrameReceiver();
     try {
@@ -1791,7 +2242,9 @@ function connectTunnel(token) {
   });
   ws.on("close", (code, reason) => {
     routerCaps.clear(); // 换中继/断线:能力重新协商,期间一律退回保守行为
-    clearInterval(heartbeat);
+    if (heartbeat) { try { clearTimeout(heartbeat); } catch { /* 忽略 */ } }
+    heartbeat = null;
+    sender.close(); // 丢掉未发分片,别让重连后的新连接接到旧响应的剩余部分
     console.log(`[bridge] 隧道断开(code=${code}${reason ? ", " + reason : ""})`);
     closeAllWsSessions();
     // C2 + C5：4000（被同 deviceId 的新连接顶掉）走长退避/退出；其余走 2/4/8/10s + 抖动。
@@ -1837,7 +2290,30 @@ async function initE2ee(token) {
     writeE2eeStateFile(stateFileDir, { enabled: st.enabled, reason: st.reason, profile: st.profile, epoch: st.epoch, caps: e2ee.caps() });
   }
   if (st.enabled) {
-    console.log(`[bridge] 🔒 E2EE 已启用(caps=[${e2ee.caps().join(",")}], profile=${st.profile}, epoch=${st.epoch});MK 仅驻内存`);
+    // ── E2EE 会话持久化（2026-10-23）────────────────────────────────────────────
+    // 生产事故：bridge 重启/崩一次，手机端保存的 sessId 就全成死票（每个请求 502
+    // unknown_session、每条数据 WS 1008），用户必须回设备列表重新解锁（实测某设备 3964 次）。
+    // 方案：把会话材料（SHK/saltH/verified/ctrl 计数）用 MK 派生的 storeKey 做 AES-256-GCM
+    // 加密后落 relay 数据目录 .e2ee-sessions.enc（0600，原子写），启动时解密恢复 ——
+    // 文件里没有 MK/密码/密钥，明文不存在于磁盘。详见 e2ee-client.mjs「会话持久化」段。
+    // 落盘条件与状态文件同源：受管安装或显式给了配置目录（仓库里直接跑不写工作区）。
+    const storeDir = process.env.DSH_BRIDGE_E2EE_STORE_DIR
+      || ((process.env.DSH_BRIDGE_CONFIG || process.env.DSH_BRIDGE_E2EE_STATE || IS_MANAGED_INSTALL) ? stateFileDir : "");
+    const storeEnabled = process.env.DSH_BRIDGE_E2EE_SESSIONS !== "0";
+    const store = e2ee.attachStore(storeDir, { enabled: storeEnabled });
+    if (store.restored > 0) {
+      console.log(`[bridge] 🔓 已恢复 ${store.restored} 个 E2EE 会话(加密落盘;手机重启/桥重启后免重新解锁)`);
+    }
+    if (store.discarded) {
+      // 丢弃 = 手机手里的旧票必然对不上：后续 ws-open/HTTP 会带 retryable 的 rehandshake 信号，
+      // 手机自动重建会话而不是让用户去输密码。
+      console.log(`[bridge] E2EE 会话存储已作废(${store.discarded})，手机端将自动重新握手`);
+    }
+    if (storeDir && storeEnabled) {
+      console.log(`[bridge] 🔒 E2EE 已启用(caps=[${e2ee.caps().join(",")}], profile=${st.profile}, epoch=${st.epoch});MK 仅驻内存,会话库加密落盘`);
+    } else {
+      console.log(`[bridge] 🔒 E2EE 已启用(caps=[${e2ee.caps().join(",")}], profile=${st.profile}, epoch=${st.epoch});MK 仅驻内存(会话库未落盘)`);
+    }
   } else {
     console.log(`[bridge] e2ee 未启用(${st.reason}) → 明文 v1 路径照常(能力不上报)`);
   }
@@ -2215,11 +2691,18 @@ async function main() {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`[bridge] 收到 ${sig},正在优雅退出...`);
+    // 退出前把 E2EE 会话库刷一次（滑动 TTL 的 usedAt 要落盘；崩溃也能恢复到最多 60s 前）
+    try { e2ee.flushStore(); } catch { /* 已内部兜底 */ }
     await stopWeChat();
     process.exit(0);
   };
   process.on("SIGTERM", () => { shutdown("SIGTERM"); });
   process.on("SIGINT", () => { shutdown("SIGINT"); });
+  // Windows 的 TerminateProcess 不会跑上面的信号处理，但 exit 钩子可以（同步操作）——
+  // 会话库是同步写，放在这里能在被强杀前尽量落一次盘。
+  process.on("exit", () => { try { e2ee.flushStore(); e2ee.disposeStore(); } catch { /* 忽略 */ } });
+  // 事件循环延迟探针：心跳自适应要知道"本机是不是忙"（见 adaptiveHeartbeat 长注释）。
+  startEventLoopLagMonitor();
   // 【Windows 的关键一条】Windows 上 process.kill() 是**无条件 TerminateProcess**：
   // 上面的 SIGTERM/SIGINT 处理函数在 Windows 上**永远不会被执行**，
   // 于是 notifystop（微信通道下线通知）永远发不出去，腾讯侧一直以为通道还在线。
@@ -2246,6 +2729,14 @@ async function main() {
 // test hooks：镜像页加载看门狗的内部状态（给用例断言"后续请求会撤掉它"，见 test/bridge-html-inject.test.mjs）
 export function __mirrorLoadWatchState() { return mirrorLoadWatch ? { ...mirrorLoadWatch } : null; }
 export function __armMirrorLoadWatch(path) { armMirrorLoadWatch(path); }
+// test hooks：注入 E2EE 服务（生产由 initE2ee 设置；ws-open 会话校验/快速应答用例用）
+export function __setE2eeForTest(svc) { e2ee = svc; return e2ee; }
+// test hooks：当前 ws 会话数与某条会话的内部状态（快速应答/待发队列用例用）
+export function __wsSessionState(id) {
+  const s = wsSessions.get(id);
+  if (!s) return null;
+  return { opened: s.opened === true, pending: s.pending ? s.pending.length : 0, cancelled: s.cancelled === true, failed: s.failed === true };
+}
 
 // 直接运行(node dsh-bridge.mjs)时启动服务;被测试 import 时只导出协议函数。
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;

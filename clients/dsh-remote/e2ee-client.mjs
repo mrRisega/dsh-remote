@@ -644,6 +644,11 @@ export class E2eeService {
     this.sessions = new Map(); // sessId → E2eeSession
     this.ctrlCounters = new Map(); // sessId → { p2b: SequenceGuard, b2p: SequenceGuard }
     this.httpNonces = new HttpNonceGuard();
+    // ── 会话持久化(可选,见文件末尾「会话持久化」段)──
+    this.storeDir = "";
+    this.storeTimer = null;
+    this.storeErrorLogged = false;
+    this.lastStoreReason = "";
   }
 
   /** 静态工厂:启动派生(失败即禁用并说明原因;绝不抛)。 */
@@ -718,6 +723,130 @@ export class E2eeService {
     return s || null;
   }
 
+  /* ── 会话持久化(2026-10-23)────────────────────────────────────────────────────
+   *
+   * 【为什么】生产日志：bridge 重启/崩溃后，手机端保存的 sessId 在内存表里找不到 →
+   *   每个请求 502 `unknown_session`、每条数据 WS 被 1008 `e2ee_session_locked` 拒，
+   *   用户被迫回设备列表重新解锁（实测某设备 3964 次）。
+   * 【怎么存】只存**不可推导的会话材料**（SHK / saltH / 验证标志 / 时间戳 / ctrl 计数器），
+   *   用 MK 派生出的 storeKey 做 AES-256-GCM 加密后落盘到 relay 数据目录
+   *   `.e2ee-sessions.enc`（0600，原子写）。文件里没有 MK、没有密码、没有 storeKey ——
+   *   拿到文件也解不开（同一份文件在不同账号/改密后的 MK 下 GCM 认证必失败）。
+   * 【失效纪律】解不开 / 版本不符 / salt 变了 → 丢弃文件 + 清空内存会话，并让上层给手机
+   *   回 `retryable:true, action:"rehandshake"` 的信号（自动重握手，而不是反复撞死票）。
+   *   HTTP 的防重放 nonce 窗口**不**持久化：它只有 5 分钟，重启丢窗的代价是"同一请求可能
+   *   在这 5 分钟内被重放一次"，而重放的前提是攻击者已经拿到那条完整密文请求 —— 与把
+   *   整份会话密钥落盘相比不改变信任边界（见 docs/e2ee-protocol.md §9.1）。
+   */
+  attachStore(dir, { enabled = true, flushMs = 60_000 } = {}) {
+    if (!enabled) return { restored: 0, discarded: "", skipped: "disabled" };
+    if (!this.enabled) return { restored: 0, discarded: "", skipped: "e2ee_disabled" };
+    if (!dir) return { restored: 0, discarded: "", skipped: "no_dir" };
+    this.storeDir = String(dir);
+    const r = this.restoreFromStore();
+    if (flushMs > 0) {
+      try {
+        this.storeTimer = setInterval(() => this.flushStore(), flushMs);
+        this.storeTimer.unref?.();
+      } catch { /* 定时器不可用 → 只有退出时 flush(不致命) */ }
+    }
+    return r;
+  }
+
+  /** 退出/测试用:停掉周期落盘。 */
+  disposeStore() {
+    if (this.storeTimer) { try { clearInterval(this.storeTimer); } catch { /* 忽略 */ } }
+    this.storeTimer = null;
+  }
+
+  /** 从磁盘恢复会话(同步、绝不抛)。返回 { restored, discarded, skipped? }。 */
+  restoreFromStore() {
+    if (!this.storeDir || !this.enabled) return { restored: 0, discarded: "" };
+    const loaded = loadSessionStore(this.storeDir, this.mk);
+    if (!loaded.ok) {
+      if (loaded.reason === "absent") return { restored: 0, discarded: "" };
+      // 解不开/损坏:删掉它，别让下一位继续撞。原因留给上层打日志 + 给手机 rehandshake 信号。
+      clearSessionStore(this.storeDir);
+      this.lastStoreReason = loaded.reason;
+      return { restored: 0, discarded: loaded.reason };
+    }
+    const payload = loaded.payload || {};
+    if (Number(payload.v) !== SESSION_STORE_VERSION || String(payload.salt || "") !== String(this.salt || "")) {
+      clearSessionStore(this.storeDir);
+      this.lastStoreReason = "params_changed";
+      return { restored: 0, discarded: "params_changed" };
+    }
+    const now = Date.now();
+    this.sessions.clear();
+    this.ctrlCounters.clear();
+    for (const row of Array.isArray(payload.sessions) ? payload.sessions : []) {
+      try {
+        const sessId = String(row && row.s || "");
+        if (!SESS_ID_RE.test(sessId)) continue;
+        const usedAt = Number(row.usedAt) || 0;
+        if (!usedAt || now - usedAt > SESSION_TTL_MS) continue; // 过期(sliding TTL)
+        const session = new E2eeSession({
+          sessId,
+          shk: Buffer.from(String(row.shk || ""), "base64url"),
+          saltH: Buffer.from(String(row.saltH || ""), "base64url"),
+          profile: String(row.profile || this.profile),
+          epoch: Number(row.epoch) || 0
+        });
+        session.verified = row.verified === true;
+        session.createdAt = Number(row.createdAt) || usedAt;
+        session.usedAt = usedAt;
+        this.sessions.set(sessId, session);
+        const guards = { p2b: new SequenceGuard(), b2p: new SequenceGuard() };
+        if (Number.isInteger(row.p2b)) guards.p2b.last = row.p2b;
+        if (Number.isInteger(row.b2p)) guards.b2p.last = row.b2p;
+        this.ctrlCounters.set(sessId, guards);
+      } catch { /* 单条坏 → 跳过,不影响其它会话 */ }
+    }
+    this.prune();
+    return { restored: this.sessions.size, discarded: "" };
+  }
+
+  /**
+   * 落盘一次(同步、绝不抛)。force=false 时只在 storeDir 存在时写。
+   * 写失败只记一次日志:会话库不是主链路,不能因为它把隧道拖挂。
+   */
+  flushStore() {
+    if (!this.storeDir || !this.enabled) return { ok: false, skipped: true };
+    try {
+      const payload = {
+        v: SESSION_STORE_VERSION,
+        profile: this.profile,
+        epoch: this.epoch,
+        salt: this.salt,
+        at: Date.now(),
+        sessions: [...this.sessions.values()].map((s) => ({
+          s: s.sessId,
+          shk: s.shk.toString("base64url"),
+          saltH: s.saltH.toString("base64url"),
+          profile: s.profile,
+          epoch: s.epoch,
+          verified: s.verified === true,
+          createdAt: s.createdAt,
+          usedAt: s.usedAt,
+          p2b: this.ctrlCounters.get(s.sessId)?.p2b?.last ?? -1,
+          b2p: this.ctrlCounters.get(s.sessId)?.b2p?.last ?? -1
+        }))
+      };
+      return saveSessionStore(this.storeDir, this.mk, payload);
+    } catch (e) {
+      if (!this.storeErrorLogged) {
+        this.storeErrorLogged = true;
+        console.warn(`[e2ee] 会话库落盘失败(不影响隧道,仅本次重启需重新解锁): ${e?.code || e?.message || e}`);
+      }
+      return { ok: false, error: String(e?.code || e?.message || e) };
+    }
+  }
+
+  /** 新会话建立/验证通过后立即落盘(解锁不常有,同步写 2KB 可接受;崩溃也不丢新会话)。 */
+  persistSoon() {
+    try { this.flushStore(); } catch { /* 已内部兜底 */ }
+  }
+
   /**
    * 桥端应答 e2ee-hello(§5.2 步骤 1→2)。
    * @returns {{session:E2eeSession, ack:object}} 或抛 E2eeError
@@ -747,6 +876,7 @@ export class E2eeService {
     const session = new E2eeSession({ sessId, shk, saltH, profile: this.profile, epoch: this.epoch });
     this.sessions.set(sessId, session);
     this.ctrlCounters.set(sessId, { p2b: new SequenceGuard(), b2p: new SequenceGuard() });
+    this.persistSoon(); // 新会话立刻落盘:紧接着的 bridge 崩溃不该让手机重新解锁
     const ack = {
       v: E2EE_VERSION,
       type: CTRL_HELLO_ACK,
@@ -784,6 +914,7 @@ export class E2eeService {
       data: JSON.stringify({ p: "dsh-e2ee-probe-ok", t: pt.t ?? 0, c: 0 })
     });
     this.ctrlCounters.set(sessId, guards);
+    this.persistSoon(); // verified 也落盘:重启后数据 WS 直接可用,不必再探测
     return { reply, session };
   }
 
@@ -794,6 +925,126 @@ export class E2eeService {
     if (!session.verified) throw new E2eeError("not_verified", "e2ee: 会话未完成探测校验");
     if (!this.httpNonces.check(sessId, env.n)) throw new E2eeError("replay", "e2ee: HTTP 信封 nonce 重放");
     return session;
+  }
+}
+
+// ============================================================
+// 会话持久化原语(2026-10-23;方案/信任边界见 E2eeService.attachStore 上方长注释)
+// ============================================================
+
+export const SESSION_STORE_VERSION = 1;
+export const SESSION_STORE_FILE = ".e2ee-sessions.enc";
+/** 会话库 AAD(域分隔;换格式/换用途必须改它,旧文件自动解不开 → 丢弃重握手)。 */
+export const SESSION_STORE_AAD = Buffer.from(`${E2EE_DOMAIN}\x00sessions-store-v1`, "utf8");
+
+/** 会话库路径(与 .e2ee-state.json 同级,relay 数据目录)。 */
+export function sessionStorePath(dir) {
+  return `${String(dir || "").replace(/[\\/]+$/, "")}/${SESSION_STORE_FILE}`;
+}
+
+/**
+ * 由 MK 派生会话库密钥:
+ *   storeKey = HKDF-SHA256(ikm=MK, salt=sha256("dsh-e2ee/v1\0sessions-store-salt"),
+ *                          info="dsh-e2ee/v1\0sessions-store", 32)
+ * 与 SHK/子密钥域完全隔离;storeKey 只驻内存,绝不写文件、不写日志。
+ */
+export function deriveSessionStoreKey(mk) {
+  if (!Buffer.isBuffer(mk) || mk.length !== MK_BYTES) throw new E2eeError("bad_mk", "e2ee: 会话库 MK 非法");
+  const salt = sha256(Buffer.from(`${E2EE_DOMAIN}\x00sessions-store-salt`, "utf8"));
+  return Buffer.from(hkdfSync("sha256", mk, salt, Buffer.from(`${E2EE_DOMAIN}\x00sessions-store`, "utf8"), MK_BYTES));
+}
+
+/** 加密会话库 → 可直接 JSON.stringify 的对象(明文永不落盘)。 */
+export function encryptSessionStore(mk, payload) {
+  const key = deriveSessionStoreKey(mk);
+  const iv = randomBytes(NONCE_BYTES);
+  const plaintext = Buffer.from(JSON.stringify(payload), "utf8");
+  const c = createCipheriv("aes-256-gcm", key, iv);
+  c.setAAD(SESSION_STORE_AAD);
+  const ct = Buffer.concat([c.update(plaintext), c.final()]);
+  return {
+    v: SESSION_STORE_VERSION,
+    alg: "aes-256-gcm",
+    iv: iv.toString("base64url"),
+    tag: c.getAuthTag().toString("base64url"),
+    ct: ct.toString("base64url")
+  };
+}
+
+/** 解密会话库;任何异常都抛 E2eeError(调用方据此丢弃文件)。 */
+export function decryptSessionStore(mk, blob) {
+  if (!blob || typeof blob !== "object") throw new E2eeError("bad_store", "e2ee: 会话库格式非法");
+  if (Number(blob.v) !== SESSION_STORE_VERSION) throw new E2eeError("bad_store", `e2ee: 会话库版本 ${blob.v} 不受支持`);
+  if (String(blob.alg || "") !== "aes-256-gcm") throw new E2eeError("bad_store", "e2ee: 会话库算法不受支持");
+  const key = deriveSessionStoreKey(mk);
+  const iv = Buffer.from(String(blob.iv || ""), "base64url");
+  const tag = Buffer.from(String(blob.tag || ""), "base64url");
+  const ct = Buffer.from(String(blob.ct || ""), "base64url");
+  if (iv.length !== NONCE_BYTES || tag.length !== TAG_BYTES) throw new E2eeError("bad_store", "e2ee: 会话库 nonce/tag 非法");
+  const d = createDecipheriv("aes-256-gcm", key, iv);
+  d.setAAD(SESSION_STORE_AAD);
+  d.setAuthTag(tag);
+  let plaintext;
+  try {
+    plaintext = Buffer.concat([d.update(ct), d.final()]); // 认证失败(MK 变了/被篡改)在这里抛
+  } catch {
+    throw new E2eeError("store_auth_failed", "e2ee: 会话库无法解密(MK 已变或文件损坏)");
+  }
+  try {
+    return JSON.parse(plaintext.toString("utf8"));
+  } catch {
+    throw new E2eeError("bad_store", "e2ee: 会话库明文不是 JSON");
+  }
+}
+
+/** 原子写会话库(mkdir + tmp 文件 + rename;0600)。失败抛(上层兜)。 */
+export function saveSessionStore(dir, mk, payload) {
+  if (!dir) throw new E2eeError("no_store_dir", "e2ee: 会话库目录未设置");
+  const file = sessionStorePath(dir);
+  const body = JSON.stringify(encryptSessionStore(mk, payload));
+  const tmp = `${file}.tmp-${process.pid}`;
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(tmp, body, { mode: 0o600 });
+  try { fs.chmodSync(tmp, 0o600); } catch { /* Windows 上可能不支持 */ }
+  fs.renameSync(tmp, file); // rename 原子:不会读到半截文件
+  return { ok: true, bytes: body.length, file };
+}
+
+/** 读会话库。返回 { ok, reason: absent|unreadable|corrupt|key_mismatch, payload }(绝不抛)。 */
+export function loadSessionStore(dir, mk) {
+  const file = sessionStorePath(dir);
+  let raw;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch (e) {
+    return { ok: false, reason: e?.code === "ENOENT" ? "absent" : "unreadable", payload: null, file };
+  }
+  let blob;
+  try {
+    blob = JSON.parse(raw);
+  } catch {
+    return { ok: false, reason: "corrupt", payload: null, file };
+  }
+  try {
+    return { ok: true, reason: "", payload: decryptSessionStore(mk, blob), file };
+  } catch (e) {
+    return {
+      ok: false,
+      reason: e?.code === "store_auth_failed" ? "key_mismatch" : "corrupt",
+      payload: null,
+      file
+    };
+  }
+}
+
+/** 删除会话库(丢弃死会话时用;返回是否真的删掉)。 */
+export function clearSessionStore(dir) {
+  if (!dir) return false;
+  try {
+    fs.rmSync(sessionStorePath(dir), { force: true });
+    return true;
+  } catch {
+    return false;
   }
 }
 

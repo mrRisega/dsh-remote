@@ -2739,6 +2739,66 @@ window.__ModuleLoader__.load({
       return { kind: "off", text: text };
     }
 
+    // ══ 🎉 加入用户交流群引导（实际使用满 2 小时后弹一次；2026-10-23 业主需求）═════
+    //
+    // 与手机 Web 端共用同一套企业端接口；桌面端浏览器半没有企业端用户 token 直连，
+    // 由 node 半 `/dsh-remote/community-invite/*` 用 device-login token 代调（见 lib/index.js 同名注释）。
+    //   GET  /dsh-remote/community-invite/status → { ok, show, reason, used_seconds, required_seconds, qr_url }
+    //   POST /dsh-remote/community-invite/shown  → { ok:true }（幂等）
+    //
+    // 纪律（与手机端保持同一套，别改松）：
+    // ① **弹不弹完全由服务端 show 决定**：时长口径（relay_sessions 累计 ≥ required_seconds）只在服务端算，
+    //    前端一个字节都不自己算；show 非严格 true 一律不弹（fail closed）。
+    // ② **每桌面会话一次**：sessionStorage + 内存双标记；服务端 already_shown（show:false）是第二道保险。
+    // ③ **「看过即算」**：弹层一显示就 POST shown（幂等）——用户直接关页面/不点按钮也不会被反复骚扰；
+    //    两个按钮关闭时**再调一次**同样幂等。
+    // ④ **一切失败静默**：不弹、不报错、不阻塞面板主流程（连日志都不往用户面前抛）。
+    // ⑤ 二维码降级：qr_url 为空 / 图片加载失败 → 隐藏图片但**保留文案与按钮**（绝不弹空白二维码区）。
+    var CI_SEEN_KEY = "dsh-remote-community-invite-seen-v1";
+    var ciSeenInMemory = false;   // sessionStorage 不可用（隐私模式）时的兜底：每桌面会话仍只弹一次
+    var ciReported = false;       // 已上报 shown 的本地标记（幂等；失败允许关闭时再补一次）
+    /** 本桌面会话内是否已弹过（内存 + sessionStorage 双标记）。 */
+    function ciSeen() {
+      if (ciSeenInMemory) return true;
+      try { return sessionStorage.getItem(CI_SEEN_KEY) === "1"; } catch (e) { return false; }
+    }
+    function ciMarkSeen() {
+      ciSeenInMemory = true;
+      try { sessionStorage.setItem(CI_SEEN_KEY, "1"); } catch (e) { /* 隐私模式忽略 */ }
+    }
+    /** 二维码 URL 安全化：只接受 http(s) 绝对地址或站内绝对路径；data:/javascript: 一律不加载。 */
+    function ciSafeQrUrl(raw) {
+      var s = String(raw || "").trim();
+      if (!s) return "";
+      if (/^https?:\/\//i.test(s)) return s;
+      if (s.charAt(0) === "/" && s.charAt(1) !== "/") {
+        var origin = (typeof location !== "undefined" && location && location.origin) || "";
+        return origin + s;
+      }
+      return "";
+    }
+    /** POST /dsh-remote/community-invite/shown（幂等）。失败静默，并允许关闭时再补一次。 */
+    function ciReportShown() {
+      if (ciReported) return;
+      ciReported = true;
+      api("/dsh-remote/community-invite/shown", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })
+        .then(function (b) { if (!b || b.ok === false) ciReported = false; })
+        .catch(function () { ciReported = false; /* 网络失败：关闭时再试一次即可 */ });
+    }
+    /**
+     * 问服务端要不要弹。`alive` 由 effect 的 cleanup 控制：面板卸载后回来的响应直接丢弃。
+     * @returns {Promise<{qrUrl:string}|null>} 需要弹 → 返回弹层数据；不弹/失败 → null
+     */
+    function ciMaybeShow() {
+      if (ciSeen()) return Promise.resolve(null);
+      return api("/dsh-remote/community-invite/status")
+        .then(function (b) {
+          if (!b || b.ok === false || b.show !== true) return null; // 服务端说不弹就不弹
+          return { qrUrl: ciSafeQrUrl(b.qr_url) };
+        })
+        .catch(function () { return null; }); // 静默：接口/网络/字段异常一律不弹
+    }
+
     // ── 面板主体（渲染于设置页 settings.section 栏目内） ─────────────────────
     // 匿名装机统计的「面板打开」只上报一次/每页（node 半还会每进程去重）。
     var panelOpenedSent = false;
@@ -5065,6 +5125,23 @@ window.__ModuleLoader__.load({
       // annVer 只用于让 useSyncExternalStore 的重渲染生效，本身不参与任何计算 —— 显式丢弃，免得被读成漏用。
       void annVer;
 
+      // ── 🎉 交流群引导：hook 追加在**最后一个既有 hook 之后**（同上"hook 序号铁律"）──────
+      // 触发时机 = 「面板加载完成 + 已登录 SaaS 账号」：st 由 refresh() 拉回、loggedIn 由它派生；
+      // 这里不写定时器、不抢首屏（数据回调后再 setState 渲染弹层）。本地模式（自建）不弹：
+      // node 半对这种模式直接回 ok:false/reason:local_mode（没有企业端账号体系）。
+      var ciArr = useState(null); var ciInvite = ciArr[0]; var setCiInvite = ciArr[1]; // {qrUrl}|null
+      useEffect(function () {
+        if (!loggedIn || mode !== "saas") return undefined;
+        var alive = true;
+        ciMaybeShow().then(function (data) {
+          if (!alive || !data) return;
+          ciMarkSeen();        // 先标记再展示：同一次桌面会话绝不重复弹
+          setCiInvite(data);
+          ciReportShown();     // 看过即算（幂等）：用户不点按钮、直接关页面也不会被反复骚扰
+        });
+        return function () { alive = false; };
+      }, [loggedIn, mode, phoneKey]);
+
       /** 取消本次自动重启(按事件持久化:同一 pending 事件不再自动重启)。 */
       var cancelAutoRestart = function () {
         markAutoRestartCancelled(restartInfo.at || 0);
@@ -5090,6 +5167,42 @@ window.__ModuleLoader__.load({
             h("div", { className: "dru-popup-foot" },
               h("span", null, "手机微信/企业微信扫码即可入群"),
               h("button", { type: "button", onClick: close }, "关闭")
+            )
+          )
+        );
+      }
+
+      /**
+       * 🎉 交流群引导弹层（使用满 2 小时后由服务端 show 触发；与上面的「加入交流群」二维码弹窗
+       * 共用 dru-popup 视觉，不引入新设计语言）。
+       * 关闭纪律：两个按钮 + 点遮罩都走同一个 close —— 关闭时**调用**幂等上报 shown 再收起
+       * （展示时已成功报过则本地标记跳过网络；那次失败时这里正好补报）。
+       * 展示时已经报过一次，所以即使这次上报失败（网络抖动）也已经是"看过即算"。
+       */
+      function renderCommunityInviteModal() {
+        if (!ciInvite) return null;
+        var close = function () { ciReportShown(); setCiInvite(null); };
+        var qrUrl = ciInvite.qrUrl;
+        return h("div", { className: "dru-popup", "data-dru-theme": theme, onMouseDown: function (e) { if (e.target === e.currentTarget) close(); } },
+          h("div", { className: "dru-popup-card", role: "dialog", "aria-label": "加入用户交流群" },
+            h("div", { className: "dru-popup-body" },
+              h("div", { className: "dru-popup-title" }, "🎉 加入用户交流群"),
+              h("div", { className: "dru-popup-sub" }, "在群里可以交流使用心得、提想法和建议，遇到问题也更容易找到我们"),
+              qrUrl
+                ? h("img", {
+                    className: "dru-community-qr",
+                    src: qrUrl,
+                    alt: "用户交流群二维码",
+                    // 二维码加载失败：只藏图片，文案与按钮照旧（绝不因为一张图挂了就把引导整块丢掉）
+                    onError: function (e) { try { if (e && e.target) e.target.style.display = "none"; } catch (err) { /* 忽略 */ } }
+                  })
+                : null,
+              h("div", { className: "dru-hint", style: { marginTop: 10 } },
+                qrUrl ? "用手机微信/企业微信扫码即可入群。" : "二维码暂不可用，可稍后再看（不影响正常使用）。")
+            ),
+            h("div", { className: "dru-popup-actions", style: { padding: "0 22px 20px" } },
+              h("button", { type: "button", className: "dru-btn dru-btn-primary", onClick: close }, "加入交流群"),
+              h("button", { type: "button", className: "dru-btn dru-btn-ghost", onClick: close }, "稍后再看")
             )
           )
         );
@@ -5325,6 +5438,8 @@ window.__ModuleLoader__.load({
           }, busy === "restart" ? "重启中…" : "🔄 重启 dsh web")
         ),
         renderCommunityModal(),
+        // 🎉 使用满 2 小时的交流群引导（服务端 show 决定的自动弹层；同一层，点遮罩即收起）
+        renderCommunityInviteModal(),
         // 📣 公告详情弹窗（与交流群弹窗同一层：都挂在面板根上，点遮罩即收起）
         renderAnnouncementDetail()
       );

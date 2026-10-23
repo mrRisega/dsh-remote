@@ -3930,6 +3930,84 @@ async function proxyAnnouncements(relayDir, req, res, pathname) {
   }
 }
 
+// ---------- 🎉 企微交流群引导代理（实际使用满 2 小时弹一次；2026-10-23 业主需求） ----------
+/**
+ * 桌面端插件面板的「加入企业微信群」引导数据来自企业端**用户级**接口：
+ *   GET  /api/community-invite/status → { ok, show, reason, used_seconds, required_seconds, qr_url }
+ *   POST /api/community-invite/shown  → { ok:true }（幂等）
+ * 浏览器半没有企业端用户 token（它跑在 dsh web 同源页里，只认本机 node 半的路由），
+ * 所以由 node 半用 **device-login token** 代调（企业端 device token 的 sub 就是 user，
+ * 与 /api/me、/api/mobile-sessions 走的是同一条身份链）。
+ *
+ * 三条纪律：
+ * ① **不透传浏览器带来的 Authorization**：这是纯用户级接口，身份只应该是"本机登录账号"。
+ *    面板浏览器手里没有任何企业端用户 token，透传只会让"谁的身份"变得含混
+ *    （与 announcements 的 user/install 二选一不同，那个接口两种维度都合法）。
+ * ② **判定与记账全在服务端**：show=false（未满 2h / 已弹过 / 后台没配二维码）原样透传，
+ *    前端绝不自己算时长；`shown` 幂等，展示时与关闭时各调一次是安全超集。
+ * ③ **失败一律软着陆**：未登录/自建（没有企业端账号体系）→ 200 + ok:false + reason
+ *    （面板静默、不弹不报错）；上游 4xx/5xx → 透传状态码 + 可读 error（排障能看见，
+ *    面板依旧静默）；网络不可达 → 502 JSON，绝不抛回 webServer。
+ */
+async function proxyCommunityInvite(relayDir, req, res, pathname) {
+  const method = String(req.method || "GET").toUpperCase();
+  const suffix = pathname.replace(/^\/dsh-remote\/community-invite/, "") || "/";
+  const isStatus = method === "GET" && suffix === "/status";
+  const isShown = method === "POST" && suffix === "/shown";
+  if (!isStatus && !isShown) {
+    return sendJson(res, 404, { ok: false, show: false, reason: "unknown_route", error: "unknown community-invite route" });
+  }
+  const cfg = loadConfig(relayDir);
+  // 自建部署：没有企业端账号体系，交流群引导不适用 —— 不发请求、也不让面板弹
+  if (cfg.local_key) return sendJson(res, 200, { ok: false, show: false, reason: "local_mode" });
+  // 没配账号：面板登录前也可能误调 —— 静默拒绝（前端本来就只在 loggedIn 后调）
+  if (!(cfg.phone && cfg.password)) return sendJson(res, 200, { ok: false, show: false, reason: "not_logged_in" });
+  const token = await relayToken(relayDir).catch(() => "");
+  if (!token) return sendJson(res, 200, { ok: false, show: false, reason: "not_logged_in" });
+
+  const upstreamPath = isShown ? "/api/community-invite/shown" : "/api/community-invite/status";
+  const init = { method: isShown ? "POST" : "GET", headers: { authorization: `Bearer ${token}` } };
+  if (isShown) {
+    init.headers["content-type"] = "application/json";
+    init.body = "{}";
+  }
+  const r = await relayFetch(relayDir, upstreamPath, init);
+  const d = flattenRelayBody(r);
+  if (!r.ok) {
+    // 透传状态码 + 可读错误：面板仍然静默（它只看 ok/show），但排障时能直接看到 401/404/500
+    return sendJson(res, (r && r.status) || 502, {
+      ok: false,
+      show: false,
+      reason: isShown ? "report_failed" : "status_failed",
+      error: relayErrorMessage(r),
+      relayStatus: (r && r.status) || 0
+    });
+  }
+  if (isShown) {
+    // 幂等上报：不关心上游回什么（只认 ok:false 才报失败），面板两个按钮都会调
+    return sendJson(res, 200, { ok: d.ok !== false, relayStatus: r.status || 200 });
+  }
+  // status：只挑面板需要的字段（不整包透传，避免把内部字段带进浏览器；字段容错见契约）
+  // qr_url 归一化：企业端后台配的可能是站内相对路径（如 /qr/group-qr.png），
+  // 与 /dsh-remote/community 同一约定拼成**企业端绝对地址**再下发 —— 面板跑在 dsh web 源上，
+  // 相对路径会被浏览器解析到 127.0.0.1，图片必然挂。其它协议（data:/javascript:/协议相对）一律丢弃，
+  // 前端按"二维码不可用"降级（保留文案与按钮）。
+  const apiBase = String(cfg.api_url || DEFAULT_API).replace(/\/+$/, "");
+  const rawQr = typeof d.qr_url === "string" ? d.qr_url.trim() : "";
+  let qrUrl = "";
+  if (/^https?:\/\//i.test(rawQr)) qrUrl = rawQr;
+  else if (rawQr.charAt(0) === "/" && rawQr.charAt(1) !== "/") qrUrl = apiBase + rawQr;
+  return sendJson(res, 200, {
+    ok: d.ok !== false,
+    show: d.show === true, // fail closed：非严格 true 一律不弹
+    reason: typeof d.reason === "string" ? d.reason : "",
+    used_seconds: Number(d.used_seconds) || 0,
+    required_seconds: Number(d.required_seconds) || 0,
+    qr_url: qrUrl,
+    relayStatus: r.status || 200
+  });
+}
+
 // ---------- 自管理：版本 / 在线更新 / 彻底卸载（面板内“版本与更新”卡片） ----------
 
 /** 插件 id / 包名（2026-09 由 dsh-remote-ui 更名）。 */
@@ -7652,6 +7730,19 @@ function registerRoutes(ctx, relayDir) {
       handler: async (req, res) => {
         const url = new URL(req.url ?? "/", "http://x");
         await proxyAnnouncements(relayDir, req, res, url.pathname);
+      },
+    },
+    // 🎉 企微交流群引导（桌面端面板使用满 2h 后弹一次；与手机 Web 共用同一套企业端接口）：
+    //   GET  /dsh-remote/community-invite/status → 上游 GET  {api}/api/community-invite/status
+    //   POST /dsh-remote/community-invite/shown  → 上游 POST {api}/api/community-invite/shown（幂等）
+    //   与 feedback/announcements 同一形态（prefix + handler 内判别），以后加子接口不用动路由表。
+    {
+      method: "ALL",
+      path: "/dsh-remote/community-invite",
+      prefix: true,
+      handler: async (req, res) => {
+        const url = new URL(req.url ?? "/", "http://x");
+        await proxyCommunityInvite(relayDir, req, res, url.pathname);
       },
     },
   ];
