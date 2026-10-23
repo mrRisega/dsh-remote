@@ -1,16 +1,17 @@
-// 📄 会员服务购买协议链接 —— **浏览器半**（lib/client.js 面板）行为回归。
+// 📄 购买协议**不在插件面板展示** —— **浏览器半**（lib/client.js 面板）行为回归。
 //
-// 背景（业主 2026-10-23，客户端 0.7.5-beta.1）：购买/升级入口必须带《会员服务购买协议》链接。
-// 桌面端购买入口有两条（都在「账号卡」与「连接偏慢双路块」里），两者都要摆链接：
-//   · 「🚀 升级 PRO / 转正式 / 续费会员」主按钮下方（账号卡）
-//   · 「连接偏慢」双路块里的升级按钮旁（只在该块有购买路时出现）
+// 需求变更（业主 2026-10-24）：面板的续费/购买按钮下方**不要**再出现
+// 「购买即表示同意《会员服务购买协议》」这句话 —— 协议只在**手机端支付扫码前**（支付页）展示。
+// 上一轮（task-17）在 client.js 里加的两处链接（账号卡购买按钮下方、连接偏慢双路块升级路旁）
+// 已连同相关常量/渲染函数/样式一并删除；node 半 `GET /dsh-remote/purchase-agreement` 代理**保留**
+// （手机端/其它端后续可复用，其 URL 优先级/安全过滤/降级契约见 purchase-agreement-proxy.test.mjs）。
 //
-// 本文件锁：
-//   ① 链接存在、文案/新标签/安全属性正确；
-//   ② URL 优先级：node 半下发的 `public-config.agreement_url` 覆盖兜底；
-//   ③ 安全过滤：node 半给了非法协议（javascript:/data:/相对）→ 客户端**再**过滤回兜底；
-//   ④ 失败软着陆：node 半接口 500/网络异常 → 链接仍用兜底常量存在，购买按钮不受影响；
-//   ⑤ 未登录不展示（购买入口本来就只在登录后出现）。
+// 本文件锁「不该出现」这件事（四条路径都要覆盖）：
+//   ① 免费用户账号卡：升级 PRO 按钮在，但协议文案/链接/旧样式类都不在，也不再请求协议地址；
+//   ② 会员账号卡：续费会员按钮下同样没有这句协议文案（业主点名的位置）；
+//   ③ 连接偏慢双路块：升级（购买）路旁没有协议链接；
+//   ④ 未登录：本来就没有购买入口，也不该有任何协议痕迹/请求。
+//   ⑤ 源码级回归锁：client.js 里不得再残留协议渲染痕迹（防止以后又被"顺手加回来"）。
 //
 // 做法与 community-invite-ui.test.mjs 一致：真脚本 + vm + 迷你 React（真实 useEffect）。
 import assert from "node:assert/strict";
@@ -19,17 +20,33 @@ import test from "node:test";
 import vm from "node:vm";
 
 const SOURCE = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
-const AGREEMENT_ABS = "https://relay.test/relay-api/api/purchase-agreement";              // node 半下发的（模拟 public-config 配的）
-const AGREEMENT_FALLBACK = "https://n.risegao.cn:13443/relay-api/api/purchase-agreement"; // 固定兜底常量
 // 复制自 community-invite-ui 的迷你 React harness 里，交流群/弹层接口仍有默认夹具，统一给一个假二维码地址。
 const QR_ABS = "https://relay.test/relay-api/qr/group-qr.png";
 
-/** 购买协议的 <a>（按 className 定位；要求带 href）。 */
-function agreementLink(tree) {
-  return find(tree, (n) => n.props && n.props.className === "dru-legal-a" && typeof n.props.href === "string");
+/**
+ * 面板树里所有「购买协议」痕迹：协议文案 / 协议链接 / 旧样式类。
+ * 期望结果恒为空数组 —— 这正是业主这次要的"面板上不再出现这句话"。
+ */
+function agreementTraces(tree) {
+  const out = [];
+  walk(tree, (n) => {
+    if (!n || typeof n !== "object") return;
+    const cls = String((n.props && n.props.className) || "");
+    if (cls === "dru-legal" || cls === "dru-legal-a" || cls.startsWith("dru-legal ")) out.push({ kind: "class", node: n });
+    if (n.type === "a" && n.props && /purchase-agreement/i.test(String(n.props.href || ""))) out.push({ kind: "href", node: n });
+    for (const c of n.children || []) {
+      if (typeof c !== "string") continue;
+      if (/购买协议|会员服务购买协议|购买即表示同意/.test(c)) out.push({ kind: "text", text: c });
+    }
+  });
+  return out;
 }
-function linkTexts(node) {
-  return (node.children || []).filter((c) => typeof c === "string").join("");
+/** 断言整棵面板树里没有任何协议痕迹（失败时把命中项打印出来，便于定位是谁加回来的）。 */
+function assertNoAgreementInPanel(tree) {
+  const hits = agreementTraces(tree);
+  assert.equal(hits.length, 0, `面板里不得再出现购买协议文案/链接，实际命中: ${JSON.stringify(hits.slice(0, 4))}`);
+  assert.equal(textHas(tree, "购买即表示同意"), false, "业主明确要求：不要「购买即表示同意…」这句话");
+  assert.equal(textHas(tree, "会员服务购买协议"), false);
 }
 
 function walk(node, visit) {
@@ -183,6 +200,7 @@ function loadPlugin(opts = {}) {
     fetch(path, options = {}) {
       requests.push({ path, method: options.method || "GET" });
       if (path === "/dsh-remote/status") return response(200, status);
+      if (path === "/dsh-remote/account") return response(200, opts.account !== undefined ? { ok: true, account: opts.account } : { ok: true });
       if (path === "/dsh-remote/community") return response(200, community);
       if (path === "/dsh-remote/community-invite/status") {
         if (opts.inviteReject) return Promise.reject(new Error("network down"));
@@ -236,55 +254,28 @@ function loadPlugin(opts = {}) {
   };
 }
 
-test("① 登录后账号卡购买入口旁有协议链接：新标签打开 + 文案/属性正确，URL 用 node 半下发的地址", async () => {
+
+test("① 免费用户账号卡：升级 PRO 按钮仍在，但协议文案/链接/旧样式全都不再出现，也不再请求协议地址", async () => {
   const plugin = loadPlugin();
   const tree = await plugin.settle(4);
-  const a = agreementLink(tree);
-  assert.ok(a, "购买/升级入口旁必须能看到《会员服务购买协议》链接");
-  assert.equal(a.props.href, AGREEMENT_ABS, "URL 优先用 node 半下发的 public-config.agreement_url");
-  assert.equal(a.props.target, "_blank", "必须在新标签打开（不在面板里跳走）");
-  assert.match(String(a.props.rel || ""), /noopener/, "rel 必须带 noopener（反钓鱼面）");
-  assert.match(String(a.props.rel || ""), /noreferrer/, "rel 应带 noreferrer");
-  assert.equal(a.type, "a", "必须是真正的链接（可复制地址/中键打开），不是 button");
-  assert.match(linkTexts(a), /《会员服务购买协议》/, "链接文案必须是《会员服务购买协议》");
-  // 购买/升级按钮仍然在（链接不替代购买）
-  assert.ok(nodeWithText(tree, "🚀 升级 PRO") || nodeWithText(tree, "🔄 续费会员") || nodeWithText(tree, "🚀 转正式 PRO"),
-    "购买/续费主按钮必须仍在（协议链接只是补充）");
-  assert.equal(plugin.agreementRequests().length, 1, "每页面会话只问一次协议地址");
+  // 购买入口（升级按钮）必须还在 —— 这次只删协议文案，不动购买能力
+  assert.ok(nodeWithText(tree, "🚀 升级 PRO"), "免费用户的「🚀 升级 PRO」按钮必须保留");
+  // 协议痕迹一个都不能有
+  assertNoAgreementInPanel(tree);
+  // 客户端也不再为了这句话去问 node 半（面板里已经没有消费者了）
+  assert.equal(plugin.agreementRequests().length, 0, "面板已不再展示协议，就不该再请求 /dsh-remote/purchase-agreement");
 });
 
-test("② 优先级：node 半下发 public-config 配的地址 → 覆盖兜底常量", async () => {
-  const plugin = loadPlugin({ agreement: { ok: true, url: "https://relay.test/custom/agreement.html", source: "public_config" } });
+test("② 会员账号卡（业主点名场景）：续费会员按钮下方不再有「购买即表示同意…」", async () => {
+  const plugin = loadPlugin({
+    account: { plan: "pro", plan_source: "subscription", plan_ends_at: 1893456000000, invite_code: "ABC12345" },
+  });
   const tree = await plugin.settle(4);
-  const a = agreementLink(tree);
-  assert.ok(a);
-  assert.equal(a.props.href, "https://relay.test/custom/agreement.html", "服务端配置优先于兜底");
+  assert.ok(nodeWithText(tree, "🔄 续费会员"), "前提：会员的续费入口在（这正是业主看到那句话的位置）");
+  assertNoAgreementInPanel(tree);
 });
 
-test("③ 安全过滤：node 半给了非法协议/相对路径 → 客户端丢弃并回兜底（<a href> 不能吃 javascript:）", async () => {
-  for (const bad of ["javascript:alert(1)", "data:text/html,x", "//evil.example/agreement", "/relay-api/x", ""]) {
-    const plugin = loadPlugin({ agreement: { ok: true, url: bad } });
-    const tree = await plugin.settle(4);
-    const a = agreementLink(tree);
-    assert.ok(a, `非法 URL 时链接仍应存在（用兜底）: ${JSON.stringify(bad)}`);
-    assert.equal(a.props.href, AGREEMENT_FALLBACK, `非法 URL 必须回兜底: ${JSON.stringify(bad)}`);
-  }
-});
-
-test("④ 失败软着陆：node 半 500 / 网络异常 → 链接仍存在且用兜底，购买按钮不受影响", async () => {
-  for (const opts of [{ agreementStatus: 500 }, { agreementReject: true }]) {
-    const plugin = loadPlugin(opts);
-    const tree = await plugin.settle(4);
-    const a = agreementLink(tree);
-    assert.ok(a, "协议接口挂了也不能让链接消失（这是法律/产品硬要求）");
-    assert.equal(a.props.href, AGREEMENT_FALLBACK, "失败时用固定兜底 URL");
-    assert.equal(a.props.target, "_blank");
-    assert.ok(nodeWithText(tree, "🚀 升级 PRO") || nodeWithText(tree, "🔄 续费会员") || nodeWithText(tree, "🚀 转正式 PRO"),
-      "失败不影响购买流程：主按钮照常渲染");
-  }
-});
-
-test("⑤ 「连接偏慢」双路块里的购买路旁也有协议链接，且与账号卡同一 URL", async () => {
+test("③ 连接偏慢双路块：升级（购买）路旁也没有协议链接，协议地址零请求", async () => {
   const plugin = loadPlugin({
     status: {
       ok: true,
@@ -297,18 +288,14 @@ test("⑤ 「连接偏慢」双路块里的购买路旁也有协议链接，且�
   });
   const tree = await plugin.settle(4);
   const dual = find(tree, (n) => n.props && n.props.className === "dru-dual");
-  assert.ok(dual, "前提：慢连接时双路块应出现");
-  const inDual = find(dual, (n) => n.props && n.props.className === "dru-legal-a" && typeof n.props.href === "string");
-  assert.ok(inDual, "双路块的购买（升级）路旁必须有协议链接");
-  assert.equal(inDual.props.href, AGREEMENT_ABS);
-  // 账号卡那份也在 → 同页两处；两处 href 一致（同一个来源，不能各写各的）
-  const all = [];
-  walk(tree, (n) => { if (n.props && n.props.className === "dru-legal-a" && typeof n.props.href === "string") all.push(n); });
-  assert.ok(all.length >= 2, `应至少两处（账号卡 + 双路块），实际 ${all.length}`);
-  for (const a of all) assert.equal(a.props.href, AGREEMENT_ABS, "同一页面各处 URL 必须一致");
+  assert.ok(dual, "前提：慢连接时双路块应出现（购买路仍在）");
+  assert.equal(find(dual, (n) => n.props && n.props.className === "dru-legal-a"), undefined,
+    "双路块的购买路旁不得再有协议链接");
+  assertNoAgreementInPanel(tree);
+  assert.equal(plugin.agreementRequests().length, 0);
 });
 
-test("⑥ 未登录 → 不展示协议链接、也不请求协议地址（购买入口不存在时不该出现）", async () => {
+test("④ 未登录：没有购买入口，也没有任何协议痕迹/请求", async () => {
   const plugin = loadPlugin({
     status: {
       ok: true,
@@ -318,6 +305,32 @@ test("⑥ 未登录 → 不展示协议链接、也不请求协议地址（购�
     },
   });
   const tree = await plugin.settle(4);
-  assert.equal(agreementLink(tree), undefined, "未登录没有购买入口，自然不该出现协议链接");
-  assert.equal(plugin.agreementRequests().length, 0, "未登录不该请求协议地址");
+  assert.equal(nodeWithText(tree, "🚀 升级 PRO"), undefined, "未登录没有购买入口");
+  assertNoAgreementInPanel(tree);
+  assert.equal(plugin.agreementRequests().length, 0);
+});
+
+test("⑤ 源码级回归锁：client.js 里不得再残留协议渲染痕迹（node 半代理保留）", async () => {
+  const { readFileSync: rf } = await import("node:fs");
+  const src = rf(new URL("../lib/client.js", import.meta.url), "utf8");
+  for (const sym of ["dru-legal", "renderAgreementLink", "购买即表示同意", "会员服务购买协议", "PURCHASE_AGREEMENT_FALLBACK", "loadPurchaseAgreementUrl"]) {
+    assert.equal(src.includes(sym), false, `client.js 不得再出现「${sym}」——面板不再展示购买协议（协议只在手机端支付页展示）`);
+  }
+  // node 半的代理仍在（不要顺手删掉：手机端/其它端后续可复用，且 proxy 用例锁着它的契约）
+  const idx = rf(new URL("../lib/index.js", import.meta.url), "utf8");
+  assert.ok(idx.includes('path: "/dsh-remote/purchase-agreement"'), "node 半 /dsh-remote/purchase-agreement 代理必须保留");
+  assert.ok(SOURCE.length > 0);
+});
+
+test("⑥ 只删文案、不动购买能力：点「升级 PRO」仍走既有购买流程（请求 /dsh-remote/access-key）", async () => {
+  const plugin = loadPlugin();
+  let tree = await plugin.settle(4);
+  const btn = nodeWithText(tree, "🚀 升级 PRO");
+  assert.ok(btn, "升级按钮必须还在");
+  btn.props.onClick();
+  await plugin.settle(2);
+  assert.ok(plugin.requests.some((r) => r.path === "/dsh-remote/access-key"),
+    "购买入口仍走既有 openUpgradeAuth（生成一次性访问链接 → 打开套餐页）；删的只是协议文案");
+  tree = plugin.render();
+  assertNoAgreementInPanel(tree);
 });
