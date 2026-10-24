@@ -2817,6 +2817,29 @@ function writeRestartState(relayDir, state) {
  * 标记「需要用户动一下」的状态。kind = refresh(插件被运行时改写,刷新页面即可)。
  * 历史 kind(first-install / update)已废弃:热加载落地后,装插件与在线更新都不再需要重启 harness。
  */
+/** 桌面端「暫存插件更新」marker（dsh-setup 在应用运行时暂存；bridge 在应用退出后自动安装）。 */
+function readDesktopUpdatePending(relayDir) {
+  try {
+    const m = JSON.parse(readFileSync(join(relayDir, ".plugin-update-pending.json"), "utf8"));
+    return { version: String(m.version || ""), stagedAt: Number(m.stagedAt) || 0 };
+  } catch {
+    return null;
+  }
+}
+
+/** 更新进程成功收尾后写「待生效」提示：桌面端暂存更新 → 退出应用后自动安装；其它 → 重启 dsh web。 */
+function markUpdateRestartPending(relayDir) {
+  const staged = readDesktopUpdatePending(relayDir);
+  if (staged) {
+    return markRestartPending(
+      relayDir,
+      "restart-app",
+      `新版本${staged.version ? ` ${staged.version}` : ""} 已下载：退出并重新打开 DeepSeek Harness 后自动生效（无需终端）`
+    );
+  }
+  return markRestartPending(relayDir, "restart", "插件已更新，重启 dsh web 后生效");
+}
+
 function markRestartPending(relayDir, kind, reason) {
   const cur = readRestartState(relayDir);
   if (cur.pending && cur.kind === kind) return cur; // 幂等：同一原因不反复重写
@@ -3748,6 +3771,8 @@ async function composeStatus(relayDir) {
     // 是否需要重启 DeepSeek harness（首次安装 / 在线更新后必须重启才加载插件本体）：
     // {pending, kind: first-install|update, reason, at}，供面板顶部醒目提示 + 重启按钮。
     restart: readRestartState(relayDir),
+    // 桌面端暂存的插件更新（存在 = 新版本已下载，退出应用后由 bridge 自动安装并生效）
+    desktopUpdatePending: readDesktopUpdatePending(relayDir),
     // 安装/配对自检（2026-10-17 事故）：运行时（clients/）与配对（.dsh-config.json）是否齐全、
     // 缺什么、下一步该做什么；配对主配置缺失但备份存在时给出可一键恢复的 backup.action。
     // 字段契约见 setupStateOf；connect.setup 是同一份对象（bridge-status 短轮询也能拿到）。
@@ -4586,7 +4611,7 @@ async function runOnlineUpdate(relayDir) {
           updateFailures.delete(String(relayDir));
           sweepIfSucceeded(); // C8：装完清残留（按更新前的 pid 点名 + 命令行复核）
           // 更新成功 → 落一条「必须重启 dsh web」的强提醒（见 run() 成功分支的同款注释）
-          markRestartPending(relayDir, "restart", "插件已更新，重启 dsh web 后生效");
+          markUpdateRestartPending(relayDir);
         }
       });
       child.unref();
@@ -4676,7 +4701,7 @@ async function runOnlineUpdate(relayDir) {
           // 客户端按 kind 一一对应地换文案与主按钮（见 client.js 的 restartAlert），
           // 混用一个 kind 就会再次出现"文案说刷新、状态其实是重启"。
           // settleRestartState() 靠 bootId 自动结清 —— 用户真的重启后这条提示自己消失，不需要额外清理。
-          markRestartPending(relayDir, "restart", "插件已更新，重启 dsh web 后生效");
+          markUpdateRestartPending(relayDir);
         }
       });
       child.unref();

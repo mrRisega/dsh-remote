@@ -2950,6 +2950,8 @@ window.__ModuleLoader__.load({
         : "已停止";
       // 是否需要重启 DeepSeek harness（首次安装/在线更新后置顶提醒 + 底部常驻按钮）
       var restartInfo = (st && st.restart) || {};
+      // 桌面端「暫存插件更新」：新版本已下载，退出应用后由 bridge 自动安装（见 dsh-bridge 的 applier）
+      var desktopUpdatePending = (st && st.desktopUpdatePending) || null;
       var restartPending = !!restartInfo.pending;
       // 宿主形态（node 半下发）：桌面端（Electron）Host 由桌面应用托管，重启这个动作
       // 在那边**做不到也不该做**（强行退出会弹原生致命错误）。面板据此：
@@ -5309,12 +5311,18 @@ window.__ModuleLoader__.load({
           // 不该混在桌面端适配里顺手做掉。桌面端才走新文案。
           // 2026-10-17（业主）：桌面端运行环境由应用托管、更新自动热加载 ——
           // **不再引导用户重启 DeepSeek Harness**，统一只说「刷新页面即可生效」。
-          var restartRowText = (desktopHost || !isRestartHard)
-            ? "🔄 插件已更新：刷新页面即可生效"
-            : "🔄 插件已更新：重启 dsh web 后生效";
+          // 桌面端：插件更新需要退出并重新打开应用（应用独占 profile，不能热改）；
+          // 若已暂存新版本，bridge 会在应用退出后自动安装，重开即生效 —— 绝不说「刷新页面即可」。
+          var restartRowText = desktopHost
+            ? (desktopUpdatePending
+              ? "🆕 新版本已下载：退出并重新打开 DeepSeek Harness 后自动生效（无需终端）"
+              : "🔄 插件已更新：退出并重新打开 DeepSeek Harness 后生效")
+            : (!isRestartHard
+              ? "🔄 插件已更新：刷新页面即可生效"
+              : "🔄 插件已更新：重启 dsh web 后生效");
           rows.push(h("div", { className: "dru-access-tip-row", key: "restart" },
             h("span", null, restartRowText),
-            (isRefreshOnly || !desktopHost) ? h("button", {
+            (!desktopHost || isRefreshOnly) && !desktopHost ? h("button", {
               type: "button",
               className: "dru-linkbtn",
               disabled: busy !== "",
@@ -5366,13 +5374,17 @@ window.__ModuleLoader__.load({
                     // **任何情况都不再引导"重启/退出重开应用"**，只说「刷新页面即可生效」。
                     // 非桌面端（自建 dsh web）保留原有 isRestartHard 判据，文案不变。
                     desktopHost
-                      ? "插件已更新：刷新页面即可生效"
+                      ? (desktopUpdatePending
+                        ? "新版本已下载：退出并重新打开 DeepSeek Harness 后生效"
+                        : "插件已更新：退出并重新打开 DeepSeek Harness 后生效")
                       : (isRestartHard
                         ? "插件已更新，重启 dsh web 后生效"
                         : (isRefreshOnly ? "插件已更新，刷新页面即可生效" : "需要重启 dsh web 才能载入新插件"))),
                   h("div", { className: "dru-restart-alert-sub" },
                     desktopHost
-                      ? "新插件已经在磁盘上，刷新一下这个页面即可载入（手机端连接与已登录状态都不受影响）。如果刷新后仍看不到面板，在应用内「插件」页重新安装一次即可。"
+                      ? (desktopUpdatePending
+                        ? "新版本已经下载到本机；DeepSeek Harness 退出后，后台服务会自动完成安装，重新打开应用即生效（无需终端，手机端连接与已登录状态都不受影响）。"
+                        : "新插件已在磁盘上，但桌面应用仍在运行旧插件；退出 DeepSeek Harness 后重新打开即可载入新版（应用退出后后台服务会自动完成安装，无需终端）。")
                       : (isRestartHard
                         ? "新版本已经装到这台电脑上，但当前运行的 dsh web 还是旧代码（新的后台路由与面板要等它重新载入）。手机端连接与已登录状态都不受影响；重启期间页面会短暂断开，然后自动恢复。"
                         : (isRefreshOnly

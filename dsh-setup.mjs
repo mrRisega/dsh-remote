@@ -2583,6 +2583,45 @@ function missingPluginFiles(dir) {
  *
  * 另外清掉上次被强杀留下的 `.staging-*` / `.backup-*`，不留垃圾。
  */
+// ── 桌面端「暫存安装」：应用运行中不能改写它的 profile（会把它弄退出/重启），
+// 但用户点「一键更新」必须能装到桌面端。做法：先整份拷到 ~/.dsh-remote/pending-plugin/ 并写 marker，
+// 由常驻的 bridge 在检测到应用退出后自动原子替换 profile 内的插件目录（见 dsh-bridge.mjs）。
+const PENDING_PLUGIN_MARKER = path.join(CONFIG_DIR, ".plugin-update-pending.json");
+const PENDING_PLUGIN_DIR = path.join(CONFIG_DIR, "pending-plugin");
+
+/** 暂存一份插件更新（供 bridge 在应用退出后安装）。返回 marker 对象。 */
+function stagePluginUpdateForProfile(profileDir, pluginDir) {
+  fs.rmSync(PENDING_PLUGIN_DIR, { recursive: true, force: true });
+  fs.mkdirSync(PENDING_PLUGIN_DIR, { recursive: true });
+  const cpOpts = {
+    recursive: true,
+    filter: (src) => {
+      if (src === pluginDir) return true;
+      const rel = String(path.relative(pluginDir, src));
+      const segs = rel.split(path.sep);
+      if (segs.some((seg) => seg === ".git" || seg === ".DS_Store")) return false;
+      const inBundledRuntime = segs[0] === "runtime";
+      if (!inBundledRuntime && segs.some((seg) => seg === "node_modules")) return false;
+      return true;
+    }
+  };
+  fs.cpSync(pluginDir, PENDING_PLUGIN_DIR, cpOpts);
+  for (const rel of PLUGIN_REQUIRED_FILES) {
+    const f = path.join(PENDING_PLUGIN_DIR, rel);
+    if (!fs.existsSync(f)) throw new Error(`暂存校验失败：缺少 ${rel}`);
+  }
+  const version = JSON.parse(fs.readFileSync(path.join(pluginDir, "package.json"), "utf8")).version;
+  const marker = {
+    version,
+    profileDir,
+    pluginDirName: PLUGIN_LOCAL_DIR,
+    stageDir: PENDING_PLUGIN_DIR,
+    stagedAt: Date.now()
+  };
+  fs.writeFileSync(PENDING_PLUGIN_MARKER, JSON.stringify(marker, null, 2) + "\n");
+  return marker;
+}
+
 function copyPluginIntoProfile(profileDir, pluginDir) {
   // 清理历史名残留目录（≤0.4.9 的 dsh-remote-ui-plugin），避免与新版并存
   for (const id of PLUGIN_LEGACY_IDS) {
@@ -3031,16 +3070,21 @@ async function pluginCmd(argv) {
   let last = null;
   let ok = 0;
   let skippedRunning = 0;
+  let stagedRunning = 0;
   const force = hasFlag(argv, "--force");
   for (const t of targets) {
     // ⚠️ 桌面应用在运行时**绝不改写它的 profile**：应用会因此退出/重启（2026-10-11 实测故障）
     if (t.name === "desktop" && !force && dshDesktopAppRunning()) {
-      console.log(`⚠️ 跳过 desktop：DeepSeek Harness 应用正在运行。`);
-      console.log(`   应用独占该 profile，运行中改写会让应用自己退出/重启。请任选其一：`);
-      console.log(`     · 完全退出应用后重跑本命令；或`);
-      console.log(`     · 在应用内「插件」页安装/更新 dsh-remote-web（官方路径，装完即热加载）。`);
-      console.log(`   （确实要强行写入：加 --force）`);
-      skippedRunning += 1;
+      console.log(`⚠️ DeepSeek Harness 应用正在运行 → 不直接改写它的 profile（会把它弄退出/重启）。`);
+      try {
+        const staged = stagePluginUpdateForProfile(t.dir, path.join(THIS_DIR, "packages", PLUGIN_ID));
+        stagedRunning += 1;
+        console.log(`   ✅ 新版本 ${staged.version} 已暂存：**退出 DeepSeek Harness 后会自动安装**，重新打开应用即生效（无需终端）。`);
+      } catch (e) {
+        console.log(`   ⚠️ 暂存失败：${e && e.message ? e.message : e}`);
+        console.log(`   请完全退出应用后重跑本命令，或在应用内「插件」页安装/更新 dsh-remote-web。`);
+        skippedRunning += 1;
+      }
       continue;
     }
     if (multi) console.log(`\n── profile: ${t.name}（${t.dir}）`);
@@ -3050,6 +3094,7 @@ async function pluginCmd(argv) {
     if (r !== undefined && r !== null) last = r;
   }
   if (ok === 0 && skippedRunning === 0) process.exit(1);
+  if (stagedRunning > 0) console.log(`ℹ 桌面端插件已暂存（${stagedRunning} 个）：退出 DeepSeek Harness 后由后台服务自动安装，重开应用生效。`);
   if (skippedRunning > 0) console.log(`ℹ 本次跳过了 ${skippedRunning} 个 profile（应用在运行）；桥与运行环境不受影响。`);
   return last;
 }

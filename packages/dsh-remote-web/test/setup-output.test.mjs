@@ -240,7 +240,10 @@ test("★ 桌面应用在运行时，绝不改写它的 profile（否则应用�
   const applyAt = src.indexOf("await pluginApplyTo(", loopAt);
   assert.ok(loopAt > 0 && guardAt > loopAt && applyAt > guardAt,
     "顺序必须是：循环 → 应用在运行？→ 跳过；否则才 pluginApplyTo()");
-  assert.match(src, /跳过 desktop：DeepSeek Harness 应用正在运行/, "要如实说明跳过了 desktop");
+  // 2026-10-24：应用在运行时不再只是"跳过"，而是把插件更新**暂存**，由 bridge 在应用退出后自动安装。
+  assert.match(src, /stagePluginUpdateForProfile\(/, "应用在运行时必须暂存插件更新（否则一键更新永远装不上桌面端）");
+  assert.match(src, /\.plugin-update-pending\.json/, "暂存要写 marker 供 bridge 落地");
+  assert.match(src, /退出 DeepSeek Harness 后会自动安装/, "要如实告诉用户：退出应用后自动安装、重开生效");
   assert.match(src, /应用内「插件」页安装/, "要给出官方替代路径（应用内插件页）");
   assert.match(src, /"--force"/, "要留 --force 逃生口");
   // sync-local 脚本同样要保护（本机同步最常用）

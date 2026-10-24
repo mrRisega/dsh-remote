@@ -167,11 +167,13 @@ test("桌面端：面板不得自动倒计时重启，且不摆点了必然失�
     "自动倒计时重启必须在桌面端短路（Host 由 Electron 托管，不能替用户重启）");
   assert.match(CLIENT_SRC, /\(desktopHost && !isRefreshOnly\) \? null : h\("button"/,
     "桌面端且非'刷新即可'时不得渲染重启按钮");
-  // 2026-10-17（业主）：桌面端**不再**出现"重启 DeepSeek Harness"这类引导，
-  // 统一只说「刷新页面即可生效」；非桌面端保留原有 isRestartHard 判据（发布版文案不变）。
-  assert.doesNotMatch(CLIENT_SRC, /退出并重新打开 DeepSeek Harness/,
-    "桌面端不得再引导用户重启应用（运行环境由应用托管、更新自动热加载）");
-  assert.match(CLIENT_SRC, /插件已更新：刷新页面即可生效/);
+  // 2026-10-24（业主）：桌面端 profile 由应用独占，运行中无法改写 → 插件更新必须「退出并重开应用」；
+  // 已暂存的新版本由 bridge 在应用退出后自动安装。此前「刷新页面即可生效」的文案被证实是错的。
+  assert.match(CLIENT_SRC, /退出并重新打开 DeepSeek Harness 后自动生效/,
+    "桌面端必须如实引导：退出并重新打开应用后生效（新版本由 bridge 自动安装）");
+  assert.match(CLIENT_SRC, /desktopUpdatePending/, "面板要读桌面端暂存更新状态");
+  assert.doesNotMatch(CLIENT_SRC, /desktopHost[\s\S]{0,200}插件已更新：刷新页面即可生效/,
+    "桌面端不得再说「刷新页面即可生效」（应用在运行时根本不会加载新插件）");
 });
 
 test("桌面端：删除「重启 DeepSeek Harness」整段说明（2026-10-17 业主约定）", () => {

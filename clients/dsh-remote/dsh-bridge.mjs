@@ -82,6 +82,7 @@ import WebSocket from "ws";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import net from "node:net";
 import { execSync, spawnSync } from "node:child_process";
 import { randomBytes, generateKeyPairSync, createHash } from "node:crypto";
 import { pathToFileURL, fileURLToPath } from "node:url";
@@ -2723,7 +2724,107 @@ async function main() {
     console.log("[bridge] 单实例锁检查降级（取不到进程命令行或锁不可写）——照常启动；若出现 code=4000 互踢，本实例会自动让位。");
   }
   process.on("exit", releaseInstanceLock);
+  // 桌面端插件「暂存更新」自动安装（应用退出后生效；见 applyPendingPluginUpdate 注释）
+  startPendingPluginUpdateWatcher();
   return runTunnel();
+}
+
+// ── 桌面端插件「暫存安装」落地（2026-10-24）────────────────────────────────────────────
+// dsh-setup 在桌面应用运行时无法直接改写它的 profile（会触发应用退出/重启），改为暂存到
+// <relayDir>/pending-plugin/ 并写 marker；bridge 常驻、检测到应用退出后自动原子替换插件目录，
+// 用户下次打开应用即加载新版 —— 这样「一键更新」对桌面端也能真正生效（不再需要终端）。
+const PENDING_PLUGIN_MARKER = path.join(RELAY_DIR, ".plugin-update-pending.json");
+const PENDING_PLUGIN_REQUIRED = ["package.json", "lib/index.js", "lib/client.js", "cordis.patch.yml"];
+const PENDING_PLUGIN_DISABLED = process.env.DSH_BRIDGE_PENDING_UPDATE === "0";
+
+/** upstream 端口是否在监听（= DeepSeek Harness 桌面端在运行）。TCP 判断，跨平台。 */
+export function probeUpstreamListening({ host = "127.0.0.1", port, timeoutMs = 400 } = {}) {
+  return new Promise((resolve) => {
+    if (!port) return resolve(false);
+    const sock = net.connect({ host, port });
+    let done = false;
+    const finish = (v) => { if (done) return; done = true; try { sock.destroy(); } catch { /* 忽略 */ } resolve(v); };
+    sock.setTimeout(timeoutMs, () => finish(false));
+    sock.once("connect", () => finish(true));
+    sock.once("error", () => finish(false));
+  });
+}
+function upstreamPortOf(url) {
+  try { const u = new URL(String(url)); return Number(u.port) || (u.protocol === "https:" ? 443 : 80); } catch { return 0; }
+}
+
+/**
+ * 应用暂存的插件更新（仅在桌面应用不在运行时）。原子替换：staging → rename，失败保留旧版。
+ * @returns {{applied:boolean, reason?:string, version?:string, error?:string}}
+ */
+export async function applyPendingPluginUpdate({ relayDir = RELAY_DIR, isAppRunning, now = Date.now(), log = console } = {}) {
+  const markerPath = path.join(relayDir, ".plugin-update-pending.json");
+  let marker;
+  try { marker = JSON.parse(fs.readFileSync(markerPath, "utf8")); } catch { return { applied: false, reason: "no_pending" }; }
+  const stageDir = String(marker.stageDir || "");
+  const profileDir = String(marker.profileDir || "");
+  const name = String(marker.pluginDirName || "dsh-remote-web-plugin");
+  if (!stageDir || !profileDir || !fs.existsSync(stageDir)) {
+    try { fs.rmSync(markerPath, { force: true }); } catch { /* 忽略 */ }
+    return { applied: false, reason: "staging_missing" };
+  }
+  const running = typeof isAppRunning === "function"
+    ? await isAppRunning()
+    : await probeUpstreamListening({ port: upstreamPortOf(UPSTREAM) });
+  if (running) return { applied: false, reason: "app_running" };
+  const dest = path.join(profileDir, name);
+  const stage = `${dest}.staging-${process.pid}`;
+  const backup = `${dest}.backup-${process.pid}`;
+  try {
+    fs.rmSync(stage, { recursive: true, force: true });
+    fs.cpSync(stageDir, stage, { recursive: true });
+    for (const rel of PENDING_PLUGIN_REQUIRED) {
+      if (!fs.existsSync(path.join(stage, rel))) throw new Error(`暂存包缺少 ${rel}`);
+    }
+    fs.rmSync(backup, { recursive: true, force: true });
+    const had = fs.existsSync(dest);
+    if (had) fs.renameSync(dest, backup);
+    try {
+      fs.renameSync(stage, dest);
+    } catch (e) {
+      if (had) { try { fs.renameSync(backup, dest); } catch { /* 忽略 */ } }
+      throw e;
+    }
+    if (had) { try { fs.rmSync(backup, { recursive: true, force: true }); } catch { /* 忽略 */ } }
+    try {
+      fs.writeFileSync(
+        path.join(relayDir, ".plugin-update-applied.json"),
+        JSON.stringify({ version: marker.version, appliedAt: now, profileDir }, null, 2) + "\n"
+      );
+    } catch { /* 忽略 */ }
+    try { fs.rmSync(markerPath, { force: true }); fs.rmSync(stageDir, { recursive: true, force: true }); } catch { /* 忽略 */ }
+    log.info?.(`[bridge] ✅ 插件新版本 ${marker.version} 已自动安装到 ${profileDir}（桌面应用退出后）；重新打开应用即生效`);
+    return { applied: true, version: marker.version };
+  } catch (e) {
+    try { fs.rmSync(stage, { recursive: true, force: true }); } catch { /* 忽略 */ }
+    log.warn?.(`[bridge] 插件暂存安装失败（保留旧版可回退）：${e && e.message ? e.message : e}`);
+    return { applied: false, reason: "apply_failed", error: String((e && e.message) || e) };
+  }
+}
+
+function startPendingPluginUpdateWatcher() {
+  if (PENDING_PLUGIN_DISABLED) return null;
+  let closedStreak = 0;
+  const tick = async () => {
+    try {
+      if (!fs.existsSync(PENDING_PLUGIN_MARKER)) { closedStreak = 0; return; }
+      const running = await probeUpstreamListening({ port: upstreamPortOf(UPSTREAM) });
+      if (running) { closedStreak = 0; return; }
+      closedStreak += 1;
+      if (closedStreak < 2) return; // 连续两次（≈30s）判定不在运行才动手，避开退出/重启瞬间
+      await applyPendingPluginUpdate({});
+      closedStreak = 0;
+    } catch { /* 绝不影响隧道业务 */ }
+  };
+  const t = setInterval(tick, 15_000);
+  t.unref?.();
+  void tick();
+  return t;
 }
 
 // test hooks：镜像页加载看门狗的内部状态（给用例断言"后续请求会撤掉它"，见 test/bridge-html-inject.test.mjs）
