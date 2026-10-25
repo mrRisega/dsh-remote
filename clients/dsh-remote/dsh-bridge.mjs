@@ -558,6 +558,19 @@ let upstreamRefreshInflight = null;
  * 重新解析上游地址(带身份校验;显式 DSH_BRIDGE_UPSTREAM 时是恒等操作)。
  * 上游端口变了(Desktop 换端口 / dsh web 重启到别的端口)时,靠它自愈而不必重启 bridge。
  */
+/** 轻量探测上游是否活着（refreshUpstream 用；4xx/5xx 也算活着）。 */
+async function upstreamReachableForRefresh(url, timeoutMs = 800) {
+  try {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    await fetch(String(url).replace(/\/+$/, "") + "/", { signal: ac.signal });
+    clearTimeout(timer);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function refreshUpstream(reason = "") {
   if (upstreamRefreshInflight) return upstreamRefreshInflight;
   const now = Date.now();
@@ -565,7 +578,22 @@ async function refreshUpstream(reason = "") {
   upstreamRefreshedAt = now;
   upstreamRefreshInflight = (async () => {
     try {
-      const found = await discoverUpstream({ relayDir: RELAY_DIR });
+      let found = null;
+      // 🔴 2026-10-25（设备掉线实测）：升级前装的 launchd plist 可能带着安装时的旧端口，
+      // 旧版 discoverUpstream 对「显式 env」**不探测直接采信** → 桥永久连旧端口、每次请求
+      // upstream_unreachable。这里先验证 env：死了就临时忽略它，按插件写的 .dsh-upstream/探测
+      // 重新发现；发现成功后清掉失效 env，后续都不再被它挡。
+      const envUrl = String(process.env.DSH_BRIDGE_UPSTREAM || "").trim().replace(/\/+$/, "");
+      if (envUrl && !(await upstreamReachableForRefresh(envUrl))) {
+        const env2 = { ...process.env };
+        delete env2.DSH_BRIDGE_UPSTREAM;
+        found = await discoverUpstream({ relayDir: RELAY_DIR, env: env2 });
+        if (found && found.url && found.source !== "fallback") {
+          delete process.env.DSH_BRIDGE_UPSTREAM;
+          console.log(`[bridge] 旧上游 ${envUrl} 已不可达 → 改用 ${found.url}（来源 ${found.source}）`);
+        }
+      }
+      if (!found) found = await discoverUpstream({ relayDir: RELAY_DIR });
       if (found.url && found.url !== UPSTREAM) {
         console.log(`[bridge] 上游地址切换: ${UPSTREAM} → ${found.url}（来源 ${found.source}${reason ? `,${reason}` : ""}）`);
         UPSTREAM = found.url;

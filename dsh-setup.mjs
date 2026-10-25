@@ -1127,7 +1127,15 @@ const UPSTREAM_FILE = ".dsh-upstream";
  * 本次安装要**钉住**的上游（null = 不钉，运行时按 env → .dsh-upstream → 探测 取值）。
  * 见 desktopAppPort() 的注释：插件装进多个 profile 后，各宿主会互相覆盖 `.dsh-upstream`。
  */
-let PINNED_UPSTREAM = String(process.env.DSH_BRIDGE_UPSTREAM || "").trim().replace(/\/+$/, "") || null;
+// 🔴 2026-10-25 事故：以前把安装进程里的 DSH_BRIDGE_UPSTREAM（一个**当时的动态端口**）写进
+// launchd plist，之后 dsh 每次重启换端口，plist 里的旧端口就成了永久生效的"显式指定"，
+// 守护/桥永远连不上 → 设备掉线。现在默认**不钉**（运行时按 插件写的 .dsh-upstream → 探测 取值）；
+// 仅当部署方显式要求（DSH_BRIDGE_PIN_UPSTREAM=1）时才沿用旧行为。
+let PINNED_UPSTREAM = (() => {
+  const pinFlag = String(process.env.DSH_BRIDGE_PIN_UPSTREAM || "").trim().toLowerCase();
+  if (pinFlag !== "1" && pinFlag !== "true" && pinFlag !== "on") return null;
+  return String(process.env.DSH_BRIDGE_UPSTREAM || "").trim().replace(/\/+$/, "") || null;
+})();
 
 /**
  * 探测桌面端（Electron 应用）当前监听的**回环端口**。
@@ -1672,6 +1680,19 @@ function releaseSpawnLock() {
 
 // ---------- run：前台跑 bridge（带配置 + 自启动 watcher） ----------
 async function runBridge() {
+  // 🔴 2026-10-25：升级自旧版的机器，launchd plist 里可能还带着**安装时的旧端口**
+  // （DSH_BRIDGE_UPSTREAM）。dsh 换端口后它会让守护/桥永远连旧端口 → 设备掉线。
+  // 插件每次装载都会把当前端口写进 .dsh-upstream，这里以文件为准校正进程环境（仅当文件合法且不同）。
+  try {
+    const fileUp = String(fs.readFileSync(path.join(CONFIG_DIR, UPSTREAM_FILE), "utf8")).trim().replace(/\/+$/, "");
+    const envUp = String(process.env.DSH_BRIDGE_UPSTREAM || "").trim().replace(/\/+$/, "");
+    // 只在「继承到了旧的显式 env」时校正；env 为空时保持原有发现逻辑（文件可能过期，须走探测）。
+    if (envUp && /^https?:\/\/[^\s]+$/i.test(fileUp) && fileUp !== envUp) {
+      console.log(`[dsh-remote] 忽略旧的上游地址 ${envUp || "(空)"} → 使用插件写入的最新地址 ${fileUp}（防端口漂移掉线）`);
+      process.env.DSH_BRIDGE_UPSTREAM = fileUp;
+      discoveredUpstream = fileUp;
+    }
+  } catch { /* 没有端口文件：保持原行为 */ }
   // 去重（所有平台）：自启动服务、登录任务、插件半的脱离进程兜底都可能拉起 watcher，
   // 两个 bridge 会抢同一个设备登记 → 以 pid 文件为准。
   //

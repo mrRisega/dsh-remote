@@ -897,7 +897,10 @@ window.__ModuleLoader__.load({
         for (var i = 0; i < els.length; i++) {
           var el = els[i];
           if (!el || el.id === NAV_ENTRY_ID) continue; // 排除注入按钮自身(防递归)
-          if (!navCellLike(el)) continue;
+          // 2026-10-25：新宿主把设置面板左栏的 navCell class 换掉了 → 只认 navCellLike 会漏掉
+          // 「远程访问」栏目，导致入口点击静默失败（用户实测：只能从更多→设置里手动点）。
+          // 在**设置弹层内**时放宽为「可见、文案精确匹配」，不再依赖 class 名。
+          if (!navCellLike(el) && !(insideDialog === true && navInDialog(el))) continue;
           if (NAV_BAD_RE.test(String(el.className || ""))) continue;
           var inDlg = navInDialog(el);
           if (insideDialog === true && !inDlg) continue;
@@ -928,6 +931,9 @@ window.__ModuleLoader__.load({
           if (!el.getBoundingClientRect || el.getBoundingClientRect().width === 0) continue;
           var t = String(el.textContent || "");
           if (t.indexOf("通用设置") !== -1 || t.indexOf("General") !== -1) return true;
+          // 2026-10-25：新版桌面端设置面板里是「远程访问 / 通用设置…」；若宿主把「通用设置」
+          // 改成了别的文案，只看它就会误判「设置没打开」→ 入口点击后一路走兜底/超时。
+          if (t.indexOf("远程访问") !== -1) return true;
         }
       } catch (e) { /* 忽略 */ }
       return false;
@@ -957,6 +963,15 @@ window.__ModuleLoader__.load({
           if (!el || el.id === NAV_ENTRY_ID) continue;
           var aria = String((el.getAttribute && el.getAttribute("aria-label")) || "");
           if (/账号菜单|Account menu/i.test(aria)) return el;
+          // 2026-10-25（用户反馈「只能从更多→设置里打开」）：新宿主把设置收在**更多**菜单里，
+          // 这里补充「更多」形态的候选（aria-label / title / 文本 / ⋯ 字形）。
+          var title = String((el.getAttribute && (el.getAttribute("title") || "")) || "");
+          var txt = String((el.textContent || "")).replace(/\s+/g, "");
+          if (/更多|More|菜单|Menu/i.test(aria + " " + title)) {
+            var rMore = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+            if (!rMore || (rMore.width > 0 && rMore.height > 0)) return el;
+          }
+          if (/^(更多|More|⋯|\.\.\.)$/i.test(txt) && el.getAttribute && el.getAttribute("aria-haspopup")) return el;
           var r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
           if (!best && r && r.width > 0 && r.left < 360 && r.top > 300
               && String((el.getAttribute && el.getAttribute("aria-haspopup")) || "") === "menu") best = el;
