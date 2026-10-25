@@ -631,7 +631,10 @@ export function dcSend(dc, obj) {
  *   · 每轮发送前先排空控制车道，并检查 `ws.bufferedAmount`：超过高水位就停手等它排空。
  *     于是控制帧前面最多只有「高水位 + 一片」的待发字节 —— 默认 64KB + 64KB，手机 1Mbps
  *     下 ≈1s，8Mbps 下 ≈0.13s，远小于 router 的 20s，也满足「大响应传输中 1s 内应答」目标。
- *   · 小帧（交互消息 / SSE 块）单独一条车道，优先于大帧的下一片（交互不被整帧传输拖住）。
+ *   · **数据帧严格 FIFO**（2026-10-24 修）：早期实现让小帧（交互/SSE 块）插到大帧下一片之前，
+ *     这在同一 WS 流里是**乱序** —— 生产表现为手机远程页「历史加载失败：session event stream
+ *     emitted an entry before its opening cursor」。现在只有一个数据队列，大帧按片就地推进，
+ *     绝不因大小/类型被后来的帧超越；只有控制帧（不承载有序数据）保留插队权。
  *   · 阈值 / 分片大小可用环境变量调（见 tunnelBulkOptionsFromEnv），弱网部署可再调低。
  */
 export const TUNNEL_BULK_HWM_DEFAULT = 64 * 1024;    // 发送缓冲高水位（字节）
@@ -680,13 +683,19 @@ export function makePrioritySender({
   let pumping = false;
   let scheduled = false;
   let timerPending = false;
-  const smallQ = []; // 小帧（可整帧直发）：交互消息 / SSE 块 —— 优先于大帧的下一片
-  const bigQ = [];   // 大帧：{ frames: string[], i }
-  const stats = { controlSent: 0, smallSent: 0, bigFrames: 0, bigChunks: 0, waits: 0, dropped: 0 };
+  // 🔴 2026-10-24 事故修复：数据帧**必须严格 FIFO**。
+  //   旧实现分「小帧车道 / 大帧车道」，小帧会插到大帧下一片之前 —— 这违反了同一 WS 流里
+  //   消息的顺序语义，生产表现为手机远程页「历史加载失败：session event stream emitted an
+  //   entry before its opening cursor（gateway/internal）」：事件流请求/响应被乱序送达，
+  //   客户端的游标推进到了前面，重连时服务端按该游标回放就触发 cursor 错乱。
+  //   现在：控制帧仍可插队（它们是协议控制帧，不承载有序数据）；**数据帧只有一个队列**，
+  //   大帧按片就地推进，绝不因大小/类型被后来的帧超越。
+  const dataQ = []; // { frames: string[], i: number }；frames.length===1 = 未分片小帧
+  const stats = { controlSent: 0, dataSent: 0, bigFrames: 0, bigChunks: 0, waits: 0, dropped: 0 };
 
-  function enqueueBulk(text) {
+  function enqueueData(text) {
     if (text.length <= chunkSize) {
-      smallQ.push(text);
+      dataQ.push({ frames: [text], i: 0 });
       return;
     }
     const cid = `c${++chunkSeq}`;
@@ -696,7 +705,7 @@ export function makePrioritySender({
       frames[i] = JSON.stringify({ __chunk: { id: cid, n, i, data: text.slice(i * chunkSize, (i + 1) * chunkSize) } });
     }
     stats.bigFrames += 1;
-    bigQ.push({ frames, i: 0 });
+    dataQ.push({ frames, i: 0 });
   }
 
   function scheduleNext(waitMs) {
@@ -716,7 +725,7 @@ export function makePrioritySender({
     if (pumping || closed) return;
     pumping = true;
     let yieldMode = ""; // ""=没有剩余，"schedule"=让出事件循环，"poll"=等缓冲排空
-    let budget = 32;    // 一轮最多发多少条小帧
+    let budget = 64;    // 一轮最多发多少条未分片小帧（大帧每轮只发一片）
     try {
       for (;;) {
         // ① 控制车道永远先走：哪怕大帧正传着 16MB，控制帧也在**下一轮**第一时间出去。
@@ -725,31 +734,31 @@ export function makePrioritySender({
           try { rawSend(frame); stats.controlSent += 1; } catch { closed = true; }
         }
         if (closed) { yieldMode = ""; break; }
-        // ② 小帧优先于大帧的下一片：大包传输期间，交互消息 / SSE 块不该排在它后面。
-        if (smallQ.length > 0 && budget > 0) {
-          try { rawSend(smallQ.shift()); stats.smallSent += 1; } catch { closed = true; break; }
+        if (dataQ.length === 0) { yieldMode = ""; break; }
+        if (budget <= 0) { yieldMode = "schedule"; break; }
+        const head = dataQ[0];
+        if (head.frames.length === 1) {
+          // 未分片小帧：可连着多发几条，但绝不越过队头（保证 FIFO）
+          try { rawSend(head.frames[0]); stats.dataSent += 1; } catch { closed = true; break; }
+          dataQ.shift();
           budget -= 1;
           continue; // 回环顶先查控制车道
         }
-        if (smallQ.length > 0) { yieldMode = "schedule"; break; } // 一轮预算用完
-        if (bigQ.length === 0) { yieldMode = ""; break; }
-        // ③ 背压：已入队字节超过高水位 → 停手等排空，别把控制帧埋进几十秒的队列里。
+        // 队头是大帧：每轮只推一片，片间让出事件循环（控制帧/入站帧不被饿死），顺序不变
         let pending = 0;
         try { pending = Number(bufferedAmount()) || 0; } catch { pending = 0; }
         if (pending > bulkHighWater) { stats.waits += 1; yieldMode = "poll"; break; }
-        const item = bigQ[0];
-        try { rawSend(item.frames[item.i]); stats.bigChunks += 1; } catch { closed = true; break; }
-        item.i += 1;
-        if (item.i >= item.frames.length) bigQ.shift();
-        yieldMode = "schedule"; // 大帧：一片一让，给入站帧 / 控制帧 / 小帧机会
+        try { rawSend(head.frames[head.i]); stats.dataSent += 1; stats.bigChunks += 1; } catch { closed = true; break; }
+        head.i += 1;
+        if (head.i >= head.frames.length) dataQ.shift();
+        yieldMode = "schedule";
         break;
       }
     } finally {
       pumping = false;
       if (closed) {
         controlQ.length = 0;
-        smallQ.length = 0;
-        bigQ.length = 0;
+        dataQ.length = 0;
       } else if (yieldMode) {
         scheduleNext(yieldMode === "poll" ? pollMs : 0);
       }
@@ -761,7 +770,7 @@ export function makePrioritySender({
     try { text = JSON.stringify(obj); } catch { return false; }
     if (closed) { stats.dropped += 1; return false; }
     if (isControlFrame(obj)) controlQ.push(text);
-    else enqueueBulk(text);
+    else enqueueData(text);
     pump();
     return true;
   }
@@ -770,8 +779,7 @@ export function makePrioritySender({
   function close() {
     closed = true;
     controlQ.length = 0;
-    smallQ.length = 0;
-    bigQ.length = 0;
+    dataQ.length = 0;
   }
 
   return {
@@ -779,11 +787,11 @@ export function makePrioritySender({
     close,
     stats: () => ({
       ...stats,
-      queued: smallQ.length + bigQ.length,
+      queued: dataQ.length,
       controlQueued: controlQ.length,
       closed
     }),
-    hasBacklog: () => smallQ.length > 0 || bigQ.length > 0 || controlQ.length > 0
+    hasBacklog: () => dataQ.length > 0 || controlQ.length > 0
   };
 }
 

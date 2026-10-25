@@ -151,7 +151,7 @@ test("契约②：发送缓冲高水位以上时停手（控制帧不会被埋�
   assert.equal(pos, beforeControl, "排空后第一时间发控制帧（之前的背压不能把它排到分块后面）");
 });
 
-test("契约③：大帧传输中小帧优先（交互不被整帧传输拖住）；close() 丢弃未发内容", () => {
+test("契约③：数据帧严格 FIFO（大小不得插队，2026-10-24 历史游标错乱事故回归）；close() 丢弃未发内容", () => {
   const sock = fakeSocket();
   const sched = makeScheduler();
   const sender = makePrioritySender({
@@ -162,15 +162,23 @@ test("契约③：大帧传输中小帧优先（交互不被整帧传输拖住�
   });
   // 大帧刚发出第一片（之后每轮只发一片）
   sender.send({ id: "big3", type: "http", body: "C".repeat(512 * 1024) });
-  // 传输中插入两条小帧（交互消息 / SSE 块）：必须插在大帧的下一片之前，而不是排在整帧之后
+  // 传输中插入两条小帧（交互消息 / SSE 块）：**不得插队**，必须排在大帧之后（FIFO）
   sender.send({ id: "i1", type: "ws-msg", data: "hello" });
   sender.send({ id: "i2", type: "http-chunk", body: "chunk" });
   const ids = sock.frames.map((s) => {
     const o = JSON.parse(s);
     return o.__chunk ? "__chunk" : o.id;
   });
-  assert.deepEqual(ids.slice(0, 3), ["__chunk", "i1", "i2"], "小帧必须插在大帧的下一片之前");
-  assert.equal(sender.stats().bigChunks, 1, "此时大帧只发了 1 片");
+  assert.equal(ids[0], "__chunk", "大帧第一片先发");
+  assert.ok(!ids.slice(0, 3).includes("i1"), "后入队的小帧绝不能插队到大帧分片之前（顺序语义）");
+  for (let i = 0; i < 5000 && sched.pending() > 0; i += 1) { sock.drain(10 * 1024 * 1024); sched.tick(); }
+  const orderedIds = sock.frames.map((s) => {
+    const o = JSON.parse(s);
+    return o.__chunk ? "__chunk" : o.id;
+  });
+  const firstNonChunk = orderedIds.findIndex((id) => id !== "__chunk");
+  assert.ok(firstNonChunk >= 8, `大帧的分片必须全部先发完（首个非分片位置 ${firstNonChunk}）`);
+  assert.deepEqual(orderedIds.slice(firstNonChunk), ["i1", "i2"], "小帧必须在大帧之后、且保持入队顺序");
 
   // close 后：未发内容丢弃，后续 send 返回 false（重连后不能把旧分片发到新连接上）
   const sock2 = fakeSocket();
