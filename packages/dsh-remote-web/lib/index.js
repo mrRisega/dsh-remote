@@ -6676,17 +6676,20 @@ function installSourceOf(relayDir) {
   return "plugin_market";
 }
 /**
- * 渠道归因码：安装器 `--ref <code>` 写进 .dsh-config.json 的 `ref_code`（3~6 位数字）。
+ * 渠道归因码：安装器 `--ref <code>` 写进 .dsh-config.json 的 `ref_code`（3~12 位字母或数字）。
  * 规则与 clients/dsh-remote/src/channel-ref.mjs 同一份；插件包**不包含** clients/（files 只有 lib+runtime），
  * 所以这里保留这几行等价实现 —— 改契约时两边一起改。
+ * 归一化 = NFKC（全角→半角）+ trim + 小写，与后端 channel.js normalizeCode 一致。
  * 缺失/非法 → 空串，调用方据此**整个省略**字段（绝不上报空串/脏值）。
  */
 function refCodeOf(cfg) {
   const raw = cfg && cfg.ref_code;
-  if (typeof raw === "number") return Number.isInteger(raw) && /^\d{3,6}$/.test(String(raw)) ? String(raw) : "";
-  if (typeof raw !== "string") return "";
-  const v = raw.trim();
-  return /^\d{3,6}$/.test(v) ? v : "";
+  let v = "";
+  if (typeof raw === "number") v = Number.isInteger(raw) && raw >= 0 ? String(raw) : "";
+  else if (typeof raw === "string") v = raw;
+  else return "";
+  const normalized = v.normalize("NFKC").trim().toLowerCase();
+  return /^[a-z0-9]{3,12}$/.test(normalized) ? normalized : "";
 }
 async function reportInstallOnce(relayDir, cfgOverride, opts = {}) {
   const cfg = cfgOverride || loadConfig(relayDir);

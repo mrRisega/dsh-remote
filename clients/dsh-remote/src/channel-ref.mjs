@@ -2,7 +2,7 @@
  * 渠道归因码（ref）的**唯一**解析规则。
  *
  * 契约见 dsh-relay-enterprise/docs/channel-referral-contract.md §1/§5：
- *   安装器 `npx @mrrisega/dsh-remote --ref 368`
+ *   安装器 `npx @mrrisega/dsh-remote --ref bili`
  *     → 写 ~/.dsh-remote/.dsh-config.json 的 `ref_code`（字符串）
  *     → bridge `POST /api/devices`、插件 `POST /api/install-report` 都带 `ref_code`
  *     → 面板注册 `POST /api/register` 带 `channel_code`。
@@ -13,21 +13,31 @@
  *    主链路（装得上、连得上）永远优先。
  */
 
-/** 合法形态：3~6 位纯数字（与 channel_codes.code 契约一致）。 */
-export const REF_CODE_RE = /^\d{3,6}$/;
+/**
+ * 合法形态：3~12 位字母或数字（归一化后小写），与 channel_codes.code 契约一致。
+ *
+ * 业主 2026-10 口径：纯数字「368」太像渠道码，改用小写短词（bili/dsh/xhs8）更隐蔽。
+ * 老数字码仍是合法子集；`BILI` / `ＢＩＬＩ` / ` Bili ` 统一归一化为 `bili`（与后端同口径）。
+ */
+export const REF_CODE_RE = /^[a-z0-9]{3,12}$/;
 
 /**
  * 归一化 ref 码：合法返回字符串（保留前导零），否则返回 ""（调用方据此省略字段）。
  * 兼容配置文件里被手改成数字的情况（`"ref_code": 368`）。
  */
 export function normalizeRefCode(raw) {
+  let v = "";
   if (typeof raw === "number") {
     if (!Number.isInteger(raw) || raw < 0) return "";
-    return REF_CODE_RE.test(String(raw)) ? String(raw) : "";
+    v = String(raw);
+  } else if (typeof raw === "string") {
+    v = raw;
+  } else {
+    return "";
   }
-  if (typeof raw !== "string") return "";
-  const v = raw.trim();
-  return REF_CODE_RE.test(v) ? v : "";
+  // NFKC：全角字母/数字 → 半角；再 trim + 小写（与后端 channel.js normalizeCode 一致）
+  const normalized = v.normalize("NFKC").trim().toLowerCase();
+  return REF_CODE_RE.test(normalized) ? normalized : "";
 }
 
 /**

@@ -31,18 +31,22 @@ const SETUP = path.join(HERE, "..", "..", "..", "dsh-setup.mjs");
 
 // ───────────────────────── A. 纯函数（安装器/桥共用同一份规则） ─────────────────────────
 
-test("ref 解析：3~6 位数字才合法，其余一律空串（绝不抛错）", () => {
+test("ref 解析：3~12 位字母或数字才合法，其余一律空串（绝不抛错）", () => {
   const valid = [
     ["368", "368"],
     [" 368 ", "368"],        // 前后空白容忍（argv 里偶尔带）
     ["0368", "0368"],        // 保留前导零：码是字符串不是数字
-    ["123456", "123456"],    // 6 位上限
+    ["123456789012", "123456789012"], // 12 位上限
+    ["bili", "bili"],        // ★字母短词（更隐蔽，业主 2026-10 口径）
+    ["BILI", "bili"],        // 大小写不敏感 → 归一化小写
+    [" Bili ", "bili"],
+    ["xhs8", "xhs8"],
     [368, "368"],            // 配置被手改成数字也能救回来
   ];
   for (const [input, want] of valid) {
     assert.equal(normalizeRefCode(input), want, `合法值 ${JSON.stringify(input)} 应归一化为 ${want}`);
   }
-  const invalid = ["12", "1234567", "abc", "36a", "-368", "3.68", "", "   ", null, undefined, {}, [], 12, 3.68, -368];
+  const invalid = ["12", "a", "ab", "1234567890123", "36 8", "36-8", "-368", "3.68", "", "   ", null, undefined, {}, [], 12, 3.68, -368];
   for (const input of invalid) {
     assert.equal(normalizeRefCode(input), "", `非法值 ${JSON.stringify(input)} 必须是空串（调用方据此省略字段）`);
   }
@@ -52,8 +56,8 @@ test("ref 解析优先级：命令行 --ref 优先；非法/缺值的命令行�
   assert.equal(resolveRefCode(["--ref", "368"]), "368");
   assert.equal(resolveRefCode(["--ref", "368"], { DSH_REF: "999" }), "368", "命令行优先于 DSH_REF");
   assert.equal(resolveRefCode([], { DSH_REF: "456" }), "456", "命令行没给时用 DSH_REF");
-  assert.equal(resolveRefCode([], { DSH_REF: "nope" }), "", "环境变量非法 → 忽略");
-  assert.equal(resolveRefCode(["--ref", "abc"], { DSH_REF: "456" }), "", "命令行给了非法值 → 忽略，不回落到环境变量（避免来路不明的归因）");
+  assert.equal(resolveRefCode([], { DSH_REF: "x" }), "", "环境变量非法 → 忽略");
+  assert.equal(resolveRefCode(["--ref", "x"], { DSH_REF: "456" }), "", "命令行给了非法值 → 忽略，不回落到环境变量（避免来路不明的归因）");
   assert.equal(resolveRefCode(["--ref"], { DSH_REF: "456" }), "", "--ref 后面没值 → 忽略");
   assert.equal(resolveRefCode([], {}), "");
   assert.equal(resolveRefCode(undefined, undefined), "", "参数异常也不得抛错");
@@ -66,7 +70,7 @@ test("配置合并：本次没带/非法 ref 时保留旧值（升级清空 = �
     "111",
     "★升级（不带 --ref）必须保留配置里已有的 ref_code"
   );
-  assert.equal(applyRefCodeToConfig(old, ["--ref", "bad"]).ref_code, "111", "非法值不得覆盖旧值");
+  assert.equal(applyRefCodeToConfig(old, ["--ref", "x"]).ref_code, "111", "非法值不得覆盖旧值");
   assert.equal(applyRefCodeToConfig(old, ["--ref", "368"]).ref_code, "368", "带合法 --ref → 覆盖");
   assert.equal(applyRefCodeToConfig({}, ["--ref", "368"]).ref_code, "368", "首次安装 → 写入");
   assert.ok(!("ref_code" in applyRefCodeToConfig({}, [])), "没有就没有：绝不写空串占位");
@@ -218,7 +222,7 @@ test("安装器：--ref 写入 ref_code；升级不带 --ref 必须保留；非�
     const home2 = path.join(root, "home2");
     await mkdir(home2, { recursive: true });
     const relayDir2 = path.join(root, ".dsh-remote-2");
-    const third = await runSetup({ relayDir: relayDir2, home: home2, api: mock.base, args: ["--ref", "abc"] });
+    const third = await runSetup({ relayDir: relayDir2, home: home2, api: mock.base, args: ["--ref", "x"] });
     assert.equal(third.code, 0, `非法 --ref 绝不能导致安装失败：${third.stderr}`);
     assert.match(third.stdout + third.stderr, /安装完成/, "安装器应走完正常流程并打印「安装完成」");
     const cfg3 = await readSetupConfig(relayDir2);
