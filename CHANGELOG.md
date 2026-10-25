@@ -6,6 +6,16 @@ All notable changes to dsh-remote are documented here. This project follows
 > 写法约定：每条只写**用户能看到的变化**（1~8 行），分点陈述；
 > 不列 commit、不写排查过程、内部路径/标识/事件编号，也不写"我们怎么发现的"。
 
+## [0.7.6-beta.5] - 2026-10-25
+
+**修复「重启 DeepSeek Harness 后电脑端设备掉线」。**
+
+- 原因：DeepSeek Harness 每次启动的本地端口可能变化，而后台守护进程把上次的端口记在进程内缓存里；
+  重启后守护仍盯着旧端口 → 判定「dsh web 离线」→ 停掉桥 → 设备离线，直到手动重启守护。
+- 修复：探测/启动桥之前都会重新读取并验证插件写入的最新端口；dsh web 离线时清掉旧缓存，
+  重启后自动用新端口把桥拉起来并重新登记设备（无需手动操作）。
+- 顺带：连续重启/守护重入时不会再用旧端口空转。
+
 ## [0.7.6-beta.4] - 2026-10-24
 
 **修复远程访问「历史加载失败：session event stream emitted an entry before its opening cursor」。**

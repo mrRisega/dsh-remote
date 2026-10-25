@@ -1223,6 +1223,18 @@ async function upstreamReachable(url = upstreamUrl(), timeoutMs = 1200) {
  */
 async function isDshWebUp(timeoutMs = 1200) {
   if (await upstreamReachable(upstreamUrl(), timeoutMs)) return true;
+  // 🔴 2026-10-25（设备掉线实测）：Electron 每次启动可能换端口。端口文件由 dsh web 内的插件
+  //   在每次启动时重写，比进程内的 discoveredUpstream 缓存新 —— 先直接试文件，别被旧缓存挡住。
+  try {
+    const fromFile = String(fs.readFileSync(path.join(CONFIG_DIR, UPSTREAM_FILE), "utf8")).trim();
+    if (/^https?:\/\/[^\s]+$/i.test(fromFile)) {
+      const normalized = fromFile.replace(/\/+$/, "");
+      if (normalized !== upstreamUrl() && (await upstreamReachable(normalized, timeoutMs))) {
+        discoveredUpstream = normalized;
+        return true;
+      }
+    }
+  } catch { /* 没有端口文件：继续走动态发现 */ }
   const before = upstreamUrl();
   const after = await refreshUpstreamDiscovery(true);
   if (after === before) return false;
@@ -1859,6 +1871,9 @@ async function runBridge() {
     const alive = await checkUpstream();
     if (alive && childStopped(bridgeProc)) {
       starting = true;
+      // dsh 重启可能换端口（Electron 每次启动端口可能变）：拉起前**强制重新发现**，
+      // 否则 discoveredUpstream 缓存旧端口 → bridge 连不上上游 → 设备掉线（2026-10-25 实测）。
+      await refreshUpstreamDiscovery(true);
       console.log("[dsh-remote] dsh web 在线，启动 bridge...");
       // 清除代理环境变量（bridge 需直连 relay，不受本机代理影响）
       const childEnv = {
@@ -1913,6 +1928,8 @@ async function runBridge() {
       setTimeout(() => { starting = false; }, 5000);
     } else if (!alive && bridgeProc && bridgeProc.exitCode === null) {
       console.log("[dsh-remote] dsh web 离线，停止 bridge...");
+      // dsh 重启后端口可能变化：清掉进程内缓存，下一轮优先用插件新写的端口文件探测
+      discoveredUpstream = "";
       await stopChildGracefully(bridgeProc); // 同上：Windows 上 kill() 跑不到退出钩子
     }
   };
