@@ -1915,6 +1915,17 @@ async function runBridge() {
         // 另一个 bridge 把本连接顶掉）后会以"重复实例"退出码优雅退出（见 dsh-bridge.mjs）。
         // 这种退出**绝不能**照常 10s 重拉：本机已经有另一个实例在跑，重拉只会继续乒乓互踢。
         if (code === DUPLICATE_INSTANCE_EXIT_CODE) {
+          // 🔴 2026-10-25：升级/重启后常见「上一代 bridge 变成孤儿继续占着单实例锁」，
+          //   新 bridge 因此退出 code=4。旧逻辑一律暂停 5 分钟 → 设备在线要等 5 分钟（用户实测掉线）。
+          //   现在先**清扫同运行时的孤儿 bridge**；扫到了说明冲突已解除，3 秒后立即重试；
+          //   扫不到（多半真有另一个 watcher 的活实例）才按 5 分钟退避，避免乒乓互踢。
+          let swept = [];
+          try { swept = sweepStrayBridges(); } catch { /* 清扫失败不致命 */ }
+          if (swept.length > 0) {
+            duplicateBridgeBackoffUntil = Date.now() + 3000;
+            console.log(`[dsh-remote] bridge 因同实例冲突退出（code=${code}），已清扫 ${swept.length} 个孤儿 bridge（pid ${swept.join(", ")}）→ 3 秒后重试。`);
+            return;
+          }
           duplicateBridgeBackoffUntil = Date.now() + DUPLICATE_BRIDGE_BACKOFF_MS;
           console.log(`[dsh-remote] bridge 检测到同 deviceId 的另一个实例并退出（code=${code}）——本守护暂停 ${Math.round(DUPLICATE_BRIDGE_BACKOFF_MS / 60000)} 分钟后再试，避免两个实例反复互踢。`);
           return;
