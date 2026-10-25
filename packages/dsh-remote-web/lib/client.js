@@ -1636,6 +1636,33 @@ window.__ModuleLoader__.load({
       try { clearTimeout(t); } catch (e) { /* 忽略 */ }
     }
 
+    // ── 设备超额锁定（契约 docs/device-overquota-lock-contract.md §8）─────────────
+    /**
+     * 「设备被超额锁定」的统一文案（远程访问红条 / 后台服务卡共用，避免两处各写一套漂移）。
+     * 契约 §8.1 要求同时讲清三件事：① 当前套餐可同时用 N 台；② 两条出路（升级 Pro Max / 解绑）；
+     * ③ 解绑或升级后**本机会自动解锁**（不是"点重试直到成功"，也不能暗示无限重试）。
+     * @param {number|null} limit 服务端给的可用额度；null/未知时用 N 占位
+     */
+    function lockedPanelDetail(limit) {
+      var n = (limit === 0 || limit) ? String(limit) : "N";
+      return "本机已被锁定（当前套餐可同时使用 " + n + " 台）。"
+        + "升级 Pro Max 可多台设备同时使用；或到手机端「管理电脑」解绑其他设备后本机会自动解锁。";
+    }
+    /**
+     * 从云端地址派生「升级 Pro Max」页 URL：`https://host/app/…` → `https://host/app/promo`。
+     * **不硬编码任何域名**（官方/自建/测试环境都走同一个派生规则）；拿不到地址返回 ""，
+     * 调用方回退到既有「带登录态升级」通道（openUpgradeAuth）。
+     */
+    function upgradePromoUrlOf(base) {
+      var s = String(base || "");
+      if (!s) return "";
+      try {
+        var origin = s.split("/app")[0];
+        if (origin && /^https?:\/\//i.test(origin)) return origin.replace(/\/+$/, "") + "/app/promo";
+      } catch (e) { /* 落到返回空 */ }
+      return "";
+    }
+
     // ── 剪贴板（0.6.9 邀请区「一键复制」）────────────────────────────────────
     /**
      * 复制文本到剪贴板，返回 Promise<boolean>。
@@ -4677,11 +4704,15 @@ window.__ModuleLoader__.load({
         // 状态行优先用连接阶段文案（node 半下发的 user-facing 文案）：
         // 「正在准备运行环境（首次约 1~2 分钟）… / 正在启动 Bridge… / 正在连接中继… / 已连接 ✅ …」；
         // 旧版 host 没有 connect 字段 → 完全回退到原来的 running 文案（既有行为不变）。
+        // 锁定态的状态行不能沿用 CONNECT_TEXT.error（"连接失败，请按下方提示处理"）：用户会以为是自己网络/软件坏了。
+        var connLocked = Boolean(connInfo && connInfo.locked);
         var statusTxt = st === null
           ? "查询中…"
           : !loggedInSaaS
             ? "请先登录（下方账号卡片）后启用远程访问"
-            : connInfo ? connText : serviceRunning ? "已连接（可远程访问）" : "等待设备连接";
+            : connInfo
+              ? (connLocked ? "本机已被锁定（当前套餐设备额度已满，升级 Pro Max 或解绑其他设备后自动恢复）" : connText)
+              : serviceRunning ? "已连接（可远程访问）" : "等待设备连接";
         var dotOn = loggedInSaaS ? (connInfo ? connOnline : serviceRunning) : false;
         var dotCls = "dru-dot " + (dotOn ? "dru-dot-on" : "dru-dot-off");
 
@@ -4764,6 +4795,22 @@ window.__ModuleLoader__.load({
           return h("div", null, rows);
         }
 
+        /**
+         * 锁定态的主行动：「🚀 升级 Pro Max」。
+         * 链接从云端账号信息派生（public-config 的 app_url / 面板已拿到的 remoteUrl → origin + /app/promo），
+         * **不硬编码域名**；派生不出地址（未登录/取配置失败）时退回既有「带登录态升级」通道。
+         */
+        function openLockedUpgrade() {
+          var promo = "";
+          try { promo = upgradePromoUrlOf((st && st.remoteUrl) || (pub && pub.app_url)); } catch (e) { promo = ""; }
+          if (promo) {
+            try { window.open(promo, "_blank", "noopener"); } catch (e2) { /* 弹窗被拦截：下面给提示 */ }
+            return;
+          }
+          try { openUpgradeAuth(); } catch (e3) {
+            try { setMessage({ kind: "err", text: "打开升级页失败，请在手机端「我的 → 升级 Pro Max」完成升级" }); } catch (e4) { /* 忽略 */ }
+          }
+        }
         function renderConnectBlock() {
           if (!loggedInSaaS || !connInfo) return null;
           var phase = connInfo.phase || "";
@@ -4773,18 +4820,29 @@ window.__ModuleLoader__.load({
                 ? "设备已登记到你的账号：手机端「设备列表」可以看到这台电脑。"
                 : "设备已注册到中继：手机端扫码或打开链接即可进入这台电脑。");
           }
+          // 锁定态（契约 §8.1）：设备被超额锁定 ≠ 普通故障 —— bridge 活着并在 30s 轮询等解锁，
+          // 所以文案给「升级 / 解绑」两条出路，主行动是升级按钮，且**不显示"自动重试 N 次"**（那会暗示死循环）。
+          var lockedInfo = connInfo.locked && typeof connInfo.locked === "object" ? connInfo.locked : null;
+          var isLocked = Boolean(lockedInfo) || Boolean(connError && connError.code === "device_locked");
           var rows = [];
           if (phase === "error") {
             rows.push(h("div", { className: "dru-msg dru-msg-err", style: { marginTop: 6 } },
-              "⚠️ " + ((connError && connError.message) || connText)));
+              (isLocked ? "🔒 " : "⚠️ ") + ((connError && connError.message) || connText)));
             if (connInfo.detail) rows.push(h("div", { className: "dru-hint", style: { marginTop: 4 } }, connInfo.detail));
-            if (connInfo.nextRetryInMs > 0) {
+            if (!isLocked && connInfo.nextRetryInMs > 0) {
               rows.push(h("div", { className: "dru-hint", style: { marginTop: 4 } },
                 "已自动重试 " + (connInfo.attempts || 0) + " 次，约 " + Math.ceil(connInfo.nextRetryInMs / 1000) + " 秒后自动再试（也可以点下面按钮立刻重试）"));
             }
-            rows.push(h("div", { className: "dru-actions", style: { marginTop: 8 } },
-              h("button", { type: "button", className: "dru-btn dru-btn-primary", disabled: busy !== "", onClick: retryConnect }, busy === "connect-retry" ? "重试中…" : "重试"),
-              h("button", { type: "button", className: "dru-btn dru-btn-ghost", onClick: copyDiagnostics }, copiedDiag ? "已复制" : "复制诊断信息")));
+            if (isLocked) {
+              // 主行动：升级 Pro Max（红色错误条里最该点的就是它）
+              rows.push(h("div", { className: "dru-actions", style: { marginTop: 8 } },
+                h("button", { type: "button", className: "dru-btn dru-btn-primary", onClick: openLockedUpgrade }, "🚀 升级 Pro Max"),
+                h("button", { type: "button", className: "dru-btn dru-btn-ghost", onClick: copyDiagnostics }, copiedDiag ? "已复制" : "复制诊断信息")));
+            } else {
+              rows.push(h("div", { className: "dru-actions", style: { marginTop: 8 } },
+                h("button", { type: "button", className: "dru-btn dru-btn-primary", disabled: busy !== "", onClick: retryConnect }, busy === "connect-retry" ? "重试中…" : "重试"),
+                h("button", { type: "button", className: "dru-btn dru-btn-ghost", onClick: copyDiagnostics }, copiedDiag ? "已复制" : "复制诊断信息")));
+            }
             rows.push(h("div", { className: "dru-hint", style: { marginTop: 6 } },
               "查看日志：后台服务 " + (connInfo.logPath || "") + " ，安装 " + (connInfo.installLogPath || "") + "（把「复制诊断信息」的内容发给客服可加速定位）"));
             var diagToolsErr = renderDiagTools();
@@ -5134,7 +5192,8 @@ window.__ModuleLoader__.load({
             // 自动连接进度（登录后由面板 2.5s 短轮询自动推进）：让用户在 bridge 卡也能一眼看到
             // 「到底走到哪一步了」——进程在跑≠能用，注册到中继才算。
             connInfo && connPhase && connPhase !== "no_account"
-              ? h("div", { className: "dru-hint", style: { marginTop: 6 } }, "自动连接进度：" + connText)
+              ? h("div", { className: "dru-hint", style: { marginTop: 6 } },
+                  "自动连接进度：" + (connInfo.locked ? "本机已被锁定（当前套餐额度已满，升级或解绑后自动恢复）" : connText))
               : null,
             h("div", { className: "dru-actions", style: { marginTop: 10 } },
               !serviceRunning
@@ -5158,13 +5217,22 @@ window.__ModuleLoader__.load({
                     "⚠️ 上一次启动失败（自启动入口失效），已自动清理失效自启动项并重新补装运行环境。稍候会自动恢复；仍失败请点「一键更新」。")
                 : null,
             st && st.service && st.service.bindError
-              ? h("div", { className: "dru-msg dru-msg-err", style: { marginTop: 8 } },
-                  "⚠️ 设备注册失败：" + (st.service.bindError.message || "未说明原因"),
-                  h("div", { className: "dru-hint", style: { marginTop: 4 } },
-                    st.service.bindError.code === "device_limit_exceeded"
-                      ? "已达本套餐设备数上限。若是同一台电脑重装，稍等片刻会自动顶替旧设备；仍未恢复请在手机端「设备管理」解绑旧设备（免费用户每月可解绑 3 次）后，回到这里点「启动后台服务」。"
-                      : "请确认网络与账号状态后重试；仍未解决可点下方「彻底卸载」后重新安装。")
-                )
+              ? (function (be) {
+                  var isLocked = be.code === "device_locked" || be.code === "device_limit_exceeded";
+                  var isBindCap = be.code === "device_bind_cap";
+                  var beLimit = (be.limit === 0 || be.limit) ? be.limit : null;
+                  return h("div", { className: "dru-msg dru-msg-err", style: { marginTop: 8 } },
+                    (isLocked ? "🔒 本机已被锁定：" : "⚠️ 设备注册失败：") + (be.message || "未说明原因"),
+                    h("div", { className: "dru-hint", style: { marginTop: 4 } },
+                      isLocked
+                        // 契约 §8.1 的新语义：不是"解绑旧设备才能登录"，而是"超额锁定 → 升级或解绑，本机自动解锁"
+                        ? lockedPanelDetail(beLimit)
+                        : isBindCap
+                          // device_bind_cap = 防滥用硬上限（bridge 退出码 5）：守护按指数退避重试，不是无限重试
+                          ? "已绑定设备数达到上限：请在手机端「管理电脑」解绑不再使用的设备；解绑后本机会自动恢复（后台守护会按指数退避重试，无需反复点按钮）。"
+                          : "请确认网络与账号状态后重试；仍未解决可点下方「彻底卸载」后重新安装。")
+                  );
+                })(st.service.bindError)
               : null
           ),
           // 版本与更新（自管理：检测新版 / 一键在线更新 / 彻底卸载）

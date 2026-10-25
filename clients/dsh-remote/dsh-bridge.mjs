@@ -1992,6 +1992,15 @@ let consecutive4000 = 0;
 export const DUPLICATE_CLOSE_CODE = 4000;
 /** bridge 判定"本机已有另一个同 deviceId 实例"后的退出码（必须与 dsh-setup.mjs 的常量一致）。 */
 export const DUPLICATE_INSTANCE_EXIT_CODE = 4;
+/**
+ * 设备登记遇到**防滥用硬上限**（`device_bind_cap`）后的专用退出码（必须与 dsh-setup.mjs 的常量一致）。
+ *
+ * 为什么要跟普通失败（exit 1）分开：普通失败是瞬时的（网络/服务端抖动），watcher 10s 重拉是对的；
+ * 而"已绑定条数 ≥ 硬上限"是**永久性**失败——用户不去手机端解绑就不会好。旧实现两者都走 exit(1)，
+ * watcher 于是每 10s 拉起一次、每 10s 撞一次 409，日志刷屏还把真正的第一现场淹没（契约 §6.4 P0）。
+ * 用专用退出码让 watcher 做指数退避（10s→1min→5min→15min，封顶 30min），用户解绑后自动恢复。
+ */
+export const DEVICE_BIND_CAP_EXIT_CODE = 5;
 export const DUPLICATE_RECONNECT_BASE_MS = 30_000;
 export const MAX_RECONNECT_DELAY_MS = 10_000;
 export const RECONNECT_JITTER_MS = 3_000;
@@ -2147,9 +2156,14 @@ function tunnelEndpoint(raw) {
   }
 }
 
-/** 账号设备表登记:手机端 /api/devices 才能看到本设备(带稳定 device_id)。自建模式无账号体系,跳过。 */
+/** 账号设备表登记:手机端 /api/devices 才能看到本设备(带稳定 device_id)。自建模式无账号体系,跳过。
+ *
+ * @returns {Promise<{status:"ok"|"locked", locked?:object}>}
+ *   `locked` = 服务端按套餐额度判定本机不可用（旧版 409 `device_limit_exceeded` 或新契约 `device_locked`）。
+ *   此时**不要**再去连隧道，由调用方进入解锁轮询（见 enterLockedWait）。
+ */
 async function registerDeviceInAccount(token) {
-  if (process.env.DSH_BRIDGE_LOCAL_KEY) return; // 自建模式:设备列表来自 router 实时 WS 注册表
+  if (process.env.DSH_BRIDGE_LOCAL_KEY) return { status: "ok", local: true }; // 自建模式:设备列表来自 router 实时 WS 注册表
   const pubKey = resolveDevicePubKey();
   // 渠道归因码（可选）：安装器 `--ref 368` 写进配置，这里随设备登记原样带给服务端。
   // 契约：字段可选、3~6 位数字；没有/非法 → **整个省略**，绝不发空串或猜的值。
@@ -2180,28 +2194,264 @@ async function registerDeviceInAccount(token) {
       clearBindError();
       persistBridgeState({ device_id: DEVICE_ID, account_bound_at: Date.now(), phase: "bound" });
       console.log(`[bridge] ✅ 设备已登记到账号: ${DEVICE_ID}`);
-      return;
+      // v18 契约 §4.2：201 响应带 locked —— 但**不据此跳过隧道连接**（旧中继不做准入检查，
+      // 直接跳过会让老中继下的用户被误锁）。锁定以 router 的 tunnel-register-err 为准。
+      if (d.locked === true) {
+        console.log("[bridge] 服务端标记本机已超额（等 router 准入结论）…");
+      }
+      return { status: "ok" };
     }
     if (r.status === 409) {
       const code = d.error?.code || "";
-      if (code === "device_limit_exceeded") {
-        const msg = d.error?.message || "当前套餐最多绑定 1 台设备";
-        persistBindError({ code, message: msg });
-        console.error(`[bridge] 设备数已达上限: ${msg}`);
-        console.error("   同机重装会自动顶替旧设备;仍失败请到手机端设备管理解绑旧设备后重启(免费每月可解绑 3 次)。");
-      } else {
-        persistBindError({ code, status: 409, message: d.error?.message || "绑定冲突" });
-        console.error(`[bridge] 设备 ${DEVICE_ID} 绑定失败(${code || 409}): ${d.error?.message || "未知错误"}`);
+      const message = d.error?.message || "绑定冲突";
+      const policy = d.policy && typeof d.policy === "object" ? d.policy : {};
+      // 详情一律带 device_id；plan/limit/upgrade_to 有才写（没有就不硬编造，面板按缺省文案兜底）
+      const details = {
+        device_id: DEVICE_ID,
+        ...(d.error?.plan || policy.plan ? { plan: d.error?.plan || policy.plan } : {}),
+        ...(Number.isFinite(Number(d.error?.limit ?? policy.limit)) ? { limit: Number(d.error?.limit ?? policy.limit) } : {}),
+        ...(d.error?.upgrade_to || policy.upgrade_to ? { upgrade_to: d.error?.upgrade_to || policy.upgrade_to } : {})
+      };
+      if (code === "device_bind_cap") {
+        // 防滥用硬上限：永久性失败 → 专用退出码，watcher 按指数退避重拉（契约 §6.3/§6.4）
+        persistBindError({ code, status: 409, message, ...details });
+        console.error(`[bridge] 设备绑定已达上限：${message}`);
+        console.error("[bridge] 这是按套餐设定的防滥用硬上限（不是网络问题），本机不会反复空撞接口。");
+        console.error("[bridge] 请在手机端「管理电脑」解绑不再使用的设备；守护会按指数退避自动重试，解绑后自动恢复。");
+        process.exit(DEVICE_BIND_CAP_EXIT_CODE);
       }
+      if (code === "device_limit_exceeded" || code === "device_locked") {
+        // 旧版服务端 409 device_limit_exceeded / 新契约 device_locked：**不再 exit(1) 空转**，
+        // 交给解锁轮询等待（向后兼容，契约 §6.2）。旧服务端不返回 limit，从文案里尽力解析。
+        const limitFromMsg = (() => {
+          const m = /(?:最多|上限|超过)[^\d]{0,6}(\d+)\s*台/.exec(String(message));
+          return m ? Number(m[1]) : null;
+        })();
+        const locked = normalizeLockedInfo({
+          message,
+          plan: d.error?.plan || policy.plan,
+          limit: d.error?.limit ?? policy.limit ?? limitFromMsg,
+          upgrade_to: d.error?.upgrade_to || policy.upgrade_to || "pro_max"
+        });
+        console.error(`[bridge] 本机设备额度已满（${code}）：${message}`);
+        return { status: "locked", locked };
+      }
+      persistBindError({ code: code || "device_conflict", status: 409, message, ...details });
+      console.error(`[bridge] 设备 ${DEVICE_ID} 绑定失败(${code || 409}): ${message}`);
       process.exit(1);
     }
-    persistBindError({ code: d.error?.code || `http_${r.status}`, status: r.status, message: d.error?.message || "设备登记失败" });
+    persistBindError({ code: d.error?.code || `http_${r.status}`, status: r.status, message: d.error?.message || "设备登记失败", device_id: DEVICE_ID });
     console.warn(`[bridge] 设备登记失败(${r.status}): ${d.error?.message || "未知错误"}(手机端设备列表可能看不到本设备)`);
   } catch (e) {
-    persistBindError({ code: "api_unreachable", message: `无法连接账号 API: ${e.message}` });
+    persistBindError({ code: "api_unreachable", message: `无法连接账号 API: ${e.message}`, device_id: DEVICE_ID });
     console.warn(`[bridge] 无法连接账号 API ${API_BASE}: ${e.message}(手机端设备列表可能看不到本设备)`);
   }
+  return { status: "failed" };
 }
+
+/* ══════════════════════════════════════════════════════════════════════════════
+ * 「设备被超额锁定」等待态（契约 docs/device-overquota-lock-contract.md §6）
+ *
+ * 触发：router 回 `tunnel-register-err code=device_locked`（服务端按套餐额度判定本机不可用），
+ *      或旧版服务端 409 `device_limit_exceeded`。
+ * 行为（**不退出进程**——旧实现 exit(1)，watcher 每 10s 重拉、每 10s 撞一次，用户侧表现为
+ *      "设备列表里能看到这台电脑但永远连不上"，日志还被刷屏）：
+ *   ① 关掉当前隧道，写状态 phase=locked + locked 详情（面板据此显示升级引导）；
+ *   ② 每 30s `GET /api/devices`（Bearer token）找本机 device_id：
+ *        · locked === false → 清 locked 状态、立即 connectTunnel 重连；
+ *        · 行不存在（用户在手机端解绑了这台）→ registerDeviceInAccount 后重连；
+ *        · 仍 locked → 继续等。
+ *   ③ **轮询期间不重连隧道、不发心跳**（本模块只在 ws 已关闭后启动轮询；close 处理器
+ *      看到 lockedWait.active 会直接 return，不排重连）。
+ * ══════════════════════════════════════════════════════════════════════════════ */
+
+/** 解锁轮询间隔（契约 §6.1：30s）。测试/诊断可用 DSH_BRIDGE_LOCK_POLL_MS 压缩。 */
+export const DEVICE_LOCKED_POLL_MS = 30_000;
+function lockedPollIntervalMs() {
+  const n = Number(process.env.DSH_BRIDGE_LOCK_POLL_MS);
+  return Number.isFinite(n) && n >= 20 ? Math.floor(n) : DEVICE_LOCKED_POLL_MS;
+}
+
+/** 进程内等待态（同一时刻只允许一份轮询；测试钩子可读）。 */
+const lockedWait = { active: false, timer: null, token: "", detail: null, polls: 0, warnedUnknown: false };
+
+/** 整理 locked 详情：字段可能来自 frame（message/plan/limit/upgrade_to）、409 error 或 policy。 */
+export function normalizeLockedInfo(src = {}, fallback = {}) {
+  const pick = (k) => (src[k] !== undefined && src[k] !== null && src[k] !== "" ? src[k] : fallback[k]);
+  const limitRaw = pick("limit");
+  const limit = Number.isFinite(Number(limitRaw)) && Number(limitRaw) >= 0 ? Number(limitRaw) : null;
+  return {
+    message: String(pick("message") || ""),
+    plan: String(pick("plan") || ""),
+    limit,
+    upgrade_to: String(pick("upgrade_to") || pick("upgradeTo") || "pro_max")
+  };
+}
+
+/** 面向用户的可操作中文日志（这就是他们唯一能看到的解释：为什么手机连不上）。 */
+function logLockedHelp(info) {
+  const detail = normalizeLockedInfo(info);
+  const limitTxt = detail.limit !== null && detail.limit >= 0 ? `${detail.limit} 台设备` : "套餐额度内的设备";
+  console.error("[bridge] 🔒 本机已被锁定（超出当前套餐的设备额度），暂时无法连上中继。");
+  if (detail.message) console.error(`[bridge] 服务端说明：${detail.message}`);
+  console.error(`[bridge] 当前套餐（${detail.plan || "free"}）可同时使用 ${limitTxt}；本机排在额度之外。`);
+  console.error("[bridge] 处理办法（二选一，任一步完成后本机会自动恢复，不需要重启）：");
+  console.error("[bridge]   ① 打开手机端「管理电脑」，解绑不再使用的设备（先绑定的优先可用）→ 本机自动解锁；");
+  console.error(`[bridge]   ② 升级 ${detail.upgrade_to === "pro_max" ? "Pro Max 会员" : String(detail.upgrade_to).toUpperCase()} → 可多台设备同时使用。`);
+  console.error(`[bridge] 已进入自动等待：每 ${Math.round(lockedPollIntervalMs() / 1000)} 秒检查一次解锁状态，期间不重连、不占用中继。`);
+}
+
+/** 只有 `{status:"ok"}` 的登记才算登记成功（其余状态留给调用方决定下一步）。 */
+function registrationOk(reg) { return Boolean(reg && reg.status === "ok"); }
+
+/**
+ * 进入（或刷新）「设备被锁定」等待态。幂等：已在等待时只更新详情，不重复打日志、不重复排轮询。
+ * @param {string} token 当前可用 JWT（轮询解锁用）
+ * @param {object} info  {message, plan, limit, upgrade_to}
+ */
+function enterLockedWait(token, info) {
+  const detail = normalizeLockedInfo(info || {});
+  if (token) lockedWait.token = token;
+  lockedWait.detail = detail;
+  persistBridgeState({ device_id: DEVICE_ID, phase: "locked", locked: detail, last_error: null });
+  // .bind-error.json 同步一份：面板即使读不到状态文件（旧版 bridge 状态 / 文件被删）也能识别
+  persistBindError({
+    code: "device_locked",
+    message: detail.message || "本机已被锁定（超出当前套餐设备额度）",
+    device_id: DEVICE_ID,
+    ...(detail.plan ? { plan: detail.plan } : {}),
+    ...(detail.limit !== null ? { limit: detail.limit } : {}),
+    ...(detail.upgrade_to ? { upgrade_to: detail.upgrade_to } : {})
+  });
+  if (lockedWait.active) return; // 已在等待：只刷新详情
+  lockedWait.active = true;
+  lockedWait.polls = 0;
+  lockedWait.warnedUnknown = false;
+  logLockedHelp(detail);
+  scheduleLockedPoll();
+}
+
+/** 排下一拍解锁检查（不 unref：bridge 必须靠这个定时器保持进程存活）。 */
+function scheduleLockedPoll() {
+  if (!lockedWait.active) return;
+  if (lockedWait.timer) { try { clearTimeout(lockedWait.timer); } catch { /* 已触发 */ } }
+  lockedWait.timer = setTimeout(() => {
+    lockedWait.timer = null;
+    lockedPollTick().catch((e) => {
+      console.log(`[bridge] 解锁检查异常：${e.message}；稍后再试`);
+      scheduleLockedPoll();
+    });
+  }, lockedPollIntervalMs());
+}
+
+/**
+ * 等待期内换一张 JWT。**刻意不复用 resolveToken()**：它在失败时会 process.exit(1)/(3)，
+ * 而等待态的要求是"进程活着把轮询跑完"，不能让一次刷新失败把 bridge 打死。
+ */
+async function refreshTokenForLockedPoll() {
+  if (!PHONE || !PASSWORD) return "";
+  try {
+    const r = await fetch(API_BASE + "/api/device-login", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(process.env.DSH_BRIDGE_SECRET ? { "x-dsh-bridge-secret": process.env.DSH_BRIDGE_SECRET } : {}) },
+      body: JSON.stringify({ phone: PHONE, email: PHONE, password: PASSWORD })
+    });
+    const d = await r.json().catch(() => ({}));
+    return r.status === 200 && d.token ? d.token : "";
+  } catch { return ""; }
+}
+
+/** 解锁（或设备行已不存在且重新登记成功）→ 退出等待态并立即重连隧道。 */
+function resumeTunnelFromLock(token) {
+  if (!lockedWait.active) return;
+  lockedWait.active = false;
+  if (lockedWait.timer) { try { clearTimeout(lockedWait.timer); } catch { /* 已触发 */ } }
+  lockedWait.timer = null;
+  lockedWait.detail = null;
+  lockedWait.polls = 0;
+  lockedWait.warnedUnknown = false;
+  clearBindError();
+  persistBridgeState({ device_id: DEVICE_ID, phase: "connecting", locked: null, last_error: null });
+  tunnelRetry = 0;
+  consecutive4000 = 0;
+  console.log("[bridge] 🔓 锁定已解除，重新连接中继…");
+  connectTunnel(token || lockedWait.token);
+}
+
+/**
+ * 一拍解锁检查：`GET /api/devices` → 判断本机是否恢复可用。
+ * 任何失败都不退出进程（网络/服务端抖动只是"这一拍没结论"），排下一拍继续。
+ */
+async function lockedPollTick() {
+  if (!lockedWait.active) return;
+  lockedWait.polls += 1;
+  const intervalMs = lockedPollIntervalMs();
+  const retryLater = (why) => {
+    if (why) console.log(`[bridge] 解锁检查：${why}；${Math.round(intervalMs / 1000)} 秒后再试`);
+    scheduleLockedPoll();
+  };
+  let status = 0;
+  let body = null;
+  try {
+    const r = await fetch(API_BASE + "/api/devices", { headers: { authorization: `Bearer ${lockedWait.token}` } });
+    status = r.status;
+    body = await r.json().catch(() => null);
+  } catch (e) {
+    return retryLater(`无法连接账号 API（${e.message}）`);
+  }
+  if (!lockedWait.active) return;
+  if (status === 401) {
+    const fresh = await refreshTokenForLockedPoll();
+    if (fresh) {
+      lockedWait.token = fresh;
+      console.log("[bridge] 等待期间登录凭证已刷新，继续检查解锁状态。");
+      return retryLater("");
+    }
+    return retryLater("登录凭证已失效（401），请在面板重新登录后重启后台服务");
+  }
+  if (status !== 200 || !body || typeof body !== "object") {
+    return retryLater(`服务端返回 ${status || "无响应"}`);
+  }
+  const rows = Array.isArray(body.devices) ? body.devices : [];
+  const policy = body.policy && typeof body.policy === "object" ? body.policy : {};
+  if (policy.plan || Number.isFinite(Number(policy.limit))) {
+    // 解绑/升级后 policy 会实时变化：同步刷新等待详情（面板的「可同时使用 N 台」跟着变）
+    const merged = normalizeLockedInfo({}, {
+      ...lockedWait.detail,
+      ...(policy.plan ? { plan: policy.plan } : {}),
+      ...(Number.isFinite(Number(policy.limit)) ? { limit: Number(policy.limit) } : {}),
+      ...(policy.upgrade_to ? { upgrade_to: policy.upgrade_to } : {})
+    });
+    if (JSON.stringify(merged) !== JSON.stringify(lockedWait.detail)) {
+      lockedWait.detail = merged;
+      persistBridgeState({ device_id: DEVICE_ID, phase: "locked", locked: merged, last_error: null });
+    }
+  }
+  const row = rows.find((d) => d && String(d.id || d.device_id || "") === DEVICE_ID);
+  if (!row) {
+    console.log("[bridge] 解锁检查：本机设备行已不存在（可能已在手机端解绑）→ 重新登记后重连…");
+    const reg = await registerDeviceInAccount(lockedWait.token);
+    if (registrationOk(reg)) { resumeTunnelFromLock(lockedWait.token); return; }
+    if (reg && reg.status === "locked") { enterLockedWait(lockedWait.token, reg.locked); }
+    return scheduleLockedPoll();
+  }
+  if (row.locked === false) {
+    console.log("[bridge] ✅ 解锁检查：本机已恢复可用 → 立即重连中继…");
+    resumeTunnelFromLock(lockedWait.token);
+    return;
+  }
+  if (row.locked !== true && !lockedWait.warnedUnknown) {
+    lockedWait.warnedUnknown = true;
+    console.log("[bridge] 解锁检查：服务端未返回本机锁定状态（可能是旧版服务端），继续等待；长期不恢复请升级后台运行环境。");
+  }
+  scheduleLockedPoll();
+}
+
+/** 测试钩子：读取等待态（不改变行为）；用例据此断言「不退出 + 在轮询 + 解锁后重连」。 */
+export function __lockedWaitStateForTest() {
+  return { active: lockedWait.active, polls: lockedWait.polls, detail: lockedWait.detail ? { ...lockedWait.detail } : null, hasTimer: Boolean(lockedWait.timer) };
+}
+
 
 function connectTunnel(token) {
   const endpoint = tunnelEndpoint(TUNNEL_URL);
@@ -2284,6 +2534,13 @@ function connectTunnel(token) {
           return;
         }
         if (frame?.type === "tunnel-register-err") {
+          if (frame.code === "device_locked") {
+            // 契约 §6.1：服务端按套餐额度判定本机不可用。**不退出进程**，关掉这条隧道后进入
+            // 解锁轮询（30s 一次 GET /api/devices）；期间不重连、不发心跳（close 处理器见等待态直接 return）。
+            enterLockedWait(token, { message: frame.message, plan: frame.plan, limit: frame.limit, upgrade_to: frame.upgrade_to });
+            try { ws.close(4009, "device locked"); } catch { /* 对端可能已经关了 */ }
+            return;
+          }
           persistBridgeState({ phase: "error", last_error: { code: frame.code || "register_err", message: frame.message || "router 拒绝注册" } });
           console.error(`[bridge] router 拒绝注册: ${frame.code} ${frame.message || ""}`);
           return;
@@ -2299,6 +2556,12 @@ function connectTunnel(token) {
     sender.close(); // 丢掉未发分片,别让重连后的新连接接到旧响应的剩余部分
     console.log(`[bridge] 隧道断开(code=${code}${reason ? ", " + reason : ""})`);
     closeAllWsSessions();
+    // 锁定等待中：**不排重连**（契约 §6.1 要求轮询期间不重连隧道）。解锁后由
+    // resumeTunnelFromLock 统一重连一次，避免这里每 2s 再撞一次必然被拒的注册。
+    if (lockedWait.active) {
+      console.log("[bridge] 当前处于「设备被锁定」等待态，暂不重连中继（解锁后自动恢复）。");
+      return;
+    }
     // C2 + C5：4000（被同 deviceId 的新连接顶掉）走长退避/退出；其余走 2/4/8/10s + 抖动。
     const plan = reconnectPlan({ code, retry: tunnelRetry, consecutive4000 });
     consecutive4000 = plan.consecutive4000;
@@ -2696,9 +2959,15 @@ async function runTunnel() {
   // 新进程开始:重置状态文件(上一轮的成功记录不能代表这一轮,面板据此判定 online)
   persistBridgeState({ device_id: DEVICE_ID, started_at: Date.now(), phase: "connecting", last_error: null }, { reset: true });
   await initE2ee(token);
-  await registerDeviceInAccount(token);
-  connectTunnel(token);
-  // 隧道已发起后再起微信:主链路优先,微信永不阻塞远程访问
+  const reg = await registerDeviceInAccount(token);
+  if (reg && reg.status === "locked") {
+    // 旧版服务端 409 device_limit_exceeded（新契约走 router 的 device_locked，见 connectTunnel）：
+    // 不再 process.exit(1) 空转，改为 30s 轮询等待解锁/解绑（契约 §6.2，向后兼容）
+    enterLockedWait(token, reg.locked);
+  } else {
+    connectTunnel(token);
+  }
+  // 隧道已发起（或已进入锁定等待）后再起微信:主链路优先,微信永不阻塞远程访问
   startWeChat();
   setTimeout(() => {
     console.log(`[bridge] 隧道模式运行中(上游 ${UPSTREAM},Ctrl-C 退出)`);

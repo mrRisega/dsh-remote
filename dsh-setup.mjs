@@ -75,6 +75,39 @@ const BRIDGE_PID_FILE = ".dsh-bridge.pid";
  */
 const DUPLICATE_INSTANCE_EXIT_CODE = 4;
 const DUPLICATE_BRIDGE_BACKOFF_MS = 5 * 60 * 1000;
+/**
+ * 设备绑定「永久性失败」的退避（契约 docs/device-overquota-lock-contract.md §6.3/§6.4）。
+ *
+ * bridge 遇到服务端 `device_bind_cap`（防滥用硬上限）会写 `.bind-error.json` 并以**专用退出码 5**
+ * 退出：这是永久性失败 —— 用户不去手机端解绑就不会好。旧逻辑与普通失败共用 exit(1)，
+ * watcher 于是每 10s 拉起一次、每 10s 撞一次 409（日志刷屏、白耗一次 device-login 额度）。
+ * 现在按 10s→1min→5min→15min 指数退避（封顶 30min）；`.bind-error.json` 的**内容签名**变化
+ * （换账号 / 解绑后重试得到了不同结论 / 提示被清掉）时复位，用户处理完不必等满退避窗口。
+ */
+const DEVICE_BIND_CAP_EXIT_CODE = 5;
+const BIND_CAP_BACKOFF_MS = [10_000, 60_000, 300_000, 900_000];
+const BIND_CAP_BACKOFF_MAX_MS = 30 * 60 * 1000;
+/** bridge 写的「设备登记失败提示」（面板读它展示原因；watcher 用它的签名判断是否需要复位退避）。 */
+const BIND_ERROR_FILE = path.join(CONFIG_DIR, ".bind-error.json");
+
+/**
+ * `.bind-error.json` 的稳定签名：只取 code/device_id/message，**不含 at** ——
+ * bridge 每次重试都会刷新 at，拿它当变化依据等于"永远变化"，退避会形同虚设。
+ */
+function bindErrorSignature() {
+  try {
+    const j = JSON.parse(fs.readFileSync(BIND_ERROR_FILE, "utf8")) || {};
+    return [j.code || "", j.device_id || "", j.message || ""].join("|");
+  } catch { return ""; }
+}
+
+/** 第 step 次（从 1 开始）退出码 5 后的退避时长：10s→1min→5min→15min，之后翻倍到封顶 30min。 */
+function bindCapBackoffMs(step) {
+  const list = BIND_CAP_BACKOFF_MS;
+  const n = Math.max(1, Number(step) || 1);
+  if (n <= list.length) return Math.min(BIND_CAP_BACKOFF_MAX_MS, list[n - 1]);
+  return BIND_CAP_BACKOFF_MAX_MS;
+}
 
 // ---------- 运行时自物化（npm/npx 安装 → 固化到配置目录，脱离 npx 缓存） ----------
 // npx 每次安装的缓存目录（~/.npm/_npx/<hash>）不固定：缓存一旦清理，指向它的自启动服务
@@ -1807,6 +1840,12 @@ async function runBridge() {
   let warnedDuplicateBridge = false;
   /** 限流提示只打一次，避免刷屏。 */
   let warnedRateLimit = false;
+  /** 设备绑定硬上限（bridge 退出码 5）的指数退避状态（契约 §6.4）。 */
+  let bindCapBackoffStep = 0;
+  let bindCapBackoffUntil = 0;
+  let bindCapErrorSig = "";
+  /** 退避提示只打一次，避免刷屏。 */
+  let warnedBindCap = false;
 
   // watcher：检测 dsh web 是否存活（端口动态解析，绝不写死 3080），存活才启动 bridge。
   // 走 isDshWebUp()：探测失败会自动做一次动态发现（DSH Desktop 的 43120 / 自定义端口都靠它）。
@@ -1867,6 +1906,7 @@ async function runBridge() {
       await stopChildGracefully(bridgeProc); // 先请它优雅退出，跑完微信通道下线通知
       bridgeAccountFp = "";
       duplicateBridgeBackoffUntil = 0; // 用户明确换了账号：清掉"让位"暂停，立即用新凭据拉起
+      bindCapBackoffStep = 0; bindCapBackoffUntil = 0; bindCapErrorSig = ""; // 换账号 = 绑定前提已变：设备绑定退避一并复位
       return; // 下一轮（10s 内）用新配置重新拉起
     }
     // 指纹又回到一致（或本来就没变）→ 之前的"疑似变化"作废，绝不让它跨轮累积。
@@ -1894,6 +1934,28 @@ async function runBridge() {
       return;
     }
     warnedDuplicateBridge = false;
+
+    // 设备绑定硬上限（bridge 退出码 5）：永久性失败 → 指数退避，别每 10s 空撞一次。
+    // 复位：`.bind-error.json` 的内容签名变了（换账号 / 用户解绑后重试得到不同结论 / 提示被清掉）。
+    // 提示只打一次；退避窗口内直接返回、不拉起 bridge（也不占用一次 device-login 额度）。
+    const bindSig = bindErrorSignature();
+    if (bindSig !== bindCapErrorSig) {
+      if (bindCapBackoffUntil > Date.now()) {
+        console.log("[dsh-remote] 设备登记失败提示已变化（解绑/换账号/服务端结论变了）→ 重置设备绑定退避，立即重试。");
+      }
+      bindCapErrorSig = bindSig;
+      bindCapBackoffStep = 0;
+      bindCapBackoffUntil = 0;
+    }
+    if (Date.now() < bindCapBackoffUntil) {
+      if (!warnedBindCap) {
+        warnedBindCap = true;
+        console.log(`[dsh-remote] 设备绑定已达上限（bridge code=${DEVICE_BIND_CAP_EXIT_CODE}）→ 本守护暂停拉起约 ${Math.ceil((bindCapBackoffUntil - Date.now()) / 1000)} 秒（指数退避，最长 30 分钟）。`);
+        console.log("   请在手机端「管理电脑」解绑不再使用的设备；解绑后会自动恢复，无需重启。");
+      }
+      return;
+    }
+    warnedBindCap = false;
 
     reconcileUpstreamEnvFromFile(); // dsh 可能刚重启并换了端口：拉起前再以最新端口文件为准
     const alive = await checkUpstream();
@@ -1956,6 +2018,24 @@ async function runBridge() {
           }
           duplicateBridgeBackoffUntil = Date.now() + DUPLICATE_BRIDGE_BACKOFF_MS;
           console.log(`[dsh-remote] bridge 检测到同 deviceId 的另一个实例并退出（code=${code}）——本守护暂停 ${Math.round(DUPLICATE_BRIDGE_BACKOFF_MS / 60000)} 分钟后再试，避免两个实例反复互踢。`);
+          return;
+        }
+        // 设备绑定硬上限（退出码 5，契约 §6.3/§6.4）：永久性失败 → 指数退避重试，
+        // 绝不沿用"10s 后照常重拉"（那会每 10s 撞一次 409，日志刷屏且白耗登录额度）。
+        if (code === DEVICE_BIND_CAP_EXIT_CODE) {
+          const sig = bindErrorSignature();
+          if (sig && sig !== bindCapErrorSig) {
+            bindCapErrorSig = sig;
+            bindCapBackoffStep = 1;
+            console.log("[dsh-remote] 设备绑定失败提示已变化 → 重置设备绑定退避。");
+          } else {
+            bindCapBackoffStep = Math.min(bindCapBackoffStep + 1, 99);
+          }
+          const waitMs = bindCapBackoffMs(bindCapBackoffStep);
+          bindCapBackoffUntil = Date.now() + waitMs;
+          warnedBindCap = false;
+          console.log(`[dsh-remote] bridge 因设备绑定达到硬上限退出（code=${code}，第 ${bindCapBackoffStep} 次）——本守护 ${Math.round(waitMs / 1000)} 秒后再试（指数退避，最长 30 分钟）。`);
+          console.log("   请在手机端「管理电脑」解绑不再使用的设备；解绑后自动恢复，无需重启。");
           return;
         }
         console.log("[dsh-remote] bridge 退出，等待重启...");

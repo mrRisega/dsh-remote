@@ -2533,6 +2533,24 @@ function scheduleRuntime(relayDir) {
         logSelfhealReady(relayDir, cfg, "进程探测（pgrep/pid 文件）");
         return;
       }
+      // ── ②.5 设备绑定硬上限（bridge 退出码 5）：永久性失败时**不要**每 12 秒重启一次 ──
+      // 本自愈循环与 ensureConnection 是两条独立的拉起路径。watcher（dsh-setup.mjs）已在按
+      // 10s→1min→5min→15min（封顶 30min）退避等待时，这里再 startBridge（systemctl restart /
+      // launchctl kickstart）会把 watcher 整个换掉、把它的内存退避清零 —— 又回到 10s 空撞一次。
+      // 所以退避窗口内直接放弃本拍（人工操作走面板按钮 = force 路径，不受这条约束）。
+      const bindErrNow = readBindError(relayDir);
+      const bindGateNow = bindFailGate(relayDir, bindErrNow);
+      if (bindGateNow.permanent && bindGateNow.blocked) {
+        const book = connectBook(relayDir);
+        if (book.bindFailLogged !== bindGateNow.until) {
+          book.bindFailLogged = bindGateNow.until;
+          appendLogLine(relayDir, AUTO_INSTALL_LOG,
+            `[dsh-remote-web] 自愈暂停拉起 bridge：设备绑定已达上限（退出码 ${DEVICE_BIND_CAP_EXIT_CODE}），`
+            + `约 ${Math.ceil(bindGateNow.remainingMs / 1000)} 秒后再试（指数退避，最长 30 分钟）；`
+            + "请在手机端「管理电脑」解绑不再使用的设备，解绑后自动恢复");
+        }
+        return;
+      }
       // ── ③ 确实没在跑 → 过护栏后才动手（绝不允许"判据失败"直接变成"每 12 秒杀一次隧道"）──
       const gate = selfhealRestartGate(relayDir);
       if (!gate.allowed) { noteSelfhealBlocked(relayDir, gate); return; }
@@ -4983,6 +5001,10 @@ function resetBridgeForAccountChange(relayDir, why) {
   //   它必须无条件生效 —— 所以顺手清掉自愈护栏额度，绝不允许"自愈循环之前用完了 3 次额度"
   //   导致切换账号后新 bridge 起不来（那会让设备继续留在旧账号里，是 2026-09-19 那个老故障的翻版）。
   resetSelfhealGuard(relayDir);
+  // 换账号 = 设备绑定前提已变：插件半的设备绑定退避也一并复位（新账号的额度/硬上限可能完全不同）
+  const bk = connectBook(relayDir);
+  bk.bindFail = { sig: bindFailSignatureOf(readBindError(relayDir)), step: 0, until: 0 };
+  bk.bindFailLogged = 0;
   const stopped = stopBridge(relayDir);
   // 脱离进程形态（launchd 托管不住时的兜底）也要收干净，否则它会用旧凭据继续跑
   try { stopBridgeDetached(relayDir, { force: true }); } catch { /* 非关键 */ }
@@ -5078,6 +5100,18 @@ const INSTALL_STALE_MS = 10 * 60 * 1000;
 const BIND_ERROR_FRESH_MS = 60 * 60 * 1000;
 /** 自动重试退避（毫秒）：可重试错误按此节奏自动重试，用尽后停在 60s（仍会自动重试，不出现死胡同）。 */
 const CONNECT_BACKOFF_MS = [2000, 4000, 8000, 16_000, 30_000, 60_000];
+/**
+ * 设备登记「永久性失败」的退避（契约 docs/device-overquota-lock-contract.md §6.3/§6.4）。
+ *
+ * bridge 遇到服务端 `device_bind_cap`（防滥用硬上限）会写 `.bind-error.json` 并以**专用退出码 5**
+ * 退出。watcher（dsh-setup.mjs）自己会做 10s→1min→5min→15min（封顶 30min）的指数退避，但它的状态
+ * 在**内存**里 —— 插件半的 startBridge（`launchctl kickstart` / `systemctl restart`）会把 watcher
+ * 一并换掉，等于每次自愈都把它辛苦攒的退避清零、又 10s 空撞一次。所以插件半必须自己记一份：
+ * 退避窗口内不再发起拉起，`.bind-error.json` 的内容签名变化（解绑/换账号/被清掉）时复位。
+ */
+const DEVICE_BIND_CAP_EXIT_CODE = 5;
+const BIND_CAP_BACKOFF_MS = [10_000, 60_000, 300_000, 900_000];
+const BIND_CAP_BACKOFF_MAX_MS = 30 * 60 * 1000;
 
 /** 连接阶段文案（面向非技术用户；node 半算好，面板直接显示，避免两端各写一套）。 */
 const CONNECT_TEXT = {
@@ -5096,7 +5130,7 @@ const connectBooks = new Map();
 function connectBook(relayDir) {
   let b = connectBooks.get(relayDir);
   if (!b) {
-    b = { attempts: 0, lastAttemptAt: 0, reportAt: 0, watcherSeenAt: 0 };
+    b = { attempts: 0, lastAttemptAt: 0, reportAt: 0, watcherSeenAt: 0, bindFail: { sig: "", step: 0, until: 0 } };
     connectBooks.set(relayDir, b);
   }
   return b;
@@ -5105,6 +5139,63 @@ function connectBook(relayDir) {
 function connectBackoffMs(attempts) {
   const i = Math.min(Math.max(attempts, 0), CONNECT_BACKOFF_MS.length - 1);
   return CONNECT_BACKOFF_MS[i];
+}
+
+/**
+ * `.bind-error.json` 的稳定签名：只取 code/device_id/message，**不含 at** ——
+ * bridge 每次重试都会刷新 at，拿它当"变了"的依据等于永远变化、退避形同虚设。
+ */
+function bindFailSignatureOf(bindError) {
+  if (!bindError || typeof bindError !== "object") return "";
+  return [bindError.code || "", bindError.device_id || "", bindError.message || ""].join("|");
+}
+
+/** 是否是「永久性」登记失败（硬上限；用户不解绑就不会自愈，必须指数退避而不是每 10s 重试）。 */
+function isPermanentBindFailure(bindError) {
+  return Boolean(bindError && typeof bindError === "object" && bindError.code === "device_bind_cap");
+}
+
+/** 第 step 次（从 1 开始）拉起后的退避时长：10s→1min→5min→15min，之后封顶 30min。 */
+function bindCapBackoffMs(step) {
+  const n = Math.max(1, Number(step) || 1);
+  if (n <= BIND_CAP_BACKOFF_MS.length) return Math.min(BIND_CAP_BACKOFF_MAX_MS, BIND_CAP_BACKOFF_MS[n - 1]);
+  return BIND_CAP_BACKOFF_MAX_MS;
+}
+
+/**
+ * 插件半的「设备绑定硬上限」退避闸门：**只读**，由 ensureConnection 在动手前调用。
+ * 签名变化（换账号 / 用户解绑后重试得到不同结论 / 成功登记把提示清掉）→ 复位。
+ * @returns {{permanent:boolean, blocked:boolean, until:number, step:number, remainingMs:number}}
+ */
+function bindFailGate(relayDir, bindError) {
+  const book = connectBook(relayDir);
+  if (!book.bindFail) book.bindFail = { sig: "", step: 0, until: 0 };
+  const st = book.bindFail;
+  const sig = bindFailSignatureOf(bindError);
+  if (sig !== st.sig) {
+    st.sig = sig;
+    st.step = 0;
+    st.until = 0;
+  }
+  const now = Date.now();
+  return {
+    permanent: isPermanentBindFailure(bindError),
+    blocked: now < st.until,
+    until: st.until,
+    step: st.step,
+    remainingMs: Math.max(0, st.until - now),
+  };
+}
+
+/** 记一次「即将（重新）拉起 bridge」：永久性失败时步进退避，返回退避后的状态。 */
+function noteBindFailAttempt(relayDir, bindError) {
+  const book = connectBook(relayDir);
+  if (!book.bindFail) book.bindFail = { sig: bindFailSignatureOf(bindError), step: 0, until: 0 };
+  const st = book.bindFail;
+  st.sig = bindFailSignatureOf(bindError);
+  st.step = Math.min(st.step + 1, BIND_CAP_BACKOFF_MS.length + 1);
+  st.until = Date.now() + bindCapBackoffMs(st.step);
+  return st;
 }
 /** 本机是否已有可用账号凭据（SaaS 账号或自建访问密钥）——没有就谈不上自动连接，先引导登录。 */
 function hasAccountCreds(cfg) {
@@ -5365,6 +5456,31 @@ async function composeConnect(relayDir, opts = {}) {
   const state = bridgeStateFile(relayDir);
   const deviceId = String(cfg.device_id || "");
 
+  // ── 「设备被超额锁定」证据（契约 §8.1）──
+  // 两个来源都认：① 新 bridge 写的状态文件 phase=locked + locked{plan,limit,upgrade_to}；
+  // ② `.bind-error.json` code=device_locked / 旧版 device_limit_exceeded（老 bridge/半升级场景）。
+  // 锁定 ≠ 故障：设备行还在、手机端能看到它，只是中继按套餐额度拒绝接入；bridge 不退出，
+  // 每 30s 轮询 /api/devices，用户解绑或升级后自动解锁重连。面板的任务是把这两条出路讲清楚。
+  const stateLocked = state && state.phase === "locked" && state.locked && typeof state.locked === "object" ? state.locked : null;
+  const bindLocked = bindError && (bindError.code === "device_locked" || bindError.code === "device_limit_exceeded")
+    ? bindError
+    : null;
+  const lockRaw = stateLocked || bindLocked || null;
+  const locked = lockRaw
+    ? {
+        message: String(lockRaw.message || ""),
+        plan: String(lockRaw.plan || ""),
+        limit: Number.isFinite(Number(lockRaw.limit)) && Number(lockRaw.limit) >= 0 ? Number(lockRaw.limit) : null,
+        upgradeTo: String(lockRaw.upgrade_to || lockRaw.upgradeTo || "pro_max")
+      }
+    : null;
+  /** 契约 §8.1 的固定文案（盘点口径：可同时用 N 台 + 两条出路 + 会自动解锁，不让用户以为要重启）。 */
+  const lockedDetail = locked
+    ? `本机已被锁定（当前套餐可同时使用 ${locked.limit === null ? "N" : locked.limit} 台）。`
+      + "升级 Pro Max 可多台设备同时使用；或到手机端「管理电脑」解绑其他设备后本机会自动解锁。"
+      + "（后台服务保持运行并每 30 秒检查一次，解锁后自动恢复，无需重启。）"
+    : "";
+
   // ── 中继注册证据（只有 bridge 进程在跑时才算「现在能用」） ──
   // ⚠️ 先判「这个 bridge 是不是当前账号的」：账号切换后进程不会自己换凭据，
   // 旧账号留下的状态文件（phase=online + 旧 device_id）会让面板谎报「已连接」，
@@ -5432,6 +5548,15 @@ async function composeConnect(relayDir, opts = {}) {
           + "正在后台自动补装（约 1~2 分钟），装完会自动启动 bridge。";
       }
     }
+  } else if (locked) {
+    // 契约 §8.1：锁定态给「error」阶段（用户确实用不了），但**不是**普通故障：
+    // 文案要说清「两条出路」+「会自动解锁」，且不能出现"无限重试"的暗示。
+    // 必须排在「bridge 没在跑」之前：锁定是服务端额度结论，bridge 为等待解锁会一直跑着；
+    // 即使进程被手动停掉，用户看到的也该是「已被锁定」而不是「正在启动」。
+    phase = "error";
+    retryable = true;
+    error = { code: "device_locked", message: locked.message || "本机已被锁定（超出当前套餐设备额度）" };
+    detail = lockedDetail;
   } else if (!bridgeRunning) {
     if (launchd.crashing) {
       phase = "error";
@@ -5443,7 +5568,11 @@ async function composeConnect(relayDir, opts = {}) {
     } else if (bindFresh && bindError) {
       phase = "error";
       error = { code: bindError.code || "bind_failed", message: bindError.message || "设备登记失败" };
-      detail = "bridge 因设备登记失败退出，已进入自动重试；请按提示处理后重试。";
+      // device_bind_cap = 防滥用硬上限（bridge 退出码 5）：守护按指数退避重试（10s→1min→5min→15min，
+      // 封顶 30min），不是"每 10 秒撞一次"。文案要给出用户能做的事，不能暗示无限重试。
+      detail = bindError.code === "device_bind_cap"
+        ? "已绑定设备数达到上限：请在手机端「管理电脑」解绑不再使用的设备；解绑后本机会自动恢复（守护已按指数退避重试，无需手动重启）。"
+        : "bridge 因设备登记失败退出，已进入自动重试；请按提示处理后重试。";
     } else if (wedge.wedged && wedge.exhausted) {
       // 守护活着、却反复拉不起 bridge，且已自动重启到上限 → 这是**真的**卡死了，给明确结论 + 出路。
       // 旧实现在这种状态下永远显示「正在启动 Bridge…」，用户只能反复点修复（实测反馈）。
@@ -5479,8 +5608,10 @@ async function composeConnect(relayDir, opts = {}) {
   } else if (bindFresh && bindError) {
     phase = "error";
     error = { code: bindError.code || "bind_failed", message: bindError.message || "设备登记失败" };
-    detail = bindError.code === "device_limit_exceeded"
-      ? "已达本套餐设备数上限：同机重装会自动顶替旧设备；仍失败请到手机端「设备管理」解绑旧设备后点「重试」。"
+    // 旧语义（「解绑旧设备才能登录」「无限重试」）已废弃：超额现在一律走 locked 分支（上面），
+    // 只有硬上限/网络类注册失败会落到这里。
+    detail = bindError.code === "device_bind_cap"
+      ? "已绑定设备数达到上限：请在手机端「管理电脑」解绑不再使用的设备；解绑后本机会自动恢复（守护已按指数退避重试，无需手动重启）。"
       : "请确认网络与账号状态后点「重试」；仍不成功可点「复制诊断信息」发给客服。";
   } else if (!accountCurrent) {
     // 进程在跑，但它是**上一个账号**的 bridge：必须重启才能用新账号登记
@@ -5545,7 +5676,19 @@ async function composeConnect(relayDir, opts = {}) {
     attempts: book.attempts,
     nextRetryInMs,
     error,
-    bindError: bindFresh && bindError ? { code: bindError.code || "", message: bindError.message || "" } : null,
+    // 设备被超额锁定（契约 §8）：null = 未锁定；非 null 时面板显示锁定文案 + 「🚀 升级 Pro Max」按钮。
+    // limit 为 null 表示服务端没给额度数值（旧版），文案退回占位。
+    locked,
+    bindError: bindFresh && bindError
+      ? {
+          code: bindError.code || "",
+          message: bindError.message || "",
+          deviceId: bindError.device_id || "",
+          plan: bindError.plan || "",
+          limit: Number.isFinite(Number(bindError.limit)) && Number(bindError.limit) >= 0 ? Number(bindError.limit) : null,
+          upgradeTo: bindError.upgrade_to || ""
+        }
+      : null,
     // 安装/配对自检（2026-10-17）：kind/text/backup.action 见 setupStateOf 的长注释。
     // 面板据此显示「运行环境缺失：需要重新安装…」「未配对：需要在面板里登录一次…」
     // 以及「检测到历史配对备份（时间），可一键恢复」。
@@ -5786,6 +5929,27 @@ function ensureConnection(relayDir, opts = {}) {
   if (opts.force) resetSelfhealGuard(relayDir);
   if (opts.force) { book.attempts = 0; book.lastAttemptAt = 0; }
   const now = Date.now();
+  // ── 设备绑定「永久性失败」→ 插件半指数退避（契约 §6.3/§6.4）────────────────────────────
+  // bridge 撞到防滥用硬上限（device_bind_cap）会写 .bind-error.json 并以**退出码 5** 退出。
+  // watcher 自己会退避，但它的退避状态只存在内存里 —— 插件半的 startBridge（launchctl kickstart /
+  // systemctl restart）会把 watcher 整个换掉，等于每轮自愈都把它的退避清零、又回 10s 空撞一次。
+  // 所以插件半必须自己记一份：退避窗口内**不**发起拉起（也不白耗一次 device-login），
+  // 窗口过了才允许一次新尝试，并按 10s→1min→5min→15min（封顶 30min）继续加倍。
+  // ⚠️ 必须放在「通用 connect 退避」之前判断：否则上一轮动作留下的 2s connect 退避会先 return null，
+  //   面板看到的是"什么也没发生"，而不是"设备绑定已达上限、正在退避等待"。
+  // 人工操作（opts.force = 面板「重试 / 一键修复」）永远立即放行：安全阀不能把用户锁在门外。
+  const bindErrorNow = readBindError(relayDir);
+  if (opts.force) book.bindFail = { sig: bindFailSignatureOf(bindErrorNow), step: 0, until: 0 };
+  const bindGateEarly = bindFailGate(relayDir, bindErrorNow);
+  if (bindGateEarly.permanent && !opts.force && bindGateEarly.blocked && runtimeReady(relayDir)) {
+    // 同一条结论只写一行日志（面板每 2~3s 轮询一次，逐轮写会把安装日志刷爆）
+    if (book.bindFailLogged !== bindGateEarly.until) {
+      book.bindFailLogged = bindGateEarly.until;
+      appendLogLine(relayDir, AUTO_INSTALL_LOG,
+        `[dsh-remote-web] 设备绑定已达上限（bridge 退出码 ${DEVICE_BIND_CAP_EXIT_CODE}）→ 自愈暂停拉起约 ${Math.ceil(bindGateEarly.remainingMs / 1000)} 秒（指数退避，最长 30 分钟）；请在手机端「管理电脑」解绑不再使用的设备，解绑后自动恢复`);
+    }
+    return { action: "bind-cap-backoff", until: bindGateEarly.until, step: bindGateEarly.step };
+  }
   if (!opts.force && book.lastAttemptAt && now - book.lastAttemptAt < connectBackoffMs(book.attempts)) return null;
   const cfg = loadConfig(relayDir);
   if (!hasAccountCreds(cfg)) {
@@ -5810,6 +5974,9 @@ function ensureConnection(relayDir, opts = {}) {
     ensureRuntime(relayDir);
     return { action: "provision" };
   }
+  // 运行时已就绪 → 退避窗口外允许一次新尝试：先记账（下一次要等更久），再照常走下面的判断。
+  if (bindGateEarly.permanent && !opts.force) noteBindFailAttempt(relayDir, bindErrorNow);
+  else book.bindFailLogged = 0;
   const launchd = launchdStatus();
   const manual = manualStatus(relayDir);
   const bridgeProcs = [...(manual.allBridge || []), ...(manual.bridge || [])];
@@ -8239,6 +8406,11 @@ export { pinBrowseDirectoryPicker as __pinBrowseDirectoryPicker, schedulePickerP
   // （用例必须把 relayDir 指向 mkdtemp 临时目录、HOME 指向假目录，绝不能在真实
   //   ~/.dsh-remote 或真实 ~/.dsh 上做写入测试）。
   setupStateOf as __setupStateOf, ensureConnection as __ensureConnection,
+  // 设备超额锁定（契约 §8）：面板文案 / 插件半设备绑定退避都要能被单测钉住
+  composeConnect as __composeConnect, readBindError as __readBindError, bindFailGate as __bindFailGate,
+  bindFailSignatureOf as __bindFailSignatureOf, isPermanentBindFailure as __isPermanentBindFailure,
+  bindCapBackoffMs as __bindCapBackoffMs, connectBook as __connectBook, noteBindFailAttempt as __noteBindFailAttempt,
+  DEVICE_BIND_CAP_EXIT_CODE as __DEVICE_BIND_CAP_EXIT_CODE, BIND_CAP_BACKOFF_MAX_MS as __BIND_CAP_BACKOFF_MAX_MS,
   backupConfigFile as __backupConfigFile, listConfigBackups as __listConfigBackups,
   restoreConfigBackup as __restoreConfigBackup, runtimeDirPresent as __runtimeDirPresent,
   CONFIG_BACKUP_KEEP as __CONFIG_BACKUP_KEEP, CONFIG_BACKUP_DIR as __CONFIG_BACKUP_DIR,
