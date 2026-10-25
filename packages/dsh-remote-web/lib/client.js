@@ -1266,6 +1266,7 @@ window.__ModuleLoader__.load({
      * 之所以是模块级的：拉取发生在 apply() 里（组件还没挂载），而消费方有两个
      * （设置面板的卡片 / shell.overlay 上的弹窗），模块级 store 才能让两边看到同一份数据。
      */
+    var annRetryCount = 0;   // 公告首次拉取瞬态失败的有界重试计数（成功即清零）
     var annState = {
       ok: false,          // 拉取成功且结构是我们认识的那一种（老服务端 404 / 结构不符 → 一直是 false）
       bubble: false,      // bubble_enabled === true 才置真（字段缺失一律当 false = fail closed）
@@ -1428,6 +1429,7 @@ window.__ModuleLoader__.load({
         var norm = annNormalize(b);
         if (!norm) { annState.ok = false; annState.bubble = false; annState.items = []; annState.unread = 0; annEmit(); return false; }
         annState.ok = true;
+        annRetryCount = 0;
         annState.bubble = norm.bubble;
         annState.items = norm.items;
         annState.unread = norm.unread;
@@ -1436,13 +1438,24 @@ window.__ModuleLoader__.load({
         }
         annEmit();
         return true;
-      }).catch(function () {
+      }).catch(function (err) {
         // 404（老服务端）/ 不可达 / 超时：fail closed —— 不显示入口、不弹窗，**绝不抛**
         annState.ok = false;
         annState.bubble = false;
         annState.items = [];
         annState.unread = 0;
         annEmit();
+        // 2026-10-25（用户反馈「公告板块没了」）：dsh 重启后页面常常比插件宿主路由先就绪，
+        // 首次拉取失败一次，整页（sessionStorage 一次性标记）就再也没有公告入口。
+        // 这里只对**瞬态失败**做有界重试（最多 2 次、间隔 1.5s/3s）；404 明确是老服务端，不重试。
+        // 注意：这只发生在**失败后**，成功路径仍然严格"每次页面加载只拉一次"。
+        var st = Number(err && (err.status || err.statusCode));
+        if (st !== 404 && annRetryCount < 2) {
+          annRetryCount += 1;
+          try {
+            setTimeout(function () { annFetch({ openPopup: false }); }, 1500 * annRetryCount);
+          } catch (e2) { /* 忽略 */ }
+        }
         return false;
       });
     }
@@ -5332,8 +5345,12 @@ window.__ModuleLoader__.load({
       function renderAnnouncementsCard() {
         if (!annState.ok || !annState.bubble) return null;
         var items = annState.items;
-        if (!items.length) return null;
         var unread = annState.unread;
+        // 2026-10-25：列表为空时**保留板块**（显示「暂无公告」）而不是整卡消失 ——
+        // 板块本身是用户确认"公告功能还在"的锚点，静默消失会被当成功能坏了。
+        if (!items.length) {
+          return card("📣 公告", [h("div", { className: "dru-hint" }, "暂无公告")]);
+        }
         return card("📣 公告" + (unread > 0 ? "（" + unread + " 条未读）" : ""), [
           h("div", { className: "dru-ann-list" }, items.map(function (it) {
             return h("button", {
