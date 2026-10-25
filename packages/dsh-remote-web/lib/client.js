@@ -98,7 +98,7 @@ window.__ModuleLoader__.load({
       // 绝不写 :root / body —— 否则会污染整个 GUI。JS 解析出主题后往根节点写
       // data-dru-theme="dark|light"，下面按属性切换；末一条 `:not([data-dru-theme])`
       // 是 JS 尚未执行时的纯 CSS 兜底（一旦 JS 写过属性就不再参与，不会打架）。
-      ".dru-settings-section,.dru-popup,.dru-nav-remote{",
+      ".dru-settings-section,.dru-popup,.dru-nav-remote,.dru-standalone-card{",
       "  color-scheme:light;",
       "  --dru-surface:#f6f8fa;",          // 卡片底
       "  --dru-surface-2:#ffffff;",        // 抬升面（输入框/行/弹窗卡）
@@ -149,10 +149,11 @@ window.__ModuleLoader__.load({
       // 深色：JS 写的 data-dru-theme 优先；宿主属性作 JS 未执行时的兜底。
       // 取值跟着宿主的深色基色走（body 实测 #151517 / 层 1 #232324 / 层 2 #2c2c2e / 层 3 #353638），
       // 语义色**在深底上重新取值**，不是沿用亮色值（亮色的 #1a7f37 / #cf222e 在深底对比度不足）。
-      ".dru-settings-section[data-dru-theme=\"dark\"],.dru-popup[data-dru-theme=\"dark\"],.dru-nav-remote[data-dru-theme=\"dark\"],",
+      ".dru-settings-section[data-dru-theme=\"dark\"],.dru-popup[data-dru-theme=\"dark\"],.dru-nav-remote[data-dru-theme=\"dark\"],.dru-standalone-card[data-dru-theme=\"dark\"],",
       "body[data-ds-dark-theme] .dru-settings-section:not([data-dru-theme]),",
       "body[data-ds-dark-theme] .dru-popup:not([data-dru-theme]),",
-      "body[data-ds-dark-theme] .dru-nav-remote:not([data-dru-theme]){",
+      "body[data-ds-dark-theme] .dru-nav-remote:not([data-dru-theme]),",
+      "body[data-ds-dark-theme] .dru-standalone-card:not([data-dru-theme]){",
       "  color-scheme:dark;",
       "  --dru-surface:#232324;",
       "  --dru-surface-2:#2c2c2e;",
@@ -202,6 +203,15 @@ window.__ModuleLoader__.load({
       "}",
       // 设置页栏目容器（nav 选中后渲染在 settings.section 内容区）
       ".dru-settings-section{max-width:720px;display:flex;flex-direction:column;gap:14px;padding-top:2px;color:var(--dru-fg)}",
+      // 📱 独立「远程访问」弹层（2026-10-25）：入口点击不再去"猜"官方设置面板的 DOM，
+      // 直接弹我们自己的一份设置页 —— 宿主改版也影响不到它。
+      ".dru-standalone-overlay{position:fixed;inset:0;z-index:2147483000;display:flex;align-items:center;justify-content:center;padding:24px;background:var(--dru-overlay)}",
+      ".dru-standalone-card{width:min(760px,100%);max-height:88vh;overflow:auto;box-sizing:border-box;padding:18px 20px 22px;border:1px solid var(--dru-border);border-radius:14px;background:var(--dru-surface-2);color:var(--dru-fg);box-shadow:0 18px 60px var(--dru-shadow)}",
+      ".dru-standalone-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px}",
+      ".dru-standalone-title{font-size:16px;font-weight:700}",
+      ".dru-standalone-close{appearance:none;border:1px solid var(--dru-border-ctl);background:var(--dru-surface-2);color:var(--dru-fg-muted);width:30px;height:30px;border-radius:8px;font-size:18px;line-height:1;cursor:pointer}",
+      ".dru-standalone-close:hover{background:var(--dru-hover);color:var(--dru-fg)}",
+      "@media (max-width:640px){.dru-standalone-overlay{padding:8px}.dru-standalone-card{max-height:94vh;border-radius:12px;padding:14px 14px 18px}}",
       ".dru-settings-head{display:flex;align-items:center;gap:10px;padding:6px 2px 2px}",
       ".dru-settings-icon{font-size:24px;line-height:1;flex:none}",
       // 标题/副标题优先沿用宿主语义令牌（自带深浅两套），取不到再退回本插件令牌
@@ -1117,6 +1127,61 @@ window.__ModuleLoader__.load({
        0.2 实测该槽就在侧栏底部、且**当前是空的**）—— 位置、宽度、折叠态全由宿主负责。
        所以这里不再注入任何 DOM，直接注册进槽位。id 仍保留 `dru-nav-remote`：
        公告徽标 / 首次红点那套按 id 取节点的既有逻辑因此不用改。 */
+    /* 📱 独立「远程访问」弹层（2026-10-25 用户拍板）：
+       桌面端点击侧栏入口时，不再去"点官方设置/找栏目"（宿主一改版就点错或没反应，
+       实测会点到左上角「更多→浏览插件」），而是弹出我们自己的一份设置页。
+       「设置 → 远程访问」栏目保留，正常从官方设置页进入的用户仍走那条路。
+       实现上用 shell.overlay 槽（宿主最上层，不受侧栏容器裁剪），组件常驻、按事件开关。 */
+    var standaloneOverlayMounted = false;
+    function openRemoteStandalonePanel() {
+      try { window.dispatchEvent(new CustomEvent("dsh-remote:open-standalone")); } catch (e) { /* 忽略 */ }
+    }
+    function RemoteStandaloneOverlay() {
+      var st = useState(false);
+      var open = st[0];
+      var setOpen = st[1];
+      useEffect(function () {
+        standaloneOverlayMounted = true;
+        function onOpen() { try { setOpen(true); } catch (e) { /* 忽略 */ } }
+        function onKey(e) {
+          if (!e) return;
+          if (e.key === "Escape" || e.keyCode === 27) { try { setOpen(false); } catch (e2) { /* 忽略 */ } }
+        }
+        try {
+          window.addEventListener("dsh-remote:open-standalone", onOpen);
+          window.addEventListener("keydown", onKey);
+        } catch (e3) { /* 忽略 */ }
+        return function () {
+          standaloneOverlayMounted = false;
+          try {
+            window.removeEventListener("dsh-remote:open-standalone", onOpen);
+            window.removeEventListener("keydown", onKey);
+          } catch (e4) { /* 忽略 */ }
+        };
+      }, []);
+      if (!open) return null;
+      var dark = false;
+      try { dark = !!document.body && document.body.hasAttribute("data-ds-dark-theme"); } catch (e5) { /* 忽略 */ }
+      return h("div", {
+        className: "dru-standalone-overlay",
+        role: "dialog",
+        "aria-modal": "true",
+        "aria-label": "远程访问",
+        onClick: function (e) { if (e && e.target === e.currentTarget) setOpen(false); }
+      },
+        h("div", { className: "dru-standalone-card", "data-dru-theme": dark ? "dark" : "light" },
+          h("div", { className: "dru-standalone-head" },
+            h("b", { className: "dru-standalone-title" }, "📱 远程访问"),
+            h("button", {
+              type: "button",
+              className: "dru-standalone-close",
+              "aria-label": "关闭",
+              onClick: function () { setOpen(false); }
+            }, "×")),
+          h(RemoteControlSection, { standalone: true })
+        ));
+    }
+
     function RemoteNavEntry(props) {
       var wide = !(props && props.wide === false);
       var seenArr = useState(false);
@@ -1133,12 +1198,15 @@ window.__ModuleLoader__.load({
           try { e.preventDefault(); } catch (err) { /* 忽略 */ }
           setClicked(true);
           dotMarkSeen();                       // 用过入口 = 已了解位置 → 收起首次红点
-          // 2026-10-25（用户实测「点不动、只能从更多→设置里打开」）：
-          // 不再依赖 remoteNavOpen 的赋值时序/是否被调用过，直接走内部打开链；
-          // 打开链内部自带兜底：侧栏候选 → 官方快捷键 → 更多/账号菜单 → 栏目点击。
+          // 2026-10-25（用户拍板）：优先弹**我们自己的独立设置页**（不再依赖官方设置面板 DOM）；
+          // 只有宿主没有 shell.overlay 槽（极老版本）时才退回旧的"打开官方设置栏目"链路。
           try {
-            if (typeof remoteNavOpen === "function") remoteNavOpen();
-            else openRemoteSettings();
+            openRemoteStandalonePanel();
+            setTimeout(function () {
+              if (!standaloneOverlayMounted) {
+                try { openRemoteSettings(); } catch (e2) { /* 忽略 */ }
+              }
+            }, 150);
           } catch (errOpen) { /* 绝不因打开失败抛到宿主 */ }
         }
       }, [
@@ -6135,6 +6203,13 @@ window.__ModuleLoader__.load({
         // 🔴 客户端插件抛异常 = 整个 web app 起不来（壳里的 assertEntriesActive 会 throw）。
         //    公告是锦上添花，**没有任何资格**把门关上 —— 任何异常都只是"这次没有弹窗"。
       }
+
+      // 📱 独立「远程访问」弹层（入口点击用；见 RemoteStandaloneOverlay 注释）
+      try {
+        ctx.slots.inject("shell.overlay", function () {
+          return ctx.slots.register({ name: "shell.overlay", id: "dsh-remote-standalone", order: 95 }, RemoteStandaloneOverlay);
+        });
+      } catch (eStand) { /* 老宿主没有 shell.overlay：入口会在 150ms 后回退到官方设置栏目链路 */ }
 
       // 📣 公告：每次页面加载**只拉一次**（sessionStorage 一次性标记，见 annPullOnce）。
       //    放在 apply() 里是刻意的：apply 跑在 app mount **之前**，所以这里**绝不能碰产品 DOM**

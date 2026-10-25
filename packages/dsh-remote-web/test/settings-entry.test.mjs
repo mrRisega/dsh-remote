@@ -193,11 +193,13 @@ test("入口：settings.section 栏目（id/order/label）+ 侧栏底部官方�
   assert.ok(String(label).includes("📱"), "栏目名应带 📱 远程访问图标（手机访问语义）");
   assert.ok(!String(label).includes("远程控制"), "栏目名不应再残留旧称「远程控制」");
 
-  // shell.overlay 仅保留满意度弹窗，浮动面板已移除
+  // shell.overlay：满意度弹窗 + 公告弹窗 + 「远程访问」独立弹层（2026-10-25 新增）
   assert.ok(plugin.injects.has("shell.overlay"));
   plugin.injects.get("shell.overlay")();
   assert.ok(plugin.registered.has("dsh-feedback-popup"), "满意度弹窗应保留在 shell.overlay");
-  assert.equal(plugin.registered.has("dsh-remote-panel"), false, "浮动配置面板不应再注册");
+  assert.ok(plugin.registered.has("dsh-remote-standalone"),
+    "入口点击要弹**独立**的远程访问设置页（不再依赖官方设置面板 DOM）");
+  assert.equal(plugin.registered.has("dsh-remote-panel"), false, "旧的浮动配置面板不应复活");
 });
 
 test("入口迁移：settings.section 里**只有一个**栏目（id=dsh-remote）——微信机器人不再是第二个栏目", () => {

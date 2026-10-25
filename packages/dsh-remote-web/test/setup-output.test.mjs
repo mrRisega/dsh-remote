@@ -214,17 +214,23 @@ test("★ launchd bootout 后必须等 label 摘干净再 bootstrap（否则随�
   assert.match(fn, /bootok|!boot\.ok[\s\S]{0,400}launchctl bootstrap/, "bootstrap 失败应重试一次再兜底");
 });
 
-test("★ 自启动配置里可以钉住上游（多 profile 时代，各宿主会互抢 .dsh-upstream）", () => {
+test("★ 自启动配置**默认不钉**上游端口；仅在 DSH_BRIDGE_PIN_UPSTREAM=1 时显式 opt-in", () => {
+  // 2026-10-25 事故：把安装时的动态端口写进 launchd plist 后，dsh 每次重启换端口，
+  // 守护/桥就永远连旧端口（upstream_unreachable / 设备掉线）。所以默认改为不钉。
   const src = readFileSync(SETUP, "utf8");
   assert.match(src, /function desktopAppPort\(/, "要有桌面端端口探测（lsof -c DeepSeek）");
-  assert.match(src, /PINNED_UPSTREAM/, "要有钉住上游的机制");
-  // plist 模板里必须把它写进 EnvironmentVariables（环境变量优先级高于 .dsh-upstream 文件）
+  assert.match(src, /DSH_BRIDGE_PIN_UPSTREAM/, "要有显式 opt-in 开关（部署方需要固定上游时用）");
+  // plist 模板仍支持写 DSH_BRIDGE_UPSTREAM（opt-in 时），但默认 PINNED_UPSTREAM 必须为空
   assert.match(src, /DSH_BRIDGE_UPSTREAM<\/key><string>\$\{PINNED_UPSTREAM\}/,
-    "plist 里要写入 DSH_BRIDGE_UPSTREAM，否则两端宿主会互相覆盖上游");
-  // ⚠️ 顺序：必须在写自启动文件**之前**算出来，否则 plist 里带不上（实测踩到过）
-  const pinAt = src.indexOf("PINNED_UPSTREAM = `http://127.0.0.1:${p}`");
+    "opt-in 时 plist 仍要能写入 DSH_BRIDGE_UPSTREAM");
+  // 关键回归锁：安装流程里不能再出现「把探测到的端口赋给 PINNED_UPSTREAM」
+  assert.doesNotMatch(src, /PINNED_UPSTREAM = `http:\/\/127\.0\.0\.1:\$\{p\}`/,
+    "不得再把动态端口回填进 PINNED_UPSTREAM（否则又会写进 plist，dsh 换端口即掉线）");
+  // 运行时端口仍必须写进 .dsh-upstream（守护/桥按它取最新端口）
+  assert.match(src, /UPSTREAM_FILE\)[^\n]*\n/);
+  const writeFileAt = src.indexOf("fs.writeFileSync(path.join(CONFIG_DIR, UPSTREAM_FILE)");
   const svcAt = src.indexOf("svc = installAutostart()");
-  assert.ok(pinAt > 0 && svcAt > 0 && pinAt < svcAt, "钉定必须发生在 installAutostart() 之前");
+  assert.ok(writeFileAt > 0 && svcAt > 0 && writeFileAt < svcAt, "运行时端口文件要在 installAutostart() 之前写好");
 });
 
 test("★ 桌面应用在运行时，绝不改写它的 profile（否则应用会自己退出/重启）", () => {

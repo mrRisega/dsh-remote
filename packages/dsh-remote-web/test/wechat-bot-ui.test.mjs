@@ -467,8 +467,8 @@ test("主题不变量：根节点带 .dru-settings-section + data-dru-theme；�
   assert.doesNotMatch(block, /--dru-[a-z0-9-]+\s*:/, "新样式不得**声明**令牌（只许引用）");
   assert.doesNotMatch(block, /:root|\bbody\b/, "新样式不得挂在 :root/body 上（会污染整个 GUI）");
   assert.match(block, /var\(--dru-/, "新样式应复用既有令牌");
-  // 令牌声明只允许出现在那三个选择器上（原有注释所述的不变量）
-  assert.match(SOURCE, /"\.dru-settings-section,\.dru-popup,\.dru-nav-remote\{"/, "亮色令牌块的选择器不得扩大");
+  // 令牌声明只允许出现在那四个选择器上（2026-10-25 新增 .dru-standalone-card：独立远程访问弹层）
+  assert.match(SOURCE, /"\.dru-settings-section,\.dru-popup,\.dru-nav-remote,\.dru-standalone-card\{"/, "亮色令牌块的选择器不得再扩大");
   assert.doesNotMatch(SOURCE, /":root\{/);
 });
 
