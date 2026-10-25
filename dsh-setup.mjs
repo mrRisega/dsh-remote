@@ -30,6 +30,7 @@ import { spawn, spawnSync, execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { childStopped, stopChildGracefully } from "./clients/dsh-remote/src/lifecycle.mjs";
 import { discoverUpstream, resolveUpstreamHint, FALLBACK_UPSTREAM } from "./clients/dsh-remote/upstream-discovery.mjs";
+import { normalizeRefCode, applyRefCodeToConfig } from "./clients/dsh-remote/src/channel-ref.mjs";
 
 const THIS_DIR = path.dirname(fileURLToPath(import.meta.url)); // 本包目录（仓库或 node_modules）
 const IS_NPM_INSTALL = THIS_DIR.includes(`${path.sep}node_modules${path.sep}`);
@@ -104,9 +105,9 @@ function findDepWs(startDir) {
  * 同步运行时文件时一并覆盖的客户端脚本（bridge 会把这些直接发给手机/桌面，必须与装置器一致）。
  * ⚠️ `src/lifecycle.mjs` 也在表里：本安装器**自己**import 它（进程优雅停机的共用实现），
  * 漏同步就会出现「入口脚本在、依赖不在」的半装运行时（插件半据此判定「运行环境已就绪」，
- * 却永远起不来 bridge —— 2026-09-23 用户反馈的现场）。
+ * 却永远起不来 bridge —— 2026-09-23 用户反馈的现场）。`src/channel-ref.mjs` 同理（本安装器也 import）。
  */
-const RUNTIME_CLIENT_FILES = ["mobile-adapter.mjs", "dsh-bridge.mjs", "e2ee-shim.mjs", "e2ee-client.mjs", "e2ee-shim-script.js", "mobile-adapter.test.mjs", "wechat-channel.mjs", "dsh-events.mjs", "wechat-runtime.mjs", "src/lifecycle.mjs"];
+const RUNTIME_CLIENT_FILES = ["mobile-adapter.mjs", "dsh-bridge.mjs", "e2ee-shim.mjs", "e2ee-client.mjs", "e2ee-shim-script.js", "mobile-adapter.test.mjs", "wechat-channel.mjs", "dsh-events.mjs", "wechat-runtime.mjs", "src/lifecycle.mjs", "src/channel-ref.mjs"];
 
 /**
  * 把"客户端脚本"补齐到配置目录。
@@ -196,6 +197,9 @@ function printHelp() {
 自建模式（可选）:
   dsh-remote setup --server wss://你的域名:端口 --key 访问密钥
 
+可选参数:
+  --ref <数字>    指定接入标识（可选，用于路由/灰度分组）
+
 登录/连接配置: 打开 dsh web → 设置 → 「远程访问」→ 注册或登录手机号即可
 （自建用户切「自建服务」标签或直接用上方 setup 命令，无需另开页面）。
 文档: ${REPO_URL}
@@ -204,7 +208,7 @@ function printHelp() {
 
 // 认识的参数（只给 flag 也要能装上去，所以不认识时才拦）。
 const KNOWN_FLAGS = new Set([
-  "--api", "--server", "--key", "--profile",
+  "--api", "--server", "--key", "--profile", "--ref",
   "--no-autostart", "--no-plugin", "--no-restart", "--uninstall", "--force"
 ]);
 
@@ -2022,6 +2026,11 @@ async function setup(argv) {
   const selfHosted = Boolean(server || key);
 
   let cfg = loadConfig();
+  // 接入标识（可选）：本次带合法 `--ref <数字>`（或环境变量 DSH_REF）才写入；没带/非法 →
+  // **保留**配置里已有的值。⚠️ saveConfig 是整对象覆盖写，所以必须在刚 loadConfig() 的这份
+  // 对象上合并再写回 —— 绝不能新建对象，否则升级装一次就把上一次的归因清空了。
+  // 非法值静默忽略：归因是附加信息，绝不能因此让安装失败。
+  cfg = applyRefCodeToConfig(cfg, argv);
 
   if (selfHosted) {
     if (!server || !key) {
@@ -3446,6 +3455,11 @@ else if (cmd === "status") {
   console.log("配置文件:", CONFIG_PATH);
   console.log("连接模式:", local ? `自建服务（${cfg.tunnel_url || "未设置服务器地址"}）` : `SaaS 云端服务（${cfg.phone || "未配置账号"}）`);
   console.log("API:", cfg.api_url || (local ? "（自建模式无需账号 API）" : DEFAULT_API));
+  // 接入标识（安装时 --ref 写入）：运维自查用；没设置就不打这一行，保持默认输出稳定。
+  {
+    const refCode = normalizeRefCode(cfg.ref_code);
+    if (refCode) console.log("接入标识:", refCode);
+  }
   console.log("远程地址/登录: 打开 dsh web → 设置 → 「远程访问」查看与操作");
   // 插件挂载诊断：报障时一眼看出是"链接坏了"还是"别的毛病"
   const profileDir = resolveProfileDir([]);

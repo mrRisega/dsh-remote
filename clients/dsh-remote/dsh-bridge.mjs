@@ -92,6 +92,8 @@ import { gzip as gzipCb } from "node:zlib";
 import { maybeInjectMobileAdapter } from "./mobile-adapter.mjs";
 import { maybeInjectMirrorDiag } from "./mirror-diag.mjs";
 import { discoverUpstream, resolveUpstreamHint, FALLBACK_UPSTREAM } from "./upstream-discovery.mjs";
+// 渠道归因码（安装器 --ref → .dsh-config.json 的 ref_code）的归一化规则，与安装器/插件同一份契约。
+import { normalizeRefCode } from "./src/channel-ref.mjs";
 // 镜像页 E2EE 加密 shim(Phase-4):text/html 注入;DSH_E2EE_SHIM=0 可关闭,叠加 e2ee.enabled 灰度门
 import { maybeInjectE2eeShim } from "./e2ee-shim.mjs";
 // E2EE(端到端加密)客户端基建(Phase-2):MK 派生/会话密钥/信封/握手/开关
@@ -307,6 +309,15 @@ const HARNESS_VERSION = resolveHarnessVersion();
 
 function loadLocalConfig() {
   try { return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8")); } catch { return {}; }
+}
+
+/**
+ * 渠道归因码：安装器 `--ref` 写进配置的 `ref_code`（3~6 位数字）。
+ * 每次读配置（不缓存）：配置由安装器/插件随时重写，缓存会让「装完没带、后补 --ref」
+ * 这种升级路径永远不上报。缺失/非法 → 空串，调用方据此**整个省略**该字段。
+ */
+function refCodeFromConfig() {
+  try { return normalizeRefCode(loadLocalConfig().ref_code); } catch { return ""; }
 }
 
 /**
@@ -2140,6 +2151,9 @@ function tunnelEndpoint(raw) {
 async function registerDeviceInAccount(token) {
   if (process.env.DSH_BRIDGE_LOCAL_KEY) return; // 自建模式:设备列表来自 router 实时 WS 注册表
   const pubKey = resolveDevicePubKey();
+  // 渠道归因码（可选）：安装器 `--ref 368` 写进配置，这里随设备登记原样带给服务端。
+  // 契约：字段可选、3~6 位数字；没有/非法 → **整个省略**，绝不发空串或猜的值。
+  const refCode = refCodeFromConfig();
   try {
     const r = await fetch(API_BASE + "/api/devices", {
       method: "POST",
@@ -2156,6 +2170,7 @@ async function registerDeviceInAccount(token) {
         // v15 宿主版本(由插件注入;老插件不注入 → 空串 = 未上报)。服务端 devices.harness_version。
         // 与 install_version 是两个不同的数:前者是"插件版本",这个是"DeepSeek Harness 版本"。
         harness_version: HARNESS_VERSION,
+        ...(refCode ? { ref_code: refCode } : {}),
         host_os: process.platform,
         host_arch: process.arch
       })

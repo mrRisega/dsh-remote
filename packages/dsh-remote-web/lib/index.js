@@ -6661,8 +6661,8 @@ export const __telemetryInternals = {
  * 安装信息上报（插件侧通道）：登录后把本机安装信息发给企业端，供「已登录用户升级插件后刷新版本号」
  * 之类的约定统计。无账号凭据不上报；失败静默（绝不阻塞面板、不弹错误）。
  * 契约：POST <api_url>/api/install-report，头 `authorization: Bearer <device-login JWT>`，
- * body { device_id?, install_source, install_version, harness_version, host_os, host_arch }，成功 200 {ok:true}；
- * 404/400 一律忽略（老服务端没有该接口时不能报错）。
+ * body { device_id?, install_source, install_version, harness_version, ref_code?, host_os, host_arch }，
+ * 成功 200 {ok:true}；404/400 一律忽略（老服务端没有该接口时不能报错）。
  */
 const INSTALL_REPORT_FILE = ".dsh-install-report.json";
 const INSTALL_REPORT_TTL_MS = 24 * 3600 * 1000;
@@ -6675,16 +6675,33 @@ function installSourceOf(relayDir) {
   if (runtimeReady(relayDir)) return "npx";
   return "plugin_market";
 }
+/**
+ * 渠道归因码：安装器 `--ref <code>` 写进 .dsh-config.json 的 `ref_code`（3~6 位数字）。
+ * 规则与 clients/dsh-remote/src/channel-ref.mjs 同一份；插件包**不包含** clients/（files 只有 lib+runtime），
+ * 所以这里保留这几行等价实现 —— 改契约时两边一起改。
+ * 缺失/非法 → 空串，调用方据此**整个省略**字段（绝不上报空串/脏值）。
+ */
+function refCodeOf(cfg) {
+  const raw = cfg && cfg.ref_code;
+  if (typeof raw === "number") return Number.isInteger(raw) && /^\d{3,6}$/.test(String(raw)) ? String(raw) : "";
+  if (typeof raw !== "string") return "";
+  const v = raw.trim();
+  return /^\d{3,6}$/.test(v) ? v : "";
+}
 async function reportInstallOnce(relayDir, cfgOverride, opts = {}) {
   const cfg = cfgOverride || loadConfig(relayDir);
   if (!hasAccountCreds(cfg)) return { ok: false, skipped: "no_credentials" };
   const source = installSourceOf(relayDir);
   const version = PLUGIN_VERSION;
+  // 渠道归因码（可选）：服务端字段可选，缺失/非法就整个省略。
+  const refCode = refCodeOf(cfg);
   const marker = join(relayDir, INSTALL_REPORT_FILE);
   if (!opts.force) {
     try {
       const prev = JSON.parse(readFileSync(marker, "utf8"));
-      if (prev && prev.version === version && prev.source === source && Date.now() - Number(prev.at || 0) < INSTALL_REPORT_TTL_MS) {
+      // ref 也是去重键的一部分：同一版本下后补 `--ref`（重跑安装器）时必须能补报一次，
+      // 否则归因会在 24h 窗口内被"已上报过"吞掉。
+      if (prev && prev.version === version && prev.source === source && (prev.ref || "") === refCode && Date.now() - Number(prev.at || 0) < INSTALL_REPORT_TTL_MS) {
         return { ok: true, skipped: "already_reported" };
       }
     } catch { /* 首次上报 */ }
@@ -6699,6 +6716,7 @@ async function reportInstallOnce(relayDir, cfgOverride, opts = {}) {
     // 宿主（DeepSeek Harness）版本：与 install_version（插件版本）是两个数，
     // 只报插件版本时「是不是 DSH 升级导致的故障」答不出来（2026-10 生产反馈的普遍缺口）。
     harness_version: harnessVersion(),
+    ...(refCode ? { ref_code: refCode } : {}),
     host_os: process.platform,
     host_arch: process.arch,
   };
@@ -6716,8 +6734,8 @@ async function reportInstallOnce(relayDir, cfgOverride, opts = {}) {
     // 老服务端没有该接口（404）或字段不认（400）→ 忽略，绝不影响 UI
     if (r.status === 400 || r.status === 404) return { ok: false, skipped: `http_${r.status}` };
     if (!r.ok) return { ok: false, status: r.status };
-    try { writeFileSync(marker, JSON.stringify({ at: Date.now(), version, source })); } catch { /* 非关键 */ }
-    return { ok: true, status: r.status, install_source: source, install_version: version };
+    try { writeFileSync(marker, JSON.stringify({ at: Date.now(), version, source, ref: refCode })); } catch { /* 非关键 */ }
+    return { ok: true, status: r.status, install_source: source, install_version: version, ...(refCode ? { ref_code: refCode } : {}) };
   } catch (e) {
     return { ok: false, skipped: `unreachable: ${e.message}` };
   }
@@ -7735,6 +7753,11 @@ function registerRoutes(ctx, relayDir) {
         const captchaAnswer = body.captcha_answer ?? body.captcha;
         if (captchaId !== void 0) payload.captcha_id = String(captchaId);
         if (captchaAnswer !== void 0) payload.captcha_answer = String(captchaAnswer);
+        // 渠道归因（安装器 `--ref` → 配置 ref_code）：面板注册时带上 `channel_code`，
+        // 与 `invite_code`（C 端裂变）是两个字段、互不影响。请求体里自带 channel_code 时
+        // 以请求体为准（手机端 `?ref=` 路径会自己带），这里绝不覆盖。
+        const refCode = refCodeOf(loadConfig(relayDir));
+        if (refCode && !payload.channel_code) payload.channel_code = refCode;
         const r = await relayFetch(relayDir, "/api/register", {
           method: "POST",
           headers: { "content-type": "application/json" },
