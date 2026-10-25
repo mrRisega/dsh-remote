@@ -1679,20 +1679,22 @@ function releaseSpawnLock() {
 }
 
 // ---------- run：前台跑 bridge（带配置 + 自启动 watcher） ----------
-async function runBridge() {
-  // 🔴 2026-10-25：升级自旧版的机器，launchd plist 里可能还带着**安装时的旧端口**
-  // （DSH_BRIDGE_UPSTREAM）。dsh 换端口后它会让守护/桥永远连旧端口 → 设备掉线。
-  // 插件每次装载都会把当前端口写进 .dsh-upstream，这里以文件为准校正进程环境（仅当文件合法且不同）。
+/** 以插件写入的 .dsh-upstream 为准校正进程内的旧上游环境变量（dsh 换端口后不再连旧端口）。 */
+function reconcileUpstreamEnvFromFile() {
   try {
     const fileUp = String(fs.readFileSync(path.join(CONFIG_DIR, UPSTREAM_FILE), "utf8")).trim().replace(/\/+$/, "");
     const envUp = String(process.env.DSH_BRIDGE_UPSTREAM || "").trim().replace(/\/+$/, "");
-    // 只在「继承到了旧的显式 env」时校正；env 为空时保持原有发现逻辑（文件可能过期，须走探测）。
     if (envUp && /^https?:\/\/[^\s]+$/i.test(fileUp) && fileUp !== envUp) {
-      console.log(`[dsh-remote] 忽略旧的上游地址 ${envUp || "(空)"} → 使用插件写入的最新地址 ${fileUp}（防端口漂移掉线）`);
+      console.log(`[dsh-remote] 忽略旧的上游地址 ${envUp} → 使用插件写入的最新地址 ${fileUp}（防端口漂移掉线）`);
       process.env.DSH_BRIDGE_UPSTREAM = fileUp;
       discoveredUpstream = fileUp;
     }
-  } catch { /* 没有端口文件：保持原行为 */ }
+  } catch { /* 无文件：保持原行为 */ }
+}
+
+async function runBridge() {
+  // 启动/每次拉起前都按插件写入的端口校正继承来的旧 env（旧 plist 可能钉着安装时的端口）
+  reconcileUpstreamEnvFromFile();
   // 去重（所有平台）：自启动服务、登录任务、插件半的脱离进程兜底都可能拉起 watcher，
   // 两个 bridge 会抢同一个设备登记 → 以 pid 文件为准。
   //
@@ -1889,6 +1891,7 @@ async function runBridge() {
     }
     warnedDuplicateBridge = false;
 
+    reconcileUpstreamEnvFromFile(); // dsh 可能刚重启并换了端口：拉起前再以最新端口文件为准
     const alive = await checkUpstream();
     if (alive && childStopped(bridgeProc)) {
       starting = true;
@@ -2073,9 +2076,11 @@ async function setup(argv) {
       if (!PINNED_UPSTREAM && pluginTargets.some((t) => t.name === "desktop")) {
         const p = desktopAppPort();
         if (p) {
-          PINNED_UPSTREAM = `http://127.0.0.1:${p}`;
-          try { fs.writeFileSync(path.join(CONFIG_DIR, UPSTREAM_FILE), PINNED_UPSTREAM + "\n"); } catch { /* 忽略 */ }
-          console.log(`ℹ 桌面端在 127.0.0.1:${p} 监听 → 桥的上游已钉到它（避免与 Web 版互抢）`);
+          // 🔴 2026-10-25：这里只能写运行时端口文件；**不能**回填 PINNED_UPSTREAM ——
+          // 它会被写进 launchd plist 变成永久显式指定，dsh 换端口后守护/桥永远连旧端口
+          // （用户实测 upstream_unreachable）。
+          try { fs.writeFileSync(path.join(CONFIG_DIR, UPSTREAM_FILE), `http://127.0.0.1:${p}` + "\n"); } catch { /* 忽略 */ }
+          console.log(`ℹ 桌面端在 127.0.0.1:${p} 监听 → 已写入运行时上游端口（不再钉进自启动配置）`);
         }
       }
     } catch { /* 探测失败不阻断安装 */ }

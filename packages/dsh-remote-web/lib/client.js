@@ -1133,7 +1133,13 @@ window.__ModuleLoader__.load({
           try { e.preventDefault(); } catch (err) { /* 忽略 */ }
           setClicked(true);
           dotMarkSeen();                       // 用过入口 = 已了解位置 → 收起首次红点
-          if (remoteNavOpen) remoteNavOpen();
+          // 2026-10-25（用户实测「点不动、只能从更多→设置里打开」）：
+          // 不再依赖 remoteNavOpen 的赋值时序/是否被调用过，直接走内部打开链；
+          // 打开链内部自带兜底：侧栏候选 → 官方快捷键 → 更多/账号菜单 → 栏目点击。
+          try {
+            if (typeof remoteNavOpen === "function") remoteNavOpen();
+            else openRemoteSettings();
+          } catch (errOpen) { /* 绝不因打开失败抛到宿主 */ }
         }
       }, [
         h("span", { className: "ico", key: "ico" }, "📱"),
