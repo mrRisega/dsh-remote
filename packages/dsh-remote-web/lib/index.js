@@ -1687,21 +1687,59 @@ function launchdStatusIn(target) {
   return { running: false, pid: null, state: "", runs: null, lastExitCode: null, crashing: false };
 }
 
-// ---------- Windows：bridge 进程发现（0.6.7） ----------
+// ---------- Windows：bridge 进程发现（0.6.7 立；2026-10-29 反馈后重写） ----------
 //
 // Windows 没有 pgrep/ps/launchctl，而 bridge 在 Windows 上也不由服务管理器托管
-// （dsh-setup.mjs 明确不生成 Windows 自启动）。所以进程发现按「pid 文件优先、PowerShell 兜底」两级：
+// （dsh-setup.mjs 明确不生成 Windows 自启动）。所以进程发现按「pid 文件 → bridge 自写证据 → PowerShell 扫描」三级：
 //   ① pid 文件：插件自己 spawn 的 watcher、以及 `dsh-remote run` 跑起来的 watcher/bridge
 //      都会把 pid 落到配置目录（见 dsh-setup.mjs 的 writePidFile）。读文件 + process.kill(pid,0)
 //      判活，零 shell 开销——面板 2~3s 轮询一次也扛得住。
-//   ② PowerShell 扫 node.exe 的命令行：兼容「用户跑的是没写 pid 文件的旧版运行时」。
+//   ② bridge **自己**写的单实例锁 `.dsh-bridge-instance.lock`（{pid,at,script}，见 dsh-bridge.mjs 的
+//      acquireInstanceLock）与状态文件 `.dsh-bridge-state.json` 里的 pid：进程自证身份。父进程
+//      watcher 会把 `.dsh-bridge.pid` 删掉（子进程一退出就删），而孤儿 bridge 仍活着的场景里，
+//      这条「自写证据」是唯一还成立的判据（2026-10-29 事故正是这个形态）。
+//   ③ PowerShell 全量枚举 + 命令行匹配：兼容「用户跑的是没写 pid 文件的旧版运行时」。
 //      这条路径要起一个 powershell.exe（数百毫秒），故结果带 TTL 缓存，绝不被轮询打爆。
+//
+// 【2026-10-29 修复的三处结构性缺陷】（取证：dsh-relay-internal/2026-10-29-反馈bridge_wedged-取证/）
+//   F1 旧条件 `if (!watcher.length && !bridge.length)`：**watcher pid 文件有效时永不扫**。于是
+//      「watcher 在跑 + bridge pid 文件刚被删（新 bridge 撞本地实例锁秒退时 watcher 会删它）」
+//      ⇒ bridge 恒为空 ⇒ 面板「bridge 未运行 / 中继未注册」⇒ 90s 后判「守护卡死」⇒ 误重启 3 次
+//      ⇒ bridge_wedged，而中继数据面全程在线。现在改成「**只要 bridge 为空就扫**」，扫描结果只补充不覆盖。
+//   F2 旧扫描写死 `Name='node.exe'`：桌面端（Electron）宿主用 process.execPath 拉起 watcher，
+//      镜像名是桌面端 exe；bridge 的解释器是 NODE_BIN（可能也是同一个 exe）⇒ 两类进程都可能全漏。
+//      现在无 Name 过滤、按命令行匹配，并把 Name 一起带回（故障时一眼看出解释器是谁）。
+//   F3 扫描失败与「扫到 0 个」不再混为一谈：失败时置 degraded，随 /bridge-status 下发（scanDegraded）。
 
 const WATCHER_PID_FILE = ".dsh-watcher.pid";
 const BRIDGE_PID_FILE = ".dsh-bridge.pid";
+/** bridge 自己写的单实例锁（必须与 dsh-bridge.mjs 的 INSTANCE_LOCK_FILE 同名）。 */
+const BRIDGE_LOCK_FILE = ".dsh-bridge-instance.lock";
 /** Windows 自启动任务名（与 dsh-setup.mjs 的 WIN_TASK_NAME 必须一致）。 */
 const WIN_TASK_NAME = "dsh-remote-bridge";
 const WIN_SCAN_TTL_MS = 5000;
+/**
+ * pid 文件的「信任窗口」：**取不到进程命令行**时（Windows 上 PowerShell 不可用/进程不在扫描结果里；
+ * POSIX 上 ps 失败），只有 pid 文件足够新才敢按「大概是我们的进程」处理。超过窗口一律当无法确认 ——
+ * 宁可漏杀/漏报，也绝不对一个可能已被系统回收给无关进程的 pid 发 taskkill /T /F。
+ */
+const PID_FILE_TRUST_MS = 10 * 60 * 1000;
+/**
+ * 状态文件心跳的信任窗口：新版 bridge 在心跳拍里节流刷新 `.dsh-bridge-state.json` 的
+ * `{pid, heartbeat_at}`（≥10s 一次，隧道心跳默认 20s；见 dsh-bridge.mjs 的 stampBridgeHeartbeat）。
+ * 120s ≈ 容忍 6 拍丢失（机器休眠/事件循环卡顿）。超过窗口就认为「这份 pid 可能已被系统回收
+ * 给无关进程」，此时必须靠命令行确认，绝不能只看 pid 活着就报「bridge 在跑」。
+ */
+const STATE_HEARTBEAT_TRUST_MS = 120_000;
+
+/**
+ * 扫描结果缓存 TTL。生产恒为 WIN_SCAN_TTL_MS；`DSH_RELAY_WIN_SCAN_TTL_MS` 只给用例用
+ * （0 = 不缓存），避免同一进程内多条用例被 5s 缓存互相串味 —— 与 DSH_RELAY_WEDGE_MS 同一约定。
+ */
+function winScanTtlMs() {
+  const v = Number(process.env.DSH_RELAY_WIN_SCAN_TTL_MS);
+  return Number.isFinite(v) && v >= 0 ? v : WIN_SCAN_TTL_MS;
+}
 
 /** 读 pid 文件（内容为纯数字 pid；缺失/损坏返回 null）。 */
 function readPidFile(relayDir, name) {
@@ -1713,41 +1751,65 @@ function readPidFile(relayDir, name) {
   }
 }
 
+/** pid 文件有多旧（毫秒）；读不到 = Infinity（= 完全不可信）。 */
+function pidFileAgeMs(relayDir, name) {
+  try { return Date.now() - (statSync(join(relayDir, name)).mtimeMs || 0); } catch { return Infinity; }
+}
+
+/** 安静读一个 JSON 证据文件（bridge 自写的锁/状态）；缺失/损坏 → null。 */
+function readJsonFileQuiet(p) {
+  try {
+    const j = JSON.parse(readFileSync(p, "utf8"));
+    return j && typeof j === "object" ? j : null;
+  } catch { return null; }
+}
+
 /**
- * 用 PowerShell 列出所有 node.exe 的 pid/父 pid/命令行。
+ * 用 PowerShell 列出所有**命令行里带 dsh-setup.mjs / dsh-bridge.mjs** 的进程（不再按镜像名过滤）。
  * 走 -EncodedCommand（UTF-16LE base64）：命令行里带引号/中文/空格时不会被 PowerShell 自己的
  * 引号解析吃掉，也不需要经过 shell。Get-CimInstance 不可用时回退 Get-WmiObject（Win7/精简系统）。
+ *
+ * @returns {{procs: Array<{pid:number, ppid:number|null, name:string, commandLine:string}>, degraded:boolean}}
+ *          degraded=true 表示「没扫成」（无 PowerShell / 调用超时 / JSON 解析失败）——
+ *          必须与「扫到 0 个」区分开，否则诊断里会谎报「本机一个进程都没有」。
  */
-let winProcScanCache = { at: 0, procs: [] };
-function windowsNodeProcesses() {
-  if (Date.now() - winProcScanCache.at < WIN_SCAN_TTL_MS) return winProcScanCache.procs;
+let winProcScanCache = { at: 0, procs: [], degraded: false };
+function windowsProcessScan() {
+  const ttl = winScanTtlMs();
+  if (ttl > 0 && Date.now() - winProcScanCache.at < ttl) return winProcScanCache;
   const script = [
-    "try { $p = Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" }",
-    "catch { $p = Get-WmiObject Win32_Process -Filter \"Name='node.exe'\" }",
-    "$p | Select-Object ProcessId,ParentProcessId,CommandLine | ConvertTo-Json -Compress",
+    "try { $p = Get-CimInstance Win32_Process } catch { $p = Get-WmiObject Win32_Process }",
+    "$p | Where-Object { $_.CommandLine -and ($_.CommandLine -match 'dsh-setup\\.mjs' -or $_.CommandLine -match 'dsh-bridge\\.mjs') } | Select-Object ProcessId,ParentProcessId,Name,CommandLine | ConvertTo-Json -Compress",
   ].join("; ");
   const encoded = Buffer.from(script, "utf16le").toString("base64");
   let procs = [];
+  let degraded = false;
   try {
     const r = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], {
       encoding: "utf8", timeout: 8000, windowsHide: true, maxBuffer: 8 * 1024 * 1024,
     });
     const raw = String(r.stdout || "").trim();
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      for (const p of (Array.isArray(parsed) ? parsed : [parsed])) {
-        const pid = Number(p && p.ProcessId);
-        if (!Number.isInteger(pid) || pid <= 0) continue;
-        procs.push({
-          pid,
-          ppid: Number(p.ParentProcessId) || null,
-          commandLine: String((p && p.CommandLine) || ""),
-        });
-      }
+    // 非 0 退出且没有输出 = 没扫成（无 PowerShell / 被策略拒 / WMI 不可用）
+    if (!raw) {
+      if (r.error || (Number.isFinite(r.status) && r.status !== 0)) degraded = true;
+    } else {
+      try {
+        const parsed = JSON.parse(raw);
+        for (const p of (Array.isArray(parsed) ? parsed : [parsed])) {
+          const pid = Number(p && p.ProcessId);
+          if (!Number.isInteger(pid) || pid <= 0) continue;
+          procs.push({
+            pid,
+            ppid: Number(p.ParentProcessId) || null,
+            name: String((p && p.Name) || ""),
+            commandLine: String((p && p.CommandLine) || ""),
+          });
+        }
+      } catch { procs = []; degraded = true; } // 有输出但不是 JSON → 当作没扫成
     }
-  } catch { procs = []; } // 无 PowerShell / 解析失败 → 静默降级为空（不阻断状态查询）
-  winProcScanCache = { at: Date.now(), procs };
-  return procs;
+  } catch { procs = []; degraded = true; } // spawnSync 抛错（ENOENT 等）→ 没扫成
+  if (ttl > 0) winProcScanCache = { at: Date.now(), procs, degraded };
+  return { procs, degraded };
 }
 
 /**
@@ -1766,35 +1828,146 @@ function windowsTaskRegistered() {
   return ok;
 }
 
-/** Windows 版 manualStatus：pid 文件优先，PowerShell 兜底。语义与 POSIX 版一致。 */
+/* ── 进程身份校验（防 PID 复用：既防误判「在跑」，也防误杀）─────────────────────────
+ *
+ * pid 文件只证明「某个时刻有人写了这个 pid」，**不证明**「现在这个 pid 还是我们的进程」。
+ * Windows 的 PID 会被快速回收，于是「watcher 死了 → pid 文件还在 → 该 pid 已被无关进程占用」
+ * 是常态而不是异常。旧实现只做 pidAlive() 判活，后果有两个方向：
+ *   · 误判「守护在运行」⇒ 自愈永久 no-op（「多次修复都没解决」那一类）；
+ *   · 更严重：stopBridgeDetached 会 taskkill /T /F 杀掉它 ⇒ **杀掉一棵与产品无关的进程树**。
+ * 纪律（与 dsh-setup.mjs 的 looksLikeWatcher/looksLikeBridge 同一方向：宁可漏杀）：
+ *   · 命令行**确认**是本 relayDir 的 dsh-setup.mjs / dsh-bridge.mjs → ident 非空（是我们的）；
+ *   · 命令行**取到了但不是**（不指向这两个脚本 / 不指向本 relayDir）→ cmdKnown=true、ident=""；
+ *   · 取不到命令行（Windows：不在扫描结果里或扫描 degraded；POSIX：ps 失败）→ cmdKnown=false，
+ *     这一档只能用 pid 文件新鲜度兜底（PID_FILE_TRUST_MS）。
+ */
+function processCommandLine(pid, procs) {
+  if (!Number.isInteger(pid) || pid <= 0) return "";
+  if (procs) {
+    const hit = procs.find((p) => p && p.pid === pid);
+    return hit ? String(hit.commandLine || "") : "";
+  }
+  return commandLineOfPid(pid);
+}
+
+/** @returns {{ident:"watcher"|"bridge"|"", cmdKnown:boolean}} */
+function pidIdentityOf(pid, relayDir, procs) {
+  const cmd = processCommandLine(pid, procs);
+  if (!cmd) return { ident: "", cmdKnown: false };
+  const norm = (v) => String(v).replace(/\\/g, "/").toLowerCase();
+  const isBridge = /dsh-bridge\.mjs/.test(cmd);
+  const isWatcher = /dsh-setup\.mjs/.test(cmd);
+  if (!isBridge && !isWatcher) return { ident: "", cmdKnown: true };      // 取到了命令行：明确不是我们的脚本
+  if (!norm(cmd).includes(norm(relayDir || ""))) return { ident: "", cmdKnown: true }; // 同类脚本，但不是本配置目录
+  return { ident: isBridge ? "bridge" : "watcher", cmdKnown: true };
+}
+
+/**
+ * Windows 版 manualStatus：pid 文件 → bridge 自写证据 → PowerShell 扫描（扫描结果只补充、不覆盖）。
+ *
+ * 返回值里的 scanDegraded / bridgeEvidence 是 2026-10-29 事故的产物：面板/诊断必须能区分
+ * 「bridge 真没有（pid 文件、锁、状态文件、扫描四路都说没有）」与「我们根本没能扫」（degraded），
+ * 否则又会像那次一样把「工具看不见」当成「进程不存在」。
+ */
 function windowsManualStatus(relayDir) {
+  const selfPid = process.pid;
   const watcher = [];
   const bridge = [];
   const allBridge = [];
+  const evidence = [];
   const push = (arr, pid) => { if (pid && !arr.includes(pid)) arr.push(pid); };
+  const addBridge = (pid, why) => {
+    if (!pid || pid === selfPid || allBridge.includes(pid)) return;
+    push(bridge, pid); push(allBridge, pid); evidence.push(why);
+  };
   const wPid = readPidFile(relayDir, WATCHER_PID_FILE);
   const bPid = readPidFile(relayDir, BRIDGE_PID_FILE);
-  if (wPid && pidAlive(wPid) !== false && wPid !== process.pid) push(watcher, wPid);
-  if (bPid && pidAlive(bPid) !== false && bPid !== process.pid) { push(bridge, bPid); push(allBridge, bPid); }
-  // 兜底扫描只在 pid 文件一无所获时进行：避免每次轮询都起一个 PowerShell。
-  if (!watcher.length && !bridge.length) {
-    for (const p of windowsNodeProcesses()) {
-      if (p.pid === process.pid || p.pid === wPid || p.pid === bPid) continue;
-      if (/dsh-setup\.mjs/.test(p.commandLine)) push(watcher, p.pid);
-      else if (/dsh-bridge\.mjs/.test(p.commandLine)) { push(bridge, p.pid); push(allBridge, p.pid); }
+  const wAlive = Boolean(wPid && pidAlive(wPid) !== false);
+  const bAlive = Boolean(bPid && pidAlive(bPid) !== false);
+
+  // ① bridge pid 文件（父进程 watcher 写的那份；子进程一退出它就会被删 —— 这正是事故现场的形态）
+  if (bAlive && bPid !== selfPid) addBridge(bPid, "pid-file");
+
+  // ② bridge 自写证据（F3）：进程自己写的「我在跑」比任何外部扫描都可靠，而且不需要起 PowerShell。
+  //    · `.dsh-bridge-instance.lock`：{pid,at,script}，bridge 启动时自己写（script 即身份自证）；
+  //    · `.dsh-bridge-state.json`：新版 bridge 写 {pid, heartbeat_at}（心跳拍 ≥10s 刷新一次）。
+  //    这两条正是「父进程把 .dsh-bridge.pid 删了、孤儿 bridge 还活着」时唯一还成立的判据。
+  const state = bridgeStateFile(relayDir);
+  const stPid = Number(state && state.pid);
+  const hbAt = Number(state && state.heartbeat_at) || 0;
+  const hbFresh = hbAt > 0 && Date.now() - hbAt < STATE_HEARTBEAT_TRUST_MS;
+  const stPidAlive = Number.isInteger(stPid) && stPid > 0 && stPid !== selfPid && pidAlive(stPid) !== false;
+  const lock = readJsonFileQuiet(join(relayDir, BRIDGE_LOCK_FILE));
+  const lockPid = Number(lock && lock.pid);
+  const lockAlive = Number.isInteger(lockPid) && lockPid > 0 && lockPid !== selfPid && pidAlive(lockPid) !== false;
+  const lockScriptOk = String((lock && lock.script) || "") === "dsh-bridge.mjs";
+  // 心跳「已经停了」= 状态文件里有过心跳但已超信任窗口。此时锁文件里的 pid 很可能已被系统回收给
+  // 无关进程（bridge 死了、锁没删），必须先拿到命令行确认 —— 否则会永久谎报「bridge 在跑」。
+  const heartbeatStopped = hbAt > 0 && !hbFresh;
+  let lockNeedsProof = false;      // 需要命令行确认的锁候选
+
+  let procs = null;                // null = 本次没扫描（省掉一次 PowerShell）
+  let scanDegraded = false;
+  if (!bridge.length) {
+    if (lockAlive && lockScriptOk) {
+      if (heartbeatStopped) lockNeedsProof = true;   // 心跳停了 → 等扫描用命令行确认
+      else addBridge(lockPid, "instance-lock");      // script 自证 + pid 活着（心跳新鲜或旧版无心跳）
+    }
+    if (!bridge.length && stPidAlive && hbFresh) addBridge(stPid, "state-file");
+  }
+
+  if (!bridge.length) {
+    // ③ F1：**只要 bridge 为空就扫**（不再要求 watcher 也为空）。
+    //    旧条件 `if (!watcher.length && !bridge.length)` 让「watcher 在跑、bridge pid 文件刚被删」
+    //    时一次都不扫 ⇒ bridge 恒为空 ⇒ 误判卡死 → 误重启 → bridge_wedged（2026-10-29 事故）。
+    //    F2：扫描不按镜像名过滤（Electron 宿主的 watcher/bridge 不叫 node.exe），按命令行匹配。
+    const sc = windowsProcessScan();
+    procs = sc.procs;
+    scanDegraded = Boolean(sc.degraded);
+    for (const p of procs) {
+      if (!p || p.pid === selfPid) continue;
+      const cmd = String(p.commandLine || "");
+      if (/dsh-setup\.mjs/.test(cmd)) { push(watcher, p.pid); continue; }
+      if (/dsh-bridge\.mjs/.test(cmd)) addBridge(p.pid, "scan");
+    }
+    // 扫描也没找到时，才允许「自写证据 + 命令行确认」这一档（宁可漏报，也不假阳性）
+    if (!bridge.length && lockNeedsProof && pidIdentityOf(lockPid, relayDir, procs).ident === "bridge") {
+      addBridge(lockPid, "instance-lock");
+    }
+    if (!bridge.length && stPidAlive && pidIdentityOf(stPid, relayDir, procs).ident === "bridge") {
+      addBridge(stPid, "state-file");
     }
   }
-  return { watcher, bridge, allBridge };
+
+  // ⑤ watcher（守护）pid 文件：必须通过身份/新鲜度校验，否则**不得**报「守护在运行」——
+  //    否则 PID 复用会让 watcherWedgeOf 判「守护活了 N 秒仍无 bridge」→ 误重启（甚至误杀）。
+  if (wAlive && wPid !== selfPid) {
+    let trusted;
+    if (procs) {
+      const id = pidIdentityOf(wPid, relayDir, procs);
+      if (id.ident === "watcher") trusted = true;
+      else if (id.ident === "bridge") { addBridge(wPid, "scan"); trusted = false; } // pid 文件被覆盖成 bridge：算 bridge 更准
+      else trusted = !id.cmdKnown && pidFileAgeMs(relayDir, WATCHER_PID_FILE) < PID_FILE_TRUST_MS;
+    } else {
+      // bridge 已从 pid 文件/自写证据确认 ⇒ 本次没扫描。watcher 列表此时不参与任何风险决策
+      // （wedge 只在「bridge 为空」时才计算），保持旧行为即可，不必为此白起一次 PowerShell。
+      trusted = true;
+    }
+    if (trusted) push(watcher, wPid);
+  }
+
+  return { watcher, bridge, allBridge, scanDegraded, bridgeEvidence: evidence };
 }
 
 /** 检查手动运行的 watcher（dsh-setup.mjs run）与 bridge 子进程（排除 launchd 托管链）。 */
 function manualStatus(relayDir) {
   if (isWindows()) return windowsManualStatus(relayDir || DEFAULT_RELAY_DIR);
   const launchdPid = launchdStatus().pid;
-  const out = (() => {
+  const pg = (() => {
     const r = sh("pgrep -fl 'dsh-setup.mjs|dsh-bridge.mjs'");
-    return r.ok ? r.stdout : "";
+    return { out: r.ok ? r.stdout : "", stderr: String(r.stderr || "") };
   })();
+  const out = pg.out;
   const watcher = [];
   const bridge = [];
   // 全部 bridge 子进程（含 launchd 托管链里的）：连接阶段判定「bridge 进程真的在跑」用它。
@@ -1823,7 +1996,15 @@ function manualStatus(relayDir) {
       if (!launchdManaged) bridge.push(pid); // launchd 托管的 bridge 子进程（原语义：不计入 manual.bridge）
     }
   }
-  return { watcher, bridge, allBridge };
+  // scanDegraded/bridgeEvidence 与 Windows 版对齐（见 windowsManualStatus 的注释）：
+  // POSIX 上 pgrep 匹配的就是命令行本身，不存在「镜像名不对」的盲区。
+  // 注意 pgrep「没匹配到」= 退出码 1 + 无输出 + 无错误输出 ⇒ 这是**有效结论（0 个）**，不是 degraded；
+  // 只有 pgrep 本身不存在/执行失败（stderr 非空）才算扫描不可用。
+  return {
+    watcher, bridge, allBridge,
+    scanDegraded: Boolean(pg.stderr && pg.stderr.trim()),
+    bridgeEvidence: allBridge.length ? ["pgrep"] : [],
+  };
 }
 
 // ---------- 插件市场一键全功能：缺桌面运行环境时自动后台安装 dsh-remote ----------
@@ -2309,10 +2490,27 @@ function startBridgeDetached(relayDir, fallbackReason = "") {
       detail: "桌面运行环境（bridge）尚未安装，已在后台自动安装，完成后会自动启动 bridge——请稍候刷新面板（也可点下方「一键更新」查看进度）",
     };
   }
-  // 幂等：watcher 已在跑就别再拉第二个（否则会有两个 bridge 抢同一个设备登记）
-  const existing = readPidFile(relayDir, WATCHER_PID_FILE);
-  if (existing && pidAlive(existing) !== false) {
-    return { ok: true, status: "running", pid: existing };
+  // 幂等：watcher 已在跑就别再拉第二个（否则会有两个 bridge 抢同一个设备登记）。
+  // ⚠️ 2026-10-29（PID 复用）：pid **活着**不等于它是我们的 watcher —— pid 文件可能是上一任守护
+  //    留下的，而那个 pid 早已被系统回收给无关进程。不校验就会**永久**返回「已在运行」⇒
+  //    面板「启动 / 立即修复」与每轮自愈全部空转（这与「多次修复都没解决」是同一类故障）。
+  const forced = takeForcedDetachedSpawn();
+  if (forced) {
+    // 旧守护杀不掉/被跳过结束，但本轮确实要「换掉它」：跳过幂等判断，直接拉起新实例。
+    // 新实例会用自己的 pid 覆盖 pid 文件；旧实例若真活着，dsh-setup.mjs 自己的 pid 去重会拦住它自己。
+    appendLogLine(relayDir, AUTO_INSTALL_LOG,
+      `[dsh-remote-web] ${forced} → 强制拉起新守护（跳过「已在运行」幂等判断）`);
+  }
+  const existing = forced ? null : readPidFile(relayDir, WATCHER_PID_FILE);
+  if (existing && existing !== process.pid && pidAlive(existing) !== false) {
+    const id = pidIdentityOf(existing, relayDir);
+    const fresh = pidFileAgeMs(relayDir, WATCHER_PID_FILE) < PID_FILE_TRUST_MS;
+    if (id.ident || (!id.cmdKnown && fresh)) return { ok: true, status: "running", pid: existing };
+    appendLogLine(relayDir, AUTO_INSTALL_LOG,
+      `[dsh-remote-web] watcher pid 文件里的 pid=${existing} `
+      + `${id.cmdKnown ? "不是本运行环境的进程（PID 可能已被系统回收）" : "无法确认归属且 pid 文件已超 10 分钟未更新"}`
+      + " → 按过期处理，重新拉起守护");
+    removePidFileQuiet(relayDir, WATCHER_PID_FILE);
   }
   const setup = join(relayDir, "dsh-setup.mjs");
   if (!existsSync(setup)) return { ok: false, status: "not-installed", detail: `运行环境入口脚本不存在（${setup}）` };
@@ -2360,20 +2558,85 @@ function startBridgeDetached(relayDir, fallbackReason = "") {
   };
 }
 
+/* ── F4：动进程之前先验身份（2026-10-29 修复 PID 复用误杀）────────────────────────
+ *
+ * 旧实现 `stopBridgeDetached` 对 pid 文件里的 pid 只做 pidAlive() 判活，然后直接
+ * `killPid()`（Windows = `taskkill /PID <pid> /T /F`）。pid 一旦被系统回收给无关进程，
+ * 这条路径会**杀掉一棵与产品无关的进程树**。现在按「身份 / 新鲜度」两级决定：
+ *   · ident 非空（命令行确认是本 relayDir 的 dsh-setup.mjs / dsh-bridge.mjs）→ 结束它；
+ *   · cmdKnown=true 但 ident=""（取到了命令行、明确不是我们的）→ **不结束**，只清残留 pid 文件；
+ *   · 取不到命令行 → 只有 pid 文件在 PID_FILE_TRUST_MS 内才敢结束，否则跳过并写一行安装日志。
+ * pid 文件的删除同样收紧：**只有「进程已确认结束」或「已确认不是我们的进程」才删**，
+ * 不再无条件先删（那会让「进程还在、现场没了」成为常态，正是这次事故取证困难的原因之一）。
+ */
+function pidFileVerdict(relayDir, name) {
+  const pid = readPidFile(relayDir, name);
+  if (!pid) return { name, pid: null, alive: false, ident: "", cmdKnown: false, ageMs: Infinity, fresh: false };
+  const alive = pidAlive(pid) !== false;
+  const ageMs = pidFileAgeMs(relayDir, name);
+  const id = alive ? pidIdentityOf(pid, relayDir) : { ident: "", cmdKnown: false };
+  return { name, pid, alive, ident: id.ident, cmdKnown: id.cmdKnown, ageMs, fresh: ageMs < PID_FILE_TRUST_MS };
+}
+
+function removePidFileQuiet(relayDir, name) {
+  try { rmSync(join(relayDir, name), { force: true }); } catch { /* 非关键 */ }
+}
+
+/* 「重启卡死守护」专用的一次性强制拉起标记。
+ *
+ * 场景：pid 文件里的守护**杀不掉**（pid 已被系统回收给无关进程 / kill 工具不可用 / 按安全纪律
+ * 主动跳过）。这时 `startBridge` 的幂等判断会因「pid 文件还在且新鲜」再次返回「已在运行」→
+ * 重启自愈变成永久 no-op（本次要根治的死循环换个形态回来）。所以由调用方显式下一个一次性标记，
+ * 让紧接着的那次 `startBridgeDetached` 跳过幂等判断、直接拉起新实例。
+ * 用模块级标记而不是改 `startBridge(relayDir)` 签名：那两处签名被源码契约用例按字面锁定。
+ */
+let forcedDetachedSpawn = "";
+function forceNextDetachedSpawn(reason) { forcedDetachedSpawn = String(reason || "restart"); }
+function takeForcedDetachedSpawn() { const r = forcedDetachedSpawn; forcedDetachedSpawn = ""; return r; }
+
 /** 停止「脱离进程」方式运行的 bridge（结束 watcher 与其 bridge 子进程，并清掉 pid 文件）。 */
 function stopBridgeDetached(relayDir, opts = {}) {
   // 账号切换时用 force：即使处于测试隔离模式也要把进程停掉（否则"换个账号"在测试里走不通），
   // 但隔离模式下仍只用信号结束**本插件记录的** pid，不碰任何系统服务。
   if (skipsSystemOps() && !opts.force) return { ok: false, status: "skipped", detail: "测试隔离（DSH_RELAY_SKIP_SERVICE=1）：跳过真实服务操作" };
-  const targets = [];
-  for (const name of [WATCHER_PID_FILE, BRIDGE_PID_FILE]) {
-    const pid = readPidFile(relayDir, name);
-    if (pid && pidAlive(pid) !== false && !targets.includes(pid)) targets.push(pid);
+  const decisions = [WATCHER_PID_FILE, BRIDGE_PID_FILE].map((name) => pidFileVerdict(relayDir, name));
+  const killed = [];
+  const skipped = [];
+  for (const d of decisions) {
+    if (!d.pid) { removePidFileQuiet(relayDir, d.name); continue; }      // 文件里没有有效 pid：无主残留
+    if (!d.alive) { removePidFileQuiet(relayDir, d.name); continue; }    // 已确认结束 → 删（安全）
+    if (d.ident) {
+      killPid(d.pid, "SIGKILL");                                        // Windows 上是 taskkill /T /F：连带子进程
+      killed.push(d.pid);
+      if (pidAlive(d.pid) === false) removePidFileQuiet(relayDir, d.name); // 只有确认结束才删
+      continue;
+    }
+    if (d.cmdKnown) {
+      // 取到了命令行、明确不是我们的进程（别的配置目录/别的脚本）：不结束，只清残留文件
+      appendLogLine(relayDir, AUTO_INSTALL_LOG,
+        `[dsh-remote-web] ${d.name} 里的 pid=${d.pid} 不是本运行环境的进程（PID 可能已被系统回收），`
+        + "不结束它，按残留清理 pid 文件");
+      removePidFileQuiet(relayDir, d.name);
+      continue;
+    }
+    // 取不到命令行：只有 pid 文件足够新才敢认为它是我们的进程；否则宁可漏杀
+    if (d.fresh) {
+      killPid(d.pid, "SIGKILL");
+      killed.push(d.pid);
+      if (pidAlive(d.pid) === false) removePidFileQuiet(relayDir, d.name); // 只有确认结束才删
+      continue;
+    }
+    skipped.push(d);
   }
-  for (const pid of targets) killPid(pid, "SIGKILL");
-  for (const name of [WATCHER_PID_FILE, BRIDGE_PID_FILE]) {
-    try { rmSync(join(relayDir, name), { force: true }); } catch { /* 非关键 */ }
+  for (const d of skipped) {
+    appendLogLine(relayDir, AUTO_INSTALL_LOG,
+      `[dsh-remote-web] 无法确认 pid 归属，跳过结束（避免误杀）：${d.name} pid=${d.pid}`
+      + `（pid 文件已 ${Math.max(1, Math.round((d.ageMs || 0) / 60000))} 分钟未更新，且取不到该进程的命令行）`);
   }
+  // 本轮「没能结束掉」的 pid（尝试过但杀不掉，或按安全纪律主动跳过）：
+  // 调用方（尤其是「重启卡死守护」那条自愈）用它决定要不要强制拉起新实例 ——
+  // 否则「pid 文件里那个 pid 杀不掉且仍然新鲜」会让重启变成永久 no-op。
+  const unresolvedPids = [...killed, ...skipped.map((d) => d.pid)].filter((pid) => pidAlive(pid) !== false);
   // 复核：pid 文件之外可能还有用户手动跑起来、或用旧版运行时起的进程
   const manual = manualStatus(relayDir);
   const still = [...new Set([...manual.watcher, ...manual.bridge])];
@@ -2381,7 +2644,12 @@ function stopBridgeDetached(relayDir, opts = {}) {
     ok: still.length === 0,
     status: still.length ? "failed" : "stopped",
     pid: null,
-    detail: still.length ? `仍有 ${still.length} 个 bridge 相关进程未结束（pid ${still.join(", ")}）` : void 0,
+    killed,
+    skippedPids: skipped.map((d) => d.pid),
+    unresolvedPids,
+    detail: still.length
+      ? `仍有 ${still.length} 个 bridge 相关进程未结束（pid ${still.join(", ")}）`
+      : (skipped.length ? "已结束可确认归属的进程；无法确认归属的 pid 已跳过（避免误杀）" : void 0),
   };
 }
 
@@ -4416,7 +4684,8 @@ function spawnUpdater(relayDir, extraEnv, onError, spec = UPDATE_SPEC) {
 function commandLineOfPid(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return "";
   if (isWindows()) {
-    const hit = windowsNodeProcesses().find((p) => p.pid === pid);
+    // 2026-10-29：改走「无镜像名过滤」的全量扫描（旧的 Name='node.exe' 过滤看不到 Electron 宿主的进程）。
+    const hit = windowsProcessScan().procs.find((p) => p.pid === pid);
     return hit ? String(hit.commandLine || "") : "";
   }
   const r = sh(`ps -p ${pid} -o command=`);
@@ -4453,8 +4722,11 @@ function stopBridgeForRuntimeReplace(relayDir) {
   if (skipsSystemOps()) return { skipped: true, pids: [] };
   const pids = collectRuntimePids(relayDir).filter((pid) => pidAlive(pid) !== false && pidRunsFrom(pid, relayDir));
   for (const pid of pids) killPid(pid, "SIGKILL"); // Windows 上是 taskkill /T /F：连带子进程
+  // 2026-10-29：pid 文件只在「已确认结束」或「已确认不是我们的进程」时才删；
+  // 取不到命令行且进程仍活着的条目保持现场（宁可留残留文件，也不制造「进程在、文件没了」的假象）。
   for (const name of [WATCHER_PID_FILE, BRIDGE_PID_FILE]) {
-    try { rmSync(join(relayDir, name), { force: true }); } catch { /* 非关键 */ }
+    const v = pidFileVerdict(relayDir, name);
+    if (!v.pid || !v.alive || v.cmdKnown) removePidFileQuiet(relayDir, name);
   }
   return { skipped: false, pids };
 }
@@ -5448,6 +5720,11 @@ async function composeConnect(relayDir, opts = {}) {
   const bridgeRunning = Boolean(launchd.running || bridgePids.length > 0 || (manual.bridge || []).length > 0);
   const watcherPids = Array.isArray(manual.watcher) ? manual.watcher : [];
   const watcherRunning = Boolean(!bridgeRunning && watcherPids.length > 0);
+  // F5（2026-10-29）：进程发现的「结论」与「工具怎么得出这个结论的」必须一起下发 ——
+  // 那次事故里面板只有一句「bridge 未运行」，看不出是「扫描不可用（工具看不见）」还是
+  // 「四路证据都说没有（真没有）」，于是排查方向被带偏。scanDegraded/bridgeEvidence 就是答案。
+  const scanDegraded = Boolean(manual.scanDegraded);
+  const bridgeEvidence = Array.isArray(manual.bridgeEvidence) ? manual.bridgeEvidence : [];
   const wedge = watcherWedgeOf(relayDir, { watcherRunning, bridgeRunning, now });
   const rateLimitedUntil = loginRateLimitedUntil(relayDir);
   const bindError = readBindError(relayDir);
@@ -5648,6 +5925,11 @@ async function composeConnect(relayDir, opts = {}) {
     bridgeRunning,
     accountCurrent, // 运行中的 bridge 是否属于当前账号（false = 上一个账号的进程还在跑）
     bridgePids,
+    // 进程发现的「证据来源」与「扫描是否可用」（F5，2026-10-29）：
+    //   bridgeEvidence ∈ {pid-file, instance-lock, state-file, scan, pgrep}，
+    //   scanDegraded=true 表示这台机器上插件根本没能扫进程（这时「bridge 未运行」没有说服力）。
+    bridgeEvidence,
+    scanDegraded,
     // 守护（watcher）与上游：这两项以前完全不下发，于是「守护活着但拉不起 bridge」
     // 与「上游端口不对」在面板上都长得跟「正在启动」一模一样（用户反馈就是这么来的）。
     watcherPids,
@@ -5771,6 +6053,11 @@ function buildConnectDiagnostics(relayDir, conn, log) {
       ? ""
       : `运行环境缺文件: ${conn.runtimeMissing.slice(0, 8).join(", ")}${conn.runtimeMissing.length > 8 ? ` 等 ${conn.runtimeMissing.length} 个` : ""}`,
     `bridge 进程: ${conn.bridgeRunning ? "在运行" : "未运行"}（pid=${conn.bridgePids && conn.bridgePids.length ? conn.bridgePids.join(",") : "-"}，launchd state=${conn.launchdState || "-"}，崩溃循环=${conn.launchdCrashLoop ? "是" : "否"}）`,
+    // 进程发现的证据来源（F5，2026-10-29）：没有这一行时，「bridge 未运行」到底是「真没有」还是
+    // 「工具没看见」在诊断里无法区分 —— 上一次事故就是这么被带偏的。
+    `进程发现: ${conn.scanDegraded
+      ? "⚠️ 进程扫描不可用（PowerShell 调用失败），本次结论只来自 pid 文件/自写证据 —— 「未运行」不一定是真的没跑"
+      : "扫描可用"}｜bridge 证据: ${conn.bridgeEvidence && conn.bridgeEvidence.length ? conn.bridgeEvidence.join("/") : "无（pid 文件、实例锁、状态文件、扫描都没有活着的 bridge）"}`,
     `后台守护: ${conn.watcherRunning ? `在运行（pid=${conn.watcherPids.join(",")}${conn.watcherAgeMs ? `，已 ${Math.round(conn.watcherAgeMs / 1000)} 秒` : ""}${conn.watcherWedged ? "，⚠️ 迟迟未拉起 bridge" : ""}${conn.watcherRestarts ? `，已自动重启 ${conn.watcherRestarts} 次` : ""}）` : "未运行"}`,
     // 只在真的重启过 bridge 时才出现这一行（正常用户零新增文案，不制造噪音）：
     // 它回答的是"插件自己有没有在反复重启 bridge"—— 2026-10-13 那个故障里，这个问题
@@ -6011,7 +6298,14 @@ function ensureConnection(relayDir, opts = {}) {
         // 这两种都必须**显式结束卡死的守护**，否则 startBridge 幂等会直接返回、重启变成 no-op。
         // macOS 走 launchctl，startBridge 内部已先 bootout 再 bootstrap，等价于重启。
         // ★ 0.6.15：以前这里把 Linux 排除在外（那时 Linux 的 startBridge 是死路，重启没意义）。
-        if (isWindows() || (isLinux() && !systemdUserAvailableCached())) stopBridgeDetached(relayDir);
+        // ★ 2026-10-29：如果那个守护**杀不掉**（pid 已被系统回收给无关进程 / kill 工具不可用 /
+        //   按安全纪律主动跳过），`startBridge` 的幂等判断会因「pid 文件还在且新鲜」再次返回
+        //   「已在运行」→ 重启变成永久 no-op（就是本次要根治的死循环）。此时必须**强制拉起**：
+        //   新 watcher 会用自己的 pid 覆盖 pid 文件；旧实例若真活着，dsh-setup.mjs 自己的 pid 去重会拦。
+        let stopInfo = null;
+        if (isWindows() || (isLinux() && !systemdUserAvailableCached())) stopInfo = stopBridgeDetached(relayDir);
+        const unresolved = (stopInfo && Array.isArray(stopInfo.unresolvedPids)) ? stopInfo.unresolvedPids : [];
+        if (unresolved.length) forceNextDetachedSpawn(`watcher pid 未能结束（pid ${unresolved.join(", ")}）`);
         const r = startBridge(relayDir);
         appendLogLine(relayDir, AUTO_INSTALL_LOG,
           `[dsh-remote-web] 后台守护已存活 ${Math.round(wedge.ageMs / 1000)} 秒仍无 bridge 进程`

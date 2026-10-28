@@ -50,7 +50,16 @@ const DEFAULT_APP_URL = "https://n.risegao.cn:13443/app/";
 const REPO_URL = "https://github.com/mrRisega/dsh-remote";
 
 // ---------- 平台（0.6.7 起支持 Windows） ----------
-const IS_WIN = process.platform === "win32";
+/**
+ * 有效平台：`DSH_SETUP_PLATFORM` 可覆盖（**只用于测试**，让 win32 分支能在 macOS/Linux 上被
+ * 行为级跑一遍；生产不设置 → 与 `process.platform` 完全一致，行为不变）。
+ *
+ * 为什么值得开这个口子：Windows 的进程发现 / 自检扫描在开发机上根本跑不到，而它们恰恰是
+ * 最贵的一类 bug —— 2026-10 那次「活着的 bridge 被判成没运行 → 反复 taskkill → bridge_wedged」
+ * 里，win32 的两条扫描分支（`Name='node.exe'` 过滤 + doctor 的 tasklist 无命令行）**从来没被真正执行过**。
+ */
+const SETUP_PLATFORM = String(process.env.DSH_SETUP_PLATFORM || process.platform).toLowerCase();
+const IS_WIN = SETUP_PLATFORM === "win32";
 /**
  * Windows 自启动 = 任务计划程序（Task Scheduler）里的登录任务。
  * 为什么不是「启动文件夹快捷方式」：生成 .lnk 需要额外依赖或 COM 调用，而 schtasks 系统自带，
@@ -587,17 +596,55 @@ function schtasks(args, timeoutMs = 15000) {
   }
 }
 
-/** 写 pid 文件（Windows 进程发现用；失败不致命，插件半还有 PowerShell 兜底扫描）。 */
+/**
+ * 运行期留痕：写/删 pid 文件这类"非关键"动作失败时**必须留一行**（追加到安装日志）。
+ *
+ * 为什么不再静默 `catch {}`：pid 文件是插件半发现进程的唯一入口（Windows 无 pgrep/ps）。
+ * 它一旦"莫名消失"，现场能看到的只有「bridge 未运行」——而**为什么**消失（EBUSY / 杀软 /
+ * 权限 / 并发截断）一点线索都没有。2026-10 那次排查里，这一层缺失直接把方向带偏。
+ * 日志本身写失败也不得影响业务（磁盘满/目录不可写 → 静默放弃）。
+ */
+function logSetupIssue(line) {
+  try {
+    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+    fs.appendFileSync(path.join(CONFIG_DIR, ".dsh-setup-install.log"),
+      `\n[${new Date().toISOString()}] [dsh-setup] ${line}\n`);
+  } catch { /* 日志失败不得影响业务 */ }
+}
+
+/** 写 pid 文件（Windows 进程发现用；失败不致命，插件半还有 PowerShell 兜底扫描，但必须留痕）。 */
 function writePidFile(name, pid) {
   if (!Number.isInteger(pid) || pid <= 0) return;
   try {
     fs.mkdirSync(CONFIG_DIR, { recursive: true });
     fs.writeFileSync(path.join(CONFIG_DIR, name), String(pid));
-  } catch { /* 非关键 */ }
+  } catch (e) {
+    logSetupIssue(`写 pid 文件失败（${name}，pid=${pid}）：${e && (e.code || e.message)}`);
+  }
 }
 
-function removePidFile(name) {
-  try { fs.rmSync(path.join(CONFIG_DIR, name), { force: true }); } catch { /* 非关键 */ }
+/**
+ * 删除 pid 文件。
+ *
+ * `expectPid`：**只在文件内容等于它时才删**（不传 = 旧语义「无条件删」，仅留给确实要清理
+ * 整份残留的场景；本文件 `run()` 里的所有调用点都必须传）。
+ *
+ * 为什么必须校验归属：pid 文件是"谁持有谁负责"的：父进程无条件删会把**别的实例（或孤儿）**
+ * 的 pid 文件删掉，状态立刻变成「进程还活着、pid 文件没了」。2026-10 事故的根因链第 2 步
+ * 正是这个：新 bridge 撞本地实例锁秒退 → watcher 的 exit 钩子无条件删 `.dsh-bridge.pid` →
+ * 真正持有隧道的孤儿 bridge 从面板上"消失" → 被判成"没运行" → 反复重启 → `bridge_wedged`。
+ */
+function removePidFile(name, expectPid = null) {
+  const file = path.join(CONFIG_DIR, name);
+  try {
+    if (expectPid != null) {
+      const cur = readPidFile(name);
+      if (cur !== expectPid) return; // 不是我们的（或已被别人改写/删除）→ 一个字节都不动
+    }
+    fs.rmSync(file, { force: true });
+  } catch (e) {
+    logSetupIssue(`删除 pid 文件失败（${name}）：${e && (e.code || e.message)}`);
+  }
 }
 
 function readPidFile(name) {
@@ -605,6 +652,22 @@ function readPidFile(name) {
     const n = Number(String(fs.readFileSync(path.join(CONFIG_DIR, name), "utf8")).trim());
     return Number.isInteger(n) && n > 0 ? n : null;
   } catch { return null; }
+}
+
+/**
+ * 取某 pid 的**完整命令行**（跨平台）。取不到 → 空串（调用方一律按"不认识这个进程"处理）。
+ *
+ * Windows 分支是本次修复的关键之一：旧实现只有 `ps -p <pid> -o command=`，而 Windows
+ * 没有 `ps`（`sh()` 走 cmd.exe）⇒ `looksLikeWatcher/looksLikeBridge` 在 Windows 上**恒 false**
+ * ⇒ 接管/回收上一任进程这两条安全回收路径在 Windows 上**从不生效**。这里改用
+ * `windowsProcessCommandLine()`（PowerShell CIM 按 ProcessId 点查，与 bridge 自己
+ * `instanceLockVerdict` 用的是同族手法）。
+ */
+function processCommandLine(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return "";
+  if (IS_WIN) return windowsProcessCommandLine(pid);
+  const r = sh(`ps -p ${pid} -o command=`);
+  return r.ok ? String(r.stdout || "") : "";
 }
 
 /**
@@ -616,22 +679,21 @@ function readPidFile(name) {
  */
 function looksLikeWatcher(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
-  const r = sh(`ps -p ${pid} -o command=`);
-  return Boolean(r.ok && /dsh-setup\.mjs/.test(r.stdout));
+  return /dsh-setup\.mjs/.test(processCommandLine(pid));
 }
 
 /**
  * 这个 pid 是不是我们的 **bridge 子进程**（不是 watcher、也不是别的 node）。
  *
  * 为什么要单独判：接管时我们要回收"上一任遗留的 bridge"，而 pid 可能已被系统回收给无关进程 ——
- * 对无关进程发 SIGKILL 是不可接受的。所以对 `ps` 出来的命令行做**双重**校验：
+ * 对无关进程发 SIGKILL 是不可接受的。所以对命令行做**双重**校验：
  * 必须同时出现 bridge 脚本名与 clients/dsh-remote 路径片段。
+ * （Windows 分支见 `processCommandLine`：Electron 宿主下拉起的 bridge 可能不叫 node.exe，
+ * 所以**不能**靠镜像名判断，只能靠命令行。）
  */
 function looksLikeBridge(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
-  const r = sh(`ps -p ${pid} -o command=`);
-  if (!r.ok) return false;
-  const cmd = String(r.stdout || "");
+  const cmd = processCommandLine(pid);
   return /dsh-bridge\.mjs/.test(cmd) && /clients[\\/]dsh-remote/.test(cmd);
 }
 
@@ -692,29 +754,60 @@ function isThisRuntimeBridgeCmd(cmd) {
   return norm(c).includes(norm(needle));
 }
 
-/** 列出本机属于**本运行时**的 bridge 进程 pid（命令行校验；取不到命令行 → 空数组）。 */
+/**
+ * Windows：一次性 PowerShell CIM **全量枚举**进程的 {pid, name, cmd}。
+ *
+ * 返回值的三态是**契约**（doctor 的"假证据"就是被两态混用坑出来的）：
+ *   · `null`  → **扫描不可用**（无 PowerShell / 超时 / 退出码非 0 / JSON 解析失败）
+ *   · `[]`    → 扫描成功，但确实一个进程都没有（或输出为空）
+ *   · 数组    → 扫描成功，逐项 `{ pid, name, cmd }`
+ *
+ * 🔴 为什么不按镜像名过滤（旧实现是 `-Filter "Name='node.exe'"`）：
+ *   桌面端（Electron）宿主起的 watcher 镜像名**一定不是** node.exe
+ *（`process.execPath` = 桌面端 exe），bridge 的镜像名则取决于本机有没有真 node
+ *（`preferredNode()` 回落 Electron 时为桌面端 exe）。按 node.exe 过滤 ⇒ 这类进程
+ * **永远扫不到** ⇒ 活着的孤儿 bridge 清不掉、doctor 恒报 0/0。
+ *   全量枚举 + 命令行匹配的代价是 PowerShell 多返回一些行（一次性 8s 上限），换来
+ * "与镜像名彻底解耦"——与 bridge 自己的单实例锁判定（按 ProcessId 查 CommandLine）同族手法。
+ */
+function windowsCimProcesses() {
+  if (!IS_WIN) return null;
+  const script = [
+    "try { $p = Get-CimInstance Win32_Process }",
+    "catch { $p = Get-WmiObject Win32_Process }",
+    "$p | Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress",
+  ].join("; ");
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+  try {
+    const r = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+      { encoding: "utf8", timeout: 8000, windowsHide: true, maxBuffer: 8 * 1024 * 1024 });
+    if (r && r.error) return null;                                          // ENOENT（没 PowerShell）等
+    if (r && typeof r.status === "number" && r.status !== 0) return null;   // 命令失败 ≠ 没有进程
+    const raw = String((r && r.stdout) || "").trim();
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    const out = [];
+    for (const p of Array.isArray(parsed) ? parsed : [parsed]) {
+      const pid = Number(p && p.ProcessId);
+      if (!Number.isInteger(pid) || pid <= 0) continue;
+      out.push({ pid, name: String((p && p.Name) || ""), cmd: String((p && p.CommandLine) || "") });
+    }
+    return out;
+  } catch { return null; } // 无 PowerShell / 解析失败 → 调用方按"扫描不可用"处理，绝不输出 0
+}
+
+/** 列出本机属于**本运行时**的 bridge 进程 pid（命令行校验；扫描不可用/取不到命令行 → 空数组）。 */
 function listRuntimeBridgePids() {
   const pids = [];
   if (IS_WIN) {
-    // 一次性 PowerShell CIM 枚举（逐个 windowsProcessCommandLine 会起 N 个进程，太贵）
-    const script = [
-      "try { $p = Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" }",
-      "catch { $p = Get-WmiObject Win32_Process -Filter \"Name='node.exe'\" }",
-      "$p | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress",
-    ].join("; ");
-    const encoded = Buffer.from(script, "utf16le").toString("base64");
-    try {
-      const r = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
-        { encoding: "utf8", timeout: 8000, windowsHide: true, maxBuffer: 8 * 1024 * 1024 });
-      const raw = String(r.stdout || "").trim();
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        for (const p of Array.isArray(parsed) ? parsed : [parsed]) {
-          const pid = Number(p && p.ProcessId);
-          if (Number.isInteger(pid) && pid > 0 && isThisRuntimeBridgeCmd(p.CommandLine)) pids.push(pid);
-        }
-      }
-    } catch { /* 无 PowerShell / 解析失败 → 不杀任何进程 */ }
+    // 全量 CIM 枚举（**不按镜像名过滤**：Electron 宿主拉起的进程可能不叫 node.exe）
+    const procs = windowsCimProcesses();
+    if (!procs) return pids; // 扫描不可用 → 一个都不杀（失败方向必须是漏杀，不能误杀）
+    for (const p of procs) {
+      // isThisRuntimeBridgeCmd 的严格性保持不变：命令行必须同时含 dsh-bridge.mjs 与
+      // **本运行时**的 clients/dsh-remote 路径（另一个运行时目录的进程不动，避免跨配置目录误杀）
+      if (isThisRuntimeBridgeCmd(p.cmd)) pids.push(p.pid);
+    }
     return pids;
   }
   const r = sh("pgrep -fl 'dsh-bridge\\.mjs'");
@@ -1811,7 +1904,8 @@ async function runBridge() {
         if (pidAlive(leftover) && looksLikeBridge(leftover)) {
           try { process.kill(leftover, "SIGKILL"); } catch { /* 已退出 */ }
         }
-        removePidFile(BRIDGE_PID_FILE);
+        // 只删**刚才确认属于我们的**那个 pid（内容已核对过是 leftover）；不无条件删整份文件
+        removePidFile(BRIDGE_PID_FILE, leftover);
       }
     }
     // ── C2：清扫「pid 文件之外的孤儿 bridge」（命令行校验，绝不误杀）──────────────
@@ -1999,8 +2093,16 @@ async function runBridge() {
           // POSIX 上该选项被忽略。
           windowsHide: true
         });
+      // 记下这个子进程的 pid：退出钩子删 pid 文件时必须核对归属（见 removePidFile 注释）。
+      // 为什么不能直接用 bridgeProc.pid：bridgeProc 之后会被下一次 spawn 覆盖，而旧子进程的
+      // exit 回调仍会跑 —— 那时若去删"当前"pid 文件，就会把新实例的 pid 文件删掉。
+      const spawnedBridgePid = bridgeProc.pid;
       bridgeProc.on("exit", (code) => {
-        removePidFile(BRIDGE_PID_FILE);
+        // ⚠️ 只删**属于这个子进程**的 pid 文件（内容 == 它的 pid）。
+        // 旧实现无条件删：新 bridge 撞本地实例锁秒退（code=4）是**常态事件**，每次都把
+        // 真正活着的那条 bridge（孤儿）的 pid 文件删掉 → 面板「bridge 未运行」→ 反复重启
+        // → bridge_wedged。这是 2026-10 事故根因链的第 2 步。
+        removePidFile(BRIDGE_PID_FILE, spawnedBridgePid);
         // C2 互踢根治的 watcher 半边：bridge 连续 2 次收到 code=4000（= 本机已有同 deviceId 的
         // 另一个 bridge 把本连接顶掉）后会以"重复实例"退出码优雅退出（见 dsh-bridge.mjs）。
         // 这种退出**绝不能**照常 10s 重拉：本机已经有另一个实例在跑，重拉只会继续乒乓互踢。
@@ -2056,7 +2158,18 @@ async function runBridge() {
   // watcher 自身的 pid 也要落盘（插件半据此判断"守护在跑"并避免重复拉起）
   {
     writePidFile(WATCHER_PID_FILE, process.pid);
-    const cleanup = () => { removePidFile(WATCHER_PID_FILE); removePidFile(BRIDGE_PID_FILE); };
+    /**
+     * 退出清理：**只删属于自己的 pid 文件**。
+     * watcher 文件属于本进程；bridge 文件属于**本进程拉起的那个子进程**。
+     * 无条件删（旧行为）会把孤儿/别的实例的 pid 文件删掉 → 状态变成「进程还活着、pid 文件没了」，
+     * 正是本次事故根因链的第 2 步；失败方向必须是"残留一份过期文件"（插件按 pidAlive 会判掉），
+     * 而不是"删掉别人活着的证据"。
+     */
+    const cleanup = () => {
+      removePidFile(WATCHER_PID_FILE, process.pid);
+      const childPid = bridgeProc && bridgeProc.pid;
+      if (Number.isInteger(childPid) && childPid > 0) removePidFile(BRIDGE_PID_FILE, childPid);
+    };
     process.on("exit", cleanup);
     for (const sig of ["SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"]) {
       try {
@@ -3341,7 +3454,11 @@ async function doctorCmd(argv = []) {
   };
 
   console.log("dsh-remote 自检（doctor，只读，不改任何东西）");
-  console.log("时间:", new Date().toISOString(), "| 平台:", `${process.platform}/${process.arch}`, "| node:", process.version);
+  // 平台：若被 DSH_SETUP_PLATFORM 覆盖（仅测试用），如实标注 —— 否则"平台 darwin 却走了 win32 扫描"会非常难解释
+  const platformLabel = SETUP_PLATFORM === process.platform
+    ? `${process.platform}/${process.arch}`
+    : `${SETUP_PLATFORM}/${process.arch}（DSH_SETUP_PLATFORM 覆盖；实际 ${process.platform}）`;
+  console.log("时间:", new Date().toISOString(), "| 平台:", platformLabel, "| node:", process.version);
   console.log("配置目录:", CONFIG_DIR);
 
   // ── ① 插件与运行环境版本 ────────────────────────────────────────────────
@@ -3373,20 +3490,55 @@ async function doctorCmd(argv = []) {
   const bridgePid = readPidFile(BRIDGE_PID_FILE);
   console.log(`   watcher pid  : ${watcherPid || "-"}${watcherPid ? (alive(watcherPid) ? "（在跑）" : "（已死，pid 文件过期）") : ""}`);
   console.log(`   bridge pid   : ${bridgePid || "-"}${bridgePid ? (alive(bridgePid) ? "（在跑）" : "（已死，pid 文件过期）") : ""}`);
-  // 进程扫描（平台各自的方式）：只报数量，不猜
+  // 进程扫描（平台各自的方式）：只报**扫描拿到的真实数据**；扫不到就说"扫描不可用"。
+  //
+  // 🔴 旧实现是本次「假证据」的直接来源：Windows 侧用
+  //   `tasklist /FI "IMAGENAME eq node.exe" /FO CSV` 拿镜像名列表，再用
+  //   /dsh-setup\.mjs/、/dsh-bridge\.mjs/ 去过滤 **CSV 行** —— 而 tasklist 的输出里
+  //   **根本没有命令行**，于是两个计数在 Windows 上**恒为 0/0**，与真实情况毫无关系。
+  //   2026-10 那次排查正是被这条"证据"带向「进程真的没起来」的错误方向。
+  // 现在：Windows 复用 CIM 全量枚举（windowsCimProcesses，**带 CommandLine、不按镜像名过滤**），
+  //   按命令行分别统计 watcher / bridge，并打出 pid + 解释器名 + 命令行摘要；
+  //   扫描不可用（没 PowerShell / 超时 / 命令失败）时**显式打印「扫描不可用」**，
+  //   绝不输出一个会被误读成"没有进程"的 0。
   try {
-    const r = process.platform === "win32"
-      ? sh("tasklist /FI \"IMAGENAME eq node.exe\" /FO CSV 2>NUL")
-      : sh("pgrep -fl 'dsh-setup.mjs|dsh-bridge.mjs' 2>/dev/null");
-    const lines = String(r.stdout || "").split("\n").map((l) => l.trim()).filter((l) => l && !/pgrep/.test(l));
-    const watchers = lines.filter((l) => /dsh-setup\.mjs/.test(l));
-    const bridges = lines.filter((l) => /dsh-bridge\.mjs/.test(l)).filter((l) => !/dsh-setup/.test(l));
-    console.log(`   实测进程     : watcher ${watchers.length} 个 / bridge ${bridges.length} 个`);
-    if (watchers.length && !bridges.length) console.log("   ⚠️ 守护在跑、bridge 没起来 —— 这类情况看日志尾部（通常是在等 dsh web 或登录限流）");
-    if (!watchers.length && !bridges.length) {
-      console.log("   ⚠️ 一个进程都没在跑。手动起一次看报错：`dsh-remote run`（前台，能直接看到输出）");
+    if (IS_WIN) {
+      const procs = windowsCimProcesses();
+      if (!procs) {
+        console.log("   实测进程     : 扫描不可用（PowerShell/CIM 取不到进程列表：可能没装 PowerShell、被策略禁用或超时）");
+        console.log("   ⚠️ 这条**不能**当作「进程没在跑」的证据 —— 只看上面的 pid 文件结论与日志尾部。");
+      } else {
+        const watchers = procs.filter((p) => /dsh-setup\.mjs/.test(p.cmd));
+        const bridges = procs.filter((p) => /dsh-bridge\.mjs/.test(p.cmd)).filter((p) => !/dsh-setup/.test(p.cmd));
+        console.log(`   实测进程     : watcher ${watchers.length} 个 / bridge ${bridges.length} 个（CIM 全量扫描，按命令行识别）`);
+        for (const [kind, list] of [["watcher", watchers], ["bridge", bridges]]) {
+          for (const p of list) {
+            const brief = p.cmd.length > 160 ? `${p.cmd.slice(0, 157)}...` : p.cmd;
+            console.log(`   · ${kind} pid=${p.pid} 解释器=${p.name || "?"} 命令行=${brief || "（取不到）"}`);
+          }
+        }
+        if (watchers.length && !bridges.length) console.log("   ⚠️ 守护在跑、bridge 没起来 —— 这类情况看日志尾部（通常是在等 dsh web 或登录限流）");
+        if (!watchers.length && !bridges.length) {
+          console.log("   ⚠️ 一个进程都没在跑。手动起一次看报错：`dsh-remote run`（前台，能直接看到输出）");
+        }
+      }
+    } else {
+      const r = sh("pgrep -fl 'dsh-setup.mjs|dsh-bridge.mjs' 2>/dev/null");
+      if (!r.ok && r.code !== 1) {
+        // pgrep 退出码 1 = "没有匹配的进程"（合法的 0），其它码 = 工具不可用（不能当 0 读）
+        console.log(`   实测进程     : 扫描不可用（pgrep 退出码 ${r.code}：本机没有 pgrep 或被禁用）`);
+      } else {
+        const lines = String(r.stdout || "").split("\n").map((l) => l.trim()).filter((l) => l && !/pgrep/.test(l));
+        const watchers = lines.filter((l) => /dsh-setup\.mjs/.test(l));
+        const bridges = lines.filter((l) => /dsh-bridge\.mjs/.test(l)).filter((l) => !/dsh-setup/.test(l));
+        console.log(`   实测进程     : watcher ${watchers.length} 个 / bridge ${bridges.length} 个`);
+        if (watchers.length && !bridges.length) console.log("   ⚠️ 守护在跑、bridge 没起来 —— 这类情况看日志尾部（通常是在等 dsh web 或登录限流）");
+        if (!watchers.length && !bridges.length) {
+          console.log("   ⚠️ 一个进程都没在跑。手动起一次看报错：`dsh-remote run`（前台，能直接看到输出）");
+        }
+      }
     }
-  } catch (e) { console.log(`   实测进程     : 扫描失败（${e.message}）`); }
+  } catch (e) { console.log(`   实测进程     : 扫描不可用（${e.message}）`); }
   if (process.platform === "linux") {
     const hasUser = Boolean(process.env.XDG_RUNTIME_DIR);
     console.log(`   自启动       : systemd --user ${hasUser ? "（有 runtime dir）" : "（无 XDG_RUNTIME_DIR → 本机没有 user systemd，插件会用后台进程兜底）"}`);

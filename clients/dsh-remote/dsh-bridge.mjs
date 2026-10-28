@@ -253,7 +253,14 @@ function clearBindError() {
  * bridge 运行状态文件:供 dsh web 插件面板判定「设备是否已在中继注册成功」(连接阶段 online)。
  * 面板用它把「bridge 进程在跑」与「设备已注册、手机端真的能用」区分开——后者才是用户关心的状态,
  * 只按进程存活判断会谎报可用。
- *   { device_id, started_at, account_bound_at, tunnel_registered_at, phase, last_error? }
+ *   { pid, heartbeat_at, device_id, started_at, account_bound_at, tunnel_registered_at, phase, last_error? }
+ *
+ * `pid` / `heartbeat_at` 是 **bridge 自证存活**的第二判据(2026-10 `bridge_wedged` 事故):
+ *   · 进程启动时写一次 `pid: process.pid`;
+ *   · 心跳拍里节流刷新 `heartbeat_at`(≥10s 一次,失败静默)。
+ * 插件侧可以据此用「state.pid 活着 + heartbeat 新鲜」判断桥是否在跑，**不必**依赖
+ * 按镜像名(node.exe)扫描 —— Electron 宿主拉起的进程名压根不是 node.exe，扫描会漏。
+ *
  * 每次进程启动都 reset 一次:上一轮进程的成功记录不能代表当前这一轮。
  */
 const BRIDGE_STATE_FILE = path.join(path.dirname(CONFIG_PATH), ".dsh-bridge-state.json");
@@ -266,6 +273,22 @@ function persistBridgeState(patch, opts = {}) {
     }
     fs.writeFileSync(BRIDGE_STATE_FILE, JSON.stringify({ ...base, ...patch, at: Date.now() }, null, 2), { mode: 0o600 });
   } catch { /* 非关键:面板侧还有日志/账号兜底判据 */ }
+}
+
+/**
+ * 状态文件心跳:把「我这一秒确实还活着」写进 `.dsh-bridge-state.json`(节流 ≥10s)。
+ *
+ * 为什么要节流:心跳拍的默认间隔是 20s(TUNNEL_HEARTBEAT_MS),但 RTT 好时自适应会缩短;
+ * 每拍都整文件重写既没必要(面板轮询 2~3s,10s 粒度足够"新鲜")又增加与读侧撞车的机会。
+ * 失败一律静默:状态文件只是**附加**判据,写不进去不得影响隧道(旧行为保持)。
+ */
+const STATE_HEARTBEAT_MIN_MS = 10_000;
+let lastStateHeartbeatAt = 0;
+function stampBridgeHeartbeat() {
+  const now = Date.now();
+  if (now - lastStateHeartbeatAt < STATE_HEARTBEAT_MIN_MS) return;
+  lastStateHeartbeatAt = now;
+  persistBridgeState({ pid: process.pid, heartbeat_at: now });
 }
 
 // ---------- 安装来源 / 版本(服务端设备行统计约定) ----------
@@ -2485,6 +2508,10 @@ function connectTunnel(token) {
     // 事件循环延迟逐拍自适应（见 adaptiveHeartbeat 长注释）。
     const beat = () => {
       heartbeat = null;
+      // 自证存活:每一拍(节流 ≥10s)刷新状态文件里的 pid/heartbeat_at —— 插件用它做
+      // 「state.pid 活着 + heartbeat 新鲜」的第二判据,不依赖按镜像名扫描进程。
+      // 放在判定之前:即使这一拍即将判死重连,只要进程还活着,状态文件就该是新鲜的。
+      stampBridgeHeartbeat();
       const plan = adaptiveHeartbeat({
         pongReceived,
         missedPongs,
@@ -2956,8 +2983,10 @@ async function runTunnel() {
   // (真机日志实测:同一个桥接启动里出现两条并发的 device-login)。
   // 而 /api/device-login 是按出口 IP 限流的 —— 每次启动都多花一份登录额度没有道理。
   WECHAT_TIER_TOKEN = { value: token, at: Date.now() };
-  // 新进程开始:重置状态文件(上一轮的成功记录不能代表这一轮,面板据此判定 online)
-  persistBridgeState({ device_id: DEVICE_ID, started_at: Date.now(), phase: "connecting", last_error: null }, { reset: true });
+  // 新进程开始:重置状态文件(上一轮的成功记录不能代表这一轮,面板据此判定 online)。
+  // `pid` 一并写入 = **bridge 自证身份**:插件可以用「state.pid 活着 + heartbeat_at 新鲜」
+  // 判断桥是否真的在跑,不必依赖按镜像名(node.exe)扫描 —— 桌面端宿主拉起的进程名不是 node.exe。
+  persistBridgeState({ pid: process.pid, heartbeat_at: Date.now(), device_id: DEVICE_ID, started_at: Date.now(), phase: "connecting", last_error: null }, { reset: true });
   await initE2ee(token);
   const reg = await registerDeviceInAccount(token);
   if (reg && reg.status === "locked") {
