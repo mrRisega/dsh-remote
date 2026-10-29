@@ -5707,6 +5707,19 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 宽松读一个「条数」字段：只有真正的数字（JSON number / 纯数字串）才算权威，
+     * null / "" / undefined / true 一律视为**这个字段没有** → 用 fallback。
+     * 为什么要较真：旧 bridge 不认这个键时若把它当 0，面板会**藏起**真实积压（用户以为通知丢了）；
+     * 反过来把字段缺失当"有积压"同样不行 —— 那会平白吓人。
+     */
+    function wechatCountOf(value, fallback) {
+      var numeric = typeof value === "number" || (typeof value === "string" && value.trim() !== "");
+      var n = numeric ? Number(value) : NaN;
+      if (!Number.isFinite(n) || n < 0) return fallback;
+      return Math.floor(n);
+    }
+
+    /**
      * 🤖 微信机器人绑定面板。
      * @param {{embedded?: boolean}} [props] embedded=true（远程访问面板里的「微信机器人通道」tab）
      *   → 省掉外层 .dru-settings-section 壳与标题行（避免 settings-section 套娃）；默认独立渲染。
@@ -6085,6 +6098,16 @@ window.__ModuleLoader__.load({
         // 规格 §9：**只有两态**。这一行是「已绑定 · 健康提示」，两种取值都明确带「已绑定」；
         // 健康只由「最近一次推送是否失败」决定，**不参与绑定状态**（通道没在跑等情形另起一行说明，不冒充第三种状态）。
         var healthy = !wx.last_error;
+        // 🛑 推送静默（2026-10-29）：微信只在「你最近发过消息」的很短窗口内允许机器人主动发言，
+        // 窗口外平台没有续期接口（契约 §2.4/§3.4）→ bridge 识别出令牌过期后会**暂停主动推送**
+        // （不再每小时猛打 60 次），并把没送出去的通知留在待补发队列，等你下次说话再补。
+        // 面板这里只做两件事：① 如实说明「为什么暂时收不到推送」；② 给出唯一一条恢复动作（回一句话）。
+        // ⚠️ 它只是**提示**：不参与两态绑定判定，也不隐藏绑定/解绑按钮（规格 §9）。
+        // 字段缺失（旧 bridge 没有这个键）= 没开启静默 → 一律不渲染，绝不能把 undefined 当成"已静默"。
+        var pushPaused = wx.push_paused === true;
+        // 待补发条数：新 bridge 下发 pending_outbox_count（契约 §3.7），旧 bridge 只有 pending_outbox。
+        // 两个字段都在时**只认优先的那一个**，避免同一件事在卡片上提示两遍。
+        var outboxCount = wechatCountOf(wx.pending_outbox_count, wechatCountOf(wx.pending_outbox, 0));
         body.push(h("div", { className: "dru-card" },
           h("h3", null, "已绑定"),
           h("div", { className: "dru-status-line" },
@@ -6098,6 +6121,16 @@ window.__ModuleLoader__.load({
           wechatTimeText(wx.connected_at) ? h("div", { className: "dru-meta" }, "最近上线：" + wechatTimeText(wx.connected_at)) : null,
           Number(wx.pending_replies) > 0 ? h("div", { className: "dru-meta" }, "等待你回复的通知：" + Number(wx.pending_replies) + " 条") : null,
           wx.last_error ? h("div", { className: "dru-msg dru-msg-warn", role: "status", "aria-live": "polite" }, "⚠️ 最近一次推送失败：" + String(wx.last_error)) : null,
+          // 静默提示紧跟 last_error：两者是**两回事**（上面是单次发送失败，这里是"平台侧窗口关了"），
+          // 但都只是健康提示。文案刻意给出可执行的恢复动作，避免用户以为要重新绑定。
+          pushPaused
+            ? h("div", { className: "dru-msg dru-msg-warn", role: "status", "aria-live": "polite" },
+                "⚠️ 微信推送已静默：微信通道只在你最近发过消息后的一小段时间内允许机器人主动发消息。给机器人回任意一条消息即可恢复，未送达的通知会补发。")
+            : null,
+          // 静默期间给一个**简短**的待补发数字（详细说明已由上面的静默提示承担，不再重复一整段）。
+          pushPaused && outboxCount > 0
+            ? h("div", { className: "dru-meta" }, "待补发 " + outboxCount + " 条：你回任意一条消息后会一起补给你。")
+            : null,
           Number(wx.cooldown_ms) > 0
             ? h("div", { className: "dru-msg dru-msg-warn" }, [
                 "⏳ 微信侧会话超时，后台已按官方做法退避（还剩 " + wechatCooldownText(wx.cooldown_ms) + "）。",
@@ -6122,9 +6155,11 @@ window.__ModuleLoader__.load({
             ? h("div", { className: "dru-msg dru-msg-warn" },
                 "提示：任务事件订阅未就绪（状态 " + String(wx.events_state) + "），这段时间任务跑完可能不会推给你。稍候会自动重连；持续如此请到「📱 远程访问」重启后台服务。")
             : null,
-          (Number(wx.pending_outbox) || 0) > 0
+          // 静默态下这条长文案与上面的「静默提示 + 待补发 N 条」重复，故只在**未静默**时显示：
+          // 条数统一走 outboxCount（新 bridge 用 pending_outbox_count，旧 bridge 回落 pending_outbox）。
+          !pushPaused && outboxCount > 0
             ? h("div", { className: "dru-msg dru-msg-warn" },
-                "有 " + Number(wx.pending_outbox) + " 条通知刚才没能发出去（微信侧发送失败），已排在待补发队列里 —— 你下次在微信里任意发一句话，就会自动补给你。")
+                "有 " + outboxCount + " 条通知刚才没能发出去（微信侧发送失败），已排在待补发队列里 —— 你下次在微信里任意发一句话，就会自动补给你。")
             : null,
           wx.last_fault && wx.last_fault.code
             ? h("div", { className: "dru-hint" },

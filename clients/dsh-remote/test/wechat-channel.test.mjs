@@ -60,6 +60,7 @@ import {
   formatNotification,
   handleCommand,
   hardenFile,
+  inboundMessageId,
   isDestructiveTool,
   isSessionExpired,
   loadAccount,
@@ -2107,6 +2108,457 @@ test("★ 回归:Windows 上取不到用户名时必须告警,而不是静默跳
     Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
     if (savedDomain === undefined) delete process.env.USERDOMAIN; else process.env.USERDOMAIN = savedDomain;
     if (savedUser === undefined) delete process.env.USERNAME; else process.env.USERNAME = savedUser;
+    await fs.promises.rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ===========================================================================
+// 13. ClawBot 修复回归锁(错误分类 / 游标持久化 / 入站去重 / 令牌生命周期)
+// ===========================================================================
+//
+// 对应 CONTRACT §2.1–§2.4 与 §5 的 channel 部分。全部走本地 mock / 临时目录,
+// 不打真接口(scripts/test-net-guard.cjs 会拦掉一切非 loopback 请求)。
+//
+// 背景(用户 2026-10 报的两个 bug):
+//   · 「AI 不能主动回消息 / 每日简报不发 / 发「你好」后补发一堆」→ context_token 分钟级过期,
+//     而旧实现把 `ret=-2 prepare failed` 当"间歇性网络失败"每小时猛打 60 次;
+//   · 「会话发两遍 / 收不到 Agent 返回」→ 游标只在内存(重启即重放)+ 入站没有按 id 去重。
+
+/** 找出按 bot 账号落盘的状态文件(命名约定由 CONTRACT §2.2/§2.3 规定)。 */
+function botStateFiles(dir, prefix) {
+  return fs.readdirSync(dir).filter((f) => f.startsWith(prefix) && f.endsWith(".json"));
+}
+
+// ── §2.1 错误分类 ─────────────────────────────────────────────────────────────
+
+test("ClawBot §2.1:sendMessage ret=-2 + 'prepare failed' → WeChatError(context_token_expired)", async () => {
+  const mock = await withMockServer((rec, send) => {
+    if (rec.path === "/ilink/bot/sendmessage") return send(200, { ret: -2, errmsg: "prepare failed" });
+    return send(404, {});
+  });
+  try {
+    const client = new IlinkClient({ baseUrl: mock.baseUrl, token: SECRET_TOKEN, logger: silentLogger() });
+    await assert.rejects(
+      () => client.sendMessage({ to: "user-1", text: "任务完成了" }),
+      (e) => {
+        assert.ok(e instanceof WeChatError, "必须是 WeChatError 而不是普通 Error");
+        assert.equal(e.code, "context_token_expired", "★ 必须是一等错误码:调用方据此暂停主动推送,而不是重试");
+        assert.equal(e.detail.ret, -2);
+        assert.match(String(e.detail.errmsg), /prepare failed/i);
+        return true;
+      }
+    );
+  } finally {
+    await mock.close();
+  }
+});
+
+test("ClawBot §2.1:只有 ret=-2 且 errmsg 是 prepare failed 才判为令牌过期(不误伤其它错误)", async () => {
+  const bodies = [
+    { ret: -2, errmsg: "Prepare Failed" }, // 大小写不同,仍是同一类(平台文案不保证大小写)
+    { ret: -2, errmsg: "unknown error" }, // ret 相同但语义不同 → 不能当令牌过期(否则会错误地静默推送)
+    { ret: 5, errmsg: "prepare failed" } // errmsg 相同但 ret 不同 → 也不能当令牌过期
+  ];
+  let i = 0;
+  const mock = await withMockServer((rec, send) => {
+    if (rec.path === "/ilink/bot/sendmessage") {
+      send(200, bodies[i]);
+      i += 1;
+      return;
+    }
+    return send(404, {});
+  });
+  try {
+    const client = new IlinkClient({ baseUrl: mock.baseUrl, token: SECRET_TOKEN, logger: silentLogger() });
+    const codes = [];
+    for (let n = 0; n < bodies.length; n += 1) {
+      try {
+        await client.sendMessage({ to: "user-1", text: "x" });
+        codes.push("ok");
+      } catch (e) {
+        codes.push(e.code);
+      }
+    }
+    assert.deepEqual(codes, ["context_token_expired", "http_error", "http_error"]);
+  } finally {
+    await mock.close();
+  }
+});
+
+test("ClawBot §2.1:errcode -14 仍保持 session_expired(旧防护不能被新分类吃掉)", async () => {
+  const mock = await withMockServer((rec, send) => {
+    if (rec.path === "/ilink/bot/sendmessage") return send(200, { ret: 0, errcode: -14 });
+    return send(404, {});
+  });
+  try {
+    const client = new IlinkClient({ baseUrl: mock.baseUrl, token: SECRET_TOKEN, logger: silentLogger() });
+    await assert.rejects(
+      () => client.sendMessage({ to: "user-1", text: "x" }),
+      (e) => {
+        assert.equal(e.code, "session_expired");
+        return true;
+      }
+    );
+  } finally {
+    await mock.close();
+  }
+});
+
+// ── §2.2 游标持久化 ───────────────────────────────────────────────────────────
+
+test("ClawBot §2.2:游标落盘 → 新实例 load 回同值(按 bot 账号,0600)", async () => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "wc-cursor-"));
+  try {
+    const clock = fakeClock();
+    const ch = new WeChatChannel({ relayDir: dir, logger: silentLogger(), clock });
+    ch.adoptConfirmed({ token: SECRET_TOKEN, accountId: "bot-cursor", baseUrl: "http://127.0.0.1:1", userId: "u1" });
+    ch.saveUpdatesBuf("cursor-1");
+    assert.equal(ch.updatesBuf, "cursor-1", "内存游标要同步更新(不必再读盘)");
+
+    const files = botStateFiles(dir, ".wechat-sync-");
+    assert.equal(files.length, 1, `应恰好落一个游标文件,实际 ${JSON.stringify(files)}`);
+    assert.ok(files[0].includes("bot-cursor"), `文件名必须按 bot 账号派生,实际 ${files[0]}`);
+    const file = path.join(dir, files[0]);
+    assert.equal(fileMode(file), 0o600, "游标文件必须 0600");
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    assert.equal(raw.get_updates_buf, "cursor-1");
+    assert.equal(raw.bot_id, "bot-cursor");
+    assert.equal(raw.at, clock(), "要记下保存时间(排障用)");
+
+    // bridge 重启:凭据在盘上 → 必须读回同一个游标(否则服务端会把已处理的消息重投一遍)
+    const ch2 = new WeChatChannel({ relayDir: dir, logger: silentLogger(), clock });
+    assert.equal(ch2.loadUpdatesBuf(), "cursor-1", "★ 重启后必须接着上次的游标");
+
+    // 空游标绝不能覆盖已有进度(超时路径会原样返回空串)
+    ch2.saveUpdatesBuf("");
+    assert.equal(ch2.updatesBuf, "cursor-1", "空游标不得把内存值清掉");
+    assert.equal(new WeChatChannel({ relayDir: dir, logger: silentLogger(), clock }).loadUpdatesBuf(), "cursor-1");
+
+    ch2.clearUpdatesBuf();
+    assert.equal(ch2.updatesBuf, "");
+    assert.equal(fs.existsSync(file), false, "clear 必须删掉文件");
+    assert.equal(new WeChatChannel({ relayDir: dir, logger: silentLogger(), clock }).loadUpdatesBuf(), "");
+  } finally {
+    await fs.promises.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("ClawBot §2.2:换绑清掉旧 bot 的本地状态(旧游标/去重表不残留,新 bot 从空开始)", async () => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "wc-cursor2-"));
+  try {
+    const ch = new WeChatChannel({ relayDir: dir, logger: silentLogger(), clock: fakeClock() });
+    ch.adoptConfirmed({ token: SECRET_TOKEN, accountId: "bot-A", baseUrl: "http://127.0.0.1:1", userId: "u1" });
+    ch.saveUpdatesBuf("cursor-A");
+    assert.equal(ch.isDuplicateMessage("m-A"), false);
+    const oldSync = botStateFiles(dir, ".wechat-sync-")[0];
+    const oldSeen = botStateFiles(dir, ".wechat-seen-")[0];
+    assert.ok(oldSync && oldSync.includes("bot-A"), "前置:bot-A 的游标已落盘");
+    assert.ok(oldSeen && oldSeen.includes("bot-A"), "前置:bot-A 的去重表已落盘");
+
+    // 换绑到另一个 bot:旧 bot 的文件必须按**旧**账号指纹删掉(不是在改成新账号之后去删新账号的)
+    ch.adoptConfirmed({ token: SECRET_TOKEN, accountId: "bot-B", baseUrl: "http://127.0.0.1:1", userId: "u1" });
+    assert.equal(ch.loadUpdatesBuf(), "", "★ 换绑后游标必须从空开始(旧 bot 的游标会让服务端重放)");
+    assert.equal(fs.existsSync(path.join(dir, oldSync)), false, "★ 旧 bot 的游标文件必须被清掉,不能残留");
+    assert.equal(fs.existsSync(path.join(dir, oldSeen)), false, "★ 旧 bot 的去重表必须被清掉(上一个用户的消息指纹)");
+
+    // 新 bot 落盘时用的是**新**账号的名字,不会覆盖回旧文件
+    ch.saveUpdatesBuf("cursor-B");
+    const files = botStateFiles(dir, ".wechat-sync-");
+    assert.equal(files.length, 1, `换绑后只应剩新 bot 的一份游标,实际 ${JSON.stringify(files)}`);
+    assert.ok(files[0].includes("bot-B"), `文件名必须按新 bot 账号派生,实际 ${files[0]}`);
+    // 新实例(按盘上凭据 = bot-B)读回的必须是自己的
+    const ch2 = new WeChatChannel({ relayDir: dir, logger: silentLogger(), clock: fakeClock() });
+    assert.equal(ch2.loadUpdatesBuf(), "cursor-B");
+  } finally {
+    await fs.promises.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("ClawBot §2.2:adoptConfirmed() 清空游标(重绑不得沿用旧游标)", async () => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "wc-cursor3-"));
+  try {
+    const ch = new WeChatChannel({ relayDir: dir, logger: silentLogger(), clock: fakeClock() });
+    ch.adoptConfirmed({ token: SECRET_TOKEN, accountId: "bot-rebind", baseUrl: "http://127.0.0.1:1", userId: "u1" });
+    ch.saveUpdatesBuf("stale-cursor");
+    assert.equal(botStateFiles(dir, ".wechat-sync-").length, 1, "前置:游标已落盘");
+
+    // 重新绑定同一个 bot → 必须从空游标开始(旧游标属于上一次会话)
+    ch.adoptConfirmed({ token: SECRET_TOKEN, accountId: "bot-rebind", baseUrl: "http://127.0.0.1:1", userId: "u1" });
+    assert.equal(ch.updatesBuf, "", "内存游标必须清空");
+    assert.equal(ch.loadUpdatesBuf(), "", "★ adoptConfirmed 必须清空游标");
+    assert.equal(botStateFiles(dir, ".wechat-sync-").length, 0, "游标文件必须被删掉");
+  } finally {
+    await fs.promises.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("ClawBot §2.2/§2.3:unbind() 清空游标与去重表", async () => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "wc-cursor4-"));
+  try {
+    const ch = new WeChatChannel({ relayDir: dir, logger: silentLogger(), clock: fakeClock() });
+    ch.adoptConfirmed({ token: SECRET_TOKEN, accountId: "bot-unbind", baseUrl: "http://127.0.0.1:1", userId: "u1" });
+    ch.saveUpdatesBuf("cursor-x");
+    assert.equal(ch.isDuplicateMessage("m-unbind"), false);
+    assert.equal(botStateFiles(dir, ".wechat-sync-").length, 1, "前置:游标已落盘");
+    assert.equal(botStateFiles(dir, ".wechat-seen-").length, 1, "前置:去重表已落盘");
+
+    const r = await ch.unbind();
+    assert.equal(r.ok, true);
+    assert.equal(ch.updatesBuf, "", "内存游标必须清空");
+    assert.equal(botStateFiles(dir, ".wechat-sync-").length, 0, "★ 解绑必须删掉游标文件");
+    assert.equal(botStateFiles(dir, ".wechat-seen-").length, 0, "★ 解绑必须清空去重表(上一个人的指纹没有保留理由)");
+  } finally {
+    await fs.promises.rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ── §2.3 入站去重 ────────────────────────────────────────────────────────────
+
+test("ClawBot §2.3:inboundMessageId 取值优先级(message_id > seq > 指纹),都没有 → 空", () => {
+  assert.equal(inboundMessageId({ message_id: "m-1" }), "m-1");
+  assert.equal(inboundMessageId({ message_id: 12345 }), "12345", "数字 message_id 要转成字符串");
+  assert.equal(inboundMessageId({ seq: 7 }), "7", "没有 message_id 时退回 seq");
+  const msg = { from_user_id: "u1", create_time_ms: 1_700_000_000_000, item_list: [{ type: 1, text_item: { text: "你好" } }] };
+  const idA = inboundMessageId(msg);
+  const idB = inboundMessageId({
+    from_user_id: "u1",
+    create_time_ms: 1_700_000_000_000,
+    item_list: [{ type: 1, text_item: { text: "你好" } }]
+  });
+  assert.match(idA, /^sha1:[0-9a-f]{40}$/, "两者都没有时要退到 sha1 指纹");
+  assert.equal(idA, idB, "同一条消息必须得到同一个 id(否则去重失效)");
+  assert.notEqual(
+    idA,
+    inboundMessageId({ from_user_id: "u1", create_time_ms: 1_700_000_000_001, item_list: [{ type: 1, text_item: { text: "你好" } }] }),
+    "时间不同 → 不是同一条消息"
+  );
+  assert.equal(inboundMessageId({}), "");
+  assert.equal(inboundMessageId({ message_id: "   " }), "", "纯空白当没有");
+  assert.equal(inboundMessageId(null), "");
+  assert.equal(inboundMessageId("hello"), "");
+});
+
+test("ClawBot §2.3:同 id 第二次判重;重启后仍认得;空 id 不去重", async () => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "wc-seen-"));
+  try {
+    const clock = fakeClock();
+    const ch = new WeChatChannel({ relayDir: dir, logger: silentLogger(), clock });
+    ch.adoptConfirmed({ token: SECRET_TOKEN, accountId: "bot-seen", baseUrl: "http://127.0.0.1:1", userId: "u1" });
+
+    assert.equal(ch.isDuplicateMessage("m-1"), false, "第一次见 → 不是重复");
+    assert.equal(ch.isDuplicateMessage("m-1"), true, "★ 第二次必须判重(重投的同一条消息)");
+    assert.equal(ch.isDuplicateMessage(""), false, "★ 空 id 不去重:宁可多派一次,也不能吞掉用户消息");
+
+    const files = botStateFiles(dir, ".wechat-seen-");
+    assert.equal(files.length, 1, "去重表要落盘");
+    assert.ok(files[0].includes("bot-seen"), `文件名必须按 bot 账号派生,实际 ${files[0]}`);
+    const file = path.join(dir, files[0]);
+    assert.equal(fileMode(file), 0o600, "去重表必须 0600");
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    assert.equal(raw.bot_id, "bot-seen");
+    assert.ok(raw.ids.some((e) => e.id === "m-1"), "id 要记进去");
+
+    // bridge 重启 → 仍然认得这条消息,不能一重启就把重投的消息再派一次
+    const ch2 = new WeChatChannel({ relayDir: dir, logger: silentLogger(), clock });
+    assert.equal(ch2.isDuplicateMessage("m-1"), true, "★ 重启后仍要判重");
+    assert.equal(ch2.isDuplicateMessage("m-2"), false, "没见过的仍要放行");
+  } finally {
+    await fs.promises.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("ClawBot §2.3:去重表上限 200 条(丢最旧)且只保留 7 天", async () => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "wc-seen2-"));
+  try {
+    const clock = fakeClock();
+    const ch = new WeChatChannel({ relayDir: dir, logger: silentLogger(), clock });
+    ch.adoptConfirmed({ token: SECRET_TOKEN, accountId: "bot-seen2", baseUrl: "http://127.0.0.1:1", userId: "u1" });
+    for (let i = 0; i < 250; i += 1) {
+      assert.equal(ch.isDuplicateMessage(`id-${i}`), false);
+      clock.advance(1000); // 每条间隔 1s,保证"越靠前越旧"
+    }
+    const file = path.join(dir, botStateFiles(dir, ".wechat-seen-")[0]);
+    let raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    assert.equal(raw.ids.length, 200, `★ 去重表上限必须是 200 条,实际 ${raw.ids.length}`);
+    assert.equal(raw.ids.some((e) => e.id === "id-0"), false, "★ 超过上限要丢最旧的");
+    assert.equal(raw.ids.some((e) => e.id === "id-249"), true, "最新的一条必须保留");
+
+    // 保质期:手工塞一条 8 天前的,下一次写入时它必须被清掉(去重表不能无限留隐私指纹)
+    const eightDays = 8 * 24 * 60 * 60 * 1000;
+    raw.ids.unshift({ id: "too-old", at: clock() - eightDays });
+    fs.writeFileSync(file, JSON.stringify(raw), { mode: 0o600 });
+    ch.isDuplicateMessage("after-old");
+    raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    assert.equal(raw.ids.some((e) => e.id === "too-old"), false, "★ 超过 7 天的条目必须被清掉");
+    assert.equal(raw.ids.some((e) => e.id === "after-old"), true);
+  } finally {
+    await fs.promises.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("ClawBot §2.3:去重表读写失败 fail-open(当没见过,绝不丢消息),且只 warn 一次", async () => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "wc-seen3-"));
+  try {
+    const logger = createLogger();
+    const ch = new WeChatChannel({ relayDir: dir, logger, clock: fakeClock() });
+    ch.adoptConfirmed({ token: SECRET_TOKEN, accountId: "bot-seen3", baseUrl: "http://127.0.0.1:1", userId: "u1" });
+    ch.isDuplicateMessage("seed"); // 建立文件,拿到路径
+    const file = path.join(dir, botStateFiles(dir, ".wechat-seen-")[0]);
+    // 用同名**目录**占住路径 → 读(EISDIR)和写都失败
+    fs.rmSync(file, { force: true });
+    fs.mkdirSync(file);
+
+    assert.equal(ch.isDuplicateMessage("never-seen-before"), false, "★ 写盘失败必须 fail-open(放行),不能因此丢消息");
+    assert.equal(ch.isDuplicateMessage("another-one"), false, "持续失败也继续放行(不抛)");
+
+    const warnLines = logger.lines.filter((l) => /去重表写盘失败/.test(l));
+    assert.equal(warnLines.length, 1, `落盘失败只 warn 一次(避免刷屏),实际 ${warnLines.length} 条`);
+    fs.rmSync(file, { recursive: true, force: true });
+  } finally {
+    await fs.promises.rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ── §2.4 context_token 生命周期 ───────────────────────────────────────────────
+
+test("ClawBot §2.4:invalidateContextToken 清令牌 + 写 push_paused(脱敏截断,不含 token)", async () => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "wc-token-"));
+  try {
+    const clock = fakeClock();
+    const logger = createLogger({ secrets: [SECRET_TOKEN] });
+    const ch = new WeChatChannel({ relayDir: dir, logger, clock });
+    ch.adoptConfirmed({ token: SECRET_TOKEN, accountId: "bot-token", baseUrl: "http://127.0.0.1:1", userId: "u1" });
+
+    assert.equal(ch.rememberContextToken("CT-fresh-1", "u1"), true);
+    let st = loadState(dir);
+    assert.equal(st.context_token, "CT-fresh-1");
+    assert.equal(st.context_token_peer, "u1");
+    assert.equal(st.context_token_at, clock(), "rememberContextToken 必须写 context_token_at");
+
+    // 真实失败原文里可能带着 token,而 push_paused 会落进**面板可读**的状态文件
+    const reason = `sendMessage: ret=-2 errmsg=prepare failed token=${SECRET_TOKEN} ${"x".repeat(200)}`;
+    const paused = ch.invalidateContextToken(reason);
+    st = loadState(dir);
+    assert.equal(st.context_token, "", "★ state 里的令牌必须清掉(过期令牌留着只会继续撞 prepare failed)");
+    assert.equal(st.context_token_peer, "");
+    assert.equal(st.context_token_at, 0);
+    assert.equal(typeof st.push_paused, "object");
+    assert.equal(st.push_paused.at, clock());
+    assert.ok(st.push_paused.reason.length <= 120, `reason 必须截断到 120 字以内,实际 ${st.push_paused.reason.length}`);
+    assert.match(st.push_paused.reason, /prepare failed/, "要保留可诊断的信息(不能一脱敏就什么都不剩)");
+    assert.equal(st.push_paused.reason.includes(SECRET_TOKEN), false, "★ reason 里绝不能出现 token");
+    assert.equal(ch.client.contextToken, "", "内存令牌也要清");
+    assert.equal(paused.paused, true);
+    assert.deepEqual(ch.pushPaused(), { paused: true, at: clock(), reason: st.push_paused.reason });
+    for (const line of logger.lines) assert.equal(line.includes(SECRET_TOKEN), false, `日志泄漏 token: ${line}`);
+
+    // 状态要能跨重启(否则 bridge 一重启就又开始猛打)
+    const ch2 = new WeChatChannel({ relayDir: dir, logger: silentLogger(), clock });
+    assert.equal(ch2.pushPaused().paused, true, "★ push_paused 必须落盘:重启后仍在静默状态");
+    assert.equal(ch2.pushPaused().reason.includes(SECRET_TOKEN), false);
+  } finally {
+    await fs.promises.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("ClawBot §2.4:静默期间的重复失败只 warn 一次(断线重连不刷屏),at 保持首次进入静默的时间", async () => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "wc-token1b-"));
+  try {
+    const clock = fakeClock();
+    const logger = createLogger({ secrets: [SECRET_TOKEN] });
+    const ch = new WeChatChannel({ relayDir: dir, logger, clock });
+    ch.adoptConfirmed({ token: SECRET_TOKEN, accountId: "bot-token1b", baseUrl: "http://127.0.0.1:1", userId: "u1" });
+    ch.rememberContextToken("CT-1", "u1");
+
+    // ① 第一次失败:进入静默 → 必须有一条 warn
+    const first = ch.invalidateContextToken("prepare failed #1");
+    assert.equal(first.paused, true);
+    const pausedAt = first.at;
+    const warnLines = () => logger.lines.filter((l) => /推送静默/.test(l));
+    assert.equal(warnLines().length, 1, "第一次进入静默必须示警(否则用户/排障完全看不到)");
+
+    // ② 静默期间又失败两次(重连风暴 / replay 提示 / 非主动推送的 reply 路径):
+    //    状态仍照写(reason 更新、令牌照清),但**不许再 warn** —— 每次一条就是刷屏。
+    clock.advance(1_000);
+    const second = ch.invalidateContextToken("prepare failed #2");
+    clock.advance(1_000);
+    const third = ch.invalidateContextToken("prepare failed #3");
+    assert.equal(warnLines().length, 1, `★ 静默期间只 warn 一次,实际 ${warnLines().length} 条`);
+    assert.equal(second.paused, true);
+    assert.equal(third.paused, true);
+    // 落盘状态仍是"静默中",但 at 保持第一次进入静默的时间(它回答"从什么时候开始发不出去",
+    // 每次都刷新会让面板/日志节流窗口永远显示"刚刚发生",反而看不出持续了多久)。
+    const st = loadState(dir);
+    assert.equal(st.push_paused.at, pausedAt, "★ 重复失败不得刷新 push_paused.at");
+    assert.match(st.push_paused.reason, /#3/, "reason 要更新成最近一次失败(排障看最新原因)");
+    assert.equal(ch.client.contextToken, "", "令牌仍必须清掉");
+    for (const line of logger.lines) assert.equal(line.includes(SECRET_TOKEN), false, `日志泄漏 token: ${line}`);
+
+    // ③ 恢复后再失败 → 是新的一次静默,必须重新示警(不能因为"这辈子只报一次"而漏掉)
+    ch.rememberContextToken("CT-2", "u1");
+    assert.equal(ch.pushPaused().paused, false);
+    clock.advance(1_000);
+    ch.invalidateContextToken("prepare failed #4");
+    assert.equal(warnLines().length, 2, "解除静默后再次进入,必须重新 warn 一次");
+  } finally {
+    await fs.promises.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("ClawBot §2.4:rememberContextToken 清 push_paused 并刷新 context_token_at;clearPushPaused 幂等", async () => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "wc-token2-"));
+  try {
+    const clock = fakeClock();
+    const ch = new WeChatChannel({ relayDir: dir, logger: silentLogger(), clock });
+    ch.adoptConfirmed({ token: SECRET_TOKEN, accountId: "bot-token2", baseUrl: "http://127.0.0.1:1", userId: "u1" });
+
+    ch.rememberContextToken("CT-old", "u1");
+    ch.invalidateContextToken("sendMessage: ret=-2 prepare failed（上下文令牌已过期）");
+    assert.equal(ch.pushPaused().paused, true, "前置:已进入静默");
+
+    clock.advance(5_000);
+    assert.equal(ch.rememberContextToken("CT-new", "u1"), true);
+    let st = loadState(dir);
+    assert.equal("push_paused" in st, false, "★ 入站=令牌已刷新,静默必须当场解除");
+    assert.equal(st.context_token, "CT-new");
+    assert.equal(st.context_token_at, clock(), "时间戳必须刷新");
+    assert.equal(ch.pushPaused().paused, false);
+
+    // 令牌没变、也没静默 → 不重复写盘(入站频率不低,每次写会放大磁盘 IO)
+    assert.equal(ch.rememberContextToken("CT-new", "u1"), false);
+    // 但"令牌没变 + 正在静默"仍必须解除:入站本身就是刷新信号
+    ch.writeState({ push_paused: { at: clock(), reason: "stale pause" } });
+    assert.equal(ch.rememberContextToken("CT-new", "u1"), true, "★ 即使令牌不变,也要解除静默");
+    assert.equal(ch.pushPaused().paused, false);
+
+    // 解除静默必须幂等:本来就没静默时不能凭空造出这个键
+    ch.clearPushPaused();
+    ch.clearPushPaused();
+    assert.equal(ch.pushPaused().paused, false);
+    assert.equal("push_paused" in loadState(dir), false);
+
+    // 绑定成功 = 全新 bot_token + 新会话 → 旧的静默结论作废
+    ch.invalidateContextToken("prepare failed");
+    assert.equal(ch.pushPaused().paused, true);
+    ch.adoptConfirmed({ token: "another-token", accountId: "bot-token3", baseUrl: "http://127.0.0.1:1", userId: "u1" });
+    assert.equal(ch.pushPaused().paused, false, "★ 重绑后不得残留上一个会话的静默");
+  } finally {
+    await fs.promises.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("ClawBot §2.4:push_paused 里不得出现任何明文凭据(状态文件是面板可读的)", async () => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "wc-token3-"));
+  try {
+    const ch = new WeChatChannel({ relayDir: dir, logger: silentLogger(), clock: fakeClock() });
+    ch.adoptConfirmed({ token: SECRET_TOKEN, accountId: "bot-token4", baseUrl: "http://127.0.0.1:1", userId: "u1" });
+    ch.rememberContextToken("CT-secret-value-999", "u1");
+    ch.invalidateContextToken(`prepare failed context_token=CT-secret-value-999 bot_token=${SECRET_TOKEN}`);
+    const raw = fs.readFileSync(path.join(dir, ".wechat-state.json"), "utf8");
+    assert.equal(raw.includes(SECRET_TOKEN), false, "状态文件里不能出现 bot_token");
+    assert.equal(raw.includes("CT-secret-value-999"), false, "状态文件里不能出现 context_token 明文");
+    assert.match(raw, /push_paused/);
+  } finally {
     await fs.promises.rm(dir, { recursive: true, force: true });
   }
 });

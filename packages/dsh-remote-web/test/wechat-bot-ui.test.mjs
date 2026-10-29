@@ -1005,3 +1005,53 @@ test("★ 通道下发 caps: [] → 面板不得回退本地镜像(否则会展�
     "★空 caps 时一个能力都不能显示为可用（回退镜像就会显示一排 ✅）");
   assert.ok(texts.some((t) => t.indexOf("🔒") === 0), "应显示为不可用");
 });
+
+// ---------------------------------------------------------------------------
+// 推送静默（2026-10-29 契约 §4）：context_token 过期后平台不给续期，bridge 会暂停主动推送。
+// 面板要做的是「如实说明 + 给一条恢复动作」，且**不**改变两态绑定判定；
+// 旧 bridge 没有这些新字段时一个字都不能多显示（字段缺失 ≠ 已静默）。
+// ---------------------------------------------------------------------------
+const PAUSED_TEXT = "微信推送已静默";
+
+test("推送静默：push_paused=true 时在已绑定卡上给出恢复提示（仍是已绑定、绑定/解绑按钮都在）", async () => {
+  const plugin = loadPlugin({
+    status: {
+      ...BOUND, push_paused: true, push_paused_at: 1_700_000_800_000,
+      push_paused_reason: "sendMessage: ret=-2 prepare failed"
+    }
+  });
+  const tree = await plugin.settle();
+  assert.ok(textHas(tree, PAUSED_TEXT), "必须说明推送已静默（否则用户以为机器人坏了/要重新绑定）");
+  assert.ok(textHas(tree, "回任意一条消息即可恢复"), "要给出唯一可执行的动作");
+  assert.ok(textHas(tree, "未送达的通知会补发"), "要说明未送达的通知不会静默丢失");
+  assert.ok(textHas(tree, "已绑定"), "仍是已绑定态：静默只是健康提示，不是第三种绑定状态");
+  assert.ok(!textHas(tree, "未绑定"), "★静默绝不能把面板判成未绑定（那会诱导用户重新扫码）");
+  assert.ok(buttonWithText(tree, "解绑"), "解绑按钮不得被隐藏");
+  assert.equal(buttonWithText(tree, "连接微信机器人"), undefined, "已绑定时仍不应出现「连接微信机器人」");
+  // 复用既有 warn 样式 + 可播报：不引入任何新配色，也不需要读屏用户盯着屏幕才能知道
+  const warn = find(tree, (n) => hasClass(n, "dru-msg-warn") && n.props?.role === "status"
+    && (n.children || []).some((c) => typeof c === "string" && c.includes(PAUSED_TEXT)));
+  assert.ok(warn, "静默提示必须是 dru-msg dru-msg-warn + role=status 的节点");
+});
+
+test("推送静默：pending_outbox_count>0 给一行「待补发 N 条」，且不与旧的长文案重复", async () => {
+  const plugin = loadPlugin({ status: { ...BOUND, push_paused: true, pending_outbox_count: 3 } });
+  const tree = await plugin.settle();
+  assert.ok(textHas(tree, "待补发 3 条"), "静默期间要能看到待补发条数");
+  assert.ok(!textHas(tree, "条通知刚才没能发出去"),
+    "★静默态已由「待补发 N 条」说明，不再重复整段长文案（同一件事提示两遍 = 噪音）");
+});
+
+test("推送静默：旧 bridge 没有 push_paused（字段缺失/为 null）→ 不渲染提示，且待补发旧字段展示保持", async () => {
+  const plugin = loadPlugin({ status: { ...BOUND, pending_outbox: 2 } });
+  const tree = await plugin.settle();
+  assert.ok(!textHas(tree, PAUSED_TEXT), "★字段缺失就是旧 bridge，不能当成「已静默」渲染");
+  assert.ok(textHas(tree, "有 2 条通知刚才没能发出去"), "旧字段 pending_outbox 的既有展示必须保持（回归）");
+  assert.ok(textHas(tree, "已绑定"));
+
+  // null 也不得被当成「已静默」或「0 条」：null 只是"没给"，回落 pending_outbox 的 2
+  const nul = loadPlugin({ status: { ...BOUND, push_paused: null, pending_outbox_count: null, pending_outbox: 2 } });
+  const tree2 = await nul.settle();
+  assert.ok(!textHas(tree2, PAUSED_TEXT), "push_paused=null 不是 true，不能渲染静默提示");
+  assert.ok(textHas(tree2, "有 2 条通知刚才没能发出去"), "★pending_outbox_count=null 不能覆盖掉旧字段的 2 条");
+});

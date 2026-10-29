@@ -40,6 +40,7 @@ import {
   extractInboundText,
   extractFromUserId,
   extractContextToken,
+  inboundMessageId,
   handleCommand,
   classifyInbound,
   formatCompletion,
@@ -219,6 +220,49 @@ const OUTBOX_TTL_MS = 2 * 60 * 60 * 1000;
 const OUTBOX_MARK = "（补发）";
 
 /**
+ * 单次补发**最多逐条重发几条**（2026-10-29 ClawBot 修复，CONTRACT §3.5）。
+ *
+ * 为什么在 TTL/上限之外还要再收一层：平台在"一次连打多条"时最容易触发
+ * `ret=-2 prepare failed`（真机现场就是这个循环：补发 → 失败 → 队列涨 → 再补发）。
+ * TTL 只把**老的**丢掉，挡不住"一分钟内攒了 5 条"；单次最多 2 条 + 一条汇总，
+ * 既让用户知道"还漏了东西"，又不至于把平台重新打到限流。剩下的汇总成一句，绝不静默丢。
+ */
+const MAX_OUTBOX_FLUSH = 2;
+/** 补发时"较早的通知已省略"的汇总文案（N = 被省略的条数）。 */
+const OUTBOX_OVERFLOW_TEXT = (n) => `${OUTBOX_MARK}另有 ${n} 条较早的通知未送达，已省略`;
+/**
+ * 通道静默期间"又有一条推送被跳过/入队"的日志节流窗口。
+ *
+ * 静默时每收到一条通知都记一行，就是我们自己刷屏（真机一次积压几十条）——
+ * 10 分钟一条足够看清趋势，又不会把真正该看的日志淹掉。
+ */
+const PUSH_PAUSED_LOG_INTERVAL_MS = 10 * 60_000;
+/**
+ * 日报失败/静默后的**重试退避**（15 分钟）。
+ *
+ * 旧实现每个 60 秒 tick 都重试一次，18 点那一小时真机日志里刷了 111/240/175 条
+ * `ret=-2 prepare failed`（CONTRACT §0）。退避不是"放弃"：真正的补发机会在用户下次
+ * 说话时（入站 = 令牌刚刷新，见 #flushPendingDigest）。
+ */
+const DIGEST_RETRY_BACKOFF_MS = 15 * 60_000;
+/**
+ * `/status` 在推送静默时追加的提示（文案与面板/CONTRACT §3.7 同源）。
+ * 用户最怕的是"机器人坏了"这种误解 —— 必须说清是平台的窗口限制、以及怎么恢复。
+ */
+const PUSH_PAUSED_HINT = "推送已静默：微信通道只在你最近发过消息后的一小段时间内允许机器人主动发消息。回任意一条消息即可恢复，未送达的通知会补发。";
+/**
+ * 入站前**刚刚**静默过时，`/status` 追加的提示。
+ *
+ * 为什么需要单独一句：用户最可能的诊断动作就是发 `/status` 问"怎么不推送了"，
+ * 而入站消息本身会清掉 `push_paused` —— 等 #cmdStatus 判断时已经"不静默"了。
+ * 若不快照"这条消息到达之前的状态"，这个提示在真实入站路径下永远不会出现，
+ * 用户就得不到解释（Lead 2026-10-29 复审指出）。
+ */
+const PUSH_RECOVERED_HINT = "（刚才推送静默过：你这条消息已恢复推送；此前未送达的通知会补发）";
+/** `lastSilence` 的有效期：10 分钟内发 `/status` 才认为"刚才静默过"（再久就不算刚发生了）。 */
+const SILENCE_RECENT_MS = 10 * 60_000;
+
+/**
  * 把事件节点翻译成文案节点。
  * @returns {{node: object|null, formatterKind: string}}
  */
@@ -356,6 +400,20 @@ export class WeChatRuntime {
   #expectedFaultSeen = new Set();
 
   /**
+   * 已 warn 过的**非绑定用户** from 集合 —— 见 handleInbound 的身份过滤。
+   * 陌生消息可能成片来（群/服务号回推），每个都 warn 就是把日志刷满；同一 from 说一次足够。
+   */
+  #foreignSenderWarned = new Set();
+
+  /**
+   * 本次"推送静默"期间是否已经 warn 过一次。
+   *
+   * 令牌过期不是网络抖动：同一段时间里每条发不出去的消息都会走到同一个 catch，
+   * 不节流就是几十条 warn。入站（令牌刷新）或发送成功后重置，下一次过期重新报一次。
+   */
+  #pauseWarned = false;
+
+  /**
    * @param {{
    *   relayDir: string,
    *   upstream?: string|(() => string), // dsh web 地址,默认 http://127.0.0.1:3080;函数=每次重连重新求值
@@ -413,6 +471,32 @@ export class WeChatRuntime {
     this.stopping = false;
     this.channelTask = null;
     this.digestTask = null;
+
+    /**
+     * 待补发队列的**单飞锁**（CONTRACT §3.5）。
+     * 入站的 fire-and-forget 补发与主动推送路径都会调 #flushOutbox —— 不加锁时
+     * 两条调用会同时读到同一份队列、把同一批通知各发一遍（用户看到"重复推送"）。
+     */
+    this.outboxFlushing = false;
+    /**
+     * 日报的下一次重试时间（clock 毫秒）。未到点直接 return —— 修掉"每小时 60 次猛打"。
+     * 0 = 没有退避在生效。
+     */
+    this.digestNextTryAt = 0;
+    /**
+     * 日报发送的**单飞锁**：#maybeDigest（定时器）与 #flushPendingDigest（入站补发）
+     * 是两个入口，并发进来会各发一条 —— 真机上就是"简报发两遍"。
+     * 磁盘原子占位（#claimDigest）挡的是跨进程，这里挡的是同进程内的并发入口。
+     */
+    this.digestFlushing = false;
+    /** "推送静默，本条已跳过/入队"日志的节流时间戳（见 #logPushPaused）。 */
+    this.pausedPushLogAt = 0;
+    /**
+     * 最近一次"入站前处于静默"的快照 `{ at, reason }`（见 handleInbound 第 ③ 步）。
+     * 只服务于 `/status`：入站会把 push_paused 清掉，不快照的话用户问"怎么不推送了"
+     * 永远得不到"刚才静默过、你这条消息已恢复"的答复。
+     */
+    this.lastSilence = null;
 
     /** 绑定会话(同一时刻至多一个)。 */
     this.bind = null;
@@ -488,6 +572,11 @@ export class WeChatRuntime {
     const state = loadState(this.relayDir);
     const acct = sanitizeAccount(this.channel.account);
     const cooldownMs = this.channel.cooldown.remainingMs ? this.channel.cooldown.remainingMs() : 0;
+    // 待补发条数只报**有效**条数（按保质期过滤后）：见下方 pending_outbox 的历史注释
+    const pendingOutboxCount = this.#pruneOutbox(state.pending_outbox).kept.length;
+    // 推送静默标记由 channel 落在 state（invalidateContextToken 写、发送成功/入站清）——
+    // 这里直接读 state，保证面板看到的与"发不发得出去"是**同一份事实**。
+    const pushPaused = state.push_paused && typeof state.push_paused === "object" ? state.push_paused : null;
     return {
       ok: true,
       disabled: this.disabled,
@@ -517,6 +606,15 @@ export class WeChatRuntime {
         : { active: false, failed: !!(this.bind && this.bind.done && !this.bind.result) },
       channel_running: !!this.channelTask,
       events_running: !!this.subscriber,
+      // ── 2026-10-29 ClawBot 修复:推送静默 / 令牌 / 待补发(面板要能解释"为什么没消息")──
+      // 静默不是故障而是平台的窗口限制(CONTRACT §0 真机实测:令牌分钟级过期、没有续期接口),
+      // 所以必须让面板/状态如实说明,而不是让用户以为机器人坏了。
+      push_paused: !!pushPaused,
+      push_paused_at: Number((pushPaused && pushPaused.at) || 0),
+      push_paused_reason: String((pushPaused && pushPaused.reason) || ""),
+      context_token_at: Number(state.context_token_at || 0),
+      pending_outbox_count: pendingOutboxCount,
+      digest_pending_day: String(state.pending_digest_day || ""),
       // ── 诊断字段（2026-09-25 故障加的）────────────────────────────────────
       // 那次「任务跑完一条微信都没收到，日志里也没有任何报错」暴露了三件必须能看见的事：
       //   ① 事件订阅到底 ready 了没、**正在 follow 哪些会话**（follow 集为空 = turn/end 收不到）；
@@ -528,7 +626,7 @@ export class WeChatRuntime {
         : [],
       // 报**有效**条数（按保质期过滤后）：否则进程重启后，面板会一直显示那几条早已过期、
       // 永远不会被补发的条目，看起来像"队列卡住了"。真正的清理由 #trimOutbox 落盘。
-      pending_outbox: this.#pruneOutbox(state.pending_outbox).kept.length,
+      pending_outbox: pendingOutboxCount,
       last_fault: state.last_fault || null,
       last_completed_session_id: state.last_completed_session_id || "",
       last_completed_at: Number(state.last_completed_at || 0),
@@ -709,6 +807,17 @@ export class WeChatRuntime {
     }
     this.channel.writeState({ connected_at: this.clock(), last_error: "" });
 
+    // ★ 恢复长轮询游标（2026-10-29 ClawBot bug 1，CONTRACT §3.1）。
+    //   旧实现只把 `get_updates_buf` 放在内存里 —— bridge 重启/重连后游标归零，
+    //   服务端会重投"未确认"的消息 → 同一条消息被派活两次（用户报的「会话发两遍」）。
+    //   官方实现按 bot 账号落盘；读写都在 channel 层，这里只负责启动时取一次。
+    //   `||` 保留内存里已有的值：channel 若自己恢复过，就不必再读盘。
+    try {
+      this.channel.updatesBuf = this.channel.updatesBuf || this.channel.loadUpdatesBuf();
+    } catch (e) {
+      this.logger.warn(`[wechat] 恢复长轮询游标失败(从空游标开始):${redact(String(e && e.message ? e.message : e))}`);
+    }
+
     while (!this.stopping) {
       // ⚠️ SessionCooldown **没有** isActive() —— 它只有 remainingMs()/remainingMinutes()/arm()。
       // 早先这里写成 `cooldown.isActive && cooldown.isActive()` 会静默短路成 false,
@@ -734,10 +843,40 @@ export class WeChatRuntime {
         this.channel.noteSessionExpired("getupdates");
         continue;
       }
-      if (typeof resp.get_updates_buf === "string") this.channel.updatesBuf = resp.get_updates_buf;
-      for (const msg of Array.isArray(resp.msgs) ? resp.msgs : []) {
-        try { await this.handleInbound(msg); } catch (e) {
-          this.logger.warn(`[wechat] 处理入站消息失败:${redact(String(e && e.message ? e.message : e))}`);
+      // ★ 游标**在本批消息处理完之后**才落盘（Lead 2026-10-29 决策，取代 CONTRACT §3.1 的"先存"）。
+      //
+      // 取舍（为什么"先处理后存"而不是"先存后处理"）：
+      //   · 先存（at-most-once）：getUpdates 成功后立刻推进游标，若进程在这批消息的处理中途崩溃，
+      //     游标已经前进 → **这批剩余的消息永久丢失**，而且没有任何补偿机会。
+      //   · 后存（at-least-once）：崩溃后重启会从旧游标重投**这一批**，同一条消息可能被再派一次 ——
+      //     但重复由 channel 的持久化去重表吸收（`isDuplicateMessage` 在派发**之前**就标记，
+      //     属于 before-dispatch 语义），所以重放是安全的。
+      //   结论：宁可极小概率下重放一批（被去重表吸收），也不要静默丢一批用户消息。
+      //   用 try/finally 保证"即使某条 handleInbound 抛错也照样保存"—— 否则一条坏消息会让游标
+      //   永久卡住，变成无限重投。循环内仍是 catch+log 继续，不中断整批。
+      try {
+        for (const msg of Array.isArray(resp.msgs) ? resp.msgs : []) {
+          // 每条入站一行 info，**不含正文**：正文里有用户的任务/隐私，日志只留可定位的元信息
+          // （id / 来源 / 类型 / 文本长度）—— 出问题时要能对上是哪条，又不能让日志成为泄密面。
+          this.logger.info(
+            `[wechat] 入站 id=${inboundMessageId(msg) || "?"} from=${extractFromUserId(msg) || "?"}`
+            + ` type=${msg && msg.message_type != null ? msg.message_type : "?"}`
+            + ` len=${String(extractInboundText(msg) || "").length}`
+          );
+          try { await this.handleInbound(msg); } catch (e) {
+            this.logger.warn(`[wechat] 处理入站消息失败:${redact(String(e && e.message ? e.message : e))}`);
+          }
+        }
+      } finally {
+        // 整批处理完（或中途抛错）才推进并落盘游标；内存值一起更新，否则下一轮会拿旧游标重投本批
+        if (typeof resp.get_updates_buf === "string") {
+          this.channel.updatesBuf = resp.get_updates_buf;
+          try {
+            this.channel.saveUpdatesBuf(resp.get_updates_buf);
+          } catch (e) {
+            // 游标落盘失败绝不能打断长轮询（否则通道直接停了）—— 最多退化成"重启后重投一批"
+            this.logger.warn(`[wechat] 保存长轮询游标失败(继续轮询):${redact(String(e && e.message ? e.message : e))}`);
+          }
         }
       }
     }
@@ -797,25 +936,77 @@ export class WeChatRuntime {
 
   /** 处理一条入站消息(回执 / 指令 / 交代任务)。公开以便 bridge 与测试直接驱动。 */
   async handleInbound(msg) {
+    const account = this.channel.account;
     const from = extractFromUserId(msg);
-    const text = normalizeInput(extractInboundText(msg));
-    // ★ 每条入站消息都带上 `context_token`,而**出站必须回带它**才发得出去
-    //   (不进它 → 真机 `ret=-2 errmsg=prepare failed`,用户「没收到微信通道」)。
-    //   放在 `if (!text) return` **之前**:图片/语音这类没有文本的消息同样会刷新上下文。
-    //   记不住不影响主流程(最坏就是这一条发不出去,与以前一样)。
-    try { this.channel.rememberContextToken(extractContextToken(msg), from); } catch { /* 忽略 */ }
-    // ★ 0.6.15：收到入站消息 = 平台侧这条会话刚刚"活过来"，是补发积压通知的最好时机。
-    //   fire-and-forget：补发失败不能影响用户这条消息的处理。
-    void this.#flushOutbox(from).catch(() => 0);
-    if (!text) return;
 
-    // 内部统计:任何入站互动都算一次"窗口续期"事件
-    this.#bumpToday();
+    // ── ① 身份 / 类型过滤（严格排在去重之前，CONTRACT §3.2 第 1 步）────────────
+    // 为什么必须先过滤：这条通道能驱动用户电脑上的 agent（session/prompt），
+    // 不过滤就等于把"谁都能派活"写进协议层。以前完全没有这道闸。
+    // ①a 机器人自己的消息（平台会把 bot 发出去的消息回灌进 getupdates）
+    if (Number(msg && msg.message_type) === 2 || /@im\.bot$/i.test(from)) {
+      if (typeof this.logger.debug === "function") {
+        this.logger.debug(`[wechat] 跳过机器人消息 from=${from || "?"} type=${msg && msg.message_type != null ? msg.message_type : "?"}`);
+      }
+      return;
+    }
+    // ①b 不是绑定用户 → 跳过 + warn（同一 from 只 warn 一次：陌生来源可能成片来，
+    //    每条都 warn 就是把真正的告警淹掉）。
+    if (account && account.userId && from && from !== account.userId) {
+      if (!this.#foreignSenderWarned.has(from)) {
+        this.#foreignSenderWarned.add(from);
+        this.logger.warn(`[wechat] 忽略非绑定用户的消息 from=${from}（当前绑定的是 ${account.userId}）`);
+      }
+      return;
+    }
+
+    // ── ② 入站去重（channel 层按 bot 账号落盘，CONTRACT §3.2 第 2 步）──────────
+    // 游标丢失/服务端重投时同一条消息会再来一次；没有去重就会把同一条派活两次。
+    // fail-open 由 channel 保证：id 为空或去重表读/写失败 → 当"不重复"（宁可重复一次，
+    // 也绝不因为去重把消息吃掉）。
+    const id = inboundMessageId(msg);
+    if (this.channel.isDuplicateMessage(id)) {
+      this.logger.info(`[wechat] 跳过重复入站 id=${id}`);
+      return;
+    }
+
+    const text = normalizeInput(extractInboundText(msg));
+    // ── ③ 记令牌（入站消息带来 `context_token`，出站必须回带它才发得出去）──────
+    //    放在 `if (!text) return` **之前**：图片/语音这类没有文本的消息同样携带新令牌，
+    //    同样是"用户刚说过话、推送窗口已打开"的信号 —— 绝不能因为 text 为空就被早退跳过。
+    //    channel 侧在写盘记住令牌的同时会**清掉 push_paused**（入站 = 令牌已刷新 = 通道恢复）。
+    //    记不住不影响主流程（最坏就是这一条发不出去，与以前一样）。
+    //    ⚠️ 反过来，**没带令牌**的入站不会解除静默：没有 context_token 发出去必然还是
+    //    `prepare failed`（CONTRACT §0），提前解除只会让补发多失败一次、把日志再刷一遍。
+    //    等带令牌的消息（真实入站都带）到了再恢复，才是"能发出去就恢复"的如实语义。
+    // ★ 先快照"这条消息到达之前是否处于静默"，再让 rememberContextToken 去清它。
+    //   用户的心理路径是「咦不推送了」→ 发 /status 问；而入站会当场解除静默，所以
+    //   #cmdStatus 必须靠这份快照才能说出「刚才静默过、你这条消息已恢复」。
+    const silenceBefore = this.#pushPaused();
+    if (silenceBefore.paused) {
+      this.lastSilence = { at: this.clock(), reason: silenceBefore.reason };
+    }
+    try { this.channel.rememberContextToken(extractContextToken(msg), from); } catch { /* 忽略 */ }
+    // 令牌已刷新 → 下一次过期属于"新的一次静默"，warn 要重新允许
+    this.#pauseWarned = false;
     // ★ 0.6.15：`context_token` 的形状一直没被验证过（§11）。真机日志里
     //   `ret=-2 prepare failed` 出现过 48 次，而状态文件里**从来没有** context_token ——
     //   也就是说入站消息里没带它（或字段名和我们猜的不一样）。这里把**字段名**记一次
     //   （只有名字，没有值），下次再出这个问题就能一眼看出该取哪个键，不用再猜。
     this.#noteInboundShapeIfNoToken(msg);
+
+    // ── ④ 补发（入站 = 平台推送窗口刚打开，是唯一能补送积压的时刻）──────────────
+    // 按契约顺序**日报优先**触发，再补待补发队列。两条都 fire-and-forget：
+    // 补发失败绝不能影响用户这条消息的处理；#flushOutbox 内部单飞，与推送路径不会并发重发。
+    // ⚠️ 实现细节（别被顺序误导）：#flushPendingDigest 走 notify → #pushProactive，而后者
+    //    **先补待补发队列再发这一条**（既有行为）。所以网络上的实际顺序可能是"积压 → 日报"。
+    //    这不影响任何承诺（每条都发、各一次、有界），只是别在别处假设严格先后。
+    void this.#flushPendingDigest(from).catch(() => false);
+    void this.#flushOutbox(from).catch(() => 0);
+
+    if (!text) return;
+
+    // 内部统计:任何入站互动都算一次"窗口续期"事件
+    this.#bumpToday();
 
     // ── v2 分派:命令 → 数字 → 普通消息 ────────────────────────────────────
     // ⚠️ 顺序不能换:
@@ -1347,7 +1538,18 @@ export class WeChatRuntime {
     const line = this.currentSessionId
       ? `当前任务:${name || "(未命名)"} ${short}`
       : "当前任务:未选中(发一句话即开新任务,/ls 可切换)";
-    await this.reply(from, `${base}\n${line}`);
+    const lines = [base, line];
+    // ★ 推送静默时**必须如实追加一句**：否则用户看到"机器人不说话了"只会以为它坏了，
+    //   而真实原因是平台的窗口限制（令牌过期、没有续期接口，见 CONTRACT §0）。
+    //   这句同时告诉他怎么办（回任意一条消息即可恢复），比任何技术细节都有用。
+    //   分两种说法：现在还静默（发不出去）／刚才静默过但这条入站已经恢复（见 lastSilence）。
+    const pausedNow = this.#pushPaused();
+    if (pausedNow.paused) {
+      lines.push("", PUSH_PAUSED_HINT);
+    } else if (this.lastSilence && this.clock() - Number(this.lastSilence.at || 0) < SILENCE_RECENT_MS) {
+      lines.push("", PUSH_RECOVERED_HINT);
+    }
+    await this.reply(from, lines.join("\n"));
   }
 
   /** `/summary` —— 重发当前会话的最近结论。 */
@@ -1497,14 +1699,59 @@ export class WeChatRuntime {
     //   让"想给多行却给了数组"退化成**正确**的多行文本,而不是一坨。
     const body = Array.isArray(text) ? text.join("\n") : String(text == null ? "" : text);
     if (!body) return false;
+    // 发送前先看一眼静默标记：这条如果能发出去，说明令牌是好的 → 下面要把它清掉
+    const pausedBefore = !!this.#pushPaused().paused;
     try {
       await this.channel.client.sendMessage({ to, text: body });
       this.channel.markPush(true);
+      // ★ 发送成功 = 令牌有效 = 通道恢复：把通道层的静默标记清掉，
+      //   让面板/状态如实变回"正常"，而不是一直挂着一条已经过期的警告。
+      if (pausedBefore) {
+        try { this.channel.clearPushPaused(); } catch { /* 清标记失败不影响这条已发出的消息 */ }
+        this.#pauseWarned = false;
+        this.logger.info("[wechat] 主动推送已恢复（令牌有效），静默标记已清除");
+      }
       return true;
     } catch (e) {
+      // 🔴 令牌过期（ret=-2 prepare failed）**不是网络抖动**：平台没有续期接口，
+      //   同一条重发必然再失败（CONTRACT §0 真机实测：有效期约 10 分钟）。
+      //   所以这里既不重试也不重写 last_error —— 立刻静默主动推送并如实记账，
+      //   否则就是我们刷满日志、还让用户以为"只是慢"。
+      if (e && e.code === "context_token_expired") {
+        const reason = String(e && e.message ? e.message : e || "context_token 已过期");
+        try { this.channel.invalidateContextToken(reason); } catch { /* 记账失败也必须保持静默 */ }
+        if (!this.#pauseWarned) {
+          this.#pauseWarned = true;
+          this.logger.warn(`[wechat] 主动推送已暂停（上下文令牌过期）：${redact(reason)}（等用户下次发消息刷新令牌后自动恢复）`);
+        }
+        return false;
+      }
       this.#noteFailure(`sendmessage 失败:${redact(String(e && e.message ? e.message : e))}`);
       return false;
     }
+  }
+
+  // ── 推送静默（2026-10-29 ClawBot 修复） ─────────────────────────────────
+
+  /**
+   * 读通道层的"主动推送是否已静默"。
+   *
+   * 静默 = 最近一次 sendMessage 撞上 `ret=-2 prepare failed`（context_token 过期，
+   * channel 层落盘 `push_paused`）。它不是网络故障，平台也没有续期接口 —— 令牌只在
+   * "最近有入站消息"的很短窗口内有效（CONTRACT §0 真机实测）。
+   * 所以静默期间**不发请求、只入队**，等用户下次说话（令牌刷新）再补。
+   */
+  #pushPaused() {
+    const r = this.channel.pushPaused();
+    return r && typeof r === "object" ? r : { paused: false, at: 0, reason: "" };
+  }
+
+  /** 静默期间"这条推送被跳过/入队"的日志：≥10 分钟一条，避免我们自己把日志刷满。 */
+  #logPushPaused(text) {
+    const now = this.clock();
+    if (now - this.pausedPushLogAt < PUSH_PAUSED_LOG_INTERVAL_MS) return;
+    this.pausedPushLogAt = now;
+    this.logger.info(`[wechat] ${text}`);
   }
 
   /**
@@ -1608,40 +1855,86 @@ export class WeChatRuntime {
   }
 
   /**
-   * 把待补发队列按 FIFO 发出去（碰到第一条失败就停，保留剩下的下次再试）。
-   * @returns {Promise<number>} 这次补发成功的条数
+   * 把待补发队列发出去（2026-10-29 收敛，CONTRACT §3.5）。
+   *
+   * 三条硬约束：
+   *  ① **单飞**：入站的 fire-and-forget 与主动推送路径会并发调用 —— 不加锁时两边会
+   *     读到同一份队列、把同一批通知各发一遍（用户看到"重复推送"）；并发调用直接返回 0。
+   *  ② **单次最多逐条重发 MAX_OUTBOX_FLUSH 条**，取**最近**的几条（越早越没价值，
+   *     而且一次连打正是平台限流的触发条件，见常量注释）。
+   *  ③ 还有更早的 → 再发**一条汇总**「另有 N 条较早的通知未送达，已省略」后清空队列：
+   *     既不让用户以为"什么都没漏"，也不逐条刷屏；被省略的条数**如实记日志**。
+   * 补发路径**不看 push_paused** —— 它是被入站触发的，此刻令牌刚刚刷新（CONTRACT §3.4）。
+   * @returns {Promise<number>} 这次补发成功的条数（含汇总那一条）
    */
   async #flushOutbox(to) {
-    // 补发前先按保质期清一遍：**过期的不发**（迟到几小时的"任务跑完了"只会误导用户），
-    // 也避免一次性连打十几条把平台打限流（那正是队列越积越多的成因）。
-    const raw = this.#outbox();
-    const list = this.#trimOutbox(raw);              // 只在真丢了东西时才落盘（避免每轮都写状态文件）
-    if (list.length !== raw.length) this.#writeOutbox(list);
-    if (!list.length || !to) return 0;
-    let sent = 0;
-    const rest = [...list];
-    while (rest.length) {
-      const item = rest[0];
-      const ok = await this.reply(to, `${OUTBOX_MARK}${String(item && item.text ? item.text : "")}`);
-      if (!ok) break; // 还是发不出去：原样留着，下次再试
-      rest.shift();
-      sent += 1;
+    // 单飞：并发调用直接返回 0（另一条调用会把队列处理掉）
+    if (this.outboxFlushing) return 0;
+    if (!to) return 0;
+    this.outboxFlushing = true;
+    try {
+      // 补发前先按保质期清一遍：**过期的不发**（迟到几小时的"任务跑完了"只会误导用户），
+      // 也避免一次性连打十几条把平台打限流（那正是队列越积越多的成因）。
+      const raw = this.#outbox();
+      const list = this.#trimOutbox(raw);              // 只在真丢了东西时才落盘（避免每轮都写状态文件）
+      if (list.length !== raw.length) this.#writeOutbox(list);
+      if (!list.length) return 0;
+      const target = list.slice(-MAX_OUTBOX_FLUSH);    // 只逐条重发最近的几条
+      const older = list.slice(0, Math.max(0, list.length - target.length));
+      let sent = 0;
+      for (const item of target) {
+        const ok = await this.reply(to, `${OUTBOX_MARK}${String(item && item.text ? item.text : "")}`);
+        if (!ok) {
+          // 还是发不出去（例如令牌又过期了）：**保留全部 older + 尚未送出的 target**，下次再试。
+          // ⚠️ 别写成 `list.slice(sent)`：`sent` 只在 target 内计数，而 list 是 [older..., target...]，
+          //    那个写法会同时犯两个错 —— 最早的 older 被静默丢掉、已经发出去的 target 又被放回队列
+          //    再发一遍（用户收到重复）。必须按两段拼回去。
+          const rest = [...older, ...target.slice(sent)];
+          this.#writeOutbox(rest);
+          this.logger.warn(`[wechat] 补发中断：已送出 ${sent} 条，剩 ${rest.length} 条留到下次（不丢，含较早的 ${older.length} 条）`);
+          return sent;
+        }
+        sent += 1;
+      }
+      if (older.length) {
+        // 更早的通知不再逐条重发，但**必须让用户知道有东西被省略了**（绝不静默丢）。
+        const ok = await this.reply(to, OUTBOX_OVERFLOW_TEXT(older.length));
+        if (!ok) {
+          // 汇总都没发出去 → 这些条目留着下次再试（不能因为已经"打算省略"就真丢了）
+          this.#writeOutbox(older);
+          this.logger.warn(`[wechat] 补发省略汇总没发出去，${older.length} 条较早的通知留到下次`);
+          return sent;
+        }
+        sent += 1;
+        this.logger.warn(`[wechat] 补发时省略了 ${older.length} 条较早的通知（单次最多逐条重发 ${MAX_OUTBOX_FLUSH} 条，避免一次连打触发平台限流）`);
+      }
+      this.#writeOutbox([]);
+      this.logger.info(`[wechat] 待补发队列已送出 ${sent} 条并清空`);
+      return sent;
+    } finally {
+      this.outboxFlushing = false;
     }
-    if (sent > 0) {
-      this.#writeOutbox(rest);
-      this.logger.info(`[wechat] 待补发队列已送出 ${sent} 条（剩 ${rest.length} 条）`);
-    }
-    return sent;
   }
 
   /**
    * 主动推送（通知类）：先补发积压，再发这一条；发不出去就入队，绝不丢。
+   *
+   * 2026-10-29 新增：通道**静默**期间（令牌过期）**不发请求** —— 发了必然 prepare failed，
+   * 只会刷日志并把平台打成限流（真机现场正是这个循环）。此时只入队，等入站补发。
    * @returns {Promise<{sent:boolean, queued:boolean}>} queued=true 表示"已排进待补发"，
    *   调用方据此仍可登记待拍板项（用户稍后看到时还能回执）。
    */
   async #pushProactive(to, text, kind = "", { queue = true } = {}) {
     const body = String(text || "");
     if (!body) return { sent: false, queued: false };
+    const paused = this.#pushPaused();
+    if (paused.paused) {
+      // 静默中：请求一个都不发（这是 CONTRACT §3.4 的核心）。
+      if (!queue) return { sent: false, queued: false };
+      const depth = this.#enqueueOutbox(body, kind);
+      this.#logPushPaused(`主动推送已静默(${kind || "?"})：本条已入队（${depth} 条待补发，等入站补发）`);
+      return { sent: false, queued: true };
+    }
     await this.#flushOutbox(to).catch(() => 0);
     const ok = await this.reply(to, body);
     if (ok) return { sent: true, queued: false };
@@ -2034,24 +2327,91 @@ export class WeChatRuntime {
     const now = this.clock();
     const hour = new Date(now).getHours();
     if (hour !== this.digestHour) return;
+    // ★ 退避（2026-10-29 修复，CONTRACT §3.6）：上一次没成功（令牌过期/静默/网络失败）→
+    //   15 分钟内不再试。旧实现每个 60 秒 tick 都猛打一次，真机 18 点那一小时刷了
+    //   111/240/175 条 `ret=-2 prepare failed`。退避不是放弃 —— 补发改由入站触发
+    //   （见 #flushPendingDigest：用户一说话令牌就刷新，那才是能把简报送出去的时刻）。
+    if (this.digestNextTryAt && now < this.digestNextTryAt) return;
     const day = this.#today(now);
     const state = loadState(this.relayDir);
     if (state.last_digest_day === day) return; // 今天已发
     // ★ 先原子占位再发送:两个实例/两次 tick 并存时,只有一个能拿到(见 #claimDigest)
     const claim = this.#claimDigest(day);
     if (!claim.ok) return;
-    const s = this.todayStats;
-    const lines = this.#digestLines();
-    const node = this.subscriber.digestDue({ lines, notified: s.notified, answered: s.answered });
-    let r = null;
-    try {
-      r = await this.notify(node);
-    } finally {
-      // 没真发出去 → 释放占位,留给下一 tick 补发(见上面 ②:不能把当天烧掉)
-      if (!(r && r.ok)) this.#releaseDigest(claim);
+    // 占位拿到就先把"今天还没送达"落盘：进程若在发送途中被杀（占位会被当作陈旧接管，
+    // 但 pending 标记能让下一次**入站**立刻补上，不必再等一天）。
+    this.channel.writeState({ pending_digest_day: day });
+    const paused = this.#pushPaused();
+    let r;
+    if (paused.paused) {
+      // 静默期间发也必然失败（prepare failed）→ 干脆一个请求都不发，等入站补发。
+      this.#logPushPaused(`日报已静默（${paused.reason || "context_token 过期"}），等下次入站补发`);
+      r = { ok: false, reason: "push_paused" };
+    } else {
+      r = await this.#sendDigestNow();
     }
     // ★ 只有**真的发出去了**才记"今天已发"(见上面 ②)
-    if (r && r.ok) this.channel.writeState({ last_digest_day: day });
+    if (r && r.ok) {
+      this.channel.writeState({ last_digest_day: day, pending_digest_day: "" });
+      this.digestNextTryAt = 0;
+      return;
+    }
+    // 没真发出去 → 释放占位（不能把当天烧掉）+ 退避 15 分钟（修掉"每小时 60 次猛打"）
+    this.#releaseDigest(claim);
+    this.digestNextTryAt = this.clock() + DIGEST_RETRY_BACKOFF_MS;
+    this.logger.warn(`[wechat] 日报未送达（${(r && r.reason) || "unknown"}）：已记为待补发，${Math.round(DIGEST_RETRY_BACKOFF_MS / 60_000)} 分钟后或下次入站再试`);
+  }
+
+  /**
+   * 真正发一次当日简报（`#maybeDigest` 与 `#flushPendingDigest` **共用**）。
+   *
+   * 单飞：两个入口都是异步发送，并发进来会各发一条（真机上就表现为"简报发两遍"）。
+   * 磁盘原子占位（`#claimDigest`）挡的是跨进程/跨实例，这里挡的是同进程内的并发入口。
+   * @returns {Promise<{ok:boolean, reason?:string}>}
+   */
+  async #sendDigestNow() {
+    if (this.digestFlushing) return { ok: false, reason: "inflight" };
+    this.digestFlushing = true;
+    try {
+      const s = this.todayStats;
+      // ⚠️ 必须把 lines 一起传：只给 notified/answered 会让用户每天收到兜底句
+      //    「今天暂时没有要做的事。」—— 那不是"今天干了啥"（见 #maybeDigest 的历史注释）。
+      const node = this.subscriber.digestDue({ lines: this.#digestLines(), notified: s.notified, answered: s.answered });
+      // queueFailedPush:false —— 日报自带 pending/退避语义，绝不能进待补发队列（否则双份）
+      return await this.notify(node, { queueFailedPush: false });
+    } catch (e) {
+      return { ok: false, reason: redact(String(e && e.message ? e.message : e)) };
+    } finally {
+      this.digestFlushing = false;
+    }
+  }
+
+  /**
+   * 入站后补发"今天没能送达的日报"（CONTRACT §3.6）。
+   *
+   * 为什么必须由**入站**触发：平台只允许"最近有入站消息"的窗口内主动推送，
+   * 日报失败/静默后靠定时器重试只会一直 prepare failed。用户一说话令牌刚刷新，
+   * 这是唯一能把简报送出去的时刻 —— 所以它排在待补发队列**之前**（日报过期就没意义了）。
+   * 这里**不看 push_paused**：入站意味着令牌已刷新（CONTRACT §3.4）。
+   * @returns {Promise<boolean>} 是否补发成功
+   */
+  async #flushPendingDigest(to) {
+    if (!to || !this.subscriber || !this.channel.account) return false;
+    const day = this.#today();
+    const state = loadState(this.relayDir);
+    if (state.last_digest_day === day) {
+      // 今天已送达：顺手清掉可能残留的待补标记（异常退出/旧版本留下的，别让状态永远挂着）
+      if (state.pending_digest_day) this.channel.writeState({ pending_digest_day: "" });
+      return false;
+    }
+    if (String(state.pending_digest_day || "") !== day) return false;
+    const r = await this.#sendDigestNow();
+    if (!(r && r.ok)) return false;
+    // ★ 只有真发出去才写 last_digest_day，并清掉待补标记（"发过才算数"）
+    this.channel.writeState({ last_digest_day: day, pending_digest_day: "" });
+    this.digestNextTryAt = 0;
+    this.logger.info("[wechat] 未送达的日报已在入站后补发成功");
+    return true;
   }
 
   /**

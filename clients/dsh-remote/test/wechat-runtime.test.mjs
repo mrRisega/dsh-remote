@@ -44,7 +44,9 @@ const quietLogger = () => ({ info() {}, warn() {}, error() {}, debug() {}, addSe
 
 /** 本地假 ilink 服务 —— 测试期网络护栏只允许回环,所以必须自带假上游。 */
 function fakeIlink(handler) {
-  const state = { sends: [], notifyStart: 0, notifyStop: 0, getUpdates: 0, queue: [] };
+  // `bufs` 记录**每次 getupdates 请求里带的游标** —— 长轮询游标恢复/重投必须能被断言
+  // （旧实现游标只在内存，重启后从空游标开始，服务端就会重投已确认消息）。
+  const state = { sends: [], notifyStart: 0, notifyStop: 0, getUpdates: 0, queue: [], bufs: [] };
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, "http://127.0.0.1");
     let body = "";
@@ -56,6 +58,7 @@ function fakeIlink(handler) {
       };
       if (url.pathname.endsWith("/getupdates")) {
         state.getUpdates += 1;
+        try { state.bufs.push(JSON.parse(body).get_updates_buf); } catch { state.bufs.push(""); }
         if (handler && handler.onGetUpdates) return handler.onGetUpdates(state, reply);
         const msgs = state.queue.splice(0);
         return reply({ ret: 0, msgs, get_updates_buf: "buf-" + state.getUpdates, longpolling_timeout_ms: 1 });
@@ -95,7 +98,9 @@ function fakeIlink(handler) {
 /** 直接构造一个"已绑定"的运行时(绕过扫码),便于测通道与回执。 */
 async function boundRuntime(ilink, opts = {}) {
   const relayDir = tmp();
-  saveAccount(relayDir, { token: "tok-abc", accountId: "bot-1", baseUrl: ilink.baseUrl, userId: "user-1", boundAt: 1 });
+  // ⚠️ `userId` 就是**绑定用户本人**：runtime 的入站身份过滤会拿它比对 from_user_id
+  //    （非本人/机器人消息一律忽略）。本文件绝大多数用例用 "u" 当用户，所以这里也用它。
+  saveAccount(relayDir, { token: "tok-abc", accountId: "bot-1", baseUrl: ilink.baseUrl, userId: "u", boundAt: 1 });
   const rt = createWeChatRuntime({
     relayDir,
     upstream: "http://127.0.0.1:1",
@@ -264,7 +269,7 @@ test("★ 审批回执走 answerApproval,提问回执走 answerQuestion(不能�
   try {
     const sub = makeFakeSubscriber();
     const { rt } = await boundRuntime(ilink, { subscriber: sub });
-    rt.channel.account = { token: "t", accountId: "b", baseUrl: ilink.baseUrl, userId: "user-1" };
+    rt.channel.account = { token: "t", accountId: "b", baseUrl: ilink.baseUrl, userId: "u" };
 
     // 1) 推一条审批
     const sent = await rt.notify({
@@ -274,8 +279,8 @@ test("★ 审批回执走 answerApproval,提问回执走 answerQuestion(不能�
     assert.match(lastText(ilink.state), /需要你拍板/);
 
     // 用户回 1 → 应走 answerApproval 且值为 allowed-once
-    ilink.state.queue.push({ from_user_id: "user-1", item_list: [{ type: 1, text_item: { text: "1" } }] });
-    await rt.handleInbound({ from_user_id: "user-1", item_list: [{ type: 1, text_item: { text: "1" } }] });
+    ilink.state.queue.push({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "1" } }] });
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "1" } }] });
     const call = sub.calls[sub.calls.length - 1];
     assert.equal(call.m, "answerApproval", "审批必须走 answerApproval,否则编码不对");
     assert.equal(call.value, "allowed-once", "选项字段是 value,不是 outcome");
@@ -285,7 +290,7 @@ test("★ 审批回执走 answerApproval,提问回执走 answerQuestion(不能�
       kind: NODE_KINDS.USER_QUESTION, eventId: "ev-2", answerShape: "question", at: 1,
       questions: [{ id: "q1", question: "选哪个?", options: ["甲", "乙"] }]
     });
-    await rt.handleInbound({ from_user_id: "user-1", item_list: [{ type: 1, text_item: { text: "2" } }] });
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "2" } }] });
     const call2 = sub.calls[sub.calls.length - 1];
     assert.equal(call2.m, "answerQuestion", "提问必须走 answerQuestion");
     assert.deepEqual(call2.answers, [{ id: "q1", selected: ["乙"] }]);
@@ -299,7 +304,7 @@ test("★ 过期绝不等于同意:没有待答通知时回数字,必须明说�
   try {
     const sub = makeFakeSubscriber();
     const { rt } = await boundRuntime(ilink, { subscriber: sub });
-    await rt.handleInbound({ from_user_id: "user-1", item_list: [{ type: 1, text_item: { text: "1" } }] });
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "1" } }] });
     assert.equal(sub.calls.length, 0, "不得在没有待答通知时发出任何回执");
     assert.match(lastText(ilink.state), /没有代你做出任何选择/);
   } finally {
@@ -313,9 +318,9 @@ test("同一条通知不得被回复两次(consume 后再次回复应被拒)", a
     const sub = makeFakeSubscriber();
     const { rt } = await boundRuntime(ilink, { subscriber: sub });
     await rt.notify({ kind: NODE_KINDS.APPROVAL_REQUEST, eventId: "ev-x", toolName: "B", answerShape: "approval", at: 1 });
-    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "1" } }] });
+    await rt.handleInbound({ from_user_id: "u", message_id: "m-dup-1", item_list: [{ type: 1, text_item: { text: "1" } }] });
     const before = sub.calls.length;
-    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "1" } }] });
+    await rt.handleInbound({ from_user_id: "u", message_id: "m-dup-2", item_list: [{ type: 1, text_item: { text: "1" } }] });
     assert.equal(sub.calls.length, before, "第二次回复不得再产生一次回执");
   } finally {
     await ilink.close();
@@ -464,7 +469,7 @@ test("★ 分层:档位取不到时沿用上次已知档位(绝不因一次网�
     });
 
     // 首次判档位时缓存为空(按免费)→ 被拒路径触发刷新 → 取到 pro → **同一条指令立即放行**
-    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "/ls" } }] });
+    await rt.handleInbound({ from_user_id: "u", message_id: "m-ls-1", item_list: [{ type: 1, text_item: { text: "/ls" } }] });
     assert.equal(sub1.calls.filter((c) => c.m === "listSessions").length, 1,
       "首次取到 pro 后就该放行(不能因为'一开始不知道'就把付费用户挡掉)");
 
@@ -478,7 +483,7 @@ test("★ 分层:档位取不到时沿用上次已知档位(绝不因一次网�
     // 而且能力也真的还在(不只是内部字段好看)
     const sub2 = makeFakeSubscriber();
     rt.subscriber = sub2;
-    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "/ls" } }] });
+    await rt.handleInbound({ from_user_id: "u", message_id: "m-ls-2", item_list: [{ type: 1, text_item: { text: "/ls" } }] });
     assert.equal(sub2.calls.filter((c) => c.m === "listSessions").length, 1,
       "沿用 pro 期间,遥控能力必须仍然可用");
   } finally {
@@ -497,11 +502,11 @@ test("★ 分层:刚升级完立刻重试必须能进(不必重启 bridge)", asy
       subscriber: sub, tier: "", tierProvider: async () => plan, tierDenyThrottleMs: 0
     });
 
-    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "/new 做点事" } }] });
+    await rt.handleInbound({ from_user_id: "u", message_id: "m-new-retry-1", item_list: [{ type: 1, text_item: { text: "/new 做点事" } }] });
     assert.equal(sub.calls.filter((c) => c.m === "createSession").length, 0, "免费时先拒");
 
     plan = "pro"; // 用户升级
-    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "/new 做点事" } }] });
+    await rt.handleInbound({ from_user_id: "u", message_id: "m-new-retry-2", item_list: [{ type: 1, text_item: { text: "/new 做点事" } }] });
     assert.equal(sub.calls.filter((c) => c.m === "createSession").length, 1,
       "★升级后必须能进:否则用户付了钱还要重启 bridge 才能用");
   } finally {
@@ -560,7 +565,7 @@ test("★ v2 安全边界(用户拍板放宽):看不到内容照给一键回执,
     assert.equal(rt.pendingReplies.length, 1, "应登记为待答,用户能一键处理");
 
     // 回 1 必须真的能放行 —— 这是放宽后要保证的核心路径
-    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "1" } }] });
+    await rt.handleInbound({ from_user_id: "u", message_id: "m-safe-a", item_list: [{ type: 1, text_item: { text: "1" } }] });
     const answered = sub.calls.filter((c) => c.m === "answerApproval");
     assert.equal(answered.length, 1, "普通审批必须能被微信一键放行");
     assert.equal(answered[0].value, "allowed-once");
@@ -572,7 +577,7 @@ test("★ v2 安全边界(用户拍板放宽):看不到内容照给一键回执,
     assert.match(b, /到电脑上确认/, `破坏性内容必须要求回电脑,实际:${b}`);
     assert.match(b, /内容.*破坏性/, "有内容时应说是**内容**被判定破坏性");
     assert.ok(!/回复 1/.test(b), "破坏性操作不得给编号选项");
-    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "1" } }] });
+    await rt.handleInbound({ from_user_id: "u", message_id: "m-safe-b", item_list: [{ type: 1, text_item: { text: "1" } }] });
     assert.equal(sub.calls.filter((c) => c.m === "answerApproval").length, 0, "破坏性操作绝不能被一键放行");
   } finally {
     await ilink.close();
@@ -802,6 +807,10 @@ test("★★ 日报发送失败时**不能**把当天标记为已发(否则当�
     await rt.runMaybeDigestNow();
     assert.ok(!stateOf().last_digest_day,
       "★发送失败时绝不能标记今天已发 —— 否则当天再也不会补发(旧实现的坑)");
+    // 失败后必须退避（修掉"每小时 60 次猛打"，CONTRACT §3.6）。这里清零 = 模拟 15 分钟已过，
+    // 让下一条断言仍能验"恢复后能补发"；退避本身的用例是下面单独那条。
+    assert.ok(rt.digestNextTryAt > Date.now(), "失败后必须设退避(否则定时器每分钟猛打一次)");
+    rt.digestNextTryAt = 0;
 
     // ② 恢复发送 → 必须能补发成功并记账
     rt.channel.client.sendMessage = origSend;
@@ -932,7 +941,10 @@ test("★★ B:免费档每月额度用完后引导升级;审批与指令不计�
     });
     rt.currentSessionId = "s";
     rt.currentSessionTitle = "t";
-    const send = () => rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "派活" } }] });
+    // ⚠️ 每次派活都要给独立 message_id：入站去重按 message_id 判重，
+    //    三条一模一样的 fixture 若不区分，第二/三条会被当成平台重投而跳过。
+    let sendSeq = 0;
+    const send = () => rt.handleInbound({ from_user_id: "u", message_id: `m-quota-${sendSeq += 1}`, item_list: [{ type: 1, text_item: { text: "派活" } }] });
 
     // 审批与指令**不**吃额度:先做一次审批,额度不受影响
     await rt.notify({
@@ -1016,7 +1028,7 @@ test("★★ 多条待审批:回数字必须答**最早那条**(先进先出),�
       `★必须告诉用户"不止这一条",否则他以为答完就结束了,实际:${lastText(ilink.state)}`);
 
     // 回「1」→ 必须答**最早**的 e1
-    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "1" } }] });
+    await rt.handleInbound({ from_user_id: "u", message_id: "m-fifo-1", item_list: [{ type: 1, text_item: { text: "1" } }] });
     const answered = sub.calls.filter((c) => c.m === "answerApproval");
     assert.equal(answered.length, 1, "必须真的回执一条");
     assert.equal(answered[0].id, "e1", "★必须答**最早那条**(e1),而不是最新那条(e2)");
@@ -1028,7 +1040,7 @@ test("★★ 多条待审批:回数字必须答**最早那条**(先进先出),�
     assert.match(after, /Write/, "要指明下一条是什么(工具名),用户才知道在批什么");
 
     // 再回一次 → 答掉 e2;队列空了就不该再发多余提醒
-    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "1" } }] });
+    await rt.handleInbound({ from_user_id: "u", message_id: "m-fifo-2", item_list: [{ type: 1, text_item: { text: "1" } }] });
     const all = sub.calls.filter((c) => c.m === "answerApproval");
     assert.equal(all.length, 2);
     assert.equal(all[1].id, "e2", "第二条应是 e2");
@@ -1519,9 +1531,9 @@ test("★ 多审批 + 提醒混排:回执仍按 FIFO 走审批(提醒不参与�
     assert.equal(rt.status().pending_replies, 2, "两条审批 = 2 条待拍板(提醒不计)");
 
     sub.calls.length = 0;
-    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "1" } }] });
+    await rt.handleInbound({ from_user_id: "u", message_id: "m-mix-1", item_list: [{ type: 1, text_item: { text: "1" } }] });
     assert.equal(sub.calls.find((c) => c.m === "answerApproval").id, "ev-1", "先答最早那条审批");
-    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "1" } }] });
+    await rt.handleInbound({ from_user_id: "u", message_id: "m-mix-2", item_list: [{ type: 1, text_item: { text: "1" } }] });
     assert.equal(sub.calls.filter((c) => c.m === "answerApproval")[1].id, "ev-2", "再答第二条审批");
     assert.equal(sub.calls.filter((c) => c.m === "answerQuestion").length, 0, "提醒全程不参与回执");
   } finally {
@@ -1730,7 +1742,7 @@ test("★ /help 必须逐行分隔:付费档也不许退化成一坨(无换行/�
 /** 两个 runtime **共用同一个 relayDir**（模拟更新期间新旧 bridge 短暂共存）。 */
 async function twoRuntimesSameDir(ilink) {
   const relayDir = tmp();
-  saveAccount(relayDir, { token: "tok-abc", accountId: "bot-1", baseUrl: ilink.baseUrl, userId: "user-1", boundAt: 1 });
+  saveAccount(relayDir, { token: "tok-abc", accountId: "bot-1", baseUrl: ilink.baseUrl, userId: "u", boundAt: 1 });
   const mk = () => {
     const rt = createWeChatRuntime({
       relayDir,
@@ -1812,13 +1824,13 @@ test("★★ 出站必须回带 context_token(入站带来什么就回什么)", 
     const { rt } = await boundRuntime(ilink, { subscriber: makeFakeSubscriber(), tier: "pro" });
     // 真实形状：入站消息带顶层 context_token；发送目标是账号的 userId
     await rt.handleInbound({
-      from_user_id: "user-1", context_token: "CT-abc-123",
+      from_user_id: "u", context_token: "CT-abc-123",
       item_list: [{ type: 1, text_item: { text: "/status" } }]
     });
     const last = ilink.state.sends.at(-1);
     assert.equal(last.msg.context_token, "CT-abc-123",
       "★出站 msg 必须回带 context_token —— 不带就是 ret=-2 prepare failed(消息根本发不出去)");
-    assert.equal(last.msg.to_user_id, "user-1");
+    assert.equal(last.msg.to_user_id, "u");
   } finally {
     await ilink.close();
   }
@@ -1828,7 +1840,7 @@ test("★ 没有 context_token 时**完全不带这个键**(而不是空串)", a
   const ilink = await fakeIlink();
   try {
     const { rt } = await boundRuntime(ilink, { subscriber: makeFakeSubscriber(), tier: "pro" });
-    await rt.handleInbound({ from_user_id: "user-1", item_list: [{ type: 1, text_item: { text: "/status" } }] });
+    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "/status" } }] });
     const last = ilink.state.sends.at(-1);
     assert.ok(!("context_token" in last.msg),
       "★拿不到令牌时不得塞空串(与官方 `contextToken ?? undefined` 同约定)");
@@ -1842,7 +1854,7 @@ test("★ context_token 落盘持久化:bridge 重启后不必等用户先说话
   try {
     const first = await boundRuntime(ilink, { subscriber: makeFakeSubscriber(), tier: "pro" });
     await first.rt.handleInbound({
-      from_user_id: "user-1", context_token: "CT-persist-9",
+      from_user_id: "u", context_token: "CT-persist-9",
       item_list: [{ type: 1, text_item: { text: "/status" } }]
     });
     // 同一个 relayDir 上新建一个 runtime（= bridge 重启）
@@ -1850,7 +1862,7 @@ test("★ context_token 落盘持久化:bridge 重启后不必等用户先说话
       relayDir: first.relayDir, upstream: "http://127.0.0.1:1", secret: SECRET, tier: "pro", logger: quietLogger()
     });
     rt2.subscriber = makeFakeSubscriber();
-    await rt2.reply("user-1", "重启后的第一条推送");
+    await rt2.reply("u", "重启后的第一条推送");
     assert.equal(ilink.state.sends.at(-1).msg.context_token, "CT-persist-9",
       "★重启后必须从状态文件恢复令牌 —— 否则重启后的第一条通知(最该送达的那条)发不出去");
   } finally {
@@ -1863,7 +1875,7 @@ test("★ 解绑必须清掉 context_token(换绑后不能拿上一个人的上�
   try {
     const { rt } = await boundRuntime(ilink, { subscriber: makeFakeSubscriber(), tier: "pro" });
     await rt.handleInbound({
-      from_user_id: "user-1", context_token: "CT-old-user",
+      from_user_id: "u", context_token: "CT-old-user",
       item_list: [{ type: 1, text_item: { text: "/status" } }]
     });
     await rt.unbind();
@@ -1968,12 +1980,12 @@ test("★ 回归锁：用户主动 /use 切走的会话不能被「最近完成�
     ];
     sub.summaryFixture = "完成。";
     const { rt } = await boundRuntime(ilink, { subscriber: sub });
-    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "/use 2" } }] });
+    await rt.handleInbound({ from_user_id: "u", message_id: "m-use-1", item_list: [{ type: 1, text_item: { text: "/use 2" } }] });
     assert.equal(rt.currentSessionId, "session-mine", "前置条件：/use 切到了 2 号");
     await rt.notify({ kind: NODE_KINDS.TURN_END, sessionId: "session-done", reason: "completed", at: 3 });
 
     // 完成事件在处理时会把它自己设为回复目标（这是产品约定）；但用户**之后**再切回去要算数：
-    await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "/use 2" } }] });
+    await rt.handleInbound({ from_user_id: "u", message_id: "m-use-2", item_list: [{ type: 1, text_item: { text: "/use 2" } }] });
     await rt.handleInbound({ from_user_id: "u", item_list: [{ type: 1, text_item: { text: "继续聊我的" } }] });
     const prompt = sub.calls.filter((c) => c.m === "promptSession").pop();
     assert.equal(prompt.sessionId, "session-mine",
@@ -2094,6 +2106,533 @@ test("★ 回归锁：订阅 fault 必须落到日志 + 状态（旧实现只 em
     } finally {
       await rt.stopChannel();
     }
+  } finally {
+    await ilink.close();
+  }
+});
+
+// ═════════════ 2026-10-29 ClawBot 通道修复（CONTRACT §3 / §5）═════════════
+//
+// 用户报的两个 bug：
+//   · bug 1：「发给 Agent 的会话会发两遍」—— 游标只在内存 + 没有 message_id 去重 +
+//            不过滤非本人/机器人消息 → 服务端重投时同一条消息被派活两次。
+//   · bug 2：「AI 不能主动回消息 / 日报不发 / 说句『你好』补发一堆」——
+//            context_token 分钟级过期且没有续期接口（CONTRACT §0 真机实测：约 10 分钟后
+//            `ret=-2 prepare failed`），旧实现把它当间歇性网络失败 → 每小时重试 60 次 + 积压后一次补发。
+// 修复原则：识别过期 → 立即静默主动推送（不再猛打）→ 有界入队 → 下次入站立即补送（日报优先）
+// → 其余汇总成一条。下面每条用例锁住其中一条承诺。
+
+/** 造一条入站消息（带 message_id，模拟真实 ilink 形状；去重按它判）。 */
+const inbound = (id, text, extra = {}) => ({
+  message_id: id,
+  from_user_id: "u",
+  item_list: [{ type: 1, text_item: { text } }],
+  ...extra
+});
+
+test("★★ bug1 去重：同一个 message_id 重投（同批 + 跨批）只派活一次", async () => {
+  // 平台在"游标丢失/消息未确认"时会重投同一条消息。修复前没有按 message_id 去重，
+  // 于是用户在微信里交代的一件事会被派两遍（用户报的「会话会发两遍」）。
+  const same = inbound(9001, "帮我修个 bug");
+  const script = [
+    { msgs: [same, same], buf: "buf-dedup-1" }, // 一次 getUpdates 里出现两次
+    { msgs: [{ ...same }], buf: "buf-dedup-2" } // 下一次 getUpdates 又重投一次
+  ];
+  const ilink = await fakeIlink({
+    onGetUpdates: (state, reply) => {
+      const step = script[state.getUpdates - 1];
+      if (step) return reply({ ret: 0, msgs: step.msgs, get_updates_buf: step.buf, longpolling_timeout_ms: 1 });
+      // 脚本用完后**延迟**回空响应：既让出 CPU（否则轮询会自旋成上万次请求），又保持循环活着
+      return setTimeout(() => reply({ ret: 0, msgs: [], get_updates_buf: "buf-dedup-2", longpolling_timeout_ms: 1 }), 20);
+    }
+  });
+  try {
+    const sub = makeFakeSubscriber();
+    const { rt } = await boundRuntime(ilink, { subscriber: sub });
+    await rt.startChannel();
+    try {
+      await waitFor(() => sub.calls.filter((c) => c.m === "promptSession").length >= 1);
+      await waitFor(() => ilink.state.getUpdates >= 2); // 确认第二/第三次重投已被处理过
+      await settle();
+      assert.equal(sub.calls.filter((c) => c.m === "promptSession").length, 1,
+        "★ 同一个 message_id 重投只能派活一次（否则用户那条指令会被执行两遍）");
+      assert.equal(sub.calls.filter((c) => c.m === "createSession").length, 1,
+        "★ 也不该因为重投多开一个会话");
+      assert.equal(ilink.state.sends.filter((s) => s && s.msg && s.msg.item_list && s.msg.item_list[0]).length, 1,
+        "重投的消息不该再回执一次（用户会看到两条回复）");
+      // 落盘去重表必须真的用上了（否则重启后照样会重复）
+      assert.ok(fs.readdirSync(rt.relayDir).some((n) => n.startsWith(".wechat-seen-")),
+        "去重 id 必须落盘（重启后仍然认得同一条消息）");
+    } finally {
+      await rt.stopChannel();
+    }
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★★ bug1 游标：整批处理完才落盘（抛错也落盘）；重启后从上次游标继续", async () => {
+  // 旧实现把 `get_updates_buf` 只放在内存 → bridge 重启后游标归零 → 服务端重投未确认消息。
+  // 落盘顺序按 Lead 2026-10-29 决策改为「先处理、后存」：
+  //   · 先存 = at-most-once：处理中途崩溃 → 这批剩余消息**永久丢失**（没有任何补偿机会）；
+  //   · 后存 = at-least-once：崩溃后重投这一批，重复由 channel 的持久化去重表吸收。
+  //     宁可极小概率重放一批（被去重吸收），也绝不静默丢一批用户消息。
+  // 三条要锁：① 正常批次处理完后游标落盘正确；② 某条 handleInbound 抛错时游标仍然保存（finally）；
+  //          ③ 重启后的第一个请求带的是上次保存的游标。
+  const script = [
+    {
+      msgs: [inbound(7001, "第一件活"), inbound(7002, "第二件活")],
+      buf: "buf-cur-1"
+    }
+  ];
+  const ilink = await fakeIlink({
+    onGetUpdates: (state, reply) => {
+      const step = script[state.getUpdates - 1];
+      if (step) return reply({ ret: 0, msgs: step.msgs, get_updates_buf: step.buf, longpolling_timeout_ms: 1 });
+      return setTimeout(() => reply({ ret: 0, msgs: [], get_updates_buf: "buf-cur-1", longpolling_timeout_ms: 1 }), 20);
+    }
+  });
+  try {
+    const sub = makeFakeSubscriber();
+    const { rt, relayDir } = await boundRuntime(ilink, { subscriber: sub });
+    /** 直接读盘（不走 channel 内存缓存）——要验的正是"落没落盘"。 */
+    const syncBufOnDisk = () => {
+      const f = fs.readdirSync(relayDir).find((n) => n.startsWith(".wechat-sync-"));
+      if (!f) return "";
+      try { return JSON.parse(fs.readFileSync(path.join(relayDir, f), "utf8")).get_updates_buf || ""; } catch { return ""; }
+    };
+    // 第一条消息派活时**故意抛错**：既验证"循环内 catch 后继续处理下一条"，
+    // 又验证"即使抛错，finally 里仍把整批的游标保存下来"（否则一条坏消息会让游标永久卡死、无限重投）。
+    const origPrompt = sub.promptSession;
+    let promptCalls = 0;
+    sub.promptSession = async (o) => {
+      promptCalls += 1;
+      if (promptCalls === 1) throw new Error("模拟派活失败");
+      return origPrompt(o);
+    };
+
+    await rt.startChannel();
+    try {
+      // 第二条消息仍被处理 → 证明一条抛错不会中断整批
+      await waitFor(() => promptCalls >= 2);
+      assert.ok(promptCalls >= 2, "★ 某条 handleInbound 抛错后，同批的后续消息仍要处理（catch+log+继续）");
+      // 整批处理完才落盘（注意：处理过程中盘上是空的 —— 这是「先处理后存」的取舍）
+      await waitFor(() => syncBufOnDisk() === "buf-cur-1");
+      assert.equal(syncBufOnDisk(), "buf-cur-1",
+        "★ 即使中途抛错，整批处理完之后游标也必须落盘（finally）");
+    } finally {
+      await rt.stopChannel();
+    }
+
+    // 重启（同 relayDir）：第一个 getUpdates 必须带上上次保存的游标
+    const n = ilink.state.bufs.length;
+    const rt2 = createWeChatRuntime({
+      relayDir, upstream: "http://127.0.0.1:1", secret: SECRET, tier: "pro", logger: quietLogger()
+    });
+    rt2.subscriber = makeFakeSubscriber();
+    await rt2.startChannel();
+    try {
+      await waitFor(() => ilink.state.bufs.length > n);
+      assert.equal(ilink.state.bufs[n], "buf-cur-1",
+        "★ 重启后必须从上次游标继续 —— 否则服务端会把已确认的消息再投一遍、同一条被派两次");
+    } finally {
+      await rt2.stop();
+    }
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★★ bug2 令牌过期：连续 3 条通知最多 2 次发送尝试，记 push_paused，且静默期间一个请求都不发", async () => {
+  // CONTRACT §0：`ret=-2 prepare failed` 不是网络抖动，是 context_token 过期（平台没有续期接口）。
+  // 修复前把它当间歇失败 → 每条通知都重试、日志刷满、平台被限流。
+  let sendAttempts = 0;
+  const ilink = await fakeIlink({
+    onSendMessage: (_state, reply) => { sendAttempts += 1; return reply({ ret: -2, errmsg: "prepare failed" }); }
+  });
+  try {
+    const sub = makeFakeSubscriber();
+    const { rt, relayDir } = await boundRuntime(ilink, { subscriber: sub });
+    const stateOf = () => JSON.parse(fs.readFileSync(path.join(relayDir, ".wechat-state.json"), "utf8"));
+
+    for (let i = 1; i <= 3; i += 1) {
+      await rt.notify({ kind: NODE_KINDS.TURN_END, sessionId: `session-${i}`, reason: "completed", at: i });
+    }
+    assert.ok(sendAttempts <= 2,
+      `★ 连续 3 条通知最多 2 次发送尝试（第一条撞上过期就要立刻静默），实际 ${sendAttempts} 次`);
+    const paused = stateOf().push_paused;
+    assert.ok(paused && paused.at > 0, "★ 必须在 state 落 push_paused（面板与静默判定都读它）");
+    assert.ok(typeof paused.reason === "string" && paused.reason.length > 0,
+      "push_paused.reason 要能解释为什么静默（且已脱敏截断）");
+    assert.equal((stateOf().pending_outbox || []).length, 3,
+      "★ 静默期间的通知全部入队（不静默丢，等入站补发）");
+
+    // status() 必须把这些如实暴露出去（面板靠它解释"为什么没消息"）
+    const s = rt.status();
+    assert.equal(s.push_paused, true);
+    assert.ok(s.push_paused_at > 0);
+    assert.ok(s.push_paused_reason.length > 0);
+    assert.equal(s.pending_outbox_count, 3, "status 要报有效待补发条数");
+
+    // 「不每分钟重试」：日报 tick 再来两次，静默期间一个请求都不该发
+    rt.digestHour = new Date().getHours();
+    const before = sendAttempts;
+    await rt.runMaybeDigestNow();
+    await rt.runMaybeDigestNow();
+    assert.equal(sendAttempts, before, "★ 静默期间日报不得再打平台（旧实现每小时 60 次 prepare failed）");
+    assert.ok(stateOf().pending_digest_day, "没送达的日报要记 pending_digest_day（当天可补）");
+    assert.ok(!fs.readdirSync(relayDir).some((n) => n.startsWith(".digest-")),
+      "占位必须释放 —— 否则那天就再也不会补发（旧实现的坑）");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★★ bug2 补发有界：入站后最多逐条补 2 条 + 1 条省略汇总，然后清空（如实记日志）", async () => {
+  // 用户原话是「说句『你好』补发一堆」—— 所以补发必须**有界**：
+  // 最近 2 条逐条发，更早的攒成一句"另有 N 条已省略"，绝不一次连打十几条（那正是限流的成因）。
+  let failSends = true;
+  const ilink = await fakeIlink({
+    onSendMessage: (_state, reply) => (failSends
+      ? reply({ ret: -2, errmsg: "prepare failed" })
+      : reply({ ret: 0, message_id: "ok" }))
+  });
+  try {
+    const sub = makeFakeSubscriber();
+    sub.sessionsFixture = [{ sessionId: "session-x", title: "跑完的活", running: false, cwd: "/p" }];
+    sub.summaryFixture = "做完了。";
+    const { rt, relayDir } = await boundRuntime(ilink, { subscriber: sub });
+    const stateOf = () => JSON.parse(fs.readFileSync(path.join(relayDir, ".wechat-state.json"), "utf8"));
+
+    // 先让通道真的进入静默：一条完成通知撞上 prepare failed
+    await rt.notify({ kind: NODE_KINDS.TURN_END, sessionId: "session-x", reason: "completed", at: 1 });
+    assert.equal(stateOf().push_paused && stateOf().push_paused.at > 0, true, "前提：通道已静默");
+
+    // 造 5 条积压（用固定正文，方便断言"补的是最近两条"）
+    const at = Date.now();
+    rt.channel.writeState({
+      pending_outbox: [1, 2, 3, 4, 5].map((i) => ({ text: `积压通知${i}`, kind: "stopped", at: at - (5 - i) * 1000 }))
+    });
+    const infos = [];
+    const warns = [];
+    rt.logger = {
+      info: (m) => infos.push(String(m)), warn: (m) => warns.push(String(m)), error() {}, debug() {}, addSecret() {}
+    };
+
+    // 平台恢复 + 用户说一句话 → 令牌刷新 → 有界补发
+    failSends = false;
+    await rt.handleInbound(inbound(5001, "/status", { context_token: "CT-fresh-1" }));
+    await waitFor(() => (stateOf().pending_outbox || []).length === 0);
+
+    const resent = allTexts(ilink.state).filter((t) => t.startsWith("（补发）"));
+    assert.equal(resent.length, 3, `★ 最多补 2 条 + 1 条汇总，实际 ${resent.length} 条`);
+    const detail = resent.filter((t) => !/另有 \d+ 条/.test(t));
+    assert.equal(detail.length, 2, "逐条补发的只能是 2 条");
+    assert.ok(detail.some((t) => t.includes("积压通知4")) && detail.some((t) => t.includes("积压通知5")),
+      `★ 补的必须是**最近**两条，实际：${JSON.stringify(detail)}`);
+    assert.ok(!resent.some((t) => /积压通知[123]/.test(t)), "较早的绝不逐条重发（否则就是「补发一堆」）");
+    const summary = resent.find((t) => /另有 \d+ 条/.test(t)) || "";
+    assert.match(summary, /另有 3 条较早的通知未送达，已省略/, `汇总要如实说省略了几条，实际：${summary}`);
+    assert.equal((stateOf().pending_outbox || []).length, 0, "★ 补完必须清空队列（否则下次入站又补一遍）");
+    // 省略是 warn（丢信息必须如实记，且要能被运维搜到）
+    assert.ok(warns.some((m) => /省略了 3 条较早的通知/.test(m)),
+      `省略必须如实记日志（不得静默），实际：${JSON.stringify(warns)}`);
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★★ bug2 日报：失败不烧当天 → 下一次入站立即补发，成功后才写 last_digest_day", async () => {
+  let failSends = true;
+  const ilink = await fakeIlink({
+    onSendMessage: (_state, reply) => (failSends
+      ? reply({ ret: -2, errmsg: "prepare failed" })
+      : reply({ ret: 0, message_id: "ok" }))
+  });
+  try {
+    const sub = makeFakeSubscriber();
+    const { rt, relayDir } = await boundRuntime(ilink, { subscriber: sub, tier: "pro" });
+    const stateOf = () => JSON.parse(fs.readFileSync(path.join(relayDir, ".wechat-state.json"), "utf8"));
+    rt.digestHour = new Date().getHours();
+
+    // ① 发送失败 → 记待补，但**绝不能**写"今天已发"
+    await rt.runMaybeDigestNow();
+    const day = stateOf().pending_digest_day;
+    assert.ok(day, "★ 失败必须落 pending_digest_day（当天还能补）");
+    assert.ok(!stateOf().last_digest_day, "★ 没送达绝不能写 last_digest_day（否则当天被烧掉）");
+    assert.equal((stateOf().pending_outbox || []).length, 0, "日报自带补发语义，不得进待补发队列（否则两份）");
+
+    // ② 平台恢复 + 用户说话 → 用入站补发，成功后才记账
+    failSends = false;
+    const before = ilink.state.sends.length;
+    await rt.handleInbound(inbound(6001, "你好", { context_token: "CT-digest-1" }));
+    await waitFor(() => stateOf().last_digest_day === day);
+    assert.equal(stateOf().last_digest_day, day, "★ 补发成功才写 last_digest_day");
+    assert.ok(!stateOf().pending_digest_day, "补发成功要清掉待补标记");
+    assert.ok(ilink.state.sends.length > before, "必须真的发出去一条");
+    assert.ok(allTexts(ilink.state).some((t) => /DSH 远程控制/.test(t)),
+      "补发的就是那份日报（带品牌露出）");
+    assert.equal(rt.digestNextTryAt, 0, "补发成功后清掉退避（下一个自然日照常发）");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★★ bug1 身份过滤：非本人 / 机器人消息一律忽略（不派活、不回执），同一 from 只 warn 一次", async () => {
+  const ilink = await fakeIlink();
+  try {
+    const sub = makeFakeSubscriber();
+    const warns = [];
+    const { rt } = await boundRuntime(ilink, { subscriber: sub });
+    rt.logger = {
+      info() {}, warn: (m) => warns.push(String(m)), error() {}, debug() {}, addSecret() {}
+    };
+    const sendsBefore = ilink.state.sends.length;
+
+    // ① 非绑定用户：可能成片来（群/服务号回推）—— 一个都不能驱动这台电脑
+    await rt.handleInbound(inbound(1, "帮我删库", { from_user_id: "stranger-1" }));
+    await rt.handleInbound(inbound(2, "再删一次", { from_user_id: "stranger-1" }));
+    assert.equal(sub.calls.length, 0, "★ 非绑定用户不得派活");
+    assert.equal(ilink.state.sends.length, sendsBefore, "★ 也不得回执（否则等于给陌生人开了响应）");
+    assert.equal(warns.filter((m) => /忽略非绑定用户/.test(m)).length, 1,
+      "同一 from 只 warn 一次（否则陌生来源会把日志刷满）");
+
+    // ② 机器人自己的消息（message_type=2）即使 from 是本人也必须忽略
+    await rt.handleInbound({ message_id: 3, from_user_id: "u", message_type: 2, item_list: [{ type: 1, text_item: { text: "机器人自己说的话" } }] });
+    // ③ @im.bot 来源（另一种机器人形状）
+    await rt.handleInbound(inbound(4, "别的机器人", { from_user_id: "bot-9@im.bot" }));
+    assert.equal(sub.calls.length, 0, "机器人消息不得派活");
+    assert.equal(ilink.state.sends.length, sendsBefore, "机器人消息也不得回执");
+
+    // ④ 本人消息照常派活 —— 证明过滤没有误伤主链路
+    await rt.handleInbound(inbound(5, "帮我修个 bug"));
+    assert.equal(sub.calls.filter((c) => c.m === "promptSession").length, 1, "★ 本人消息必须照常派活");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★ status() 暴露推送静默 / 令牌时间 / 待补发 / 日报待补字段（面板不再靠猜）", async () => {
+  const ilink = await fakeIlink();
+  try {
+    const { rt } = await boundRuntime(ilink, { subscriber: makeFakeSubscriber() });
+    const s = rt.status();
+    for (const k of ["push_paused", "push_paused_at", "push_paused_reason", "context_token_at", "pending_outbox_count", "digest_pending_day"]) {
+      assert.ok(Object.prototype.hasOwnProperty.call(s, k), `status() 必须暴露 ${k}（CONTRACT §3.7）`);
+    }
+    assert.equal(s.push_paused, false, "没静默时必须是 false（不是 undefined）");
+    assert.equal(s.push_paused_at, 0);
+    assert.equal(s.push_paused_reason, "");
+    assert.equal(s.pending_outbox_count, 0);
+    assert.equal(s.digest_pending_day, "");
+    assert.equal(typeof s.context_token_at, "number");
+
+    // 入站带来令牌 → 落盘时间必须可见（面板/排查要知道"上次令牌刷新是什么时候"）
+    await rt.handleInbound(inbound(8001, "/status", { context_token: "CT-status-1" }));
+    assert.ok(rt.status().context_token_at > 0, "★ 入站后 context_token_at 必须落盘（否则无从判断令牌新旧）");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★ 推送静默时 /status 必须说明原因与恢复方式；发送成功后静默标记自动清除", async () => {
+  const ilink = await fakeIlink();
+  try {
+    const { rt, relayDir } = await boundRuntime(ilink, { subscriber: makeFakeSubscriber() });
+    // 直接制造静默（等价于一条推送撞上 prepare failed，见 reply() 的 catch）
+    rt.channel.invalidateContextToken("sendMessage: ret=-2 prepare failed");
+    assert.equal(rt.status().push_paused, true, "前提：通道处于静默");
+
+    await rt.handleInbound(inbound(8101, "/status"));
+    const text = lastText(ilink.state);
+    assert.match(text, /推送已静默/, `★ /status 必须如实说清"为什么没消息"，实际：${text}`);
+    assert.match(text, /回任意一条消息即可恢复/, "还要告诉他怎么办（比技术细节有用）");
+    assert.ok(!JSON.parse(fs.readFileSync(path.join(relayDir, ".wechat-state.json"), "utf8")).push_paused,
+      "★ 发送成功 = 令牌有效 → 静默标记必须自动清除（否则面板永远挂着过期警告）");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★ 图片/语音入站（无文本、不派活）也必须刷新令牌并解除静默", async () => {
+  // CONTRACT §3.2 要求 rememberContextToken 排在 `if (!text) return` **之前**：
+  // 图片/语音没有文本，但同样是"用户刚说过话、平台推送窗口已打开"的信号。
+  // 若被 early-return 跳过，用户发张图后机器人仍然静默 —— 体验上就是"它还没恢复"，
+  // 而积压的通知还要再等下一次带文本的消息才能补发。
+  const ilink = await fakeIlink();
+  try {
+    const sub = makeFakeSubscriber();
+    const { rt, relayDir } = await boundRuntime(ilink, { subscriber: sub });
+    const stateOf = () => JSON.parse(fs.readFileSync(path.join(relayDir, ".wechat-state.json"), "utf8"));
+    // 先进入静默（等价于一次 prepare failed），并留一条待补发通知
+    rt.channel.writeState({
+      pending_outbox: [{ text: "一条待在补发的通知", kind: "stopped", at: Date.now() }],
+      push_paused: { at: Date.now(), reason: "sendMessage: ret=-2 prepare failed" }
+    });
+    assert.equal(rt.status().push_paused, true, "前提：通道处于静默");
+
+    // 图片消息：**没有文本**、带新 context_token
+    await rt.handleInbound({
+      message_id: 7101,
+      from_user_id: "u",
+      context_token: "CT-image-1",
+      item_list: [{ type: 2, image_item: { url: "https://example.invalid/x.jpg" } }]
+    });
+    assert.equal(rt.status().push_paused, false,
+      "★ 图片入站同样要解除静默（不能被 text 为空的早退跳过）");
+    assert.ok(rt.status().context_token_at > 0, "★ 令牌也要刷新（context_token_at 落盘）");
+    assert.equal(sub.calls.length, 0, "没有文本就不该派活");
+
+    await waitFor(() => allTexts(ilink.state).filter((t) => t.startsWith("（补发）")).length === 1);
+    const resent = allTexts(ilink.state).filter((t) => t.startsWith("（补发）"));
+    assert.equal(resent.length, 1, "★ 窗口刚打开，积压要立刻补发（不能等下一次带文本的消息）");
+    const last = ilink.state.sends.at(-1);
+    assert.equal(last.msg.context_token, "CT-image-1",
+      "补发必须回带入站带来的新令牌（否则还是 prepare failed）");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★★ 补发单飞：入站 fire-and-forget 与推送路径并发触发时，同一批通知只发一遍", async () => {
+  // verifier 在修复前的 HEAD 上复现过「同一批被发 6 遍」：入站补发与主动推送各自读到
+  // 同一份队列、各发一遍。修复靠 #flushOutbox 的**单飞锁**（outboxFlushing）：
+  // 并发调用直接返回 0，由已在跑的那次把队列处理掉。这里用并发触发把它锁死。
+  const ilink = await fakeIlink();
+  try {
+    const sub = makeFakeSubscriber();
+    sub.sessionsFixture = [{ sessionId: "session-x", title: "跑完的活", running: false, cwd: "/p" }];
+    sub.summaryFixture = "做完了。";
+    const { rt, relayDir } = await boundRuntime(ilink, { subscriber: sub });
+    const stateOf = () => JSON.parse(fs.readFileSync(path.join(relayDir, ".wechat-state.json"), "utf8"));
+    const at = Date.now();
+    rt.channel.writeState({
+      pending_outbox: [
+        { text: "积压通知A", kind: "stopped", at },
+        { text: "积压通知B", kind: "stopped", at },
+        { text: "积压通知C", kind: "stopped", at }
+      ]
+    });
+
+    // 同时触发：3 条入站（每条都 fire-and-forget 补发）+ 2 条主动推送（内部也会先补发）
+    await Promise.all([
+      rt.handleInbound(inbound(9201, "/status")),
+      rt.handleInbound(inbound(9202, "/status")),
+      rt.handleInbound(inbound(9203, "/status")),
+      rt.notify({ kind: NODE_KINDS.TURN_END, sessionId: "session-x", reason: "completed", at: 1 }),
+      rt.notify({ kind: NODE_KINDS.TURN_END, sessionId: "session-x", reason: "completed", at: 2 })
+    ]);
+    await waitFor(() => (stateOf().pending_outbox || []).length === 0);
+    await settle();
+
+    const resent = allTexts(ilink.state).filter((t) => t.startsWith("（补发）"));
+    assert.equal(resent.length, 3,
+      `★ 同一批只能补发一遍（2 条 + 1 条汇总），实际 ${resent.length} 条（并发没锁住就会翻倍）`);
+    assert.equal(new Set(resent).size, resent.length, "★ 补发内容不得重复（同一条通知只能出现一次）");
+    const detail = resent.filter((t) => !/另有 \d+ 条/.test(t));
+    assert.equal(detail.length, 2, "逐条补的只能是最新 2 条");
+    assert.equal((stateOf().pending_outbox || []).length, 0, "并发跑完后队列必须是空的");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★★ 补发失败的保留语义：older 不丢、已发出的 target 不重放（Lead 复审抓到的 bug）", async () => {
+  // 旧写法 `writeOutbox(list.slice(sent))` 在 list=[o1,o2,o3,t1,t2]、t1 成功 t2 失败时
+  // 会写出 [o2,o3,t1,t2] —— o1 被静默丢掉（既没发也没进汇总）、t1 被放回队列下次**再发一遍**。
+  // 正确语义：**全部 older + 尚未送出的 target** = [o1,o2,o3,t2]。
+  const ilink = await fakeIlink();
+  try {
+    const sub = makeFakeSubscriber();
+    const { rt, relayDir } = await boundRuntime(ilink, { subscriber: sub });
+    const stateOf = () => JSON.parse(fs.readFileSync(path.join(relayDir, ".wechat-state.json"), "utf8"));
+    const at = Date.now();
+    rt.channel.writeState({
+      pending_outbox: ["o1", "o2", "o3", "t1", "t2"].map((text) => ({ text, kind: "stopped", at }))
+    });
+
+    // 只让 t2 发失败（模拟还在抖动的网络）；t1 必须成功
+    const sentTexts = [];
+    rt.channel.client.sendMessage = async ({ text }) => {
+      sentTexts.push(text);
+      if (text === "（补发）t2") { const e = new Error("网络抖动"); e.code = "network"; throw e; }
+      return { ret: 0, message_id: "ok" };
+    };
+    const warns = [];
+    rt.logger = { info() {}, warn: (m) => warns.push(String(m)), error() {}, debug() {}, addSecret() {} };
+
+    // 图片消息（无文本 → 只走补发，不派活/不回执，断言不受别的发送干扰）
+    await rt.handleInbound({
+      message_id: 9301, from_user_id: "u", item_list: [{ type: 2, image_item: { url: "https://example.invalid/x.jpg" } }]
+    });
+    await waitFor(() => (stateOf().pending_outbox || []).length === 4);
+    await settle();
+
+    const rest = (stateOf().pending_outbox || []).map((q) => String(q.text));
+    assert.deepEqual(rest, ["o1", "o2", "o3", "t2"],
+      `★ 失败后队列必须是「全部 older + 未送出的 target」，实际 ${JSON.stringify(rest)}`);
+    assert.ok(rest.includes("o1"), "★ 最早的 old 条目绝不能被静默丢掉（既没发、也没进汇总）");
+    assert.ok(!rest.includes("t1"), "★ 已经发出去的 t1 绝不能被放回队列（否则用户收到重复）");
+    assert.equal(sentTexts.filter((t) => t.startsWith("（补发）")).length, 2, "只尝试了 target 的两条");
+    assert.ok(!sentTexts.some((t) => /另有 \d+ 条/.test(t)), "失败时不得发省略汇总（汇总同样发不出去）");
+    assert.ok(warns.some((m) => /补发中断：已送出 1 条，剩 4 条/.test(m)),
+      `中断必须如实记日志，实际：${JSON.stringify(warns)}`);
+  } finally {
+    await ilink.close();
+  }
+});
+
+// ── /status 的静默说明（Lead 2026-10-29 复审：真实入站会先清静默，必须靠快照）──
+
+test("★ /status：入站前刚静默过（这条消息已恢复）必须说明「刚才静默过」，而不是只字不提", async () => {
+  // 用户最可能的诊断动作就是发 /status 问"怎么不推送了"。而入站消息本身会清掉 push_paused，
+  // 若不在 rememberContextToken 之前快照，这个提示在真实入站路径下**永远不会出现**。
+  const ilink = await fakeIlink();
+  try {
+    const { rt } = await boundRuntime(ilink, { subscriber: makeFakeSubscriber() });
+    rt.channel.invalidateContextToken("sendMessage: ret=-2 prepare failed");
+    assert.equal(rt.status().push_paused, true, "前提：入站前通道处于静默");
+
+    // 带令牌的 /status —— 入站当场解除静默
+    await rt.handleInbound(inbound(8301, "/status", { context_token: "CT-recover-1" }));
+    assert.equal(rt.status().push_paused, false, "入站后静默已解除");
+    const text = lastText(ilink.state);
+    assert.match(text, /刚才推送静默过/, `★ 必须告知"刚才静默过"（靠 lastSilence 快照），实际：${text}`);
+    assert.match(text, /你这条消息已恢复推送/, "要说清是这条消息恢复的，不要含糊");
+    assert.match(text, /未送达的通知会补发/, "并说明积压会补发");
+    assert.ok(!/推送已静默：/.test(text), "既然已经恢复，就不该再用「当前静默」的说法");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★ /status：从未静默过时不出现任何静默字样（不能拿不成立的话吓用户）", async () => {
+  const ilink = await fakeIlink();
+  try {
+    const { rt } = await boundRuntime(ilink, { subscriber: makeFakeSubscriber() });
+    assert.equal(rt.lastSilence, null, "前提：从未静默过");
+    await rt.handleInbound(inbound(8302, "/status"));
+    const text = lastText(ilink.state);
+    assert.ok(!/推送已静默|刚才推送静默过/.test(text), `★ 没静默过就不许提，实际：${text}`);
+    assert.match(text, /DSH 微信通道状态/, "正常状态文案照旧");
+  } finally {
+    await ilink.close();
+  }
+});
+
+test("★ /status：静默快照只在最近 10 分钟内有效（再久就不算「刚才」）", async () => {
+  const ilink = await fakeIlink();
+  try {
+    let now = Date.now();
+    const { rt } = await boundRuntime(ilink, { subscriber: makeFakeSubscriber(), clock: () => now });
+    rt.channel.invalidateContextToken("sendMessage: ret=-2 prepare failed");
+    await rt.handleInbound(inbound(8303, "/status", { context_token: "CT-recover-2" }));
+    assert.match(lastText(ilink.state), /刚才推送静默过/, "前提：刚静默过 → 提示出现");
+
+    now += 11 * 60_000; // 过了 11 分钟
+    await rt.handleInbound(inbound(8304, "/status"));
+    const text = lastText(ilink.state);
+    assert.ok(!/刚才推送静默过/.test(text), `★ 超过 10 分钟就不该再说「刚才」，实际：${text}`);
   } finally {
     await ilink.close();
   }

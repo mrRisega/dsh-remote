@@ -148,6 +148,34 @@ export const QR_STATUSES = Object.freeze([
 export const ACCOUNT_FILE = ".wechat-account.json";
 export const STATE_FILE = ".wechat-state.json";
 
+/**
+ * 游标 / 去重表落盘文件名前缀 —— **按 bot 账号隔离**(后面拼 botKey)。
+ *
+ * 为什么必须落盘(用户 2026-10 报「发给 Agent 的会话会发两遍」):
+ *   `get_updates_buf` 以前只存在内存里,bridge 一重启/断线重连游标就回到空串,
+ *   服务端于是把"还没确认"的消息**重投**一遍 → 同一条消息被派活两次。
+ *   腾讯官方实现就是按 bot 账号把游标落盘的,这里对齐。
+ * 为什么按账号分隔:换绑会换 bot,旧 bot 的游标对新的毫无意义(反过来还会重放旧消息);
+ *   两个 bot 共用一个文件则会互相覆盖,等于没存。
+ */
+export const UPDATES_BUF_FILE_PREFIX = ".wechat-sync-";
+export const SEEN_MESSAGES_FILE_PREFIX = ".wechat-seen-";
+
+/**
+ * 入站去重表上限 / 保质期。
+ * 有界是硬要求:去重表只增不减会变成永不回收的隐私残留(里面是消息指纹),
+ *   而且文件越大每次同步读写的成本越高。200 条 / 7 天足够覆盖"重连后服务端重投"的实际窗口。
+ */
+export const SEEN_MESSAGES_MAX = 200;
+export const SEEN_MESSAGES_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * `push_paused.reason` 的落盘上限。
+ * 这个字段**面板可读**,而 reason 多半来自错误原文(里面可能回显 URL/token);
+ * 过长还会把状态文件/面板撑爆 —— 脱敏 + 截断在这里一次做完。
+ */
+export const PUSH_PAUSE_REASON_MAX = 120;
+
 // ===========================================================================
 // 1. 错误类型 + 脱敏
 // ===========================================================================
@@ -156,7 +184,11 @@ export const STATE_FILE = ".wechat-state.json";
  * 协议/流程错误。`code` 是稳定的机器可读标识,调用方据此分支:
  *   bad_options | http_error | bad_response_shape | unexpected_status |
  *   bind_missing_bot_id | bind_expired | verify_blocked | verify_timeout |
- *   session_expired | cooldown | network
+ *   session_expired | cooldown | network | context_token_expired
+ *
+ * `context_token_expired` 是本轮新增的一等错误码(见 sendMessage 的注释):
+ *   它**不是**网络抖动,重试同一条消息永远不会成功;调用方必须据此暂停主动推送、
+ *   等下一次入站刷新令牌后再补发,而不是按"间歇性失败"猛打接口。
  */
 export class WeChatError extends Error {
   constructor(code, message, detail) {
@@ -729,7 +761,31 @@ export class IlinkClient {
     const obj = IlinkClient.expectObject(json, "sendMessage");
     if (obj.ret && obj.ret !== 0) {
       // 注意:errmsg 可能带上下文信息,过一遍 redact 再抛(内容里可能回显 token)。
-      throw new WeChatError("http_error", `sendMessage: ret=${obj.ret} errmsg=${redact(obj.errmsg || "(none)", [this.token])}`);
+      const safeErrmsg = redact(obj.errmsg || "(none)", [this.token]);
+      /**
+       * 🔴 `ret=-2 && errmsg="prepare failed"` 必须单独分类(2026-10 真机实测的根因):
+       *
+       *   ilink 的 `context_token` 是**分钟级过期**的(入站后几分钟内可用,约 10 分钟后即失效),
+       *   而平台**没有续期接口**(getconfig / sendtyping / notifystart 都试过,救不回来)。
+       *   同一个 token 过期后、伪造 token、空串、不带该字段,拿到的响应**完全相同**:
+       *   `{"ret":-2,"errmsg":"prepare failed"}`。
+       *
+       * 所以这个响应只有一种解释:**我们手上的上下文令牌过期了,这条消息发不出去**,
+       * 重试同一条永远不会成功 —— 它**不是**网络抖动。旧实现把它归进 `http_error`,
+       * 调用方于是当"间歇性失败"处理:日报每小时重试 60 次(真机日志里 18 点各 111/240/175 条
+       * `prepare failed`),通知入队 120 分钟后等用户下次说话再一股脑补发(用户看到的"补发一堆")。
+       *
+       * 分类成独立错误码后,调用方才能:立即暂停主动推送 → 保留少量通知 → 下次入站立即补送。
+       * `detail` 带上原始 ret/errmsg,便于日志与排障(已脱敏)。
+       */
+      if (obj.ret === -2 && /prepare failed/i.test(String(obj.errmsg || ""))) {
+        throw new WeChatError(
+          "context_token_expired",
+          "sendMessage: ret=-2 prepare failed（上下文令牌已过期）",
+          { ret: obj.ret, errmsg: safeErrmsg }
+        );
+      }
+      throw new WeChatError("http_error", `sendMessage: ret=${obj.ret} errmsg=${safeErrmsg}`);
     }
     if (obj.errcode === STALE_TOKEN_ERRCODE) {
       throw new WeChatError("session_expired", "sendMessage: session timeout(errcode -14)", obj);
@@ -1644,6 +1700,26 @@ export const accountPath = (relayDir) => path.join(relayDir, ACCOUNT_FILE);
 export const statePath = (relayDir) => path.join(relayDir, STATE_FILE);
 
 /**
+ * 由 bot 账号派生**安全文件名**(botKey),给游标文件 / 去重表用。
+ *
+ * 为什么不能直接用 accountId:它是服务端给的字符串,可能是任意字符(含 `/`、`..`、空格、中文),
+ * 直接拼进路径会写到意外位置甚至跳出 relayDir。这里把不安全字符统一替换成 `_`。
+ * 为什么替换后还要补一段哈希:替换是**多对一**的(`a/b` 与 `a_b` 会落到同一个文件名),
+ * 不同 bot 互相覆盖游标/去重表 = 悄悄重放或丢消息。所以只要发生过替换(或被截断),
+ * 就再拼上原文 sha1 前 8 位,保证不同 accountId 必得不同文件名。
+ *
+ * 没有账号 → 返回 ""(调用方据此判断"还落不了盘",只留内存)。
+ */
+function botKeyFor(account) {
+  const raw = String((account && account.accountId) || "").trim();
+  if (!raw) return "";
+  const safe = raw.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 64);
+  if (!safe) return "";
+  if (safe === raw) return safe;
+  return `${safe}-${crypto.createHash("sha1").update(raw).digest("hex").slice(0, 8)}`;
+}
+
+/**
  * 读凭据。返回 {token, accountId, baseUrl, userId, boundAt} 或 null。
  * ⚠️ **只有 bridge 内部能用它** —— 面板接口一律走 sanitizeAccount()(§8:永不回显 token)。
  */
@@ -2449,6 +2525,42 @@ export function extractContextToken(msg) {
 }
 
 /**
+ * 一条入站消息的**稳定去重 id**。
+ *
+ * 为什么需要(用户 2026-10 报「发给 Agent 的会话会发两遍」):
+ *   `get_updates_buf` 落盘之前,重连会让服务端重投未确认消息;即便游标修好,
+ *   同一次 `getUpdates` 响应里也可能出现两条一模一样的消息。没有按消息 id 去重 =
+ *   同一条消息被派活两次(真机日志里 `getupdates 失败` 出现过 117 次)。
+ *
+ * 取值优先级(从最可靠到"只能猜"):
+ *   1. `message_id`(数字转字符串)—— 平台给的唯一 id,最可靠;
+ *   2. `seq` —— 协议里的序号,同账号内单调,退而求其次;
+ *   3. `sha1(from|create_time_ms|文本)` —— 两者都没有时的指纹(§11 形状未验证,
+ *      某些响应确实不带 id;指纹碰撞概率可忽略,且只在 7 天窗口内使用);
+ *   4. 什么都没有 → ""(调用方**不去重**:宁可多派一次,也不能把用户消息吞掉)。
+ */
+export function inboundMessageId(msg) {
+  if (!msg || typeof msg !== "object") return "";
+  const scalar = (v) => {
+    if (typeof v === "string") return v.trim();
+    if (typeof v === "number" && Number.isFinite(v)) return String(v);
+    if (typeof v === "bigint") return String(v);
+    return "";
+  };
+  for (const k of ["message_id", "messageId", "msg_id"]) {
+    const s = scalar(msg[k]);
+    if (s) return s;
+  }
+  const seq = scalar(msg.seq);
+  if (seq) return seq;
+  const from = extractFromUserId(msg);
+  const ts = scalar(msg.create_time_ms) || scalar(msg.createTimeMs) || scalar(msg.create_time);
+  const text = extractInboundText(msg);
+  if (!from && !ts && !text) return "";
+  return `sha1:${crypto.createHash("sha1").update(`${from}|${ts}|${text}`).digest("hex")}`;
+}
+
+/**
  * 别名 → 规范指令名。
  * ⚠️ 编排层是按**规范名**分派的(`cmd === "/ls"`),所以别名必须在 `classifyInbound()`
  * 里收敛一次;否则 `/list` 会掉进"未知指令",用户看到一句"不认识"。
@@ -2757,6 +2869,9 @@ export class WeChatChannel {
     this.cooldown = new SessionCooldown({ cooldownMs: opts.cooldownMs, clock: this.clock });
     this.registry = new EventRegistry({ clock: this.clock });
     this.updatesBuf = "";
+    // 落盘失败只 warn 一次:游标/去重表写不进去时,每个 tick 刷一行日志反而会把真正的故障淹掉。
+    this.syncWarned = false;
+    this.seenWarned = false;
     // ★ 恢复上次记住的 context_token：不恢复的话，bridge 一重启就要等用户先发一条消息
     //   才重新具备"能发出去"的能力 —— 而重启后的第一条通知恰恰是最需要送达的那条。
     this.#restoreContextToken();
@@ -2770,19 +2885,243 @@ export class WeChatChannel {
     } catch { /* 状态文件读不了就当没有:不影响主流程 */ }
   }
 
+  /** 按 bot 账号拼出某个状态文件名;还没有账号 → ""(说明此刻只能留内存,落不了盘)。 */
+  #stateFilePath(prefix) {
+    const key = botKeyFor(this.account);
+    return key ? path.join(this.relayDir, `${prefix}${key}.json`) : "";
+  }
+
+  /** 落盘类故障只 warn 一次(kind 区分游标 / 去重表,各自只报一次)。 */
+  #warnOnce(kind, message) {
+    if (kind === "sync") {
+      if (this.syncWarned) return;
+      this.syncWarned = true;
+    } else {
+      if (this.seenWarned) return;
+      this.seenWarned = true;
+    }
+    try {
+      this.logger.warn(message);
+    } catch { /* 日志失败不能影响业务 */ }
+  }
+
+  /** 删掉某个按 bot 账号命名的状态文件(游标 / 去重表共用;失败静默)。 */
+  #removeStateFile(prefix, label) {
+    const file = this.#stateFilePath(prefix);
+    if (!file) return false;
+    try {
+      fs.rmSync(file, { force: true });
+      return true;
+    } catch (e) {
+      this.#warnOnce(label, `${label}: 删除 ${path.basename(file)} 失败(下次启动可能沿用旧数据)${e && e.message ? `:${e.message}` : ""}`);
+      return false;
+    }
+  }
+
+  // ── 游标持久化(get_updates_buf,按 bot 账号) ────────────────────────────────
+  //
+  // 背景见 UPDATES_BUF_FILE_PREFIX 的注释:游标只在内存 → bridge 重启/重连即丢 →
+  // 服务端重投未确认消息 → 同一条消息派活两次。官方实现同样按 bot 账号落盘。
+
+  /**
+   * 读回上次保存的 `get_updates_buf`。
+   *
+   * 同步读盘(调用点在 #channelLoop 的循环开头,那里是同步代码);
+   * 读不到 / 形状不认识 / 属于另一个 bot → `""`(从"服务端给的起点"重新开始,不猜)。
+   * 已经有过内存值就直接返回 —— 内存比盘新。
+   * @returns {string}
+   */
+  loadUpdatesBuf() {
+    if (this.updatesBuf) return this.updatesBuf;
+    const file = this.#stateFilePath(UPDATES_BUF_FILE_PREFIX);
+    if (!file) return "";
+    let data;
+    try {
+      data = JSON.parse(fs.readFileSync(file, "utf8"));
+    } catch {
+      return "";
+    }
+    if (!data || typeof data !== "object") return "";
+    // 文件名已按账号分隔,这里再核一次 bot_id:状态文件可能被手工拷进别的账号目录,
+    // 拿旧 bot 的游标去轮询只会让服务端从头重放(甚至报错)。
+    const botId = this.account ? String(this.account.accountId || "") : "";
+    if (data.bot_id && botId && String(data.bot_id) !== botId) return "";
+    const buf = typeof data.get_updates_buf === "string" ? data.get_updates_buf : "";
+    this.updatesBuf = buf;
+    return buf;
+  }
+
+  /**
+   * 保存游标(同步落盘,0600)。
+   *
+   * 空游标**不写**:服务端偶尔会回空串(或超时路径原样返回),拿空串覆盖掉上次的有效游标,
+   * 下次重连就等于从头开始 —— 反而制造重放。写失败只 warn 一次,**不影响轮询主流程**。
+   * @param {string} buf getUpdates 响应里的 get_updates_buf
+   */
+  saveUpdatesBuf(buf) {
+    const b = typeof buf === "string" ? buf : String(buf ?? "");
+    if (!b) return;
+    this.updatesBuf = b;
+    const file = this.#stateFilePath(UPDATES_BUF_FILE_PREFIX);
+    if (!file) {
+      this.#warnOnce("sync", "saveUpdatesBuf: 还没有已绑定的 bot 账号,游标只保留在内存(重启后会重放未确认消息)");
+      return;
+    }
+    try {
+      writePrivateJson(file, { bot_id: this.account ? String(this.account.accountId || "") : "", get_updates_buf: b, at: this.clock() }, (m) => this.#warnOnce("sync", m));
+    } catch (e) {
+      this.#warnOnce("sync", `saveUpdatesBuf: 写盘失败(重启后可能重放未确认消息)${e && e.message ? `:${e.message}` : ""}`);
+    }
+  }
+
+  /** 清空游标(内存 + 文件)。换绑 / 解绑必须调用:旧 bot 的游标对新账号毫无意义。 */
+  clearUpdatesBuf() {
+    this.updatesBuf = "";
+    this.#removeStateFile(UPDATES_BUF_FILE_PREFIX, "sync");
+  }
+
+  // ── 入站去重(按 bot 账号) ──────────────────────────────────────────────────
+
+  /**
+   * 这条入站消息是不是"见过了"。
+   *
+   * 语义:**第一次见 → 记录并返回 false;见过 → true**。调用方(handleInbound)据此跳过重复消息,
+   * 但它自己不是幂等的 —— 同一进程内对同一 id 连调两次,第二次一定是 true。
+   *
+   * id 为空 → 返回 false(不去重):拿不到消息标识时,宁可多派一次,也不能把用户消息丢掉。
+   * 读/写盘失败一律 **fail-open**(当"没见过"),理由同上 —— 去重是优化,不是准入门槛。
+   */
+  isDuplicateMessage(id) {
+    const key = typeof id === "string" ? id.trim() : "";
+    if (!key) return false;
+    const file = this.#stateFilePath(SEEN_MESSAGES_FILE_PREFIX);
+    if (!file) return false; // 还没绑定:没有可落盘的位置,只能不去重
+
+    const now = this.clock();
+    const botId = this.account ? String(this.account.accountId || "") : "";
+    let ids = [];
+    try {
+      const data = JSON.parse(fs.readFileSync(file, "utf8"));
+      if (data && typeof data === "object" && Array.isArray(data.ids)) {
+        // 手改/半写坏的文件:只留形状正确的条目,别让一条脏数据把整张表带崩
+        if (!data.bot_id || !botId || String(data.bot_id) === botId) {
+          ids = data.ids.filter((e) => e && typeof e === "object" && typeof e.id === "string" && e.id);
+        }
+      }
+    } catch {
+      ids = []; // 文件不存在 / 损坏 → 当空表(fail-open)
+    }
+
+    if (ids.some((e) => e.id === key)) return true;
+
+    ids.push({ id: key, at: now });
+    // 有界:先按保质期丢过期,再只留最近 SEEN_MESSAGES_MAX 条(数组按写入顺序,越靠前越旧)
+    ids = ids.filter((e) => Number.isFinite(e.at) && e.at >= now - SEEN_MESSAGES_TTL_MS);
+    if (ids.length > SEEN_MESSAGES_MAX) ids = ids.slice(ids.length - SEEN_MESSAGES_MAX);
+    try {
+      writePrivateJson(file, { bot_id: botId, ids }, (m) => this.#warnOnce("seen", m));
+    } catch (e) {
+      // 写不进去只影响"重启后还认得",本次仍然放行(fail-open)
+      this.#warnOnce("seen", `isDuplicateMessage: 去重表写盘失败(重启后可能重派同一条消息)${e && e.message ? `:${e.message}` : ""}`);
+    }
+    return false;
+  }
+
+  /** 清空去重表(解绑时调用:上一个人的消息指纹没有留着的理由)。 */
+  #clearSeenMessages() {
+    this.#removeStateFile(SEEN_MESSAGES_FILE_PREFIX, "seen");
+  }
+
   /**
    * 记下入站消息带来的 `context_token`（发送时回带它才发得出去，见 sendMessage 注释）。
    * 落盘持久化：重启/换实例后仍然能发；同时**按对端成对保存**，绝不跨对端复用。
+   *
+   * 扩展(2026-10):同时写 `context_token_at`,并**清掉 push_paused**。
+   *   为什么:`push_paused` 表达的是"我们手上的令牌已过期,别再打接口了";
+   *   收到入站消息 = 平台刚发了一个新令牌,那个结论当场作废。不清的后果是
+   *   用户明明回了消息(token 已刷新),主动推送却还被静默着,直到某次发送"意外成功"才解除。
    * @returns {boolean} 是否有变化（无变化不重复写盘）
    */
   rememberContextToken(token, peerUserId) {
     const t = String(token || "").trim();
     if (!t) return false;
     const peer = String(peerUserId || "");
-    if (this.client.contextToken === t && this.client.contextTokenPeer === peer) return false;
+    const unchanged = this.client.contextToken === t && this.client.contextTokenPeer === peer;
+    // 令牌没变、也没处在"推送静默"里 → 不必重复写盘(入站频率不低,每次写会放大磁盘 IO)。
+    // 处在静默里时必须写:入站就是"令牌已刷新"的信号,静默要当场解除。
+    if (unchanged && !this.pushPaused().paused) return false;
     this.client.setContextToken(t, peer);
-    this.writeState({ context_token: t, context_token_peer: peer });
+    this.writeState({
+      context_token: t,
+      context_token_peer: peer,
+      context_token_at: this.clock(),
+      // saveState 用 JSON.stringify 落盘,undefined 值会被省略 → 等价于把键从状态文件里删掉。
+      // 用"置 undefined"而不是"置 false":状态文件里"没有这个键"才是"从未静默",不会被误读成已暂停。
+      push_paused: undefined
+    });
     return true;
+  }
+
+  /**
+   * 标记"上下文令牌已过期" → 清令牌 + 进入推送静默(push_paused)。
+   *
+   * 为什么需要它(见 sendMessage 里 context_token_expired 的注释):
+   *   ilink 的 context_token 只有分钟级寿命且无法续期。撞到 `ret=-2 prepare failed` 之后,
+   *   继续拿同一条消息重试永远失败 —— 只会把日志和接口打爆。正确做法是:
+   *   立刻承认"现在发不出去",清掉过期令牌,记下"静默中",等下一次入站(新令牌)再恢复补发。
+   *
+   * @param {string} reason 失败原因(通常来自错误原文)。**会脱敏 + 截断**后写进状态文件,
+   *   因为 `.wechat-state.json` 是面板可读的;它也可能被日志/排障包带走。绝不把 token 写进去。
+   * @returns {{paused:boolean, at:number, reason:string}}
+   */
+  invalidateContextToken(reason = "") {
+    // 脱敏:reason 常是 sendMessage 的错误原文,里面可能回显 token/URL。
+    // 用"当前所有已知密钥"抹一遍(账号 token + 即将被清的上下文令牌),再压成单行、截断。
+    const known = [this.account && this.account.token, this.client.contextToken].filter((s) => typeof s === "string" && s.length >= 4);
+    let safe = maskFieldsInText(String(redact(String(reason ?? ""), known)))
+      .replace(/\s*\n\s*/g, " ")
+      .trim();
+    if (safe.length > PUSH_PAUSE_REASON_MAX) safe = `${safe.slice(0, PUSH_PAUSE_REASON_MAX - 1)}…`;
+    // 先看是不是**已经**在静默里:这决定 warn 与 push_paused.at 怎么处理(见下)。
+    const wasPaused = this.pushPaused();
+    // 内存令牌立刻清掉:留着它只会让后面每条主动推送再撞一次同样的 prepare failed。
+    this.client.clearContextToken();
+    this.writeState({
+      context_token: "",
+      context_token_peer: "",
+      context_token_at: 0,
+      // 已经静默时**保留第一次进入静默的时间**:它回答的是"从什么时候开始发不出去"。
+      // 每次失败都刷新会让面板/日志节流窗口看起来永远"刚刚发生",反而看不出这次静默持续了多久。
+      push_paused: { at: wasPaused.paused ? wasPaused.at : this.clock(), reason: safe }
+    });
+    // ⚠️ 静默期间这个函数仍会被反复调用(断线重连、replay/订阅 gap 的提示、非主动推送的
+    //   reply() 路径……),每次失败都 warn 一条 → 断线风暴时就是刷屏,真正的故障反而被淹掉。
+    //   所以只在"非静默 → 静默"这一次报;状态仍然每次都如实写(令牌清空 + reason 更新)。
+    if (!wasPaused.paused) {
+      this.logger.warn(`推送静默:上下文令牌已过期(${safe || "prepare failed"}),等下一次入站消息再恢复`);
+    }
+    return this.pushPaused();
+  }
+
+  /** 解除推送静默(发送成功后调用)。幂等:本来就没静默时也不会造出这个键。 */
+  clearPushPaused() {
+    return this.writeState({ push_paused: undefined });
+  }
+
+  /**
+   * 当前是否处在"主动推送静默"里(读状态文件;损坏/缺失一律当"没静默",不能凭空挡住推送)。
+   * @returns {{paused:boolean, at:number, reason:string}}
+   */
+  pushPaused() {
+    const st = this.readState();
+    const p = st.push_paused;
+    if (!p || typeof p !== "object") return { paused: false, at: 0, reason: "" };
+    const at = Number(p.at);
+    return {
+      paused: true,
+      at: Number.isFinite(at) ? at : 0,
+      reason: typeof p.reason === "string" ? p.reason : ""
+    };
   }
 
   /** 面板接口用:永不回显 token(§8)。 */
@@ -2812,6 +3151,17 @@ export class WeChatChannel {
       },
       (m) => this.logger.warn(m)
     );
+    // ★ 换绑 = 换了一个 bot:上一个 bot 落盘的游标 / 去重表必须清掉。
+    //   游标:旧游标会让服务端从头重放未确认消息(用户看到的"补发一堆"),甚至因窗口不匹配直接报错;
+    //   去重表:里面是上一个用户的消息指纹,换人后没有任何保留理由(隐私 + 避免误判重复)。
+    //   ⚠️ 顺序:必须在 `this.account = account` **之前**清 —— 这两个文件的文件名由账号派生,
+    //   先赋值新账号就变成去删**新**账号的文件,而旧 bot 的文件永远残留(换绑/隐私清理不彻底)。
+    if (this.account) {
+      this.clearUpdatesBuf(); // 清内存游标 + 删旧 bot 的游标文件
+      this.#clearSeenMessages(); // 删旧 bot 的去重表
+    }
+    // 内存游标属于上一个 bot:哪怕旧 account 为空(未绑定态)也一并清掉,绝不让它带到新账号上。
+    this.updatesBuf = "";
     this.account = account;
     this.logger.addSecret(account.token); // 之后任何日志行都会自动脱敏
     this.client = new IlinkClient({
@@ -2828,7 +3178,10 @@ export class WeChatChannel {
       bot_id: account.accountId,
       bound_at: account.boundAt,
       last_error: "",
-      connected_at: this.clock()
+      connected_at: this.clock(),
+      // 绑定成功 = 全新 bot_token + 新会话:之前"推送静默"的结论作废,
+      // 否则用户重绑后第一条推送会被一个已经不存在的旧结论挡掉。
+      push_paused: undefined
     });
     // ★ 绑定成功必须**清掉冷却**(2026-09-22 实测 bug)。
     //   冷却原本只按"撞到 -14"计时,但**换绑会拿到全新的 bot_token** ——
@@ -2854,13 +3207,32 @@ export class WeChatChannel {
         this.logger.warn(`unbind: notifystop 失败(继续删凭据)${notifyError}`);
       }
     }
+    // ★ 解绑必须清掉按 bot 账号落盘的两份本地状态:
+    //   ① 游标:旧 bot 的游标对新账号毫无意义,留着还会让服务端重放旧消息;
+    //   ② 去重表:里面是上一个用户的消息指纹,换人后没有任何保留理由(隐私 + 避免误判重复)。
+    //   ⚠️ 顺序:必须在 `this.account = null` **之前**清 —— 文件名是由账号派生的,
+    //   账号置空后就再也算不出该删哪个文件了(会静默留下垃圾)。
+    this.clearUpdatesBuf();
+    this.#clearSeenMessages();
     const cleared = clearAccount(this.relayDir);
     this.account = null;
     this.client.setToken("");
     // ★ 会话上下文令牌属于**上一个人/上一个会话**：解绑必须一并清掉，
     //   否则换绑后第一条推送会拿旧上下文去发 —— 表现还是"发不出去"。
     this.client.clearContextToken();
-    this.writeState({ bound: false, bot_id: "", bound_at: 0, connected_at: 0, last_error: notifyError, context_token: "", context_token_peer: "" });
+    // 解绑后"推送静默"这个结论也没有意义了(静默是给"令牌过期"用的,而令牌已删);
+    // 不清的话,重新绑定后 state 里残留的 push_paused 会让新会话一开始就被静默。
+    this.writeState({
+      bound: false,
+      bot_id: "",
+      bound_at: 0,
+      connected_at: 0,
+      last_error: notifyError,
+      context_token: "",
+      context_token_peer: "",
+      context_token_at: 0,
+      push_paused: undefined
+    });
     // ★ 解绑同样清冷却:凭据都删了,再"退避"没有任何意义 ——
     //   留着只会让用户重新绑定时继续被挡(见 adoptConfirmed 的注释)。
     this.cooldown.clear();
