@@ -425,6 +425,42 @@ export function createPushReporter(options = {}) {
     },
 
     /**
+     * 上报一条"本地 Agent（Claude Code）在等拍板"的事件，让手机收到推送。
+     *
+     * 与 DSH 事件那条路的区别：这里没有 DSH 事件节点，payload 由我们直接构造；
+     * `summary` 只用于服务端风险分级（默认不进推送正文，见服务端 `notify_include_detail`），
+     * **本模块不把它写进日志**。
+     *
+     * @param {{requestId:string, toolName?:string, kind?:string, summary?:string}} info
+     * @returns {boolean} 是否真的进了队列（没启动/没订阅时返回 false）
+     */
+    reportApproval(info = {}) {
+      const requestId = String(info.requestId || "");
+      if (!requestId) return false;
+      if (!stats.started) return false;
+      const toolName = String(info.toolName || "");
+      const summary = String(info.summary || toolName || "").slice(0, MAX_BODY_LEN);
+      const payload = {
+        event_id: `${deviceId}:approval:${requestId}`.replace(/[^A-Za-z0-9._:-]/g, "_").slice(0, MAX_EVENT_ID_LEN),
+        device_id: deviceId,
+        kind: NOTIFY_KINDS.APPROVAL_REQUEST,
+        at: now(),
+        session: { id: "" },
+        title: "需要你拍板",
+        body: toolName ? `Claude Code 想执行：${toolName}` : "Claude Code 在等你允许一步操作",
+        approval: {
+          request_id: requestId,
+          summary,
+          options: [
+            { value: "allowed-once", label: "允许一次" },
+            { value: "rejected", label: "拒绝" }
+          ]
+        }
+      };
+      return enqueue(payload);
+    },
+
+    /**
      * 把一条审批回执写回 DSH（供决策轮询器调用）。
      *
      * 为什么放在这里：DSH 的审批回执要用订阅器里的 `clientId`(+ 上游地址/cookie)，

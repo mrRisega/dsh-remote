@@ -116,6 +116,7 @@ import {
 import { createWeChatRuntime } from "./wechat-runtime.mjs";
 import { createPushReporter } from "./push-reporter.mjs";
 import { createDecisionPoller } from "./decision-poller.mjs";
+import { createApprovalCoordinator } from "./approval-coordinator.mjs";
 import { createAgentRuntime } from "./agent/index.mjs";
 
 // ---------- 强制直连:清除代理环境变量 ----------
@@ -2877,7 +2878,11 @@ function startPushReporter() {
     // 不 await：启动探测失败绝不影响隧道
     void pushReporter.start().then((st) => {
       try {
-        if (st && st.started) startDecisionPoller();
+        if (st && st.started) {
+          ensureApprovalCoordinator();
+          startDecisionPoller();
+          startAgentRuntime();
+        }
       } catch { /* 忽略 */ }
     }).catch(() => {});
   } catch (e) {
@@ -2901,7 +2906,10 @@ function startAgentRuntime() {
   if (String(process.env.DSH_AGENT_ENABLED || "") !== "1") return;
   try {
     if (agentRuntime) return;
+    const coordinator = ensureApprovalCoordinator();
     agentRuntime = createAgentRuntime({
+      // 手机审批：钩子 → 协调器（等手机回执）→ allow/deny；没有协调器时 runtime 内部 fail-closed
+      decide: coordinator ? (req) => coordinator.ask(req) : undefined,
       log: (e) => {
         try {
           const level = e && e.level === "error" ? "error" : e && e.level === "warn" ? "warn" : "info";
@@ -2930,6 +2938,31 @@ function startAgentRuntime() {
  * 只有"事件上报已在跑"时才起 —— 没有上报就没有通知，也就不可能有回执；
  * 所有异常吞掉只记日志，绝不阻塞隧道。
  */
+/**
+ * 审批协调器（2026-11-06）：把 Claude Code 的审批请求接到手机回执上。
+ * 只有"推送上报已在跑"时才创建 —— 没有手机通道，等 90 秒再拒绝毫无意义。
+ */
+let approvalCoordinator = null;
+
+function ensureApprovalCoordinator() {
+  if (approvalCoordinator) return approvalCoordinator;
+  try {
+    approvalCoordinator = createApprovalCoordinator({
+      report: (info) => pushReporter && pushReporter.reportApproval ? pushReporter.reportApproval(info) : false,
+      log: (level, message) => {
+        try {
+          if (level === "warn") console.warn(message);
+          else console.log(message);
+        } catch { /* 忽略 */ }
+      }
+    });
+  } catch (e) {
+    console.warn(`[approval] 协调器初始化失败（已忽略）：${e && e.message ? e.message : e}`);
+    approvalCoordinator = null;
+  }
+  return approvalCoordinator;
+}
+
 let decisionPoller = null;
 
 function startDecisionPoller() {
@@ -2940,7 +2973,11 @@ function startDecisionPoller() {
       deviceId: DEVICE_ID,
       tokenProvider: () => PUSH_TOKEN,
       apply: async (item) => {
-        // 手机上的"允许"只能映射成 allowed-once（允许一次），绝不升级成永久放行
+        // ① 先看是不是"本地 Agent（Claude Code）"的审批 —— 协调器认得就消费掉
+        try {
+          if (approvalCoordinator && approvalCoordinator.resolve(item.request_id, item.decision)) return;
+        } catch { /* 继续走 DSH 那条路 */ }
+        // ② 否则按 DSH 审批回执处理：手机上的"允许"只能映射成 allowed-once，绝不升级成永久放行
         return pushReporter.answerApproval(item.request_id, item.outcome);
       },
       log: (level, message) => {
@@ -3156,8 +3193,8 @@ async function runTunnel() {
   startWeChat();
   // 同理：推送上报也是可选增强，最后起、失败静默
   startPushReporter();
-  // 多 Agent 运行时：默认关，只有 DSH_AGENT_ENABLED=1 才起
-  startAgentRuntime();
+  // 多 Agent 运行时：默认关，只有 DSH_AGENT_ENABLED=1 **且** 推送通道已就绪时才起
+  //（没有手机通道 = 审批无处可问，起了只会卡住用户）
   setTimeout(() => {
     console.log(`[bridge] 隧道模式运行中(上游 ${UPSTREAM},Ctrl-C 退出)`);
   }, 1000);
@@ -3205,6 +3242,8 @@ async function main() {
     try { e2ee.flushStore(); } catch { /* 已内部兜底 */ }
     // 退出前尽力把待上报的事件发出去（最多等 1s，绝不阻塞退出）
     try { if (decisionPoller) decisionPoller.stop(); } catch { /* 已内部兜底 */ }
+    // 未决审批一律拒绝（绝不留悬挂的 Promise）
+    try { if (approvalCoordinator) approvalCoordinator.stop(); } catch { /* 已内部兜底 */ }
     try { if (pushReporter) await pushReporter.stop(); } catch { /* 已内部兜底 */ }
     // 多 Agent 运行时：关端口、删临时 settings、未决审批一律 deny（runtime 内部保证幂等）
     try { if (agentRuntime) await agentRuntime.stop(); } catch { /* 已内部兜底 */ }
