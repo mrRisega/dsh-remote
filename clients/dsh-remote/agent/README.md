@@ -138,13 +138,20 @@ await runtime.stop();
 
 ## 6. 已做 / 未做（M2 边界）
 
-**已做（本轮）**
+**已做（M2 第 2 周）**
 - 版本门禁（默认 2.1.318，env 可覆盖）+ CLI 四级解析 + `--version` 探测
 - 既有 `PermissionRequest` 钩子扫描（user/project/local，只读）→ 让位
 - PermissionBridge：loopback 随机端口、临时 settings 0600、token/事件名/体积/并发四道闸、
   fail-closed 90s、实测响应体、幂等 stop
 - 进程治理：参数数组 spawn、进程组 kill、SIGTERM→SIGKILL、Windows taskkill 预留
 - 全部外部依赖可注入；单测覆盖门禁/让位/fail-closed/响应体/kill/清理
+
+**已做（M2 第 3 周）**
+- `events.mjs`：`claude --output-format stream-json` 逐行 → 5 种归一化事件
+  （`status` / `message.delta` / `tool.call` / `tool.result` / `turn.end`），可落 append-only jsonl；
+  未知行/坏 JSON/超长行计数丢弃、落盘失败静默。
+- `agent-e2e-real.mjs`：**真实 Claude Code 端到端联调**（默认跳过），实测 allow 真跑 / deny 不跑 /
+  TTL 到期自动拒；顺带用真实输出校验事件映射（`unknown=0`）。
 
 **未做（后续周）**
 - 手机端决策来源（`decide` 现在缺省 fail-closed）、事件映射（stream-json → 7 种事件）、
@@ -165,7 +172,45 @@ await runtime.stop();
 | 多个会话并发审批 | 已支持（`maxPending=8`，超限 429） | 但**同一会话多请求的排序/取消**未验证 |
 | Claude Code 版本门槛精确定值 | **未确定** | 只测了 2.1.195 ❌ / 2.1.318 ✅；默认阈值保守取 2.1.318，第 3 周二分 |
 
-## 8. 测试
+## 8. 事件映射（`events.mjs`）与真实联调（`agent-e2e-real.mjs`）
+
+### 8.1 事件映射
+
+```js
+import { createEventMapper, createJsonlSink } from "./agent/events.mjs";
+const sink = createJsonlSink({ filePath: "/path/events.jsonl" }); // 不给 filePath = 不落盘（默认）
+const mapper = createEventMapper({ sink, onEvent: (e) => phone.send(e) });
+mapper.writeLine(line);   // 喂 claude 的 stream-json 行，返回本行产出的事件
+mapper.stats();           // {lines,events,badJson,tooLong,unknown,byType,byReason,unknownReasons}
+```
+
+| 归一化事件 | 来源 | 说明 |
+|---|---|---|
+| `status` | `system/init`、`hook_started/hook_response`、`api_retry`、**`permission_denied`** | `permission_denied` 是实测拿到的"审批被拒"回执 |
+| `message.delta` | `assistant` 文本（final=true）、`stream_event` 的 `text_delta`（final=false） | 不重复成 final 事件 |
+| `tool.call` | `tool_use` | **只带 id/name/kind/输入字节数**，不带命令原文 |
+| `tool.result` | `tool_result` | 只带 isError/输出字节数/截断预览（默认 120 字符，可设 0 关闭） |
+| `turn.end` | `result` | reason: completed / error / max-turns / interrupted / aborted |
+
+### 8.2 真实联调（默认跳过）
+
+```bash
+export DSH_AGENT_E2E=1
+export DSH_AGENT_CLAUDE_BIN=/path/to/@anthropic-ai/claude-code/bin/claude.exe   # 必须 ≥ 2.1.318
+node clients/dsh-remote/agent/agent-e2e-real.mjs
+
+# 只跑某一个用例（省额度）：allow | deny | timeout
+DSH_AGENT_E2E_CASES=deny node clients/dsh-remote/agent/agent-e2e-real.mjs
+# 保留现场 / 落原始流以便排障
+DSH_AGENT_E2E_KEEP=1 DSH_AGENT_E2E_DUMP_RAW=1 node clients/dsh-remote/agent/agent-e2e-real.mjs
+```
+
+- 退出码：`0` 通过 / `1` 断言失败 / `2` 环境不具备（未开启、CLI 版本不够、起不来）。
+- 每次最多 3 次真实 `claude -p`（脚本硬上限 6 次）。
+- 每个用例都在**临时项目**里写 `permissions.ask` 强制升权，并把探测用的 `homeDir` 指向空目录，
+  避免"用户级 allow 规则吞掉审批"（第 1 周报告 §1.2）与"既有钩子让位"两种干扰。
+
+## 9. 测试
 
 ```bash
 # 本目录相关用例（5 个文件）
@@ -175,7 +220,8 @@ DSH_PROFILE_DIR= NODE_OPTIONS="--require $PWD/scripts/test-net-guard.cjs" \
   clients/dsh-remote/test/agent-detect.test.mjs \
   clients/dsh-remote/test/agent-permission-bridge.test.mjs \
   clients/dsh-remote/test/agent-proc.test.mjs \
-  clients/dsh-remote/test/agent-runtime.test.mjs
+  clients/dsh-remote/test/agent-runtime.test.mjs \
+  clients/dsh-remote/test/agent-events.test.mjs
 ```
 
 （真实跑请用仓库标准入口：`npm run test:bridge` —— 它带测试期网络护栏，只允许打本地。）
