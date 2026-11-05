@@ -114,6 +114,7 @@ import {
 // ⚠️ 微信流量只走「腾讯 ilink ↔ 本机」,**不经我们的 relay**;DSH 事件走本机回环。
 // 总开关 DSH_WECHAT=0(默认开启);未绑定时只起控制面,不起长轮询。
 import { createWeChatRuntime } from "./wechat-runtime.mjs";
+import { createPushReporter } from "./push-reporter.mjs";
 
 // ---------- 强制直连:清除代理环境变量 ----------
 // 家庭网络常配 Clash 等代理(127.0.0.1:7890),node 的 ws/fetch 会继承
@@ -2840,6 +2841,45 @@ function currentUpstreamForChannel() {
   return UPSTREAM;
 }
 
+/**
+ * 推送上报（2026-11-05）：把"任务完成/需要拍板/出错"上报给 SaaS，由服务端规则引擎决定是否推送。
+ *
+ * 为什么放在这里有独立开关：它是**可选增强**，任何失败都不得影响远程访问主链路。
+ * 真正的启动条件由 push-reporter 自己问服务端（`/api/push/public-key` 的 enabled+subscribed），
+ * 本地只有 `DSH_PUSH_REPORT=0` 能强制关闭。
+ */
+let pushReporter = null;
+let PUSH_TOKEN = "";
+
+function startPushReporter() {
+  if (String(process.env.DSH_PUSH_REPORT || "") === "0") {
+    console.log("[push] 上报已禁用(DSH_PUSH_REPORT=0)");
+    return;
+  }
+  try {
+    if (pushReporter) return;
+    pushReporter = createPushReporter({
+      apiBase: API_BASE,
+      deviceId: DEVICE_ID,
+      tokenProvider: () => PUSH_TOKEN,
+      upstream: () => currentUpstreamForChannel(),
+      cookie: harnessCookieOf,
+      detail: String(process.env.DSH_PUSH_DETAIL || "") === "1",
+      log: (level, message) => {
+        try {
+          if (level === "warn") console.warn(message);
+          else console.log(message);
+        } catch { /* 忽略 */ }
+      }
+    });
+    // 不 await：启动探测失败绝不影响隧道
+    void pushReporter.start().catch(() => {});
+  } catch (e) {
+    // 可选增强失败不得冒泡
+    console.warn(`[push] 上报器初始化失败（已忽略）：${e && e.message ? e.message : e}`);
+  }
+}
+
 function startWeChat() {
   if (WECHAT_DISABLED) {
     console.log("[bridge] 微信通道已禁用(DSH_WECHAT=0)");
@@ -3022,6 +3062,7 @@ async function runTunnel() {
   // (真机日志实测:同一个桥接启动里出现两条并发的 device-login)。
   // 而 /api/device-login 是按出口 IP 限流的 —— 每次启动都多花一份登录额度没有道理。
   WECHAT_TIER_TOKEN = { value: token, at: Date.now() };
+  PUSH_TOKEN = token;
   // 新进程开始:重置状态文件(上一轮的成功记录不能代表这一轮,面板据此判定 online)。
   // `pid` 一并写入 = **bridge 自证身份**:插件可以用「state.pid 活着 + heartbeat_at 新鲜」
   // 判断桥是否真的在跑,不必依赖按镜像名(node.exe)扫描 —— 桌面端宿主拉起的进程名不是 node.exe。
@@ -3037,6 +3078,8 @@ async function runTunnel() {
   }
   // 隧道已发起（或已进入锁定等待）后再起微信:主链路优先,微信永不阻塞远程访问
   startWeChat();
+  // 同理：推送上报也是可选增强，最后起、失败静默
+  startPushReporter();
   setTimeout(() => {
     console.log(`[bridge] 隧道模式运行中(上游 ${UPSTREAM},Ctrl-C 退出)`);
   }, 1000);
@@ -3082,6 +3125,8 @@ async function main() {
     console.log(`[bridge] 收到 ${sig},正在优雅退出...`);
     // 退出前把 E2EE 会话库刷一次（滑动 TTL 的 usedAt 要落盘；崩溃也能恢复到最多 60s 前）
     try { e2ee.flushStore(); } catch { /* 已内部兜底 */ }
+    // 退出前尽力把待上报的事件发出去（最多等 1s，绝不阻塞退出）
+    try { if (pushReporter) await pushReporter.stop(); } catch { /* 已内部兜底 */ }
     await stopWeChat();
     process.exit(0);
   };
