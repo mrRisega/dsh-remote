@@ -67,6 +67,22 @@ test("安装输出:「已创建自启动服务」路径只在汇总里打印一�
   assert.ok(/自启动服务: \$\{svc\.path/.test(src), "汇总里应展示自启动服务路径");
 });
 
+test("安装输出:装完就告诉用户「手机端下一步」(扫码或打开地址),不把引导停在「登录手机号」", () => {
+  // 背景（2026-11 复盘，C1 129 人）：安装引导原来只到「注册/登录手机号」为止 ——
+  // 用户以为装完/登录完就结束了：设备在线了、人却从没去过手机端。
+  // 现在汇总里必须把手机端的两条路都说清（扫码免登录 / 打开地址用同一手机号登录）。
+  const summary = src.slice(src.indexOf("const L = [];"), src.indexOf('console.log("\\n" + L.join'));
+  assert.ok(summary.length > 0, "应能定位到安装汇总段");
+  assert.ok(/远程访问地址: \$\{pub\.app_url \|\| DEFAULT_APP_URL\}/.test(summary), "SaaS 汇总要给出手机端 app 地址");
+  assert.ok(/手机端下一步:/.test(summary), "汇总必须给出「手机端下一步」");
+  assert.ok(/用同一手机号登录/.test(summary), "要说清手机上用同一手机号登录");
+  assert.ok(/设备列表/.test(summary), "要指到手机端的「设备列表」这个落点");
+  assert.ok(/扫那里的二维码/.test(summary), "要给出扫码这条免登录路径");
+  // 只打印一次（同一引导不得在多处重复）
+  const hits = src.match(/手机端下一步[:：]/g) || [];
+  assert.equal(hits.length, 1, `「手机端下一步」应只出现一次(实际 ${hits.length} 处)`);
+});
+
 test("安装输出:dsh web 未运行时的措辞 —— 说明会自动启动,且不出现「启动失败」误导", () => {
   assert.ok(/async function isDshWebUp/.test(src), "应探测 dsh web 是否在运行(127.0.0.1:3080)");
   const block = src.slice(src.indexOf("const webUp = await isDshWebUp();"));

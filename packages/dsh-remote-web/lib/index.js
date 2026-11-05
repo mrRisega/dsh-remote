@@ -5731,6 +5731,21 @@ async function composeConnect(relayDir, opts = {}) {
   const bindFresh = Boolean(bindError && (!bindError.at || now - Number(bindError.at) < BIND_ERROR_FRESH_MS));
   const log = bridgeLogState(relayDir);
   const state = bridgeStateFile(relayDir);
+  // 【0.7.10 / W1-T3】E2EE 死会话拒绝计数（bridge 随心跳写进状态文件）。
+  // 生产复盘：WS 升级被拒里 71.8% 是 e2ee_session_locked（涉 163 用户）；0.7.3+ 已闭环
+  // （手机侧清内存会话 + 3 连败作废 + 每页一次受控 reload；bridge 回 retryable+rehandshake）。
+  // 原比例只能在服务端看，支持包答不出来；这里把它带进「复制诊断信息」。
+  // 旧 bridge 没有这些字段 → 全 0，且**只在真的发生过时才输出**（正常用户零新增噪音）。
+  const e2eeReject = {
+    locked: Number(state && state.e2ee_ws_reject_locked) || 0,
+    disabled: Number(state && state.e2ee_ws_reject_disabled) || 0,
+    at: Number(state && state.e2ee_ws_reject_at) || 0
+  };
+  // 【0.7.10 / W1-T2】最近一次安装/更新的**归因码**（与匿名遥测同一套白名单枚举）。
+  // 面板拿它做失败分档（端口/权限/PATH/Node/上游/被锁 → 各自文案 + 一键修复），
+  // 而不是让浏览器半去猜 `launchd state=…` 这类术语。旧 host 没有该字段 →
+  // 面板自动退回按既有文案判断（client.js 的 classifyConnectFailure 里逐项特性检测）。
+  const lastInstallFailure = recentUpdateFailure(relayDir);
   const deviceId = String(cfg.device_id || "");
 
   // ── 「设备被超额锁定」证据（契约 §8.1）──
@@ -5955,6 +5970,11 @@ async function composeConnect(relayDir, opts = {}) {
     launchdCrashLoop: Boolean(launchd.crashing),
     registered,
     registerSource,
+    // 最近一次安装/更新的归因码（0.7.10）：面板失败分档用（端口/权限/PATH/Node/上游/被锁）。
+    // 旧 host 无此字段 → 面板退回按既有 error.message/detail 判断，行为不退化。
+    failCode: String((bindFresh && bindError && bindError.code) || (lastInstallFailure && lastInstallFailure.failCode) || ""),
+    // E2EE 死会话拒绝计数（见上方 e2eeReject 说明；只在真的发生过时进诊断文本）
+    e2eeReject,
     attempts: book.attempts,
     nextRetryInMs,
     error,
@@ -6068,6 +6088,12 @@ function buildConnectDiagnostics(relayDir, conn, log) {
     `上游 dsh web: ${conn.upstreamUrl}（${conn.upstreamSource}${conn.upstreamReachable === null ? "" : conn.upstreamReachable ? "，可达" : `，⚠️ 不可达：${conn.upstreamError}`}）`,
     `目录选择器: ${pickerPinState.kind === "native" ? "⚠️ 系统原生（远程时对话框弹在电脑那台机器上 → 手机上点「添加工作区」会像没反应）" : (pickerPinState.kind || "未知")}${pickerPinState.detail ? `（${pickerPinState.detail}）` : ""}`,
     `中继注册: ${conn.registered ? "已注册（" + conn.registerSource + "）" : "未注册"}`,
+    // E2EE 死会话拒绝计数（0.7.10）：正常用户永远没有这一行；出现过就说明这台机器被死会话打过，
+    // 且计数能直接回答「闭环后还剩下多少」——以前这个问题只有服务端日志答得出。
+    conn.e2eeReject && (conn.e2eeReject.locked || conn.e2eeReject.disabled)
+      ? `E2EE 会话拒绝: 会话失效 ${conn.e2eeReject.locked} 次 / 未启用 ${conn.e2eeReject.disabled} 次`
+        + `（本进程累计；手机 0.7.3+ 会自动重握手 —— 若持续增长说明手机端仍是旧版本）`
+      : "",
     `bridge 账号: ${conn.accountCurrent === false ? "⚠️ 仍是上一个账号的身份（需重启 bridge 重新登记）" : "当前账号"}`,
     conn.rateLimitedUntil ? `登录限流: 约 ${Math.ceil((conn.rateLimitedUntil - Date.now()) / 1000)} 秒后自动重试（凭据无误，无需改密码）` : "",
     `最近错误: ${conn.error ? conn.error.code + ": " + conn.error.message : (log && log.lastError ? log.lastError : "无")}`,

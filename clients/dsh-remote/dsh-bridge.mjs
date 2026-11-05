@@ -288,7 +288,44 @@ function stampBridgeHeartbeat() {
   const now = Date.now();
   if (now - lastStateHeartbeatAt < STATE_HEARTBEAT_MIN_MS) return;
   lastStateHeartbeatAt = now;
-  persistBridgeState({ pid: process.pid, heartbeat_at: now });
+  persistBridgeState({
+    pid: process.pid,
+    heartbeat_at: now,
+    // 【0.7.10 / W1-T3】E2EE 死会话拒绝计数（见 noteE2eeWsReject 的说明）。
+    // 跟着心跳一起落盘：不额外写盘、不加定时器；旧面板/旧插件读到多余字段一律忽略。
+    e2ee_ws_reject_locked: e2eeWsRejectStats.locked,
+    e2ee_ws_reject_disabled: e2eeWsRejectStats.disabled,
+    e2ee_ws_reject_at: e2eeWsRejectStats.lastAt
+  });
+}
+
+/**
+ * 【0.7.10 / W1-T3】E2EE 会话拒绝计数 —— **只做可观测，不改任何协议行为**。
+ *
+ * 生产复盘（2026-10）：WS 升级被拒里 71.8% 是 `e2ee_session_locked`（死会话），涉 163 用户；
+ * 0.7.3+ 已闭环（手机侧清内存会话 + 连续 3 次失败作废交接单 + 每页一次受控 reload；
+ * bridge 侧回 `retryable:true, action:"rehandshake"` 让手机自动重握手）。但「死会话占比
+ * 降到多少」此前只在 nginx/router 侧可见，客户端自己答不出来。
+ *
+ * 这里把本进程的拒绝次数记下来、随心跳写进状态文件（面板「复制诊断信息」会带上一行），
+ * 于是支持包/诊断信息本身就能回答「这台机器还在被死会话打吗」。
+ * 落盘节流 ≥10s：死循环期一台设备一天能拒近万次，绝不能每拒一次就写盘。
+ */
+const e2eeWsRejectStats = { locked: 0, disabled: 0, lastAt: 0 };
+const E2EE_REJECT_FLUSH_MIN_MS = 10_000;
+let lastE2eeRejectFlushAt = 0;
+function noteE2eeWsReject(kind) {
+  if (kind === "disabled") e2eeWsRejectStats.disabled += 1;
+  else e2eeWsRejectStats.locked += 1;
+  const now = Date.now();
+  e2eeWsRejectStats.lastAt = now;
+  if (now - lastE2eeRejectFlushAt < E2EE_REJECT_FLUSH_MIN_MS) return;
+  lastE2eeRejectFlushAt = now;
+  persistBridgeState({
+    e2ee_ws_reject_locked: e2eeWsRejectStats.locked,
+    e2ee_ws_reject_disabled: e2eeWsRejectStats.disabled,
+    e2ee_ws_reject_at: e2eeWsRejectStats.lastAt
+  });
 }
 
 // ---------- 安装来源 / 版本(服务端设备行统计约定) ----------
@@ -1714,6 +1751,7 @@ export async function handleWsOpen(dchOrSend, frame) {
   const tagged = parseWsE2eeParams(path);
   if (tagged) {
     if (!e2ee.enabled) {
+      noteE2eeWsReject("disabled"); // 可观测计数（见 noteE2eeWsReject；不改行为）
       sendWsOpenReject(send, id, 1008, "e2ee_disabled:bridge 未启用端到端加密(请用明文连接)");
       return;
     }
@@ -1721,6 +1759,7 @@ export async function handleWsOpen(dchOrSend, frame) {
     if (!esess || !esess.verified) {
       // 会话可能刚被重启/被 LRU 挤掉：把「可自动重握手」写成机器可读信号，
       // 手机侧据此自动重建会话，而不是弹「请重新解锁」让用户输密码（生产 3964 次/设备）。
+      noteE2eeWsReject("locked");
       console.error(`[bridge] e2ee ws 拒绝(会话未解锁/未验证): ${path}`);
       sendWsOpenReject(send, id, 1008, "e2ee_session_locked:加密会话已失效，需要重新握手", {
         retryable: true,
@@ -3187,6 +3226,9 @@ export function __wsSessionState(id) {
   if (!s) return null;
   return { opened: s.opened === true, pending: s.pending ? s.pending.length : 0, cancelled: s.cancelled === true, failed: s.failed === true };
 }
+
+// test hook：E2EE 拒绝计数快照（W1-T3 可观测字段；状态文件里同名 e2ee_ws_reject_* 字段的来源）
+export function __e2eeRejectStatsForTest() { return { ...e2eeWsRejectStats }; }
 
 // 直接运行(node dsh-bridge.mjs)时启动服务;被测试 import 时只导出协议函数。
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;

@@ -497,6 +497,21 @@ window.__ModuleLoader__.load({
       ".dru-access-tips-title{font-size:11.5px;font-weight:700;color:var(--dru-fg-muted);letter-spacing:.5px}",
       ".dru-access-tip-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;line-height:1.6;color:var(--dru-fg-muted)}",
       ".dru-access-tip-row b{color:var(--dru-fg)}",
+      // ── 📲 激活引导（0.7.10）：把「拿手机做什么」写在远程访问卡最顶部 ──
+      // 视觉上刻意用「浅色实底 + 左侧色条」而不是又一条灰 hint：它是**下一步该做的事**，
+      // 与状态 chip（描述现状）在层级上必须能一眼分开。
+      ".dru-activation-guide{display:flex;flex-direction:column;gap:7px;margin-top:8px;padding:10px 12px;border:1px solid var(--dru-accent);border-left-width:3px;border-radius:8px;background:var(--dru-accent-tint, var(--dru-surface-2))}",
+      ".dru-activation-done{border-color:var(--dru-success);background:var(--dru-success-soft, var(--dru-surface-2))}",
+      ".dru-activation-title{font-size:13px;font-weight:700;color:var(--dru-fg)}",
+      ".dru-activation-step{display:flex;align-items:flex-start;gap:8px;font-size:12.5px;line-height:1.6;color:var(--dru-fg)}",
+      ".dru-activation-n{flex:none;display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;margin-top:1px;border-radius:50%;background:var(--dru-accent-fill);color:var(--dru-on-accent);font:700 11px/1 inherit}",
+      ".dru-activation-n-ok{background:var(--dru-success, var(--dru-accent-fill))}",
+      ".dru-activation-actions{display:flex;flex-wrap:wrap;gap:8px;padding-left:26px}",
+      ".dru-activation-alt{font-size:11.5px;line-height:1.6;color:var(--dru-fg-muted);padding-left:26px;word-break:break-all}",
+      // ── 🔧 连接失败分档（0.7.10）：红色错误条下面是「原因判断 + 该做什么」 ──
+      ".dru-fail-class{margin-top:8px;padding:8px 10px;border:1px solid var(--dru-border-ctl);border-radius:8px;background:var(--dru-surface-2)}",
+      ".dru-fail-class-title{font-size:12.5px;font-weight:700;color:var(--dru-fg)}",
+      ".dru-fail-class-hint{font-size:12px;line-height:1.6;color:var(--dru-fg-muted);margin-top:3px}",
       // 公告列表（设置面板「📣 公告」卡）
       ".dru-ann-list{display:flex;flex-direction:column;gap:8px}",
       ".dru-ann-item{display:flex;align-items:flex-start;gap:8px;width:100%;box-sizing:border-box;text-align:left;background:var(--dru-surface-2);border:1px solid var(--dru-border-soft);border-radius:8px;padding:10px 12px;cursor:pointer;font-family:inherit;color:var(--dru-fg)}",
@@ -1745,6 +1760,189 @@ window.__ModuleLoader__.load({
      */
     var slowConnTrack = { since: 0 };
     var SLOW_CONNECT_HINT_MS = 90000; // 非 online 阶段持续 90s 才认为「明显偏慢」
+    /**
+     * 【0.7.10】「此刻能不能扫码」—— 设备连上即出二维码，反过来也成立：**没连上就先别出**。
+     *
+     * 生产证据（2026-11 复盘，B 段 100 人）：面板反复取一次性密钥（中位 4 次、最高 205 次），
+     * 而本机 bridge 从未在中继注册。也就是说：**二维码一直在签发，但它注定进不去** ——
+     * 用户扫了没反应/被拒，于是刷新页面、再点一次，每刷一次又签一把新密钥，人却被耗在一条不通的路上。
+     * 单看面板完全看不出差别：密钥接口走的是账号 API，不依赖 bridge 是否注册。
+     *
+     * 判据只做「确定」的一档，绝不猜：
+     *   · 旧 node 半没有 connect / 还没拿到首次轮询结果 → 判断不了 → **维持原行为**（true，向后兼容）；
+     *   · 有 phase 且是 online → true（设备已注册到中继，此刻链接确实可用）；
+     *   · 其它 phase（no_runtime/installing/starting/connecting/error…）→ false（先别出二维码）。
+     */
+    function canShowAccessKey(connInfo) {
+      if (!connInfo || !connInfo.phase) return true;
+      return connInfo.phase === "online";
+    }
+    /**
+     * 【0.7.10】连接失败分档：把 node 半既有字段归到 10 类「人话原因 + 该做什么」。
+     *
+     * 为什么要在面板侧再做一层：node 半下发的 error.code/detail 已经很详细（那是给诊断用的），
+     * 但**非技术用户读不出「下一步该点哪」**。生产里 win32 占 install_failed 95.9%，失败原因
+     * 集中在端口占用 / 权限 / PATH(npx) / Node 缺失 / dsh web 没起（上游不通）/ 设备被锁这几类，
+     * 每一类的正确动作不同（重装修复 vs 启动 dsh web vs 升级/解绑）。
+     *
+     * 输入只用**既有**字段（error.code、error.message、detail、upstreamReachable、upstreamError、locked），
+     * 不新增接口、不改契约：字段缺失时逐项跳过，最终落到 unknown 桶 —— 给通用说明，**不编造原因**。
+     * @returns {{bucket:string,title:string,hint:string,repair:boolean,retry:boolean}|null}
+     */
+    function classifyConnectFailure(ci) {
+      if (!ci) return null;
+      var code = String((ci.error && ci.error.code) || "");
+      // node 半 0.7.10+ 直接下发归因码（与匿名遥测同一套枚举）——比正则猜文案准得多；
+      // 旧 host 没有 failCode → 下面继续按 error.message/detail 文本判断（特性检测，非硬依赖）。
+      var fc = String(ci.failCode || "");
+      var text = [
+        (ci.error && ci.error.message) || "",
+        ci.detail || "",
+        ci.upstreamError || ""
+      ].join("\n");
+      // ① 设备额度锁定：不是故障，出路是升级 / 解绑（由锁定态专用 UI 处理，这里只给分类）
+      if (code === "device_locked" || ci.locked) {
+        return {
+          bucket: "locked",
+          title: "本机已被锁定（当前套餐的设备额度已满）",
+          hint: "不用重装：升级 Pro Max、或到手机端「管理电脑」解绑不用的设备，会自动解锁。",
+          repair: false, retry: false
+        };
+      }
+      // ② dsh web 没起 / 端口不对（上游不可达）—— 重装 bridge 也没用，要先让 dsh web 起来
+      if (ci.upstreamReachable === false ||
+          /econnrefused|连接被拒绝|上游.{0,6}(不通|失败)|dsh\s*web.{0,8}(没|未).{0,4}(运行|启动)/i.test(text)) {
+        return {
+          bucket: "upstream",
+          title: "找不到这台电脑上的 dsh web（上游端口）",
+          hint: "① 确认 dsh web 正开着；② 点「一键修复」重装运行环境（会自动重新发现端口）；"
+            + "③ 仍不行：启动 dsh web 前设环境变量 DSH_BRIDGE_UPSTREAM=http://127.0.0.1:<端口>。",
+          repair: true, retry: true
+        };
+      }
+      // ③ 绑定设备硬上限：出路在手机端解绑，不是重装
+      if (code === "device_bind_cap" || fc === "bind_device_limit" || /device_bind_cap|绑定设备数达到上限/.test(text)) {
+        return {
+          bucket: "bind_cap",
+          title: "已绑定的设备数到上限了",
+          hint: "到手机端「管理电脑」解绑不用的设备即可，本机会自动恢复（无需重启）。",
+          repair: false, retry: true
+        };
+      }
+      // ③' 归因码优先（node 半 0.7.10+）：与匿名遥测同一套枚举，比正则猜文案准。
+      //     命中即返回；旧 host 的 fc 为空串 → 直接落到下面的文本判断（向后兼容）。
+      var BY_FAIL_CODE = {
+        node_missing: "node", node_too_old: "node",
+        npx_cmd_unavailable: "path",
+        npm_eacces: "permission",
+        npm_unreachable: "network", registry_timeout: "network",
+        // 端口占用在归因码里没有独立枚举（白名单冻结）：仍然靠文本判断（见 ④）
+        bind_conflict: "bind_cap"
+      };
+      var fcBucket = BY_FAIL_CODE[fc];
+      if (fcBucket === "node") {
+        return {
+          bucket: "node",
+          title: "本机没有 Node.js，或版本太低",
+          hint: "装好 Node.js 20 或更高版本（nodejs.org）后点「一键修复」；装完建议重开一次 DeepSeek Harness。",
+          repair: true, retry: true
+        };
+      }
+      if (fcBucket === "path") {
+        return {
+          bucket: "path",
+          title: "本机找不到安装命令（npx / PATH）",
+          hint: "点「一键修复」会按绝对路径重试；若仍失败：重开一次 DeepSeek Harness（或终端）让 PATH 生效，再点一次。",
+          repair: true, retry: true
+        };
+      }
+      if (fcBucket === "permission") {
+        return {
+          bucket: "permission",
+          title: "没有写入权限（装不进运行目录）",
+          hint: "点「一键修复」重装到可写目录；若装了安全软件（如杀毒/EDR），请允许 dsh-remote 写入用户目录后重试。",
+          repair: true, retry: true
+        };
+      }
+      if (fcBucket === "network") {
+        return {
+          bucket: "network",
+          title: "网络或软件源连不上",
+          hint: "检查代理 / 防火墙后点「一键修复」（会自动换源重试）；公司网络可先连手机热点试一次。",
+          repair: true, retry: true
+        };
+      }
+      if (fcBucket === "bind_cap") {
+        return {
+          bucket: "bind_cap",
+          title: "已绑定的设备数到上限了",
+          hint: "到手机端「管理电脑」解绑不用的设备即可，本机会自动恢复（无需重启）。",
+          repair: false, retry: true
+        };
+      }
+      // ④ 端口被占用
+      if (/eaddrinuse|address already in use|端口.{0,8}(占用|冲突|被占)/i.test(text)) {
+        return {
+          bucket: "port",
+          title: "端口被别的程序占用了",
+          hint: "点「一键修复」会重新安装并自动换一个可用端口；仍冲突可重启电脑后再试。",
+          repair: true, retry: true
+        };
+      }
+      // ⑤ 权限不足（只读目录 / 沙箱拦截）
+      if (/eacces|eperm|permission denied|权限不足|只读文件系统|read-only file system/i.test(text)) {
+        return {
+          bucket: "permission",
+          title: "没有写入权限（装不进运行目录）",
+          hint: "点「一键修复」重装到可写目录；若装了安全软件（如杀毒/EDR），请允许 dsh-remote 写入用户目录后重试。",
+          repair: true, retry: true
+        };
+      }
+      // ⑥ Node.js 缺失 / 版本过低（放在 PATH 之前：「'node' 不是内部或外部命令」要归到 Node 缺失，
+      //    而不是泛泛的 PATH 问题 —— 两者的修复动作不同：装 Node vs 修 PATH）
+      if (/node_missing|node_too_old|找不到\s*node|node\.js.{0,8}(未安装|缺失|版本过低)|需要\s*node\s*20|['"]?node['"]?\s*(不是内部|not recognized)|spawn\s+node/i.test(text)) {
+        return {
+          bucket: "node",
+          title: "本机没有 Node.js，或版本太低",
+          hint: "装好 Node.js 20 或更高版本（nodejs.org）后点「一键修复」；装完建议重开一次 DeepSeek Harness。",
+          repair: true, retry: true
+        };
+      }
+      // ⑦ PATH / npx：Windows 上最常见的「命令都调不起来」
+      if (/npx_cmd_unavailable|spawn.{0,8}\.cmd|找不到\s*npx|npx['"]?[^a-z]{0,6}(不可用|没找到|不是内部|not recognized)|不是内部或外部命令/i.test(text)) {
+        return {
+          bucket: "path",
+          title: "本机找不到安装命令（npx / PATH）",
+          hint: "点「一键修复」会按绝对路径重试；若仍失败：重开一次 DeepSeek Harness（或终端）让 PATH 生效，再点一次。",
+          repair: true, retry: true
+        };
+      }
+      // ⑧ 网络 / 软件源
+      if (/npm_unreachable|registry_timeout|enotfound|eai_again|etimedout|连不上软件源|网络.{0,6}(不通|异常)/i.test(text)) {
+        return {
+          bucket: "network",
+          title: "网络或软件源连不上",
+          hint: "检查代理 / 防火墙后点「一键修复」（会自动换源重试）；公司网络可先连手机热点试一次。",
+          repair: true, retry: true
+        };
+      }
+      // ⑨ 反复拉不起来 / 安装卡住：重装是对的
+      if (code === "bridge_wedged" || code === "install_stuck" || code === "launchd_crash" || code === "bind_failed") {
+        return {
+          bucket: "runtime",
+          title: "后台服务的运行环境有问题（反复启动失败）",
+          hint: "点「一键修复」重装运行环境；装完会自动启动，不用手动跑命令。",
+          repair: true, retry: true
+        };
+      }
+      // ⑩ 兜底：不编原因，给通用可操作项
+      return {
+        bucket: "unknown",
+        title: "连接没有建立起来",
+        hint: "点「一键修复」重装运行环境；仍不行点「复制诊断信息」发给我们，里面已经有定位所需的全部信息。",
+        repair: true, retry: true
+      };
+    }
     // ── 事实约定常量（🔒 只写线上真值，一个字都不编）─────────────────────────────
     // 邀请奖励：线上 public-config 下发 invite_rule { n: 1, days: 3 }。
     //   此处只在 public-config 取不到时（旧 node 半 / 请求失败）兜底，
@@ -3412,9 +3610,18 @@ window.__ModuleLoader__.load({
         if (view !== "home" || mode !== "saas" || !loggedIn) return undefined;
         cancelAkeyRetry(); cancelDevRetry();
         akeyRetry.attempt = 0; devRetry.attempt = 0;
-        loadAccessKey();
+        // 【0.7.10】设备还没连上就先不签发二维码/链接（见 canShowAccessKey 的长注释）：
+        // 生产里 100 人反复取 key（最高 205 次）而 bridge 从未注册 —— 每次刷新/重试都在给自己
+        // 签一把「扫了也进不去」的新密钥。连上那一刻由 pollConnect() 自动补取，用户无需刷新。
+        // 旧 node 半没有 connect 字段时 canShowAccessKey → true，行为与改动前完全一致。
+        if (canShowAccessKey(conn || (st && st.connect) || null)) loadAccessKey();
+        else setAkey(null);
+        // 已授权设备列表照旧拉：它同时也是「手机有没有登录过」的唯一证据（激活引导据此收尾）。
         loadDevices();
-        var rotateIv = setInterval(function () { loadAccessKey(); }, KEY_AUTO_REFRESH_MS);
+        var rotateIv = setInterval(function () {
+          // 轮换同理：非 online 阶段不签发（connPhaseRef 由 pollConnect 维护，不依赖渲染闭包）
+          if (!connPhaseRef.v || connPhaseRef.v === "online") loadAccessKey();
+        }, KEY_AUTO_REFRESH_MS);
         return function () {
           clearInterval(rotateIv);
           cancelAkeyRetry();
@@ -3496,6 +3703,12 @@ window.__ModuleLoader__.load({
             } else if (devSessions !== null) {
               refreshDeviceList(); // 手机扫码后设备列表自动出现，无需刷新页面
             }
+          } else if (prev === "online") {
+            // 【0.7.10】从「已连接」掉下来（bridge 退出 / 被限流 / 设备被锁）：二维码与链接此刻
+            // 一定不可用 —— 立刻撤掉，别让用户对着一个扫了也进不去的码反复重试。
+            // 重新连上时上面的 online 分支会自动补回，全程不需要刷新页面。
+            setAkey(null);
+            setAkeyMsg(null);
           }
         }).catch(function (e) {
           // 【0.6.7】原来这里是空 catch（"轮询失败静默：下一轮自动重试"）。在 Windows 上
@@ -3528,6 +3741,27 @@ window.__ModuleLoader__.load({
           setMsg("ok", "已重新开始连接，正在自动重试…");
         }).catch(function (e) {
           setMsg("err", "重试失败：" + e.message);
+        }).finally(function () { setBusy(""); });
+      };
+
+      /**
+       * 【0.7.10】「一键修复 / 重装运行环境」—— 与「🔄 版本与更新」卡里的同一个动作
+       * （POST /dsh-remote/self/update，node 半重跑安装脚本并拉起 bridge）。
+       * 为什么在连接失败块里也放一个：用户看到错误时最该点的就是它，让他往下翻另一张卡
+       * 找同名按钮是纯粹的摩擦（生产诊断里"点了没反应/不知道点哪"正是主要抱怨）。
+       * 旧 node 半没有该路由 → 404 → 退回一句人话（绝不静默失败）。
+       */
+      var repairConnect = function () {
+        setBusy("connect-repair");
+        setAkeyMsg(null);
+        post("/dsh-remote/self/update").then(function (b) {
+          if (!b || !b.ok) {
+            var why = (b && (b.error || b.detail || b.message)) || "服务端没有接受修复请求";
+            throw new Error(why);
+          }
+          setAkeyMsg({ kind: "ok", text: "已开始重装运行环境（首次约 1~2 分钟，装完会自动启动）。进度会显示在「🖥 后台服务」卡。" });
+        }).catch(function (e) {
+          setAkeyMsg({ kind: "err", text: "没能启动一键修复：" + e.message + "（可点「复制诊断信息」把详情发给我们）" });
         }).finally(function () { setBusy(""); });
       };
 
@@ -4715,6 +4949,75 @@ window.__ModuleLoader__.load({
               : serviceRunning ? "已连接（可远程访问）" : "等待设备连接";
         var dotOn = loggedInSaaS ? (connInfo ? connOnline : serviceRunning) : false;
         var dotCls = "dru-dot " + (dotOn ? "dru-dot-on" : "dru-dot-off");
+        // 【0.7.10】「设备连上即出二维码」的另一半：**没连上就别出**（见 canShowAccessKey）。
+        // 旧 node 半 / 首轮轮询未回来时 canScan=true，行为与改动前一致。
+        var canScan = canShowAccessKey(connInfo);
+        var showKey = hasKey && canScan;
+        // 手机端地址（用于"不扫码也能用"的第二种入口）：node 半 /status 下发的 remoteUrl（= app_url），
+        // 旧 host 没有这个字段时只用既有兜底，绝不硬编码域名。
+        var appUrl = String((st && st.remoteUrl) || (pub && pub.app_url) || "");
+        // 是否已经有一台手机登录过这台电脑（= 激活真的发生了）。只认未取消配对的会话。
+        // 这是「设备 online 但手机从未登录」（生产 C1 129 人）唯一可由面板侧观测的完成信号。
+        var activeSessions = (devSessions || []).filter(function (s) { return s && !s.revoked_at; });
+        var activated = activeSessions.length > 0;
+        var lastActiveAt = activeSessions.reduce(function (a, s) {
+          var t = toMs(s && s.last_seen_at) || toMs(s && s.created_at) || 0;
+          return t > a ? t : a;
+        }, 0);
+
+        /**
+         * 【0.7.10】「3 步用上手机」激活引导 —— 放在「📱 远程访问」卡最顶部（置顶于状态 chip 之前）。
+         *
+         * 为什么加这块（2026-11 复盘，业主原话「设备连上即出二维码，先确认一下」）：
+         *   二维码链路其实**早就有**（access-key → qr_data_url → 25s 自动轮换 → 在线自动重取），
+         *   缺的不是功能，是**收尾**：安装引导停在「注册/登录手机号」，用户在电脑端登录完就以为结束了，
+         *   而二维码只存在于这个面板里、且不知道要拿手机来扫 —— 于是 129 人设备在线却从未在手机端登录。
+         * 这段只做一件事：把「现在该拿手机做什么」写在第一屏，并用 mobile_sessions 自动确认完成。
+         *
+         * 状态机（只用既有 state，不新增 hook）：
+         *   · 未登录 / 故障 / 锁定 → 不渲染（交给账号卡与连接块，避免两处抢话）；
+         *   · 已激活（存在未取消配对的手机会话）→ 一行绿色「已激活」；
+         *   · 其余 → 三步：① 本机连接（自动）② 手机扫码/复制链接 ③ 手机打开即完成（自动确认）。
+         */
+        function renderActivationGuide() {
+          if (!loggedInSaaS) return null;
+          if (connPhase === "error" || connLocked) return null;
+          if (activated) {
+            return h("div", { className: "dru-activation-guide dru-activation-done" },
+              h("div", { className: "dru-activation-title" }, "✅ 已激活：手机已经登录过这台电脑"),
+              h("div", { className: "dru-hint" },
+                (lastActiveAt ? "最近活跃 " + fmtDT(lastActiveAt) + "。" : "")
+                + "要给另一台手机用，扫下方二维码或复制链接即可（同一台手机重复扫只更新授权，不新增设备）。")
+            );
+          }
+          var rows = [];
+          rows.push(h("div", { className: "dru-activation-step" },
+            h("span", { className: "dru-activation-n" + (connOnline ? " dru-activation-n-ok" : "") }, connOnline ? "✓" : "1"),
+            h("span", null, connOnline
+              ? "本机已连接（设备已注册到中继）"
+              : "本机正在自动连接：" + (connText || "准备中…") + "（不用操作，连上后这一步会变成 ✓）")));
+          rows.push(h("div", { className: "dru-activation-step" },
+            h("span", { className: "dru-activation-n" }, "2"),
+            h("span", null, showKey
+              ? "用手机摄像头/微信扫下面的二维码；或点「复制」把链接发到手机上打开"
+              : "连上后这里会自动出现二维码/链接（不用刷新页面）")));
+          if (showKey) {
+            rows.push(h("div", { className: "dru-activation-actions" },
+              h("button", { type: "button", className: "dru-btn dru-btn-primary", disabled: akeyBusy, onClick: copyKeyUrl },
+                copiedKey ? "✅ 已复制，发到手机打开即可" : "📋 复制链接发到手机"),
+              h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: akeyBusy, onClick: openKeyUrl }, "直接打开")));
+          }
+          if (appUrl && /^https?:\/\//i.test(appUrl)) {
+            rows.push(h("div", { className: "dru-activation-alt" },
+              "不扫码也可以：手机浏览器打开 " + appUrl + " ，用同一手机号登录后在设备列表里选这台电脑。"));
+          }
+          rows.push(h("div", { className: "dru-activation-step" },
+            h("span", { className: "dru-activation-n" }, "3"),
+            h("span", null, "手机打开后即完成登录 —— 这一步不用做任何事，成功后这里会自动变成 ✅")));
+          return h("div", { className: "dru-activation-guide" },
+            h("div", { className: "dru-activation-title" }, "📲 3 步用上手机"),
+            rows);
+        }
 
         // 【0.6.9】「连接偏慢」判定（只用既有字段 + 本地计时，不新增/不假设后端字段）：
         //   ① 服务端下发 attempts ≥ 3（已经自动重试多次）；② 阶段文案里出现限速/带宽/较慢类提示；
@@ -4828,6 +5131,16 @@ window.__ModuleLoader__.load({
           if (phase === "error") {
             rows.push(h("div", { className: "dru-msg dru-msg-err", style: { marginTop: 6 } },
               (isLocked ? "🔒 " : "⚠️ ") + ((connError && connError.message) || connText)));
+            // 【0.7.10】失败分档：把「哪一类问题 + 该点哪个按钮」写在错误原文之前。
+            // 原始 message/detail 是给诊断用的（含 launchd/pgrep/EADDRINUSE 这类术语），
+            // 非技术用户读不出下一步 —— 生产里 win32 占 install_failed 95.9%，失败原因集中在
+            // 端口占用 / 权限 / PATH(npx) / Node 缺失 / 上游(dsh web)不通 / 设备被锁这几类。
+            var cls = isLocked ? null : classifyConnectFailure(connInfo);
+            if (cls) {
+              rows.push(h("div", { className: "dru-fail-class" },
+                h("div", { className: "dru-fail-class-title" }, "🔧 原因判断：" + cls.title),
+                h("div", { className: "dru-fail-class-hint" }, cls.hint)));
+            }
             if (connInfo.detail) rows.push(h("div", { className: "dru-hint", style: { marginTop: 4 } }, connInfo.detail));
             if (!isLocked && connInfo.nextRetryInMs > 0) {
               rows.push(h("div", { className: "dru-hint", style: { marginTop: 4 } },
@@ -4839,8 +5152,17 @@ window.__ModuleLoader__.load({
                 h("button", { type: "button", className: "dru-btn dru-btn-primary", onClick: openLockedUpgrade }, "🚀 升级 Pro Max"),
                 h("button", { type: "button", className: "dru-btn dru-btn-ghost", onClick: copyDiagnostics }, copiedDiag ? "已复制" : "复制诊断信息")));
             } else {
+              // 主行动按分档给：能靠重装解决的 → 「一键修复 / 重装运行环境」（与「版本与更新」卡同一个动作，
+              // 但放在失败原因旁边，用户不必往下翻找）；上游不通/绑定上限 → 「重试」为主，修复为次。
+              var primaryIsRepair = !cls || cls.repair === true;
               rows.push(h("div", { className: "dru-actions", style: { marginTop: 8 } },
-                h("button", { type: "button", className: "dru-btn dru-btn-primary", disabled: busy !== "", onClick: retryConnect }, busy === "connect-retry" ? "重试中…" : "重试"),
+                primaryIsRepair
+                  ? h("button", { type: "button", className: "dru-btn dru-btn-primary", disabled: busy !== "", onClick: repairConnect }, busy === "connect-repair" ? "修复中…" : "🔧 一键修复 / 重装运行环境")
+                  : h("button", { type: "button", className: "dru-btn dru-btn-primary", disabled: busy !== "", onClick: retryConnect }, busy === "connect-retry" ? "重试中…" : "重试"),
+                // 「重试」只在修复是主行动时作为次行动出现 —— 否则会和主按钮重复两个同名按钮。
+                primaryIsRepair
+                  ? h("button", { type: "button", className: "dru-btn dru-btn-ghost", disabled: busy !== "", onClick: retryConnect }, busy === "connect-retry" ? "重试中…" : "重试")
+                  : null,
                 h("button", { type: "button", className: "dru-btn dru-btn-ghost", onClick: copyDiagnostics }, copiedDiag ? "已复制" : "复制诊断信息")));
             }
             rows.push(h("div", { className: "dru-hint", style: { marginTop: 6 } },
@@ -4885,6 +5207,9 @@ window.__ModuleLoader__.load({
             h("span", null, e.text));
         }
         return card("📱 远程访问", [
+          // 【0.7.10】激活引导置顶：二维码链路的**收尾**（见 renderActivationGuide 的长注释）。
+          // 放在状态 chip 之前 = 「设备连上后第一屏看到的就是拿手机做什么」，而不是先读一堆技术状态。
+          renderActivationGuide(),
           // 【0.6.18 面板重排】状态性描述（连接状态 + E2EE）从"各自独占一行"收敛成**一行内的 chip**：
           //   · 用 flex-wrap 而不是硬挤：窄屏（手机镜像页也是同一份面板）自动换行，绝不横向溢出；
           //   · 文字标签始终在（点 + 文案），颜色只是辅助，不靠颜色单独表意；
@@ -4912,7 +5237,10 @@ window.__ModuleLoader__.load({
                   ? h("button", { type: "button", className: "dru-linkbtn", style: { marginLeft: 8 }, disabled: akeyBusy, onClick: akeyMsg.retry }, akeyBusy ? "重试中…" : "立即重试")
                   : null)
             : null,
-          hasKey ? h("div", null, [
+          // 【0.7.10】二维码/链接只在**设备确实连上**（或旧 host 无法判断 phase）时出现：
+          // 生产里 100 人反复取 key 而 bridge 从未注册 —— 那时候面板画出来的码扫了也进不去。
+          // 没连上时给「等它自动连上」的说明，而不是一个能点却没用的「生成访问链接」。
+          showKey ? h("div", null, [
             h("div", { className: "dru-url big", style: { marginTop: 8 } },
               h("span", null, akey.url),
               h("button", { type: "button", onClick: copyKeyUrl }, copiedKey ? "已复制" : "复制")
@@ -4934,14 +5262,28 @@ window.__ModuleLoader__.load({
                 ),
                 // 【0.6.18】原来这里只有一行 hint，右列下方空着一大片 —— 现在改成**提醒区**：
                 // 未读公告入口 / 重启提醒 / 使用提示集中在此（引导用户"下一步做什么"，而不是散落各处）。
-                renderAccessTips(hasKey)
+                renderAccessTips(showKey)
               )
             )
+          ]) : !loggedInSaaS ? h("div", null, [
+            h("div", { className: "dru-hint", style: { marginTop: 6 } },
+              "登录下方「🔑 账号」卡片中的手机号账号后，即可生成一次性访问链接，让手机或另一台电脑远程使用同一份 dsh web。"),
+            h("div", { className: "dru-actions", style: { marginTop: 8 } },
+              h("button", { type: "button", className: "dru-btn dru-btn-primary", disabled: akeyBusy, onClick: loadAccessKey },
+                akeyBusy ? "生成中…" : "生成访问链接")
+            )
+          ]) : !canScan ? h("div", null, [
+            // 已登录、但设备还没连上（或刚掉线）：这一档**不给**「生成访问链接」。
+            // 签发一把进不去的密钥只会让用户多试几次、多签几把（见 canShowAccessKey 的生产证据）。
+            h("div", { className: "dru-hint", style: { marginTop: 6 } },
+              "设备还没连上（" + (connText || "正在自动连接…") + "）：连上后二维码/访问链接会自动出现在这里，"
+              + "不需要刷新页面，也不需要重复点任何按钮。"),
+            h("div", { className: "dru-actions", style: { marginTop: 8 } },
+              h("button", { type: "button", className: "dru-btn dru-btn-primary", disabled: busy !== "", onClick: retryConnect }, busy === "connect-retry" ? "检测中…" : "立即检测连接"),
+              h("button", { type: "button", className: "dru-btn dru-btn-ghost", onClick: copyDiagnostics }, copiedDiag ? "已复制" : "复制诊断信息"))
           ]) : h("div", null, [
             h("div", { className: "dru-hint", style: { marginTop: 6 } },
-              loggedInSaaS
-                ? "正在生成一次性访问链接…（手机或另一台电脑扫码/打开即可进入）"
-                : "登录下方「🔑 账号」卡片中的手机号账号后，即可生成一次性访问链接，让手机或另一台电脑远程使用同一份 dsh web。"),
+              "正在生成一次性访问链接…（手机或另一台电脑扫码/打开即可进入）"),
             h("div", { className: "dru-actions", style: { marginTop: 8 } },
               h("button", { type: "button", className: "dru-btn dru-btn-primary", disabled: akeyBusy, onClick: loadAccessKey },
                 akeyBusy ? "生成中…" : "生成访问链接")

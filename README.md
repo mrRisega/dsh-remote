@@ -9,6 +9,9 @@
   <img alt="License" src="https://img.shields.io/badge/License-PolyForm%20Noncommercial-2ea44f?style=flat-square">
 </p>
 
+> **⚠️ 同名澄清（先看这里）**：本产品**不是** [flymysql/dsh-remote](https://github.com/flymysql/dsh-remote)——那个项目是把任意 SSH 机器变成 DSH 工作区（远程 SSH 工作区），与本产品无关。npm 上的 `dsh-remote` 包也不是本产品。
+> 认准 **`mrRisega/dsh-remote`** 仓库：CLI 根包 **`@mrrisega/dsh-remote`**（安装器）、dsh web 插件子包 **`dsh-remote-web`**。安装请用下面这条命令，不要用 `npx dsh-remote`。
+
 > **离开电脑也能用手机 100% 全功能接管电脑上的 DeepSeek Harness（`dsh web`）**——发消息、看工具执行、审批权限、改设置、管凭据，体验与坐在电脑前一致。免内网穿透，局域网即连。
 >
 > **一条命令安装**：`npx @mrrisega/dsh-remote`
@@ -22,7 +25,7 @@
 - **两端体验一致**：手机 PWA 还原电脑端界面；电脑端 `dsh web` 侧栏新增「📱 远程访问」入口。
 - **一条命令 + 开机自启**：自动装好 bridge 与 dsh web 插件，并按平台配置自启动与崩溃自愈（macOS launchd / Linux systemd --user / Windows 任务计划程序）。
 - **两种模式随时切**：官方云服务（手机号登录、含超管后台）或自建 relay（访问密钥认证），面板一键切换，互不影响。
-- **插件市场可装**：在 dsh 插件市场搜索 **`dsh-remote-web`** 即可；桌面运行环境由插件在后台自动补齐。
+- **插件市场可装**：在 dsh 插件市场搜索 **`dsh-remote-web`**（npm 子包名）即可；部分市场条目显示名是 `dsh-remote`，认准作者 **mrRisega** 即可；桌面运行环境由插件在后台自动补齐。
 
 ```
 手机浏览器
@@ -55,7 +58,11 @@
 | 许可证 | 本仓库（见下文 License） | 商业授权，闭源 |
 
 > 👉 **不想自建服务器 / 没有公网 IP？** 直接用**官方云服务版**（无公网、4G、异地都稳定，多设备 + 超管后台）：
-> **https://n.risegao.cn:13443/app/** —— 免费版 + PRO ¥19/月 + Pro Max ¥49/月，新用户送 7 天 PRO。
+> **https://n.risegao.cn:13443/app/**
+>
+> **价格与套餐以官网 / 面板实时显示为准**（本节不再硬编码具体价格，避免改价后文案过期）：
+> 免费档可用；付费为 **PRO（¥20/月起）** 与 **Pro Max**（更多设备 + 优先线路），支持**季付 9 折、年付 8 折**。
+> 托管免费档有**月度额度 + 限速**，具体额度以官网 / 面板实时显示为准；**自建 relay 与局域网直连不受托管额度限制**。
 > 客户端仍是同一条安装命令，登录后选「云服务模式」即可。
 
 ## 安装
