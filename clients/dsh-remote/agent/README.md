@@ -164,11 +164,21 @@ await runtime.stop();
 - 本机实测：`codex-cli 0.150.1`，`--json` / `--output-schema` / `--sandbox` / `--approve-for-me` 均存在，
   但 **没有"审批回调外部程序"的开关** ⇒ Codex 走 `exec` 时只能 `mode:"notify-only"`。
 
+**已做（M2 第 5 周：四家接入骨架齐）**
+- `gemini.mjs`：Gemini CLI 的 **ACP（JSON-RPC over stdio）** 映射（`session/update` 全变体、`tool_call*`、
+  `session/request_permission`、`stopReason`），`detectGemini` 实测 ACP 能力位
+  （本机 `gemini 0.31.0` 的开关是 **`--experimental-acp`**，不是文档里的 `--acp`）。
+- `opencode.mjs`：OpenCode 的 **HTTP/SSE** 映射（`message.part.updated`、`permission.updated/replied`、
+  `session.idle/status/error`）+ **SSE→事件桥接**（`createSseParser` / `attachOpenCodeSse`），`detectOpenCode`。
+- `agent-e2e-codex.mjs` + **Codex 真实校准 1 次**：实得 6 行 JSONL、`unknown=0`；发现并修掉两处差异
+  （error item 可早于 turn.started；error.message 是嵌套 JSON 字符串 → `normalizeErrorMessage`）。
+
 **未做（后续周）**
 - 手机端决策来源（`decide` 现在缺省 fail-closed）、SessionStore 落盘、`/_agent` 隧道挂载、E2EE、微信 sink、插件面板入口
-- Codex **真实 `exec --json` 实跑校准**（映射依据是官方文档样本；未核实项见 `codex.mjs` 文件头）
+- Codex 正常路径校准（本机 model 与账号不兼容 → 只拿到错误路径；修好 model 后可复跑 `agent-e2e-codex.mjs`）
 - Codex 审批（需 `codex app-server`，experimental；exec 模式做不到）
-- Gemini CLI（ACP）与 OpenCode（HTTP）驱动（下一步验什么见 §9.3/§9.4）
+- Gemini ACP 真实握手（`initialize` / 版本代际 / `request_permission` 回写）与 OpenCode 真实流校准
+  （本机未安装 opencode；两家都只有"按官方类型定义映射"）
 - Windows 真机验证（`taskkill /T /F` 的实际效果、中文/空格路径）
 - `allow_always` / `updatedPermissions`（会写用户 settings，风险大于收益，M2 不做）
 - 企业 managed settings 检测（M3）
@@ -269,43 +279,111 @@ DSH_AGENT_E2E_KEEP=1 DSH_AGENT_E2E_DUMP_RAW=1 node clients/dsh-remote/agent/agen
 - 每个用例都在**临时项目**里写 `permissions.ask` 强制升权，并把探测用的 `homeDir` 指向空目录，
   避免"用户级 allow 规则吞掉审批"（第 1 周报告 §1.2）与"既有钩子让位"两种干扰。
 
-## 9. 接入清单：接第二家要改哪 3 处、**不动**哪 2 处
+### 8.5 Gemini CLI（ACP）映射要点
+
+ACP 的 stdio 规定**一行一条 JSON-RPC**（官方 transports 原文），所以**直接复用 `createJsonlDriver`**，
+只用换 `mapLine`（`createGeminiDriver`）。
+
+| ACP 消息 | 归一化事件 | 说明 |
+|---|---|---|
+| `session/update` → `agent_message_chunk` | `message.delta(final:false)` | ACP 是流式增量，按 `messageId` 拼 |
+| `session/update` → `agent_thought_chunk` | `status(thinking)` | 只带 `textBytes`，推理内容不落 |
+| `session/update` → `tool_call` | `tool.call` | `kind` 直接用 ACP 词表；`title`/`rawInput` 不落 |
+| `session/update` → `tool_call_update`（completed/failed） | `tool.result` | `in_progress` 增量忽略（避免重复） |
+| `session/update` → `plan` / `notice` / `usage_update` | `status(plan/notice/usage)` | 其余变体（`available_commands_update` 等）**忽略而非 unknown** |
+| `session/request_permission` | `status(waiting_approval)` | JSON-RPC `id` 即回执 id；只暴露 `optionKinds`，不落 title/命令 |
+| `session/prompt` 响应 `stopReason` | `turn.end` | end_turn→completed / max_tokens→max-tokens / max_turn_requests→max-turns / refusal→refused / cancelled→aborted |
+| JSON-RPC `error` 响应 | `status(error, scope=jsonrpc)` | 精确归属 prompt 需状态机（下一步） |
+
+**依据**：ACP v1 的 [prompt-turn](https://agentclientprotocol.com/protocol/v1/prompt-turn)、
+[tool-calls](https://agentclientprotocol.com/protocol/v1/tool-calls)、
+[transports](https://agentclientprotocol.com/protocol/v1/transports)；
+本机 `gemini --help`（`0.31.0`）实测 ACP 开关为 `--experimental-acp`。
+
+### 8.6 OpenCode（HTTP/SSE）映射与 **SSE 桥接**
+
+OpenCode 的事件不是 stdout，而是 `GET /event` 的 **SSE**。桥接做法（`attachOpenCodeSse`）：
+
+```
+HTTP SSE 流 ──stream.on("data")──▶ createSseParser.push(chunk)   // 分帧：
+
+ 分隔、data: 多行拼接、: 心跳
+                                  └▶ {event, data} ──JSON.stringify(data)──▶ createJsonlDriver.writeLine
+                                                       // 之后 seq/统计/sink/unknown 全部复用通用驱动
+```
+
+| SSE 事件（SDK v1.19.5 类型） | 归一化事件 | 说明 |
+|---|---|---|
+| `server.connected` | `status(connected)` | |
+| `session.status`（busy/idle/retry） | `status(working/idle/retrying)` | |
+| `session.idle` | `turn.end(completed)` | 文档语义：空闲=回合结束 |
+| `session.error` | `turn.end(error)` | 带 errorName + message 预览 |
+| `message.part.updated`（text） | `message.delta` | 有 `delta` 用增量（final=false），否则全文（final=true，按 part.id 去重） |
+| `message.part.updated`（reasoning） | `status(thinking)` | 只带 `textBytes` |
+| `message.part.updated`（tool） | `tool.call` / `tool.result` | state.status pending/running→call；completed/error→result；input/output 只落字节数/截断预览 |
+| `permission.updated` | `status(waiting_approval)` | **不落 title/pattern**（可能含命令）；真回执走 `POST /session/:id/permissions/:permissionID` |
+| `permission.replied` | `status(approval_replied)` | |
+| 其余（`message.updated`/`session.created`/`file.edited`/`todo.updated`/`pty.*`…） | 忽略 | 明确列在 `OPENCODE_IGNORED_EVENTS`，不计 unknown |
+
+**依据**：`@opencode-ai/sdk@1.19.5` 的 `dist/gen/types.gen.d.ts`（官方发布产物，逐字对照 `Event`/`Part`/`ToolState`/`Permission`）
++ [opencode.ai/docs/server](https://opencode.ai/docs/server/)。
+
+### 8.7 Codex 真实校准脚本（默认跳过）
+
+```bash
+export DSH_AGENT_E2E_CODEX=1
+node clients/dsh-remote/agent/agent-e2e-codex.mjs     # 恰好 1 次 `codex exec --json`（只读沙箱）
+```
+- 断言：真实流喂 `createCodexDriver` 后 **unknown=0 / badJson=0 / 有 turn 边界**；
+- 退出码：`0` 映射通过（**即使 CLI 因账号/模型配置退出非 0**，只要流合法就算校准成功）、`1` 断言失败、`2` 环境不具备；
+- 本机首次实测：CLI 退出 1（`gpt-6.1-sol` 不被当前 ChatGPT 账号支持），但 6 行流 `unknown=0`，
+  并暴露两处差异（已在 `codex.mjs` 修掉/记录）；正常路径待修好 model 后再跑一次。
+
+## 9. 接入清单：四家 × 能力位 × 审批通道 × 下一步
 
 > 这是本轮"驱动可复用"的验收口径：Codex 接入**没有**改 events 词表、没有改审批桥、没有改 index。
 
-### 9.1 只改这 3 处
+### 9.1 四家能力表（2026-11 实测/官方依据）
 
-| # | 改什么 | 新文件位置 | Codex 的实际做法 |
+| Agent | 驱动 | 结构化输出 | 审批通道 | 需要外部审批通道？ | 当前接入状态 | 下一步验证动作 |
+|---|---|---|---|---|---|---|
+| **Claude Code** | jsonl（stream-json） | ✅ `--output-format stream-json` | `PermissionRequest` 钩子（http/command） | ✅ 是（钩子→PermissionBridge） | **真实联调 3/3**，`mode:approval` | Windows 真机；版本阈值二分（2.1.195❌/2.1.318✅） |
+| **Codex CLI** | jsonl（`exec --json`） | ✅ `--json` / `--output-schema` | ❌ exec 无外部审批开关（只有 `--approve-for-me` 自动审查/bypass）；审批在 `app-server`（experimental） | **exec 不需要**（只通知）；要审批需改接 app-server | 骨架 + **真实校准 1 次**（unknown=0，仅错误路径），`mode:notify-only` | 修本机 model 后跑 `agent-e2e-codex.mjs` 校准正常路径；实测 `codex app-server` 的审批请求形状 |
+| **Gemini CLI** | ACP（JSON-RPC over stdio，一行一条） | ✅ 官方 `--acp`（本机 0.31.0 为 `--experimental-acp`） | `session/request_permission`（**协议内双向请求**，我们作为 ACP client 必须回 outcome） | ❌ 不需要外部钩子（审批在协议内） | 骨架 + 本机探测通过（`mode:approval`，`approvalChannel:acp-jsonrpc`），**未真实握手** | `gemini --experimental-acp` 握手：`initialize` 版本/能力协商、`request_permission` 回写、fs 代理显式拒绝 |
+| **OpenCode** | HTTP + SSE | ✅ `opencode serve` + `GET /event` | `permission.updated` 事件 + `POST /session/:id/permissions/:permissionID` | ❌ 不需要外部钩子（HTTP 端点直接答） | 骨架 + **SSE 桥接实现**，本机未安装（探测 SKIP） | 装 `opencode` 后：`serve` 认证、SSE 真实事件形状、permission response 枚举、`prompt_async` 时序 |
+
+### 9.2 接第二家要改的 3 处
+
+| # | 改什么 | 位置 | 本轮实例 |
 |---|---|---|---|
-| ① **mapLine** | 把该 CLI 的结构化输出映射成 5 类事件 | `agent/<harness>.mjs` 的 `mapXxxObject(obj, ctx)` | `codex.mjs` 的 `mapCodexObject`；有状态的用 `createXxxMapper()`（跨行去重） |
-| ② **CLI 探测 + 能力声明** | 找 CLI、`--version`、从 `--help` 探能力位 | 同文件的 `detectXxx()` | `detectCodex()`；**能力位必须实测、探不到就报 false**，不许默认 true |
-| ③ **启动参数与生命周期** | exec 参数、会话续接、中断 | 挂载处（未来 index/bridge）+ `proc.mjs` 的 spawn/杀树 | `codex exec --json`；续接方式【未核实】；进程治理复用 `proc.mjs` |
+| ① **mapLine** | 该 CLI 的结构化输出 → 5 类事件 | `agent/<harness>.mjs` | `mapCodexObject` / `mapGeminiObject` / `mapOpenCodeObject` |
+| ② **CLI 探测 + 能力声明** | 找 CLI、`--version`、从 `--help` 探能力位（**探不到就 false，不许默认 true**） | 同文件 `detectXxx()` | `detectCodex` / `detectGemini` / `detectOpenCode` |
+| ③ **传输形态差异** | stdout 行 / SSE / JSON-RPC 的"最后一公里" | 同文件 | ACP 与 jsonl **同构**（直接复用驱动）；OpenCode 需 `createSseParser`+`attachOpenCodeSse` 桥接 |
 
-### 9.2 不许动的 2 处（动了就说明抽象漏了）
+### 9.3 **不许动**的 2 处（动了就说明抽象漏了）
 
 | # | 不动什么 | 为什么 |
 |---|---|---|
-| ① **事件词表 + 通用驱动 + sink**（`events.mjs` 的 `EVENT_TYPES` / `createJsonlDriver` / `createJsonlSink` / 隐私规则） | 手机端/微信/审计都按这 5 类消费；每接一家改一次 = 每个下游都要跟着改 |
-| ② **审批链路**（`index.mjs` 的 `PermissionBridge` 接线、fail-closed、让位逻辑） | 安全语义只有一套。**若该 harness 无法把审批回调到本机 HTTP，就明确 `mode:"notify-only"`**（Codex exec 正是这种），而不是自己发明一套审批 |
+| ① **事件词表 + 通用驱动 + sink**（`EVENT_TYPES` / `createJsonlDriver` / `createJsonlSink` / 隐私规则） | 手机端/微信/审计都按这 5 类消费；每接一家改一次 = 每个下游都要跟着改 |
+| ② **审批链路**（`index.mjs` 的 `PermissionBridge` 接线、fail-closed、让位逻辑） | 安全语义只有一套。做不到外部审批的 harness 就明确 `mode:"notify-only"`（Codex exec 是典型），不自己发明一套 |
 
-### 9.3 Gemini CLI（ACP）下一步要验什么
+### 9.4 Gemini ACP 下一步要验什么
 
-1. `gemini --acp` 的 `initialize` 能力协商字段与 **ACP v1/v2** 代际（决定驱动版本）。
-2. `session/new` + `prompt` 的回合时序；`session/update` 里 `tool_call` / `tool_call_update` 的 `kind`、`status`。
-3. `session/request_permission` 的 `options[]`（`optionId`/`kind`）与"turn 被取消必须回 `cancelled`"。
-4. **fs 代理必须明确拒绝**（不实现该 capability = Agent 用自身 fs 权限，行为可控）。
-5. `session/cancel` 的落点；会话列表能否通过 ACP 拿到（拿不到就退回 `gemini -p` 只通知 + 自己存 SessionStore）。
-6. 验收：ACP 驱动映射出的 5 类事件与 jsonl 驱动**同构**（同一个手机端页面能渲染）。
+1. 本机 0.31.0 的 ACP 代际（文档有 v1/v2）与 `initialize` 能力协商字段；`--experimental-acp` 是否等同 v1。
+2. `session/new` + `prompt` 时序；`request_permission` 回写 `{outcome:{outcome:"selected",optionId}}` 与 `cancelled` 语义。
+3. `tool_call_update` 的真实 `status` 序列（pending→in_progress→completed/failed）是否与文档一致。
+4. **显式拒绝 fs 代理 capability**（否则文件读写要经客户端，行为不可控）。
+5. `session/cancel` 的落点；会话列表能否通过 ACP 拿到（拿不到就自建 SessionStore）。
+6. 验收：ACP 驱动产出的 5 类事件与 Claude 同构（同一手机端页面可渲染）。
 
-### 9.4 OpenCode（server/HTTP）下一步要验什么
+### 9.5 OpenCode 下一步要验什么
 
-1. `opencode serve` 的绑定/认证（`OPENCODE_SERVER_PASSWORD`、默认 127.0.0.1:4096）。
-2. `GET /event` 是 **SSE** —— 我们不用 SSE 上行（E2EE 明文例外），**在驱动内部把 SSE 桥接成 5 类事件**；
-   这是 http 驱动与 jsonl 驱动最大的差异点。
-3. `POST /session/:id/permissions/:permissionID` 的 `response` 枚举与 `remember` 语义（对应我们的 allow_once/reject_once）。
-4. `POST /session/:id/prompt_async` 的时序（立即 204，结果只能从事件流看）。
-5. `GET /session` 列表 / `POST /session/:id/abort`；会话发现能否替代 SessionStore 自建。
-6. 验收：同一条任务在 OpenCode 下产出的事件序列与 Claude 一致（status→tool→turn.end）。
+1. `opencode serve` 绑定/认证（`OPENCODE_SERVER_PASSWORD`、默认 127.0.0.1:4096）。
+2. `GET /event` 真实 SSE：是否带 `event:` 行、心跳格式、`/event` vs `/global/event` 的包装差异。
+3. `permission.updated` 的 `pattern`/`title` 真实内容（决定审批卡能显示什么；当前为隐私一律不落）。
+4. `POST /session/:id/permissions/:permissionID` 的 `response` 枚举与 `remember`。
+5. `prompt_async` 时序（立即 204，结果只从事件流看）与 `session.idle` 是否等价回合结束。
+6. 验收：同一条任务在 OpenCode 下事件序列与 Claude 一致（status→tool→turn.end）。
 
 ## 10. 测试
 
@@ -320,8 +398,13 @@ DSH_PROFILE_DIR= NODE_OPTIONS="--require $PWD/scripts/test-net-guard.cjs" \
   clients/dsh-remote/test/agent-runtime.test.mjs \
   clients/dsh-remote/test/agent-events.test.mjs \
   clients/dsh-remote/test/agent-jsonl-driver.test.mjs \
-  clients/dsh-remote/test/agent-codex.test.mjs
+  clients/dsh-remote/test/agent-codex.test.mjs \
+  clients/dsh-remote/test/agent-gemini.test.mjs \
+  clients/dsh-remote/test/agent-opencode.test.mjs
 ```
+
+Codex 真实校准（默认跳过，**恰好 1 次**真实调用）：
+`DSH_AGENT_E2E_CODEX=1 node clients/dsh-remote/agent/agent-e2e-codex.mjs`
 
 （真实跑请用仓库标准入口：`npm run test:bridge` —— 它带测试期网络护栏，只允许打本地。）
 

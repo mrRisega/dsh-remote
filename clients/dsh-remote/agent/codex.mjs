@@ -18,6 +18,28 @@
  * | 同款 TS 类型（跨语言对照） | `openai/codex` → `sdk/typescript/src/events.ts`、`sdk/typescript/src/items.ts` |
  * | 本机 CLI 能力位（`--json` / `--output-schema` / `--approve-for-me` 是否存在） | 本机 `codex exec --help`（`codex-cli 0.150.1`，实测） |
  *
+ * ## 实测校准（M2 第 5 周，**1 次真实调用**）
+ *
+ * 命令：`codex exec --json --sandbox read-only --skip-git-repo-check "Reply with exactly: OK"`（本机 0.150.1）。
+ * 结果：CLI 退出码 **1**（本机 codex 配置的模型 `gpt-6.1-sol` 与当前 ChatGPT 账号不兼容 → 400 model_not_found），
+ * 但 stdout **仍是合法 JSONL**，共 6 行，喂 `createCodexDriver` 后 **unknown=0**。实得顺序：
+ *
+ * ```
+ * thread.started
+ * item.completed(error)   ← 模型元数据警告
+ * item.completed(error)   ← skills 上下文预算警告（可能多条，且**早于 turn.started**）
+ * turn.started
+ * error                   ← message 是**嵌套 JSON 字符串**（{"type":"error","status":400,…}）
+ * turn.failed             ← error.message 同样是嵌套 JSON 字符串
+ * ```
+ *
+ * 与官方文档样本的差异（已按实测修正/记录）：
+ *   ① `item.completed(error)` 可以在 `turn.started` **之前**、可以**多条**（映射器不依赖顺序，天然兼容）；
+ *   ② 顶层 `error` / `turn.failed` 的 message 是**JSON 编码的字符串** → 新增 `normalizeErrorMessage`
+ *      解一层（否则手机上会显示 {"type":"error",…} 这种乱码）；
+ *   ③ 正常路径（`agent_message` / `command_execution`）**本轮没拿到**（账号模型限制），
+ *      仍以官方文档样本为准，等业主修正 codex 的 model 后再跑一次校准。
+ *
  * ## 未核实项（**不要当成事实用**，下一轮必须实跑一次 `codex exec --json` 校准）
  *
  * 1. `item.started` 的 `command_execution` 是否一定带 `aggregated_output`（官方样本里**没有**这个字段）
@@ -112,6 +134,24 @@ function codexToolMeta(type) {
   }
 }
 
+/**
+ * 实测（0.150.1）：顶层 `error` 与 `turn.failed` 的 message 是**JSON 字符串**（内层还有一层 error 对象）。
+ * 直接进 UI 会变成乱码；这里解一层，优先取内层 `.error.message` / `.message`，解析失败原样返回。
+ */
+export function normalizeErrorMessage(raw) {
+  const s = String(raw ?? "");
+  try {
+    const obj = JSON.parse(s);
+    if (obj && typeof obj === "object") {
+      if (typeof obj?.error?.message === "string") return obj.error.message;
+      if (typeof obj.message === "string") return obj.message;
+    }
+  } catch {
+    /* 不是 JSON → 原样用 */
+  }
+  return s;
+}
+
 function isErrStatus(status) {
   return String(status || "") === "failed";
 }
@@ -180,7 +220,7 @@ export function mapCodexObject(obj, {
     }
 
     case "turn.failed": {
-      const msg = String(obj?.error?.message || "");
+      const msg = normalizeErrorMessage(obj?.error?.message);
       return {
         ok: true,
         events: [{
@@ -200,7 +240,7 @@ export function mapCodexObject(obj, {
           ...base(EVENT_TYPES.STATUS),
           status: "error",
           scope: "stream",
-          message: previewOf(String(obj.message || ""), maxPreviewChars)
+          message: previewOf(normalizeErrorMessage(obj.message), maxPreviewChars)
         }]
       };
 
@@ -427,7 +467,7 @@ function mapCodexItem(obj, { phase, at, maxPreviewChars, seen }) {
           ...base(EVENT_TYPES.STATUS),
           status: "error",
           scope: "item",
-          message: previewOf(String(item.message || ""), maxPreviewChars)
+          message: previewOf(normalizeErrorMessage(item.message), maxPreviewChars)
         }]
       };
 

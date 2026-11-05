@@ -30,7 +30,8 @@ import {
   createCodexMapper,
   detectCodex,
   mapCodexLine,
-  mapCodexObject
+  mapCodexObject,
+  normalizeErrorMessage
 } from "../agent/codex.mjs";
 import { CODEX_CAPABILITIES, CODEX_ITEM_TYPES, CODEX_TOP_EVENTS } from "../agent/codex.mjs";
 import { byteLength } from "../agent/events.mjs";
@@ -294,6 +295,62 @@ test("未知形状：未知顶层 type / 未知 item type / 坏 JSON / 超长行
   assert.equal(s.unknown, 1);
   assert.deepEqual(s.unknownReasons, { "unknown-type:thread.paused": 1 });
   assert.equal(s.events, 1);
+});
+
+/**
+ * **真实校准夹具**（M2 第 5 周，1 次真实 `codex exec --json`，逐字摘录 stdout）。
+ * 命令：`codex exec --json --sandbox read-only --skip-git-repo-check "Reply with exactly: OK"`（本机 0.150.1）。
+ * 该次 CLI 因本机 model 与账号不兼容退出 1，但流是合法 JSONL —— 正好校准了**错误路径**。
+ */
+const REAL_CAPTURE = [
+  '{"type":"thread.started","thread_id":"01a1acb4-1656-7582-ae8e-a504ade1fe23"}',
+  '{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Model metadata for `gpt-6.1-sol` not found. Defaulting to fallback metadata; this can degrade performance and cause issues."}}',
+  '{"type":"turn.started"}',
+  '{"type":"item.completed","item":{"id":"item_1","type":"error","message":"Skill descriptions were shortened to fit the skills context budget."}}',
+  '{"type":"error","message":"{\\"type\\":\\"error\\",\\"status\\":400,\\"error\\":{\\"type\\":\\"invalid_request_error\\",\\"message\\":\\"The \'gpt-6.1-sol\' model is not supported when using Codex with a ChatGPT account.\\",\\"code\\":\\"model_not_found\\"}}"}',
+  '{"type":"turn.failed","error":{"message":"{\\"type\\":\\"error\\",\\"status\\":400,\\"error\\":{\\"type\\":\\"invalid_request_error\\",\\"message\\":\\"The \'gpt-6.1-sol\' model is not supported when using Codex with a ChatGPT account.\\",\\"code\\":\\"model_not_found\\"}}"}}'
+];
+
+test("真实校准：官方之外的真实流也能全部映射（unknown=0），并覆盖错误路径", () => {
+  const d = createCodexDriver({ now: at });
+  const events = [];
+  for (const l of REAL_CAPTURE) events.push(...d.writeLine(l));
+  const s = d.stats();
+  assert.equal(s.lines, 6);
+  assert.equal(s.unknown, 0, "真实流的 6 行都必须能映射");
+  assert.equal(s.badJson, 0);
+  assert.equal(s.mapperErrors, 0);
+  // 实测顺序：thread.started → item.error ×2 → turn.started → error → turn.failed
+  assert.deepEqual(events.map((e) => e.type), ["status", "status", "status", "status", "status", "turn.end"]);
+  assert.equal(events.filter((e) => e.status === "error").length, 3, "两条 item 错误 + 一条流错误");
+  assert.equal(events[events.length - 1].reason, "error");
+});
+
+test("真实校准差异①：error 类 item 可以出现在 turn.started 之前、且可以多条（不依赖顺序）", () => {
+  const beforeTurn = mapCodexLine(REAL_CAPTURE[1], { now: at });
+  assert.equal(beforeTurn.ok, true);
+  assert.equal(beforeTurn.events[0].scope, "item");
+  const turnStarted = mapCodexLine(REAL_CAPTURE[2], { now: at });
+  assert.equal(turnStarted.events[0].phase, "turn");
+});
+
+test("真实校准差异②：error/turn.failed 的 message 是嵌套 JSON 字符串 → 被解一层", () => {
+  const streamErr = mapCodexLine(REAL_CAPTURE[4], { now: at });
+  const msg = streamErr.events[0].message;
+  assert.match(msg, /not supported when using Codex with a ChatGPT account/);
+  assert.equal(msg.startsWith("{"), false, "不能把原始 JSON 直接塞给 UI");
+
+  const failed = mapCodexLine(REAL_CAPTURE[5], { now: at });
+  assert.match(failed.events[0].errorMessage, /not supported when using Codex/);
+});
+
+test("normalizeErrorMessage：内层 error.message / 内层 message / 普通字符串 / 非法 JSON", () => {
+  assert.equal(normalizeErrorMessage('{"error":{"message":"inner"}}'), "inner");
+  assert.equal(normalizeErrorMessage('{"message":"top"}'), "top");
+  assert.equal(normalizeErrorMessage("plain text"), "plain text");
+  assert.equal(normalizeErrorMessage("{not json"), "{not json");
+  assert.equal(normalizeErrorMessage(""), "");
+  assert.equal(normalizeErrorMessage(undefined), "");
 });
 
 test("隐私总检查：官方样本 + 常见工具行映射后，任何事件都不含命令/查询原文", () => {
