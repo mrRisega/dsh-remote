@@ -1,0 +1,184 @@
+# agent/ —— 本地 Agent 运行时（M2 第 2 周：PermissionBridge 雏形）
+
+> **状态**：M2 第 2 周交付。**默认关闭**，只有被 bridge/插件显式调用 `start()` 才生效。
+> **零依赖**（只用 Node 内置）、**不 import 任何 DSH 模块**、**不碰现有链路**。
+>
+> 依据：`dsh-relay-enterprise/docs/multi-agent-design.md`（设计稿）+
+> `research/2026-11-strategy/12-multiagent-m2/00-第1周验证报告.md`（实测结论）。
+
+---
+
+## 1. 这个目录解决什么问题
+
+Claude Code 要弹审批时，会调用我们注入的 `PermissionRequest` 钩子。本模块：
+
+```
+Claude Code ──HTTP POST──▶ 127.0.0.1:<随机端口>/permission?t=<token>
+                                │
+                                ├─ 四道闸：token / 事件名 / 体积 / 并发
+                                ├─ 归一化：toolName / kind / detail（命令原文或路径）
+                                ├─ 决策来源 = 可注入回调（M2 第 3 周接手机；现在缺省 fail-closed）
+                                └─ 回写第 1 周实测确认过的响应体
+```
+
+同时负责：**版本门禁**（旧版本 Claude Code 不触发钩子 → 明确不可用，不静默丢审批）、
+**既有钩子让位**（用户/企业已有 `PermissionRequest` 钩子时，我们不注入，避免绕过他们的策略）、
+**子进程治理**（"停止"必须杀掉整棵进程树，否则 Claude 会孤儿化继续跑）。
+
+---
+
+## 2. 导出什么（挂载方只需要这些）
+
+```js
+import { createAgentRuntime, AGENT_STATUS } from "./agent/index.mjs";
+```
+
+`createAgentRuntime(opts)` 返回一个对象，**默认不启动**：
+
+| 方法 | 说明 |
+|---|---|
+| `start()` | 探测 + 门禁 + 起桥接。**永不抛错**，返回状态对象 |
+| `stop()` | 关端口、删临时 settings、结算未决审批（一律 deny）。幂等 |
+| `probe()` | 只探测（不占端口、不写盘），给"入口灰显 + 原因"用 |
+| `status()` | 同步读当前状态 |
+
+`start()` 的返回（`ok:true` 时）：
+
+```js
+{
+  ok: true,
+  status: "ready",
+  mode: "approval",
+  claude: { kind: "npm-global-exe", path: "…/bin/claude.exe", command: "…", argsPrefix: [] },
+  version: { major:2, minor:1, patch:318, text:"2.1.318" },
+  minVersion: "2.1.318",
+  settingsPath: "/tmp/dsh-agent-perm-xxxx/settings.json",
+  port: 51234,
+  launch: { args: ["--permission-mode", "default", "--settings", "<settingsPath>"] },
+  permission: { ttlMs: 90000, hookTimeoutSec: 120, url: "http://127.0.0.1:51234", pendingCount: [Function] },
+  stop: [Function]
+}
+```
+
+**挂载方式（最小接入）**：
+
+```js
+const runtime = createAgentRuntime({
+  log: (e) => logger.info(JSON.stringify(e)),   // 结构化日志；不会收到命令原文
+  decide: async (req) => ({ decision: "deny" }) // 第 3 周换成"手机回执"；缺省 fail-closed
+});
+
+const r = await runtime.start();
+if (r.ok) {
+  // 起 Claude Code 时把 r.launch.args 追加进参数数组（不要拼 shell 字符串）：
+  //   spawn(claudeBin.path, [...r.launch.args, "-p", prompt], {...})
+  // 手机端审批回调接通后，r.permission.pendingCount() 可做自检
+}
+// 退出/关闭时：
+await runtime.stop();
+```
+
+### 状态 → 降级（UI 直接映射）
+
+| `status` | 含义 | 建议行为 |
+|---|---|---|
+| `disabled` | 未启用（默认） | 不渲染 Agent 入口 |
+| `cli-missing` | 找不到 Claude Code | 灰显 + "请安装 / 检查 PATH 或 DSH_AGENT_CLAUDE_BIN" |
+| `version-unsupported` | 版本低于阈值 | 灰显 + "请升级 Claude Code ≥ `<minVersion>`" |
+| `version-unknown` | 找到候选但认不出版本 | 灰显 + "安装可能损坏" |
+| `existing-hooks` | 本机已有审批钩子（或强制 notify-only） | **只通知模式**，明示"远程审批已让位" |
+| `bridge-error` | 端口/临时目录失败 | 只通知模式 + `reason` 排障 |
+| `ready` | 审批通道就绪 | 正常启用 |
+
+> **降级原则**：任何异常都返回 `ok:false` + `status`，**不抛错**；绝不"没审批就默认放行"。
+
+---
+
+## 3. 环境变量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `DSH_AGENT_ENABLED` | 关 | `1` 打开（也可用 `createAgentRuntime({ enabled:true })`） |
+| `DSH_AGENT_CLAUDE_BIN` | — | 显式指定 CLI 路径（排障/企业定制；`.cjs` 会被当成 wrapper 用 node 启动） |
+| `DSH_AGENT_MIN_CLAUDE_VERSION` | `2.1.318` | 最低版本阈值。写错会回落默认并告警（**不会因为配置错就放行**） |
+| `DSH_AGENT_NOTIFY_ONLY` | 关 | `1` = 强制只通知（不注入钩子） |
+| `DSH_AGENT_PERMISSION_TTL_MS` | `90000` | 决策窗口；到期一律 deny |
+| `DSH_AGENT_HOOK_TIMEOUT_SEC` | `120` | 写进临时 settings 的钩子超时（秒；上游单位实测是秒） |
+| `DSH_AGENT_BRIDGE_PORT` | `0` | 桥接端口；`0`=随机（只绑 `127.0.0.1`） |
+| `DSH_AGENT_SETTINGS_DIR` | 系统临时目录 | 临时 settings 的父目录 |
+| `DSH_AGENT_NPM_ROOT` | 自动探测 | npm 全局根（Windows 自定义 prefix 时用） |
+| `DSH_AGENT_PROBE_CACHE_MS` | `300000` | `probe()` 结果缓存；避免面板重绘反复 spawn CLI（杀软敏感）。`probe({force:true})` 可强测 |
+
+---
+
+## 4. 隐私与日志契约
+
+- `log` 回调只会收到**元数据**：`{event, requestId, toolName, kind, outcome, durationMs, …}`；
+  **绝不包含命令原文 / 文件内容 / token**（有专门单测锁住）。
+- `detail`（命令原文或路径）只交给 `decide()` —— 因为手机审批要给人看。
+- 临时 settings 文件含 token → 写入即 `0600`，`stop()` 必删。
+- 不写 stdout、不落业务日志文件。
+
+---
+
+## 5. 子进程治理（`proc.mjs`）
+
+`spawnAgentProcess()`：参数数组 + `shell:false` + posix `detached`（独立进程组）+ `windowsHide`。
+
+`terminateProcessTree(pid)`：posix 先 `process.kill(-pid, SIGTERM)`（**整组**）→ 3s → `SIGKILL`
+（升级）；Windows 走 `taskkill /PID <pid> /T /F`。
+
+> ⚠️ **Windows 分支未真机验证**：返回 `verified:false`，上层只能显示"已请求停止"，
+> 不得宣称"已确认杀死"。真机验证清单见第 1 周报告 §4.4（W7）。
+
+**为什么必须整组杀**（第 1 周实测）：经 `cli-wrapper.cjs` 启动时，SIGTERM 只杀 wrapper，
+原生 claude 会 reparent 到 PPID=1 继续跑 —— 手机上点"停止"却还在执行工具。
+
+---
+
+## 6. 已做 / 未做（M2 边界）
+
+**已做（本轮）**
+- 版本门禁（默认 2.1.318，env 可覆盖）+ CLI 四级解析 + `--version` 探测
+- 既有 `PermissionRequest` 钩子扫描（user/project/local，只读）→ 让位
+- PermissionBridge：loopback 随机端口、临时 settings 0600、token/事件名/体积/并发四道闸、
+  fail-closed 90s、实测响应体、幂等 stop
+- 进程治理：参数数组 spawn、进程组 kill、SIGTERM→SIGKILL、Windows taskkill 预留
+- 全部外部依赖可注入；单测覆盖门禁/让位/fail-closed/响应体/kill/清理
+
+**未做（后续周）**
+- 手机端决策来源（`decide` 现在缺省 fail-closed）、事件映射（stream-json → 7 种事件）、
+  SessionStore 落盘、`/_agent` 隧道挂载、E2EE、微信 sink、插件面板入口
+- Windows 真机验证（`taskkill /T /F` 的实际效果、中文/空格路径）
+- `allow_always` / `updatedPermissions`（会写用户 settings，风险大于收益，M2 不做）
+- 企业 managed settings 检测（M3）
+
+---
+
+## 7. 已知风险 / 未验证（挂载前请知悉）
+
+| 项 | 状态 | 说明 |
+|---|---|---|
+| Windows `taskkill /T /F` 实际效果 | **未验证**（无真机） | 返回 `verified:false`；真机清单见第 1 周报告 §4.4 W7 |
+| 用户已在别处传 `--dangerously-skip-permissions` | **未验证** | 命令行参数谁生效取决于参数顺序与权限模式优先级；第 3 周需验证，若不成立则改为"检测到 bypass 模式就拒绝启用审批" |
+| 企业 managed settings（`allowManagedPermissionRulesOnly` 等） | **未验证** | M3 企业版前补检测 |
+| 多个会话并发审批 | 已支持（`maxPending=8`，超限 429） | 但**同一会话多请求的排序/取消**未验证 |
+| Claude Code 版本门槛精确定值 | **未确定** | 只测了 2.1.195 ❌ / 2.1.318 ✅；默认阈值保守取 2.1.318，第 3 周二分 |
+
+## 8. 测试
+
+```bash
+# 本目录相关用例（5 个文件）
+DSH_PROFILE_DIR= NODE_OPTIONS="--require $PWD/scripts/test-net-guard.cjs" \
+  node --test --test-concurrency=1 \
+  clients/dsh-remote/test/agent-version.test.mjs \
+  clients/dsh-remote/test/agent-detect.test.mjs \
+  clients/dsh-remote/test/agent-permission-bridge.test.mjs \
+  clients/dsh-remote/test/agent-proc.test.mjs \
+  clients/dsh-remote/test/agent-runtime.test.mjs
+```
+
+（真实跑请用仓库标准入口：`npm run test:bridge` —— 它带测试期网络护栏，只允许打本地。）
+
+> 注：`npm run check` 的检查清单是**显式文件列表**，本轮新增文件不在其中（未改 `package.json`，
+> 避免与其它线冲突）；新增文件已逐个 `node --check` 通过，见交付说明。

@@ -115,6 +115,7 @@ import {
 // 总开关 DSH_WECHAT=0(默认开启);未绑定时只起控制面,不起长轮询。
 import { createWeChatRuntime } from "./wechat-runtime.mjs";
 import { createPushReporter } from "./push-reporter.mjs";
+import { createAgentRuntime } from "./agent/index.mjs";
 
 // ---------- 强制直连:清除代理环境变量 ----------
 // 家庭网络常配 Clash 等代理(127.0.0.1:7890),node 的 ws/fetch 会继承
@@ -2880,6 +2881,44 @@ function startPushReporter() {
   }
 }
 
+/**
+ * 多 Agent 接入（2026-11-06）：默认**关闭**，只有 `DSH_AGENT_ENABLED=1` 才起。
+ *
+ * 为什么默认关：这条链路要 spawn 用户的 Claude Code、开本机回环端口、写临时 settings，
+ * 且手机端审批还没接通 —— 没有消费方时开机就跑它，是在用户机器上白花钱、白担风险。
+ * 启用后若任何一步不满足（没装 CLI / 版本太低 / 已有审批钩子），runtime 会返回明确状态
+ * （disabled / cli-missing / version-unsupported / existing-hooks / bridge-error），
+ * **绝不静默降级**，也绝不抛错影响远程访问主链路。
+ */
+let agentRuntime = null;
+
+function startAgentRuntime() {
+  if (String(process.env.DSH_AGENT_ENABLED || "") !== "1") return;
+  try {
+    if (agentRuntime) return;
+    agentRuntime = createAgentRuntime({
+      log: (e) => {
+        try {
+          const level = e && e.level === "error" ? "error" : e && e.level === "warn" ? "warn" : "info";
+          console[level]("[agent] " + JSON.stringify(e));
+        } catch { /* 忽略 */ }
+      }
+    });
+    // 不 await：失败也只在日志里体现，主链路照常
+    void agentRuntime.start().then((r) => {
+      try {
+        const st = r && r.status ? r.status : "unknown";
+        console.log(`[agent] 运行时状态=${st} mode=${(r && r.mode) || "-"}${r && r.reason ? " reason=" + r.reason : ""}`);
+        persistBridgeState({ agent: { status: st, mode: (r && r.mode) || null, enabled: true, at: Date.now() } });
+      } catch { /* 忽略 */ }
+    }).catch((e) => {
+      console.warn(`[agent] 启动异常（已忽略）：${e && e.message ? e.message : e}`);
+    });
+  } catch (e) {
+    console.warn(`[agent] 初始化失败（已忽略）：${e && e.message ? e.message : e}`);
+  }
+}
+
 function startWeChat() {
   if (WECHAT_DISABLED) {
     console.log("[bridge] 微信通道已禁用(DSH_WECHAT=0)");
@@ -3080,6 +3119,8 @@ async function runTunnel() {
   startWeChat();
   // 同理：推送上报也是可选增强，最后起、失败静默
   startPushReporter();
+  // 多 Agent 运行时：默认关，只有 DSH_AGENT_ENABLED=1 才起
+  startAgentRuntime();
   setTimeout(() => {
     console.log(`[bridge] 隧道模式运行中(上游 ${UPSTREAM},Ctrl-C 退出)`);
   }, 1000);
@@ -3127,6 +3168,8 @@ async function main() {
     try { e2ee.flushStore(); } catch { /* 已内部兜底 */ }
     // 退出前尽力把待上报的事件发出去（最多等 1s，绝不阻塞退出）
     try { if (pushReporter) await pushReporter.stop(); } catch { /* 已内部兜底 */ }
+    // 多 Agent 运行时：关端口、删临时 settings、未决审批一律 deny（runtime 内部保证幂等）
+    try { if (agentRuntime) await agentRuntime.stop(); } catch { /* 已内部兜底 */ }
     await stopWeChat();
     process.exit(0);
   };
