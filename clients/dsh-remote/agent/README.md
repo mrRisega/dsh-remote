@@ -33,6 +33,9 @@ Claude Code ──HTTP POST──▶ 127.0.0.1:<随机端口>/permission?t=<toke
 import { createAgentRuntime, AGENT_STATUS } from "./agent/index.mjs";
 ```
 
+> 第 4 周新增：`agent/events.mjs` 的通用驱动 `createJsonlDriver`、`agent/codex.mjs` 的
+> `mapCodexObject` / `createCodexDriver` / `detectCodex`（接入清单见 §9）。
+
 `createAgentRuntime(opts)` 返回一个对象，**默认不启动**：
 
 | 方法 | 说明 |
@@ -153,9 +156,19 @@ await runtime.stop();
 - `agent-e2e-real.mjs`：**真实 Claude Code 端到端联调**（默认跳过），实测 allow 真跑 / deny 不跑 /
   TTL 到期自动拒；顺带用真实输出校验事件映射（`unknown=0`）。
 
+**已做（M2 第 4 周）**
+- `events.mjs` 拆成 **通用 jsonl 驱动**（`createJsonlDriver`）+ Claude 映射（`mapClaudeObject` / `mapClaudeLine`），
+  对外行为不变；新增 `frameLine` / `parseLineJson` / `mapClaudeObject` 等可复用件。
+- `codex.mjs`：**第二家 harness 样板** —— `mapCodexObject`（`codex exec --json` → 同一套 5 类事件）、
+  `createCodexDriver`（跨行去重）、`detectCodex`（找 CLI / 版本 / `exec --help` 能力位）。
+- 本机实测：`codex-cli 0.150.1`，`--json` / `--output-schema` / `--sandbox` / `--approve-for-me` 均存在，
+  但 **没有"审批回调外部程序"的开关** ⇒ Codex 走 `exec` 时只能 `mode:"notify-only"`。
+
 **未做（后续周）**
-- 手机端决策来源（`decide` 现在缺省 fail-closed）、事件映射（stream-json → 7 种事件）、
-  SessionStore 落盘、`/_agent` 隧道挂载、E2EE、微信 sink、插件面板入口
+- 手机端决策来源（`decide` 现在缺省 fail-closed）、SessionStore 落盘、`/_agent` 隧道挂载、E2EE、微信 sink、插件面板入口
+- Codex **真实 `exec --json` 实跑校准**（映射依据是官方文档样本；未核实项见 `codex.mjs` 文件头）
+- Codex 审批（需 `codex app-server`，experimental；exec 模式做不到）
+- Gemini CLI（ACP）与 OpenCode（HTTP）驱动（下一步验什么见 §9.3/§9.4）
 - Windows 真机验证（`taskkill /T /F` 的实际效果、中文/空格路径）
 - `allow_always` / `updatedPermissions`（会写用户 settings，风险大于收益，M2 不做）
 - 企业 managed settings 检测（M3）
@@ -172,17 +185,28 @@ await runtime.stop();
 | 多个会话并发审批 | 已支持（`maxPending=8`，超限 429） | 但**同一会话多请求的排序/取消**未验证 |
 | Claude Code 版本门槛精确定值 | **未确定** | 只测了 2.1.195 ❌ / 2.1.318 ✅；默认阈值保守取 2.1.318，第 3 周二分 |
 
-## 8. 事件映射（`events.mjs`）与真实联调（`agent-e2e-real.mjs`）
+## 8. 事件层：通用 jsonl 驱动 + 两家映射（`events.mjs` / `codex.mjs`）+ 真实联调
 
-### 8.1 事件映射
+### 8.1 分层：驱动不认识任何一家 CLI
 
 ```js
-import { createEventMapper, createJsonlSink } from "./agent/events.mjs";
-const sink = createJsonlSink({ filePath: "/path/events.jsonl" }); // 不给 filePath = 不落盘（默认）
-const mapper = createEventMapper({ sink, onEvent: (e) => phone.send(e) });
-mapper.writeLine(line);   // 喂 claude 的 stream-json 行，返回本行产出的事件
-mapper.stats();           // {lines,events,badJson,tooLong,unknown,byType,byReason,unknownReasons}
+import { createJsonlDriver, createJsonlSink } from "./agent/events.mjs";
+import { createCodexMapper } from "./agent/codex.mjs";
+
+const driver = createJsonlDriver({
+  mapLine: (obj, ctx) => myMap(obj, ctx),      // ← 一家一份（Claude 用 mapClaudeObject，Codex 用 createCodexMapper()）
+  sink: createJsonlSink({ filePath }),          // 可选；不给 filePath = 默认不落盘
+  onEvent: (e) => phone.send(e),                // 每条归一化事件
+  onUnknown: (reason, raw) => metrics.count(reason)  // 未识别行（计数+忽略，不崩）
+});
+driver.writeLine(rawLine);   // 喂一行，返回本行产出的事件
+driver.stats();              // {driverName,lines,events,badJson,tooLong,empty,unknown,mapperErrors,byType,byReason,unknownReasons}
 ```
+
+现成的两家：`createEventMapper()`（Claude，第 3 周 API 不变）、`createCodexDriver()`（Codex，内部跨行去重）。
+第 3 周的 `mapStreamJsonLine` 保留为 `mapClaudeLine` 的别名（行为一致）。
+
+### 8.2 Claude Code 映射
 
 | 归一化事件 | 来源 | 说明 |
 |---|---|---|
@@ -192,7 +216,42 @@ mapper.stats();           // {lines,events,badJson,tooLong,unknown,byType,byReas
 | `tool.result` | `tool_result` | 只带 isError/输出字节数/截断预览（默认 120 字符，可设 0 关闭） |
 | `turn.end` | `result` | reason: completed / error / max-turns / interrupted / aborted |
 
-### 8.2 真实联调（默认跳过）
+### 8.3 Codex 映射（`codex.mjs`）与依据来源
+
+| Codex 事件（官方 `exec --json`） | 归一化事件 | 说明 |
+|---|---|---|
+| `thread.started` | `status(working, phase=thread)` | 带 `threadId`（未来续接用） |
+| `turn.started` | `status(working, phase=turn)` | |
+| `item.*` + item.type=`agent_message` | `message.delta(final=true)` | 只在 `item.completed` 发 |
+| `item.*` + `reasoning` | `status(thinking)` | **只带 textBytes**，推理内容不落 |
+| `item.*` + `command_execution` | `tool.call(shell/execute)` / `tool.result` | **命令原文不落**，只带字节数；`exit_code`/`status` 判成败 |
+| `item.*` + `file_change` | `tool.call(file_change/edit)` + `tool.result` | 只带文件数，路径不落 |
+| `item.*` + `mcp_tool_call` | `tool.call(mcp:server/tool)` / `tool.result` | arguments 只算字节数 |
+| `item.*` + `web_search` | `tool.call(web_search/fetch)` / `tool.result` | query 不落，完成带结果数 |
+| `item.*` + `todo_list` | `status(plan)` | 只带条数/完成数 |
+| `item.*` + `error` / 顶层 `error` | `status(error, scope=item/stream)` | 错误文案截断 |
+| `turn.completed` | `turn.end(completed)` | `usage` 只保留 token 数与 `cacheWriteInputTokens`（缺失按 0） |
+| `turn.failed` | `turn.end(error)` | error.message 截断 |
+| `item.updated` | **忽略** | 增量语义官方未给样本【未核实】 |
+
+**依据来源（全部官方；2026-11 读取）**
+
+| 依据 | 出处 |
+|---|---|
+| 顶层事件枚举 + 官方样本 JSONL（测试夹具逐字摘录） | <https://learn.chatgpt.com/docs/non-interactive-mode>（"Make output machine-readable" / "Sample JSON stream"） |
+| 字段级权威定义（`ThreadEvent` / `ThreadItem` / 各 Item 结构体 / 状态枚举） | `openai/codex` → `codex-rs/exec/src/exec_events.rs` |
+| 同款 TS 类型（跨语言对照） | `openai/codex` → `sdk/typescript/src/events.ts`、`sdk/typescript/src/items.ts` |
+| 本机能力位（`--json` / `--output-schema` / `--sandbox` / `--approve-for-me`） | 本机 `codex exec --help`（`codex-cli 0.150.1`，实测） |
+
+**本机真实探测结果（2026-11，`codex-cli 0.150.1`）**：`ok:true`，`mode:"notify-only"`；
+`caps={jsonOutput:true, structuredOutput:true, resume:true, appServer:true, approvalsAutoReview:true, sandboxFlag:true, externalApprovalHook:false}`。
+
+**未核实项（不要当事实）**：`item.started` 是否总带 `aggregated_output`；`item.updated` 增量语义；
+`command_execution.status` 是否出现 `declined`（Rust 有、TS 无）；`web_search`/`file_change`/`todo_list`/`collab_tool_call` 线上形状；
+以及最关键的 —— **exec 模式无法把审批回调给外部程序**（本机 help 只有 `--approve-for-me` 与 bypass），
+所以 Codex 要么只通知，要么走 `codex app-server`（experimental）。
+
+### 8.4 真实联调（默认跳过）
 
 ```bash
 export DSH_AGENT_E2E=1
@@ -210,10 +269,48 @@ DSH_AGENT_E2E_KEEP=1 DSH_AGENT_E2E_DUMP_RAW=1 node clients/dsh-remote/agent/agen
 - 每个用例都在**临时项目**里写 `permissions.ask` 强制升权，并把探测用的 `homeDir` 指向空目录，
   避免"用户级 allow 规则吞掉审批"（第 1 周报告 §1.2）与"既有钩子让位"两种干扰。
 
-## 9. 测试
+## 9. 接入清单：接第二家要改哪 3 处、**不动**哪 2 处
+
+> 这是本轮"驱动可复用"的验收口径：Codex 接入**没有**改 events 词表、没有改审批桥、没有改 index。
+
+### 9.1 只改这 3 处
+
+| # | 改什么 | 新文件位置 | Codex 的实际做法 |
+|---|---|---|---|
+| ① **mapLine** | 把该 CLI 的结构化输出映射成 5 类事件 | `agent/<harness>.mjs` 的 `mapXxxObject(obj, ctx)` | `codex.mjs` 的 `mapCodexObject`；有状态的用 `createXxxMapper()`（跨行去重） |
+| ② **CLI 探测 + 能力声明** | 找 CLI、`--version`、从 `--help` 探能力位 | 同文件的 `detectXxx()` | `detectCodex()`；**能力位必须实测、探不到就报 false**，不许默认 true |
+| ③ **启动参数与生命周期** | exec 参数、会话续接、中断 | 挂载处（未来 index/bridge）+ `proc.mjs` 的 spawn/杀树 | `codex exec --json`；续接方式【未核实】；进程治理复用 `proc.mjs` |
+
+### 9.2 不许动的 2 处（动了就说明抽象漏了）
+
+| # | 不动什么 | 为什么 |
+|---|---|---|
+| ① **事件词表 + 通用驱动 + sink**（`events.mjs` 的 `EVENT_TYPES` / `createJsonlDriver` / `createJsonlSink` / 隐私规则） | 手机端/微信/审计都按这 5 类消费；每接一家改一次 = 每个下游都要跟着改 |
+| ② **审批链路**（`index.mjs` 的 `PermissionBridge` 接线、fail-closed、让位逻辑） | 安全语义只有一套。**若该 harness 无法把审批回调到本机 HTTP，就明确 `mode:"notify-only"`**（Codex exec 正是这种），而不是自己发明一套审批 |
+
+### 9.3 Gemini CLI（ACP）下一步要验什么
+
+1. `gemini --acp` 的 `initialize` 能力协商字段与 **ACP v1/v2** 代际（决定驱动版本）。
+2. `session/new` + `prompt` 的回合时序；`session/update` 里 `tool_call` / `tool_call_update` 的 `kind`、`status`。
+3. `session/request_permission` 的 `options[]`（`optionId`/`kind`）与"turn 被取消必须回 `cancelled`"。
+4. **fs 代理必须明确拒绝**（不实现该 capability = Agent 用自身 fs 权限，行为可控）。
+5. `session/cancel` 的落点；会话列表能否通过 ACP 拿到（拿不到就退回 `gemini -p` 只通知 + 自己存 SessionStore）。
+6. 验收：ACP 驱动映射出的 5 类事件与 jsonl 驱动**同构**（同一个手机端页面能渲染）。
+
+### 9.4 OpenCode（server/HTTP）下一步要验什么
+
+1. `opencode serve` 的绑定/认证（`OPENCODE_SERVER_PASSWORD`、默认 127.0.0.1:4096）。
+2. `GET /event` 是 **SSE** —— 我们不用 SSE 上行（E2EE 明文例外），**在驱动内部把 SSE 桥接成 5 类事件**；
+   这是 http 驱动与 jsonl 驱动最大的差异点。
+3. `POST /session/:id/permissions/:permissionID` 的 `response` 枚举与 `remember` 语义（对应我们的 allow_once/reject_once）。
+4. `POST /session/:id/prompt_async` 的时序（立即 204，结果只能从事件流看）。
+5. `GET /session` 列表 / `POST /session/:id/abort`；会话发现能否替代 SessionStore 自建。
+6. 验收：同一条任务在 OpenCode 下产出的事件序列与 Claude 一致（status→tool→turn.end）。
+
+## 10. 测试
 
 ```bash
-# 本目录相关用例（5 个文件）
+# 本目录相关用例（8 个文件）
 DSH_PROFILE_DIR= NODE_OPTIONS="--require $PWD/scripts/test-net-guard.cjs" \
   node --test --test-concurrency=1 \
   clients/dsh-remote/test/agent-version.test.mjs \
@@ -221,7 +318,9 @@ DSH_PROFILE_DIR= NODE_OPTIONS="--require $PWD/scripts/test-net-guard.cjs" \
   clients/dsh-remote/test/agent-permission-bridge.test.mjs \
   clients/dsh-remote/test/agent-proc.test.mjs \
   clients/dsh-remote/test/agent-runtime.test.mjs \
-  clients/dsh-remote/test/agent-events.test.mjs
+  clients/dsh-remote/test/agent-events.test.mjs \
+  clients/dsh-remote/test/agent-jsonl-driver.test.mjs \
+  clients/dsh-remote/test/agent-codex.test.mjs
 ```
 
 （真实跑请用仓库标准入口：`npm run test:bridge` —— 它带测试期网络护栏，只允许打本地。）

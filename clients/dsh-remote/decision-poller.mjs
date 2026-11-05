@@ -114,6 +114,12 @@ export function createDecisionPoller(options = {}) {
         const requestId = String(item && item.request_id ? item.request_id : "");
         const decision = String(item && item.decision ? item.decision : "");
         const expiresAt = Number(item && item.expires_at ? item.expires_at : 0);
+        // 服务端"至少一次"语义：redeliver_count>0 表示这条之前可能已经投递过（我们回过 ack 但响应丢了）。
+        // 不改行为（仍照常应用并 ack），只在日志留痕，便于排查"为什么同一条审批被应用两次"。
+        const redeliverCount = Number(item && item.redeliver_count ? item.redeliver_count : 0);
+        if (redeliverCount > 0) {
+          log("warn", `[decision] 收到重投回执（第 ${redeliverCount} 次） request_id=${requestId || "-"}`);
+        }
         if (expiresAt > 0 && expiresAt < now()) {
           // 服务端已过期却仍返回（时钟漂移）：不应用，但 ack 掉避免反复拉
           stats.failed += 1;

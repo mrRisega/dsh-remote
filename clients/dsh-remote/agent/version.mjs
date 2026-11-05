@@ -74,6 +74,12 @@ export function compareVersions(a, b) {
   return pa < pb ? -1 : 1;
 }
 
+/**
+ * 通用别名：`parseClaudeVersion` 本质是"从任意 CLI 输出里抓第一个 x.y.z"，
+ * Codex（`codex-cli 0.150.1`）等其它 harness 也直接复用，避免各写一套解析。
+ */
+export const parseVersion = parseClaudeVersion;
+
 /** 把版本对象格式化成 `2.1.318`（预发布保留后缀）。 */
 export function formatVersion(v) {
   if (!v) return "";
