@@ -424,6 +424,24 @@ export function createPushReporter(options = {}) {
       stats.started = false;
     },
 
+    /**
+     * 把一条审批回执写回 DSH（供决策轮询器调用）。
+     *
+     * 为什么放在这里：DSH 的审批回执要用订阅器里的 `clientId`(+ 上游地址/cookie)，
+     * 而订阅器归本模块所有；另起一个订阅器既浪费一条 WS，也会让"谁有资格回执"变得模糊。
+     *
+     * @param {string} eventId DSH 的审批事件 id（= 上报体里的 approval.request_id）
+     * @param {"allowed-once"|"rejected"} outcome
+     * @returns {Promise<any>} 原样返回订阅器结果；没有订阅器时抛错（由调用方兜底）
+     */
+    async answerApproval(eventId, outcome) {
+      const sub = subscriber;
+      if (!sub || typeof sub.answerApproval !== "function") {
+        throw new Error("push-reporter: 事件订阅器未就绪，暂时无法回执审批");
+      }
+      return sub.answerApproval(eventId, outcome);
+    },
+
     /** 只读状态（面板/诊断用；不包含任何事件内容）。 */
     status() {
       return { ...stats, queued: queue.length };

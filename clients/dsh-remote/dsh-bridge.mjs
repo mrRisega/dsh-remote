@@ -115,6 +115,7 @@ import {
 // 总开关 DSH_WECHAT=0(默认开启);未绑定时只起控制面,不起长轮询。
 import { createWeChatRuntime } from "./wechat-runtime.mjs";
 import { createPushReporter } from "./push-reporter.mjs";
+import { createDecisionPoller } from "./decision-poller.mjs";
 import { createAgentRuntime } from "./agent/index.mjs";
 
 // ---------- 强制直连:清除代理环境变量 ----------
@@ -2874,7 +2875,11 @@ function startPushReporter() {
       }
     });
     // 不 await：启动探测失败绝不影响隧道
-    void pushReporter.start().catch(() => {});
+    void pushReporter.start().then((st) => {
+      try {
+        if (st && st.started) startDecisionPoller();
+      } catch { /* 忽略 */ }
+    }).catch(() => {});
   } catch (e) {
     // 可选增强失败不得冒泡
     console.warn(`[push] 上报器初始化失败（已忽略）：${e && e.message ? e.message : e}`);
@@ -2916,6 +2921,38 @@ function startAgentRuntime() {
     });
   } catch (e) {
     console.warn(`[agent] 初始化失败（已忽略）：${e && e.message ? e.message : e}`);
+  }
+}
+
+/**
+ * 决策轮询（2026-11-06）：把"手机上点的允许/拒绝"拉回电脑端并写回 DSH。
+ *
+ * 只有"事件上报已在跑"时才起 —— 没有上报就没有通知，也就不可能有回执；
+ * 所有异常吞掉只记日志，绝不阻塞隧道。
+ */
+let decisionPoller = null;
+
+function startDecisionPoller() {
+  try {
+    if (decisionPoller) return;
+    decisionPoller = createDecisionPoller({
+      apiBase: API_BASE,
+      deviceId: DEVICE_ID,
+      tokenProvider: () => PUSH_TOKEN,
+      apply: async (item) => {
+        // 手机上的"允许"只能映射成 allowed-once（允许一次），绝不升级成永久放行
+        return pushReporter.answerApproval(item.request_id, item.outcome);
+      },
+      log: (level, message) => {
+        try {
+          if (level === "warn") console.warn(message);
+          else console.log(message);
+        } catch { /* 忽略 */ }
+      }
+    });
+    decisionPoller.start();
+  } catch (e) {
+    console.warn(`[decision] 轮询器初始化失败（已忽略）：${e && e.message ? e.message : e}`);
   }
 }
 
@@ -3167,6 +3204,7 @@ async function main() {
     // 退出前把 E2EE 会话库刷一次（滑动 TTL 的 usedAt 要落盘；崩溃也能恢复到最多 60s 前）
     try { e2ee.flushStore(); } catch { /* 已内部兜底 */ }
     // 退出前尽力把待上报的事件发出去（最多等 1s，绝不阻塞退出）
+    try { if (decisionPoller) decisionPoller.stop(); } catch { /* 已内部兜底 */ }
     try { if (pushReporter) await pushReporter.stop(); } catch { /* 已内部兜底 */ }
     // 多 Agent 运行时：关端口、删临时 settings、未决审批一律 deny（runtime 内部保证幂等）
     try { if (agentRuntime) await agentRuntime.stop(); } catch { /* 已内部兜底 */ }
