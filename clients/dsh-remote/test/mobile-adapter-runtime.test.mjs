@@ -74,6 +74,15 @@ class El {
   prepend() {} focus() {} blur() {}
   hasAttribute(n) { return n in this.attrs; }
   appendChild(c) { c.parent = this; this.children.push(c); return c; }
+  /* 真实 DOM 里 removeChild/parentNode 是基本能力：适配层的「字号提示」用它把自己摘掉。
+     假 DOM 缺了它 → 提示永远摘不掉 → 用例会把一个正确的实现判成错误（假红）。 */
+  removeChild(c) {
+    const i = this.children.indexOf(c);
+    if (i >= 0) this.children.splice(i, 1);
+    if (c) c.parent = null;
+    return c;
+  }
+  get parentNode() { return this.parent || null; }
   addEventListener(t, fn) { (this._listeners.get(t) || this._listeners.set(t, []).get(t)).push(fn); }
   removeEventListener() {}
   dispatch(t, ev = {}) { for (const fn of this._listeners.get(t) || []) fn({ stopPropagation() {}, preventDefault() {}, ...ev }); }
@@ -106,7 +115,9 @@ class El {
  * 折叠时**没有拖拽把手**——这正是 2026-09-19 线上"整屏遮罩"的现场结构。
  */
 function harness({ collapsedAttr = undefined, detailsAttr = undefined, sidebarRect = null, width = 390, withToggle = true,
-  variant = "rc1", rightbarAttr = undefined, overlayRect = null, rightbarRect = null, fetchImpl = null } = {}) {
+  variant = "rc1", rightbarAttr = undefined, overlayRect = null, rightbarRect = null, fetchImpl = null,
+  /* 2026-10-2x：给"输入框可用性小修补"用例提供一个官方 Lexical 输入区（默认不提供，旧用例现场不变）。 */
+  withComposer = false } = {}) {
   const html = new El("html");
   // HOSTISH 门禁会读 documentElement.outerHTML 找官方特征（__ModuleLoader__ / DeepSeek Harness）
   html.outerHTML = '<html><head><script>window.__ModuleLoader__ = { mode: "queue" }</script>'
@@ -134,6 +145,9 @@ function harness({ collapsedAttr = undefined, detailsAttr = undefined, sidebarRe
   }
   const toggle = new El("button");
   toggle.setAttribute("aria-label", "打开侧边栏");
+  const composer = new El("div", {
+    contenteditable: "true", "data-composer-input": "true", role: "textbox", "aria-multiline": "true",
+  });
 
   const pickByClass = (sel) => {
     // 只支持本用例需要的极少数选择器（脚本里 querySelector 的用法就这些）
@@ -156,9 +170,28 @@ function harness({ collapsedAttr = undefined, detailsAttr = undefined, sidebarRe
       if (s2.includes("aria-label=")) return withToggle ? toggle : null;
       if (s2.includes(".hHd-Xa_toggle")) return withToggle ? toggle : null;
       if (s2.includes("hHd-Xa")) return sidebar; // 子列识别用（真实页面里这是侧栏）
+      if (s2.includes("data-composer-input")) return withComposer ? composer : null;
       return pickByClass(s2);
     },
-    querySelectorAll() { return []; },
+    /* 只额外支持 `img`：适配层的「图片按需加载」要扫 document.querySelectorAll("img")。
+       其它选择器仍按旧行为返回 []（不改变既有用例的现场）。 */
+    querySelectorAll(sel) {
+      if (String(sel) !== "img") return [];
+      const out = [];
+      const seen = new Set();
+      const walk = (el) => {
+        if (!el || seen.has(el)) return;
+        seen.add(el);
+        for (const c of el.children || []) {
+          if (String(c.tagName) === "IMG") out.push(c);
+          walk(c);
+        }
+      };
+      /* 这套假 DOM 里 body 不一定挂在 documentElement 下（旧用例不需要），所以两个根都走一遍。 */
+      walk(doc);
+      walk(doc.body);
+      return out;
+    },
     createElement: (t) => new El(t),
     createTextNode: (t) => ({ nodeValue: t }),
     getElementById: () => null,
@@ -179,7 +212,9 @@ function harness({ collapsedAttr = undefined, detailsAttr = undefined, sidebarRe
     fetch: fetchImpl || undefined,
     // unref：同上 —— 适配层的 4 分钟兜底计时器会让测试进程空等到期（本来 240s，只剩 0.2s）。
     // 用例里的 `_pendingTimers` 仍会被 runAdapter() 主动跑一轮，行为不变。
-    setTimeout: (fn, ms) => { const id = setTimeout(fn, ms); try { id.unref?.(); } catch { /* 忽略 */ } timers.set(id, fn); return id; },
+    // 2026-10-2x：额外把 (fn, ms) 记进 timers，便于 `flushTimers(env, maxMs)` 手动推进
+    // 「延迟才做」的首屏后优化（字号提示 1200ms、图片懒加载 600ms），不必真等。
+    setTimeout: (fn, ms) => { const id = setTimeout(fn, ms); try { id.unref?.(); } catch { /* 忽略 */ } timers.set(id, { fn, ms }); return id; },
     clearTimeout: (id) => clearTimeout(id),
     MutationObserver: class { observe() {} disconnect() {} },
     ResizeObserver: class { observe() {} disconnect() {} },
@@ -203,7 +238,7 @@ function harness({ collapsedAttr = undefined, detailsAttr = undefined, sidebarRe
   ctx.console = dbgConsole;
   ctx.globalThis = ctx;
   ctx.self = win;
-  return { ctx, html, body, frame, sidebar, rightbar, overlay, toggle, win };
+  return { ctx, html, body, frame, sidebar, rightbar, overlay, toggle, composer, win, timers };
 }
 
 const ADAPTER_DEBUG = process.env.DSH_ADAPTER_DEBUG === "1";
@@ -219,6 +254,16 @@ function runAdapter(env) {
   }
   // sync() 在 boot 时立即执行一次；脚本内用 setTimeout/rAF 的场景再推一轮
   return env;
+}
+
+/** 手动推进"延迟才做"的定时器（≤ maxMs），模拟时间流逝（不必真等 1.2 秒）。 */
+function flushTimers(env, maxMs = 2000) {
+  for (const [, rec] of [...(env.timers || new Map())]) {
+    if (!rec || typeof rec.fn !== "function") continue;
+    if (rec.ms <= maxMs) {
+      try { rec.fn(); } catch { /* 用例里吞掉：被测代码自己的兜底由它自己保证 */ }
+    }
+  }
 }
 
 const findScrim = (env) => env.body.children.find((c) => c._cls.has("dsh-ma-scrim"));
@@ -624,4 +669,143 @@ test("网络延迟：无样本 / 失败请求绝不显示 0ms（显示「测速�
   assert.notEqual(String(rtt.textContent), "0ms", "绝不能显示 0ms（那是谎言）");
   const menu = findMenu(env);
   assert.match(menu.innerHTML, /测速中…/, "空态文案必须是「测速中…」");
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 首屏性能 & 移动端体验（2026-10-2x）
+//
+// 用户原声：「字体太小，因此不用」（字号档位其实早就有，藏在悬浮菜单里，没人知道）；
+// 生产遥测 n=8903：首屏 p50 3.9s / p90 21.6s、20.2% ≥12s。
+// 这里锁住适配层**自己**能控制的那部分：
+//   ① 首启字号提示：一次性、挂在 FAB 内部（不新增 body 级浮层）、点它直接打开菜单、
+//      延迟 1.2 秒才出现（绝不掺和首屏）、用户调过字号就不再提示；
+//   ② 图片按需加载：只给「视口外且没在加载」的图片打 loading=lazy + decoding=async，
+//      首屏附近的图一个字节都不动（该立刻出现的必须立刻出现）；
+//   ③ 输入体验：输入框字号跟着档位放大但永不低于 16px（防 iOS 聚焦缩放）、只打属性不改结构；
+//   ④ 性能可测量：__dshMaDiag.perf 里有首屏里程碑 / 适配层自身 boot 耗时 / 懒加载计数，
+//      且**不新增遥测事件名**（服务端只认白名单）。
+// ══════════════════════════════════════════════════════════════════════════════
+
+test("首启字号提示：1.2s 后出现、挂在 FAB 内部、点它直接打开字号菜单、且只提示一次", () => {
+  const env = harness({ width: 390 });
+  runAdapter(env);
+  const fab = findFab(env);
+  assert.ok(fab, "前提：悬浮按钮存在");
+  assert.equal(fab.querySelector(".dsh-ma-fs-tip"), null,
+    "首屏阶段绝不能出现提示 —— 延迟 1.2 秒就是为了不跟首屏抢主线程/抢视线");
+  const bodyKids = env.body.children.length;
+
+  flushTimers(env, 1200);   // 推进「首屏之后」的延迟定时器（不必真等 1.2 秒）
+
+  const tip = fab.querySelector(".dsh-ma-fs-tip");
+  assert.ok(tip, "1.2 秒后应出现「字太小？」提示（字号档位就藏在这颗按钮里）");
+  assert.equal(env.body.children.length, bodyKids,
+    "★ 提示必须挂在 FAB 内部：body 下不得多出任何浮层（适配层曾经用全屏层干过这事）");
+  assert.match(String(tip.innerHTML), /点这里调字号/, "文案必须直接告诉用户该点哪里");
+  assert.match(String(tip.innerHTML), /✕/, "必须可关闭（✕）");
+  assert.equal(env.win.localStorage.getItem("dsh-ma-fs-tip-v1"), "1",
+    "显示即记「已提示过」：同一浏览器只提示一次（localStorage）");
+  assert.equal(env.win.__dshMaDiag.perf.tipShown, true, "诊断里要能看到提示是否展示过");
+
+  // 点气泡 = 直接打开字号菜单（不用先学会点按钮），并收起提示
+  const menu = findMenu(env);
+  assert.equal(menu.hidden, true, "前提：菜单默认收起");
+  tip.dispatch("click");
+  assert.equal(menu.hidden, false, "★ 点提示必须打开远程控制菜单（里面就是字号滑块）");
+  assert.equal(fab.querySelector(".dsh-ma-fs-tip"), null, "点过之后提示必须收起");
+});
+
+test("首启字号提示：已提示过 / 用户自己调过字号 → 都不再提示（不打扰）", () => {
+  const env = harness({ width: 390 });
+  env.win.localStorage.setItem("dsh-ma-fs-tip-v1", "1");   // 上次已经提示过
+  runAdapter(env);
+  flushTimers(env, 1200);
+  assert.equal(findFab(env).querySelector(".dsh-ma-fs-tip"), null, "已提示过 → 不得再出现");
+
+  const env2 = harness({ width: 390 });
+  env2.win.localStorage.setItem("dsh-ma-font-scale", "2");  // 用户自己调过字号
+  runAdapter(env2);
+  flushTimers(env2, 1200);
+  assert.equal(findFab(env2).querySelector(".dsh-ma-fs-tip"), null,
+    "用户已经找到并调过字号 → 不必再告知（提示的目的已达成）");
+});
+
+test("图片按需加载：视口外的图打 loading=lazy + decoding=async，首屏附近的图一个字节都不动", () => {
+  const env = harness({ width: 390 });
+  const far = new El("img");
+  far.setAttribute("src", "/assets/chat-far.png");
+  far._rect = { left: 0, top: 2000, right: 300, bottom: 2200, width: 300, height: 200 };
+  const near = new El("img");
+  near.setAttribute("src", "/assets/chat-near.png");
+  near._rect = { left: 0, top: 10, right: 300, bottom: 210, width: 300, height: 200 };
+  env.body.appendChild(far);
+  env.body.appendChild(near);
+
+  assert.equal(far.getAttribute("loading"), null, "前提：官方 <img> 本来没有 loading 属性");
+  runAdapter(env);
+  flushTimers(env, 600);   // boot 后 600ms 的「首屏之后」扫描
+
+  assert.equal(far.getAttribute("loading"), "lazy", "★ 视口外的图片必须按需加载（首屏少发请求、少抢带宽）");
+  assert.equal(far.getAttribute("decoding"), "async", "解码异步，别阻塞主线程");
+  assert.equal(near.getAttribute("loading"), null, "★ 首屏附近的图片绝不能被改成 lazy（该立刻出现的必须立刻出现）");
+  assert.equal(near.getAttribute("decoding"), null, "首屏附近的图连 decoding 也不动（保持官方原样）");
+
+  const perf = env.win.__dshMaDiag.perf;
+  assert.ok(perf.imgLazy >= 1, "诊断要能量化「省下的图片请求数」（imgLazy）");
+  assert.ok(perf.imgKept >= 1, "首屏附近未动的图片也要计数（imgKept）");
+});
+
+test("输入体验：只给官方输入框补属性（enterkeyhint/spellcheck），不动 DOM 结构", () => {
+  const env = harness({ width: 390, withComposer: true });
+  runAdapter(env);
+  flushTimers(env, 600);
+  const c = env.composer;
+  assert.equal(c.getAttribute("enterkeyhint"), "enter",
+    "回车键标注「换行」：与适配层「手机 Enter 只换行、发送交给发送按钮」的策略一致");
+  assert.equal(c.getAttribute("spellcheck"), "false", "中文会话里别画拼写红线");
+  assert.equal(c.getAttribute("contenteditable"), "true", "★ 只打属性：官方原有属性/结构一个都不能改");
+  assert.equal(c.getAttribute("data-composer-input"), "true", "★ 官方锚点属性必须原样保留");
+});
+
+test("首屏诊断：__dshMaDiag.perf 有首屏里程碑 + 适配层自身耗时，且不新增遥测事件名", () => {
+  const env = harness({ width: 390 });
+  runAdapter(env);
+  flushTimers(env, 3100);
+  const perf = env.win.__dshMaDiag && env.win.__dshMaDiag.perf;
+  assert.ok(perf, "必须在 __dshMaDiag 里暴露 perf（用户上报现场时能读）");
+  for (const k of ["startAt", "bootCalls", "bootMs", "hostishCalls", "hostishSerializations",
+    "fcp", "ttfb", "dcl", "loadEnd", "uiReadyMs", "imgLazy", "imgScanPaused", "tipShown", "vvRepositions"]) {
+    assert.ok(k in perf, "perf 缺字段: " + k);
+  }
+  assert.ok(perf.bootCalls >= 1, "boot 至少跑过一次 —— bootMs 才是「适配层自身耗时」");
+  assert.ok(perf.hostishSerializations === 0,
+    "★ 有官方结构信号时一次全量序列化都不该做（旧实现每次 boot 都先 outerHTML.slice(0,200000)）");
+  assert.equal(typeof perf.uiReadyMs, "number", "首屏可用时刻（= mirror_load 的 ms，导航开始 → 可用）");
+
+  // 纪律：不新增遥测事件名（服务端只认白名单，新名字会被丢弃）→ 唯一允许的端点仍是 mirror-load
+  const SRC = readFileSync(new URL("../mobile-adapter.mjs", import.meta.url), "utf8");
+  const endpoints = [...new Set([...SRC.matchAll(/\/dsh-remote\/telemetry\/[a-z-]+/g)].map((m) => m[0]))];
+  assert.deepEqual(endpoints, ["/dsh-remote/telemetry/mirror-load"],
+    "★ 不得新增遥测事件名（白名单只有 mirror_load；新指标只进本地 __dshMaDiag.perf）");
+});
+
+test("键盘弹出：visualViewport 变化时悬浮按钮重新贴边（按钮不能被键盘顶到看不见的地方）", async () => {
+  const env = harness({ width: 390 });
+  // 把按钮记忆在右下角：它的 top 与"可视区高度"直接相关
+  env.win.localStorage.setItem("dsh-ma-fab-pos", JSON.stringify({ h: "left", v: "bottom", dx: 10, dy: 10 }));
+  const vvListeners = new Map();
+  env.win.visualViewport = {
+    height: 800,
+    addEventListener(t, fn) { (vvListeners.get(t) || vvListeners.set(t, []).get(t)).push(fn); },
+  };
+  runAdapter(env);
+  const fab = findFab(env);
+  assert.equal(fab.style.top, String(800 - 46 - 10) + "px", "前提：先按可视区高度贴底");
+
+  env.win.visualViewport.height = 500;            // 键盘弹出：可视区矮了 300px
+  for (const fn of vvListeners.get("resize") || []) fn();
+  await new Promise((r) => setImmediate(r));      // 重算被合到一帧里（rAF）
+  assert.equal(fab.style.top, String(500 - 46 - 10) + "px",
+    "★ 键盘弹出后必须按 visualViewport 重新贴边（旧实现用 innerHeight，按钮会留在键盘后面点不到）");
+  assert.ok(env.win.__dshMaDiag.perf.vvRepositions >= 1, "重定位次数要进诊断");
 });

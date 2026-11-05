@@ -110,6 +110,29 @@
  *      "设置面板铺满全屏"赢(否则设置面板会被 100vw-24px 钉住,又变成带边的浮层)。
  *
  * 开关:环境变量 DSH_MOBILE_ADAPTER=0 整体关闭(默认开启)。
+ *
+ * ===== 首屏性能 & 移动端体验（2026-10-2x）=================================================
+ * 背景:手机镜像页首屏 p50 3.9s / p90 21.6s、20.2% 打开 ≥12s（生产遥测 n=8903，事件 mirror_load）。
+ * 其中 TTFB、官方 13MB 级 bundle、中继带宽**不在适配层手里**;适配层只对下面四件事负责,
+ * 每件都必须满足"异常静默放弃、老浏览器缺 API 就跳过、绝不影响页面加载与现有交互":
+ *   1) **首启字号提示**(不然没人知道档位在哪 —— 用户原声「字体太小,因此不用」):
+ *      小气泡挂在 FAB **内部**(不新增 body 级浮层),延迟 1.2s 出现、12s 自动消失,
+ *      点它直接打开字号菜单;localStorage 记「已提示过」→ 同一浏览器只提示一次,
+ *      用户自己调过字号就不提示。只提示,不重做档位能力。
+ *   2) **图片按需加载**:给聊天里的 <img> 打 loading=lazy + decoding=async,别让一屏几十张图
+ *      在首屏就和 /assets /plugins 的 JS/CSS 抢同一条中继带宽。三层,都是"只打属性、不改结构":
+ *        · 插入**前**钩子(唯一真能省请求的一层;headless Chrome 实测:插入后补属性无效):
+ *          只给 Node.prototype.appendChild/insertBefore 包一层,仅 ≤820px、仅对 IMG、
+ *          ?dsh_ma_img_lazy=0 可整体关掉、pagehide 还原;
+ *        · 插入后 childList 观察器(第二层,覆盖钩子装之前/其它引擎);
+ *        · 看门狗低频补扫(≤1 次/800ms,补扫几何判定的那批;打字/粘贴期间暂停),
+ *          外加一条安全阀:打了 lazy 却渲染不出来(隐藏容器等 onload 的写法)→ 改回 eager。
+ *   3) **打字/粘贴期间暂停自己的后台扫描**(图片扫描、设置面板识别):主线程留给输入法。
+ *      输入框另补 enterkeyhint="enter"/spellcheck="false"(只打属性),字号档位也放大输入框
+ *      (CSS max(16px, …) —— 永远不低于 16px,防 iOS 聚焦缩放)。
+ *   4) **可测量**:__dshMaDiag.perf 里给出首屏里程碑(FCP/TTFB/DCL/load/first-input)、
+ *      适配层自身 boot 耗时、HOSTISH 全量序列化次数、懒加载省下的图片数、打字暂停次数。
+ *      ⚠️ **不新增遥测事件名**(服务端只认白名单,新名字会被丢弃)→ 这些数字只本地可读,不上报。
  */
 
 const ADAPTER_ID = "dsh-mobile-adapter";
@@ -253,8 +276,20 @@ const STYLE = `
   textarea,
   input:not([type]), input[type="text"], input[type="search"], input[type="email"],
   input[type="url"], input[type="tel"], input[type="number"], input[type="password"],
-  [contenteditable="true"] { font-size: 16px !important; }
+  [contenteditable="true"], [data-composer-input], [role="textbox"] { font-size: 16px !important; }
   select, button, a, [role="button"], [role="menuitem"], [role="option"], [role="tab"] { touch-action: manipulation; }
+
+  /* --- 输入框跟着字号档位放大（2026-10-2x）---
+     用户原声「手机上敲字痛苦」：字号档位（中/大/超大）只放大了正文，输入框被上面那条 16px
+     !important 钉死 —— 用户越调大字号，正文越大、输入框越小，打字越难受。
+     这里让输入框也跟着 scale 走，但**永不低于 16px**：16px 是 iOS 聚焦自动放大的阈值，
+     低于它一聚焦整页就跳一下（那是另一种「敲字痛苦」）。
+     写法顺序就是降级链：先写 16px 兜底（老浏览器/不支持 max() 的），再写 max() 增强。 */
+  textarea, [contenteditable="true"], [data-composer-input], [role="textbox"] {
+    font-size: max(16px, calc(16px * var(--dsh-ma-fs-scale))) !important;
+    /* 长按选中/粘贴是手机上的刚需：只保证能选文本，不拦任何默认动作 */
+    -webkit-user-select: text; user-select: text;
+  }
 
   /* --- hero 工作区/模式座位行:可换行,防右缘被裁(实测 cubgiG_seat right=409>390) --- */
   div.wSkVaW_heroWorkspaceRow { flex-wrap: wrap; row-gap: 8px; column-gap: 8px; justify-content: center; min-width: 0; }
@@ -449,6 +484,56 @@ button.dsh-ma-fab .dsh-ma-fab-rtt[hidden] { display: none !important; }
 button.dsh-ma-fab .dsh-ma-fab-rtt[data-rtt="ok"] { color: var(--dsw-alias-label-success, #1a7f37); }
 button.dsh-ma-fab .dsh-ma-fab-rtt[data-rtt="mid"] { color: var(--dsw-alias-label-warning, #9a6700); }
 button.dsh-ma-fab .dsh-ma-fab-rtt[data-rtt="bad"] { color: var(--dsw-alias-label-danger, #cf222e); }
+/* ===== 首启「字号太小？」提示气泡（2026-10-2x）=====
+   用户原声：「字体太小，因此不用」—— 字号档位其实**早就有**（悬浮菜单里的滑块），但没人知道。
+   这个气泡只做「告知」，**挂在 FAB 内部**（绝对定位子元素），绝不新增 body 级浮层
+   （护栏见 test/mobile-adapter-guards.test.mjs「不得新增 body 级固定层」）：
+     · 位置跟按钮所在半屏走（按钮在上半屏 → 气泡在下方，反之在上方），见 SCRIPT 里 showFsTip；
+     · 点气泡 = 直接打开字号菜单；点 ✕ = 关掉；12 秒自动消失；
+     · 一次性（localStorage 记一次），且只对「从没调过字号」的人提示。 */
+button.dsh-ma-fab .dsh-ma-fs-tip {
+  position: absolute;
+  display: block;
+  box-sizing: border-box;
+  width: max-content;
+  max-width: 200px;
+  max-width: min(58vw, 200px);
+  padding: 6px 8px 6px 10px;
+  border-radius: 10px;
+  font: 400 13px/1.35 -apple-system, system-ui, sans-serif;
+  text-align: left;
+  white-space: normal;
+  background: var(--dsw-alias-bg-elevated, #fff);
+  color: var(--dsw-alias-label-primary, #111);
+  border: .5px solid var(--dsw-alias-border-l3, rgba(127,127,127,.3));
+  box-shadow: 0 4px 16px rgba(0,0,0,.22);
+  cursor: pointer;
+  animation: dsh-ma-fs-tip-in .16s ease-out;
+}
+button.dsh-ma-fab .dsh-ma-fs-tip-txt { display: inline; }
+button.dsh-ma-fab .dsh-ma-fs-tip-x {
+  display: inline-block;
+  margin-left: 6px; padding: 0 2px;
+  font-size: 12px; line-height: 1;
+  color: var(--dsw-alias-label-tertiary, #6b7280);
+}
+button.dsh-ma-fab .dsh-ma-fs-tip-right { right: -4px; }
+button.dsh-ma-fab .dsh-ma-fs-tip-left { left: -4px; }
+button.dsh-ma-fab .dsh-ma-fs-tip-below { top: calc(100% + 10px); }
+button.dsh-ma-fab .dsh-ma-fs-tip-above { bottom: calc(100% + 10px); }
+/* 小尖角指向按钮（纯装饰，不占命中区） */
+button.dsh-ma-fab .dsh-ma-fs-tip::after {
+  content: "";
+  position: absolute;
+  width: 8px; height: 8px;
+  background: var(--dsw-alias-bg-elevated, #fff);
+  border: .5px solid var(--dsw-alias-border-l3, rgba(127,127,127,.3));
+  transform: rotate(45deg);
+}
+button.dsh-ma-fab .dsh-ma-fs-tip-below::after { top: -5px; right: 14px; border-right: 0; border-bottom: 0; }
+button.dsh-ma-fab .dsh-ma-fs-tip-above::after { bottom: -5px; right: 14px; border-left: 0; border-top: 0; }
+button.dsh-ma-fab .dsh-ma-fs-tip-left::after { right: auto; left: 14px; }
+@keyframes dsh-ma-fs-tip-in { from { opacity: 0; transform: translateY(-2px); } to { opacity: 1; transform: none; } }
 /* 菜单卡片:fixed 贴右下，最大高度受限可滚动 */
 div.dsh-ma-menu {
   position: fixed;
@@ -895,6 +980,134 @@ const SCRIPT = `(() => {
                       // 受保护的 /api/* 请求被回 5xx 或直接网络错误（presence 不在镜像页这条链路上；
                       // E2EE 死会话的 502 另带 x-dsh-e2ee-error，不算离线，见 maInstallNetSampler）。
                       apiFails: 0, apiFailAt: 0, lastApiStatus: 0 };
+
+  /* ================= 首屏性能自测（2026-10-2x：只写诊断，**不上报**）=================
+     背景：手机镜像页首屏 p50 3.9s / p90 21.6s、20.2% 打开 ≥12s（生产遥测 n=8903，事件名 mirror_load）。
+     那 21.6s 的大头（HTML TTFB + 官方 13MB 级 bundle + 中继带宽）**不在适配层手里**；适配层能做、
+     也有责任量清楚的是这两件事：
+       ① 适配层自己在主线程上花了多少时间（boot 耗时 / 全量序列化 DOM 的次数）；
+       ② 它有没有少抢首屏带宽（图片懒加载真正省下多少张请求）。
+     纪律（与 mirror_load 完全一致，2026-10-17 起就定下的规矩）：
+       · **不新增遥测事件名**：服务端只认白名单，新名字会被直接丢弃 → 这里一律只写
+         window.__dshMaDiag.perf（用户上报现场时能读、mirror-diag 的复制诊断里也带着）；
+       · 只用 performance 的只读接口，拿不到就留 -1（老 Safari 静默跳过，绝不影响页面）；
+       · 每个入口 try/catch：诊断坏了绝不影响页面。 */
+  var maPerf = {
+    startAt: -1,               // 注入脚本开始执行的时刻（performance.now，零点 = 导航开始）
+    bootCalls: 0,              // 适配层 boot() 被调用次数
+    bootMs: 0,                 // 适配层 boot() 累计耗时（毫秒）—— 「适配层自身耗时」
+    hostishCalls: 0,           // HOSTISH() 调用次数
+    hostishSerializations: 0,  // 其中真的把 documentElement.outerHTML 全量序列化了几次（最贵的那步）
+    hostishMs: 0,              // 序列化累计耗时（毫秒）
+    imgScanCalls: 0,           // 图片懒加载扫描次数
+    imgScanPaused: 0,          // 因为「用户正在打字/粘贴」而主动跳过的次数
+    imgScanned: 0,             // 扫到的（新）图片数
+    imgLazy: 0,                // 真正打了 loading=lazy 的图片数（≈ 首屏少发的请求数）
+    imgKept: 0,                // 在首屏附近/已加载完 → 一个字节都不动的图片数
+    imgHook: 0,                // 由「插入前」钩子提前打上属性的图片数（真正能省请求的那一层）
+    imgUnlazy: 0,              // 安全阀：打了 lazy 却渲染不出来 → 改回 eager 的图片数
+    typingPauses: 0,           // 「打字/粘贴期间暂停后台扫描」触发次数
+    fcp: -1, ttfb: -1, dcl: -1, loadEnd: -1, firstInput: -1, // 导航/绘制里程碑（-1 = 拿不到）
+    uiReadyMs: -1,             // 首屏真正可用的时刻（= mirror_load 的 ms）
+    longTasks: 0, longTaskMs: 0, // 页面级长任务（含官方代码，仅供对照，不是适配层独占）
+    tipShown: false,           // 首启「字号太小」提示是否展示过
+    vvRepositions: 0           // 键盘弹出/收起（visualViewport 变化）触发的按钮重定位次数
+  };
+  try {
+    if (typeof performance !== "undefined" && performance && typeof performance.now === "function") {
+      var maPerfStart = performance.now();
+      if (typeof maPerfStart === "number" && isFinite(maPerfStart) && maPerfStart >= 0) maPerf.startAt = maPerfStart;
+    }
+  } catch (e0) { /* 没有 performance（老浏览器）→ startAt 保持 -1 */ }
+
+  /** 采样导航/绘制里程碑（幂等：只补空位，不覆盖已经采到的值）。 */
+  function maPerfSampleNav() {
+    try {
+      if (typeof performance === "undefined" || !performance) return;
+      var nav = null, paints = null;
+      try {
+        if (typeof performance.getEntriesByType === "function") {
+          var nv = performance.getEntriesByType("navigation");
+          nav = (nv && nv.length) ? nv[0] : null;
+          paints = performance.getEntriesByType("paint");
+        }
+      } catch (e1) { nav = null; paints = null; }
+      if (nav) {
+        try { if (maPerf.ttfb < 0 && nav.responseStart > 0) maPerf.ttfb = Math.round(nav.responseStart); } catch (e2) { /* 忽略 */ }
+        try { if (maPerf.dcl < 0 && nav.domContentLoadedEventEnd > 0) maPerf.dcl = Math.round(nav.domContentLoadedEventEnd); } catch (e3) { /* 忽略 */ }
+        try { if (maPerf.loadEnd < 0 && nav.loadEventEnd > 0) maPerf.loadEnd = Math.round(nav.loadEventEnd); } catch (e4) { /* 忽略 */ }
+      }
+      if (paints && paints.length) {
+        for (var i = 0; i < paints.length; i++) {
+          var pt = paints[i];
+          if (pt && pt.name === "first-contentful-paint" && pt.startTime > 0) maPerf.fcp = Math.round(pt.startTime);
+        }
+      }
+    } catch (e) { /* 采样失败 = 留 -1，绝不影响页面 */ }
+  }
+
+  /** 对外只读快照（__dshMaDiag.perf）。返回的是**拷贝**：外面改不改都不影响内部计数。 */
+  function maPerfSnapshot() {
+    try {
+      return {
+        startAt: Math.round(maPerf.startAt),
+        bootCalls: maPerf.bootCalls, bootMs: Math.round(maPerf.bootMs),
+        hostishCalls: maPerf.hostishCalls,
+        hostishSerializations: maPerf.hostishSerializations,
+        hostishMs: Math.round(maPerf.hostishMs),
+        imgScanCalls: maPerf.imgScanCalls, imgScanPaused: maPerf.imgScanPaused,
+        imgScanned: maPerf.imgScanned, imgLazy: maPerf.imgLazy, imgKept: maPerf.imgKept,
+        imgHook: maPerf.imgHook, imgUnlazy: maPerf.imgUnlazy,
+        typingPauses: maPerf.typingPauses,
+        fcp: maPerf.fcp, ttfb: maPerf.ttfb, dcl: maPerf.dcl, loadEnd: maPerf.loadEnd,
+        firstInput: maPerf.firstInput, uiReadyMs: maPerf.uiReadyMs,
+        longTasks: maPerf.longTasks, longTaskMs: maPerf.longTaskMs,
+        tipShown: maPerf.tipShown, vvRepositions: maPerf.vvRepositions
+      };
+    } catch (e) { return null; }
+  }
+
+  /* 采样时机：DOMContentLoaded / load / 1.5s / 4s 各补一次空位（幂等，最多补 4 次，不加定时器）。
+     解析期**不创建任何 DOM**（护栏要求），这里只有监听器与几个定时器。 */
+  try {
+    var maPerfKick = function () { try { maPerfSampleNav(); maPublishDiag(); } catch (e0) { /* 忽略 */ } };
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", maPerfKick);
+    else setTimeout(maPerfKick, 0);
+    window.addEventListener("load", maPerfKick);
+    setTimeout(maPerfKick, 1500);
+    /* ⚠️ 刻意不用 2000/4000 这类"业务上已被占用"的延迟：测试按延迟数定时器
+       （load-watch 用例断言 2000=就地重试、4000=整页重试的个数），撞上就会假红。 */
+    setTimeout(maPerfKick, 3100);
+  } catch (e1) { /* 忽略 */ }
+  /* 首响与长任务：只有支持的浏览器才有（Safari 老版本没有 longtask / first-input）→ 静默跳过。
+     注意 longtask 是**页面级**的（含官方代码），只作对照，不能当成适配层开销。 */
+  try {
+    if (typeof PerformanceObserver === "function") {
+      var maPerfObs = function (kind) {
+        try {
+          var po = new PerformanceObserver(function (list) {
+            try {
+              var es = (list && list.getEntries) ? list.getEntries() : [];
+              for (var i = 0; i < es.length; i++) {
+                var en = es[i];
+                if (!en) continue;
+                if (kind === "first-input") {
+                  if (maPerf.firstInput < 0 && en.startTime > 0) maPerf.firstInput = Math.round(en.startTime);
+                } else if (kind === "longtask") {
+                  maPerf.longTasks += 1;
+                  if (en.duration > 0) maPerf.longTaskMs += Math.round(en.duration);
+                }
+              }
+            } catch (e2) { /* 忽略 */ }
+          });
+          po.observe({ type: kind, buffered: true });
+        } catch (e3) { /* 该类型不支持 → 跳过 */ }
+      };
+      maPerfObs("first-input");
+      maPerfObs("longtask");
+    }
+  } catch (e4) { /* 老 Safari：静默跳过 */ }
+
   /* ===== 旧浏览器兼容提示条（2026-10-18）=====
      只有两种触发：① 注入体最前面的 maCompat 探测到"补不了的"（语法级不支持）；
      ② 页面脚本报出 SyntaxError / is not a function 这类典型兼容错误且界面还没就绪。
@@ -1049,6 +1262,8 @@ const SCRIPT = `(() => {
         scrim: maScrimStats,
         retry: maRetryStats,
         load: { slow: maLoadWatch.slow, apiFails: maLoadWatch.apiFails, lastApiStatus: maLoadWatch.lastApiStatus },
+        // 首屏性能自测（2026-10-2x）：只读、只在本对象里（**不上报**，见上方 maPerf 的说明）。
+        perf: (typeof maPerfSnapshot === "function") ? maPerfSnapshot() : null,
         // E2EE 死会话自动恢复 / 回前台重连（2026-10-23）：只作诊断，不参与任何判定。
         // var 提升在此处可能尚未赋值（maPublishDiag 在恢复层定义之前就会被调用一次）→ 用 typeof 兜住。
         resume: (typeof maResumeState !== "undefined" && maResumeState)
@@ -1499,6 +1714,10 @@ const SCRIPT = `(() => {
       if (!isFinite(ms) || ms < 0) ms = 0;
       if (ms > 600000) ms = 600000;
       maLoadWatch.reportMs = ms;
+      /* 首屏真正可用的时刻也进本地诊断（与上报给服务端的 mirror_load.ms 是同一个数）。
+         上报体**一个字都不改**：服务端契约只看 { ms, outcome, at }。 */
+      try { maPerf.uiReadyMs = ms; } catch (ePerfUi) { /* 忽略 */ }
+      try { maPublishDiag(); } catch (ePerfPub) { /* 忽略 */ }
       var body = JSON.stringify({ ms: ms, outcome: outcome === "slow" ? "slow" : "ok", at: Date.now() });
       var p = null;
       try {
@@ -2157,9 +2376,408 @@ const SCRIPT = `(() => {
   try {
     const HOST_RE = new RegExp(${JSON.stringify(RUNTIME_HOST_RE.source)});
     const NARROW = () => window.innerWidth <= 820;
-    const HOSTISH = () =>
-      HOST_RE.test(document.documentElement.outerHTML.slice(0, 200000)) ||
-      !!document.querySelector("[data-shell-overlay], [data-sidebar-collapsed], [data-details-collapsed], [data-rightbar-collapsed]");
+    /* ===== HOSTISH 记忆化（2026-10-2x 首屏优化）=====
+       旧实现「outerHTML.slice(0, 200000)」写在**或**的左边：每调一次 boot 都先把整页序列化一遍
+       （几十到 200KB 的主线程重活），然后才轮到那个便宜的 querySelector。而 boot 由 rAF 节流的
+       看门狗驱动 —— 官方流式输出时每帧都有 DOM 变更，首屏阶段（frame 还没挂上、fab 还没建）
+       这一次次全量序列化纯属白烧。
+       现在：① 先查便宜的结构信号（官方 frame/开合属性一挂上就命中）；② 命中一次就**记住**
+       （官方页面不会"变回不是官方"，这个判据全程单调）；③ 记录序列化次数与耗时到
+       __dshMaDiag.perf，用来证明"少烧了多少"。语义与旧实现完全等价，只是不再反复做同一件事。 */
+    let maHostishOk = false;
+    const HOSTISH = () => {
+      try {
+        if (maHostishOk) return true;
+        maPerf.hostishCalls += 1;
+        if (document.querySelector("[data-shell-overlay], [data-sidebar-collapsed], [data-details-collapsed], [data-rightbar-collapsed]")) {
+          maHostishOk = true;
+          return true;
+        }
+        const t0 = maNowMs();
+        const html = document.documentElement.outerHTML.slice(0, 200000);
+        const hit = HOST_RE.test(html);
+        maPerf.hostishSerializations += 1;
+        try { maPerf.hostishMs += Math.max(0, maNowMs() - t0); } catch (eMs) { /* 忽略 */ }
+        if (hit) maHostishOk = true;
+        return hit;
+      } catch (e) { return false; }
+    };
+
+    /* ================= 首屏优化：图片按需加载 + 打字期间暂停自己的扫描（2026-10-2x）=================
+       现场（生产遥测 n=8903）：手机镜像页首屏 p50 3.9s / p90 21.6s、20.2% ≥12s。TTFB 与官方
+       13MB 级 bundle 不在适配层手里，但下面两件事是**我们自己造的**、也由我们自己收回来：
+
+         ① 图片抢带宽：聊天/工具输出里一屏几十张图，官方 <img> 没有 loading 属性 → 插入 DOM 那一刻
+            浏览器就并发拉全部图片，和首屏关键资源（/assets、/plugins 的 JS/CSS）抢同一条中继带宽。
+            这里只**打属性**（不改 DOM 结构、不换 src、不碰官方组件）：
+              · **插入前**处理（关键，实测过）：headless Chrome 实测同一份页面 ——
+                插入前带上 loading="lazy" → 请求数 24 → **11**（剩下的 11 张在视口/lazy 预加载距离内，
+                本来就应该拉）；插入后（哪怕只晚一个微任务）再补属性 → 请求数仍是 **24**，
+                即"属性有了、请求照发"。所以真正省带宽的那一层是给 appendChild/insertBefore
+                包的一层**极窄的钩子**（只碰 IMG、只在 ≤820px、可 ?dsh_ma_img_lazy=0 关掉、可还原）；
+                只观察 childList 的 MutationObserver 作为第二层保底（对晚一步的场景/其它引擎有效）。
+              · 打 lazy 不等于"永远不加载"：原生懒加载对**已在视口内**的图片本来就是立即加载，
+                所以首屏该出现的图照常出现，只是不再为"屏幕外那几十张"先占满带宽。
+              · 已经是 complete / 官方自己给过 loading 的图片：一个字节都不动。
+              · **不做几何测量**：插入路径里读 getBoundingClientRect 会强制同步布局，官方流式输出时
+                每帧一次就是新的卡顿源。可见性判断全部交给浏览器原生的 lazy 实现。
+              · 另有看门狗里的低频补扫（≤1 次/800ms，仅针对"观察器安装之前就存在"的图片，
+                那批才需要几何判断，且一次扫描最多 120 张），以及打字/粘贴期间自动暂停。
+
+         ② 打字时和自己抢主线程：看门狗在官方流式输出时持续跑，其中"设置面板识别"要全文档
+            querySelectorAll、"图片懒加载"要扫全部 <img>。用户敲字/粘贴长文本的那一刻主线程
+            本该全留给输入法 → 只要正在输入（input / compositionupdate）或在粘贴（字符越多停越久），
+            就暂停这些**非关键扫描**一小段时间。纯降级：暂停的是"找机会做的优化"，不是任何交互。
+
+       纪律：两者都是纯优化，任何异常都静默放弃；老浏览器缺 API 就跳过，绝不影响页面。 */
+    var maTyping = { until: 0, count: 0 };
+    function maNoteTyping(ms) {
+      try {
+        var d = Number(ms);
+        if (!isFinite(d) || d <= 0) d = 1200;
+        if (d > 8000) d = 8000;
+        var t = Date.now() + d;
+        if (t > maTyping.until) maTyping.until = t;
+        maTyping.count += 1;
+        maPerf.typingPauses += 1;
+      } catch (e) { /* 忽略 */ }
+    }
+    function maTypingBusy() {
+      try { return maTyping.until > Date.now(); } catch (e) { return false; }
+    }
+    try {
+      var maTypingEvt = function () { try { maNoteTyping(1200); } catch (e) { /* 忽略 */ } };
+      document.addEventListener("input", maTypingEvt, true);
+      document.addEventListener("compositionupdate", maTypingEvt, true);
+      /* 粘贴：只读字符数（不碰内容），字符越多暂停越久（长文本一次性灌进 Lexical 时主线程最吃紧）。 */
+      document.addEventListener("paste", function (ev) {
+        try {
+          var cd = ev && ev.clipboardData;
+          var txt = (cd && cd.getData) ? String(cd.getData("text") || "") : "";
+          if (txt.length >= 4000) maNoteTyping(Math.min(8000, 800 + Math.round(txt.length / 4)));
+          else maNoteTyping(1200);
+        } catch (e) { try { maNoteTyping(1200); } catch (e2) { /* 忽略 */ } }
+      }, true);
+    } catch (e) { /* 老浏览器：不暂停也不会更糟 */ }
+
+    /* 输入框可用性小修补（只打属性，不动结构）：
+         · enterkeyhint="enter"   —— 手机键盘的回车键标注「换行」，与适配层「手机 Enter 只换行、
+           发送交给发送按钮」的策略一致（否则键盘上写着"发送"、按下去却只换行，像坏了）；
+         · spellcheck="false"     —— 中文会话里 markdown/代码片段被拼写检查画红线纯属噪音。
+       官方自己给过该属性就不动（只在缺失时补）。 */
+    var MA_COMPOSER_TAG_SEL = '[data-composer-input],[role="textbox"][aria-multiline="true"],[data-lexical-editor="true"]';
+    var maComposerTagged = null;
+    function maTagComposer() {
+      try {
+        if (!document || typeof document.querySelector !== "function") return;
+        var el = null;
+        try { el = document.querySelector(MA_COMPOSER_TAG_SEL); } catch (e1) { el = null; }
+        if (!el || !el.setAttribute) return;
+        if (maComposerTagged === el) return;
+        maComposerTagged = el;
+        if (!el.hasAttribute || !el.hasAttribute("enterkeyhint")) el.setAttribute("enterkeyhint", "enter");
+        if (!el.hasAttribute || !el.hasAttribute("spellcheck")) el.setAttribute("spellcheck", "false");
+      } catch (e) { /* 忽略 */ }
+    }
+
+    /* ---- 图片懒加载 ---- */
+    var maImgLazyLastAt = 0;
+    var maImgLazyIO = null;
+    var maImgLazyIOInited = false;
+    var maImgSeenSet = null;
+    try { if (typeof WeakSet === "function") maImgSeenSet = new WeakSet(); } catch (eSeen) { maImgSeenSet = null; }
+    var maImgSeenFallback = [];
+    function maImgSeen(img) {
+      try {
+        if (!img) return true;
+        if (maImgSeenSet) return maImgSeenSet.has(img);
+        for (var i = 0; i < maImgSeenFallback.length; i++) { if (maImgSeenFallback[i] === img) return true; }
+        return false;
+      } catch (e) { return true; }
+    }
+    function maImgMarkSeen(img) {
+      try {
+        if (!img) return;
+        if (maImgSeenSet) { maImgSeenSet.add(img); return; }
+        if (maImgSeenFallback.length > 400) maImgSeenFallback.length = 0;
+        maImgSeenFallback.push(img);
+      } catch (e) { /* 忽略 */ }
+    }
+    /** 打属性（纯写，不做 seen / 几何判定）：两个入口（插入即处理、低频补扫）共用同一套规则。 */
+    function maImgApplyAttrs(img) {
+      try {
+        if (!img || !img.getAttribute || !img.setAttribute) return false;
+        if (img.getAttribute("loading")) return false;           // 官方/别的层已经给了 → 不动
+        var done = false;
+        try { done = !!img.complete; } catch (e1) { done = false; }
+        if (done) { maPerf.imgKept += 1; return false; }          // 已加载完/在加载 → 不动
+        img.setAttribute("loading", "lazy");
+        img.setAttribute("decoding", "async");
+        maPerf.imgLazy += 1;
+        return true;
+      } catch (e2) { return false; }
+    }
+    /** 插入即处理（微任务里调用）：给**新出现的**图片打按需加载属性。
+     *  不读几何、不判可见性 —— 原生 lazy 自己会"视口内的立即加载、视口外的临近再加载"，
+     *  我们只负责把"属性"尽早打上（晚一拍就等于没打：浏览器已经开始拉了）。 */
+    function maImgConsider(img) {
+      try {
+        if (!img) return false;
+        if (String(img.tagName || "").toUpperCase() !== "IMG") return false;
+        if (maImgSeen(img)) return false;
+        maImgMarkSeen(img);
+        maPerf.imgScanned += 1;
+        return maImgApplyAttrs(img);
+      } catch (e) { return false; }
+    }
+    /* 只观察 childList（**不观察 attributes**）：我们自己改 loading 属性不会触发它，
+       不会变成自激循环；回调在每个 DOM 变更批次的微任务里跑，早于图片请求真正发出。 */
+    var maImgObserverInstalled = false;
+    var maImgMoRef = null;
+    function maInstallImgObserver() {
+      if (maImgObserverInstalled) return;
+      maImgObserverInstalled = true;
+      try {
+        if (typeof MutationObserver !== "function") return;
+        if (!document || !document.documentElement) return;
+        var mo = new MutationObserver(function (records) {
+          var tagged = false;
+          try {
+            for (var i = 0; i < records.length; i++) {
+              var added = records[i] && records[i].addedNodes ? records[i].addedNodes : [];
+              for (var j = 0; j < added.length; j++) {
+                var node = added[j];
+                if (!node) continue;
+                if (maImgConsider(node)) tagged = true;
+                var inner = null;
+                try { inner = node.querySelectorAll ? node.querySelectorAll("img") : null; } catch (eQ) { inner = null; }
+                if (inner && inner.length) {
+                  for (var k = 0; k < inner.length; k++) { if (maImgConsider(inner[k])) tagged = true; }
+                }
+              }
+            }
+          } catch (e1) { /* 单条记录失败不影响其余 */ }
+          if (tagged) { try { maPublishDiag(); } catch (e2) { /* 忽略 */ } }
+        });
+        mo.observe(document.documentElement, { childList: true, subtree: true });
+        maImgMoRef = mo;
+      } catch (e3) {
+        maImgMoRef = null;
+        maImgObserverInstalled = false;   // 退化：看门狗里的低频补扫仍然有效
+      }
+    }
+
+    /** 给一张「确定不在首屏附近」的图片打上按需加载属性（其余情况一律不动）。 */
+    /** 补扫路径的打属性入口（此时已在扫描循环里 markSeen 过，不能再走 maImgConsider 的 seen 检查）。 */
+    function maImgApplyLazy(img) { return maImgApplyAttrs(img); }
+    function maInitImgLazyObserver() {
+      if (maImgLazyIOInited) return;
+      maImgLazyIOInited = true;
+      try {
+        if (typeof IntersectionObserver !== "function") return;
+        maImgLazyIO = new IntersectionObserver(function (entries) {
+          try {
+            for (var i = 0; i < entries.length; i++) {
+              var en = entries[i];
+              if (!en || !en.target) continue;
+              if (en.isIntersecting) maPerf.imgKept += 1;   // 首屏附近 → 保持立即加载
+              else maImgApplyLazy(en.target);
+              try { maImgLazyIO.unobserve(en.target); } catch (eU) { /* 忽略 */ }
+            }
+          } catch (e2) { /* 忽略 */ }
+        }, { rootMargin: "300px 0px", threshold: 0 });
+      } catch (e3) { maImgLazyIO = null; }
+    }
+    /** 扫描新出现的 <img> 并交给观察器（节流；打字/粘贴期间暂停；一次最多 120 张）。 */
+    /* 安全阀：打上了 lazy 却**压根渲染不出来**（藏在 display:none / 未挂载容器里）→ 改回 eager。
+       这条是给「官方在隐藏容器里等 onload 再显示」这类写法兜底的：宁可多拉一张图，
+       也绝不能让图片永远出不来（懒加载只是优化，功能正确性优先）。
+       判据用 getClientRects（没有盒子 = 没有布局），**不用 offsetParent**
+       （position:fixed 的 offsetParent 也是 null，会误判）。 */
+    function maImgSafetyValve() {
+      try {
+        var lazyList = null;
+        try { lazyList = document.querySelectorAll('img[loading="lazy"]'); } catch (e0) { lazyList = null; }
+        if (!lazyList || !lazyList.length) return;
+        var n = Math.min(lazyList.length, 200);   // 上限：长会话里也不会在一次补扫里卡住主线程
+        for (var i = 0; i < n; i++) {
+          var lim = lazyList[i];
+          try {
+            if (!lim || !lim.getAttribute || !lim.setAttribute) continue;
+            var doneL = false;
+            try { doneL = !!lim.complete; } catch (e1) { doneL = false; }
+            if (doneL) continue;
+            var boxes = 1;
+            try { boxes = lim.getClientRects ? lim.getClientRects().length : 1; } catch (e2) { boxes = 1; }
+            if (boxes === 0) {
+              lim.setAttribute("loading", "eager");
+              maPerf.imgUnlazy += 1;
+            }
+          } catch (e3) { /* 单张图失败不影响其余 */ }
+        }
+      } catch (e) { /* 忽略 */ }
+    }
+    function maTagLazyImages(force) {
+      var lazyBefore = -1, keptBefore = -1;
+      try {
+        if (!document || typeof document.querySelectorAll !== "function") return;
+        var now = Date.now();
+        if (!force && now - maImgLazyLastAt < 800) return;
+        if (maTypingBusy()) {
+          maPerf.imgScanPaused += 1;
+          try { maPublishDiag(); } catch (eP) { /* 忽略 */ }   // 诊断是快照 → 计数变了要刷
+          return;
+        }
+        maImgLazyLastAt = now;
+        maPerf.imgScanCalls += 1;
+        try { maInstallImgObserver(); } catch (eObs) { /* 忽略 */ }
+        try { maImgSafetyValve(); } catch (eValve) { /* 忽略 */ }
+        var list = null;
+        try { list = document.querySelectorAll("img"); } catch (e1) { return; }
+        if (!list || !list.length) return;
+        lazyBefore = maPerf.imgLazy; keptBefore = maPerf.imgKept;
+        var fresh = [];
+        for (var i = 0; i < list.length && fresh.length < 120; i++) {
+          var img = list[i];
+          if (!img || maImgSeen(img)) continue;
+          maImgMarkSeen(img);
+          fresh.push(img);
+        }
+        maPerf.imgScanned += fresh.length;
+        if (!fresh.length) return;
+        maInitImgLazyObserver();
+        var j;
+        if (maImgLazyIO) {
+          for (j = 0; j < fresh.length; j++) { try { maImgLazyIO.observe(fresh[j]); } catch (e4) { /* 忽略 */ } }
+          return;
+        }
+        /* 没有 IntersectionObserver（老 Safari）：先**批量读**几何、再**批量写**属性。
+           顺序很重要 —— 读一次写一次会每张图都触发一次强制布局（长会话里就是肉眼可见的卡）。 */
+        var vh = 640;
+        try { vh = window.innerHeight || 640; } catch (e5) { vh = 640; }
+        var rects = [];
+        for (j = 0; j < fresh.length; j++) {
+          var rc = null;
+          try { rc = fresh[j].getBoundingClientRect ? fresh[j].getBoundingClientRect() : null; } catch (e6) { rc = null; }
+          rects.push(rc);
+        }
+        for (j = 0; j < fresh.length; j++) {
+          var r = rects[j];
+          var nearViewport = true;
+          if (r && (r.width || r.height)) nearViewport = (r.bottom > -300 && r.top < vh + 300);
+          if (nearViewport) { maPerf.imgKept += 1; continue; }
+          maImgApplyLazy(fresh[j]);
+        }
+      } catch (e) { /* 纯优化：任何异常静默放弃，绝不把页面拖挂 */ }
+      try {
+        /* perf 是**快照**（maPublishDiag 每次都新建对象）→ 计数变了要刷一次，否则诊断里看不出效果。 */
+        if (maPerf.imgLazy !== lazyBefore || maPerf.imgKept !== keptBefore) maPublishDiag();
+        else if (maPerf.imgUnlazy) maPublishDiag();
+      } catch (ePub) { /* 忽略 */ }
+    }
+    /* ===== 「插入前」那一层：给 Node.prototype.appendChild / insertBefore 包一层极窄的钩子 =====
+       为什么必须抢在插入前（2026-10-2x 实测，headless Chrome）：
+         · 插入**前**带 loading="lazy" → 24 张图只发 **11** 个请求；
+         · 插入**后**（哪怕只晚一个微任务）再补属性 → **24 个请求一个不少**（属性有了、请求照发）。
+       也就是说：只靠"插入后观察器"是拿不到带宽收益的，这一层才是真正省首屏带宽的那一刀。
+       安全边界（每一条都重要 —— 这是唯一一处会碰官方页面全局对象的地方）：
+         · **只在 ≤820px** 安装；桌面镜像页一行都不碰；
+         · 只处理 nodeName === "IMG"（DocumentFragment 只看一级子节点），其它节点原样透传；
+         · 已经有 loading 属性 / 已经加载完的图 → 一个字节都不动；
+         · 打属性失败也照常插入（try/catch），返回值原样透传；
+         · 幂等；pagehide/bfcache 时**还原**原生方法（不留悬挂改写）；
+         · 逃生口：URL 带 ?dsh_ma_img_lazy=0 → 完全不装（线上出问题不用等发版）。
+       已知风险与对策：隐藏容器里"等 onload 再显示"的写法可能被懒加载卡住 ——
+       看门狗补扫里有一条安全阀：打了 lazy 却压根渲染不出来（getClientRects 为空）→ 改回 eager。 */
+    var maImgHook = { on: false, restored: false, nativeAppend: null, nativeInsert: null };
+    function maImgHookDisabled() {
+      try {
+        if (typeof window === "undefined" || !window.location) return false;
+        return /(^|[?&])dsh_ma_img_lazy=0(&|$)/.test(String(window.location.search || ""));
+      } catch (e) { return false; }
+    }
+    /** 钩子里的计数**合并刷新**诊断（一次渲染批量插很多图时，不要每张都建一次诊断对象）。 */
+    var maImgDiagPending = false;
+    function maImgHookPublishSoon() {
+      if (maImgDiagPending) return;
+      maImgDiagPending = true;
+      try {
+        setTimeout(function () {
+          maImgDiagPending = false;
+          try { maPublishDiag(); } catch (e) { /* 忽略 */ }
+        }, 0);
+      } catch (e2) { maImgDiagPending = false; }
+    }
+    function maImgHookTagNode(node) {
+      try {
+        if (!node) return;
+        var name = "";
+        try { name = String(node.nodeName || node.tagName || "").toUpperCase(); } catch (eN) { name = ""; }
+        if (name === "IMG") {
+          if (maImgConsider(node)) { maPerf.imgHook += 1; maImgHookPublishSoon(); }
+          return;
+        }
+        /* DocumentFragment（React 列表批量插入常见）：只看它的一级子节点 —— 够用，且不会递归整棵树。 */
+        if (node.nodeType === 11 && node.childNodes) {
+          var kids = node.childNodes;
+          for (var i = 0; i < kids.length; i++) {
+            var k = kids[i];
+            var kN = "";
+            try { kN = String((k && (k.nodeName || k.tagName)) || "").toUpperCase(); } catch (eKN) { kN = ""; }
+            if (kN === "IMG" && maImgConsider(k)) {
+              maPerf.imgHook += 1;
+              maImgHookPublishSoon();
+            }
+          }
+        }
+      } catch (e) { /* 打属性失败绝不影响插入本身 */ }
+    }
+    function maInstallImgInsertHook() {
+      if (maImgHook.on) return;
+      maImgHook.restored = false;
+      try {
+        if (maImgHookDisabled()) return;
+        if (typeof NARROW === "function" && !NARROW()) return;   // 手机专属优化
+        if (typeof Node !== "function" || !Node.prototype) return;
+        var proto = Node.prototype;
+        var nAppend = proto.appendChild, nInsert = proto.insertBefore;
+        if (typeof nAppend !== "function") return;
+        if (nAppend.__dshMaImgHook) return;                       // 幂等
+        var wrap = function (native) {
+          if (typeof native !== "function") return native;
+          var W = function (node) {
+            try { maImgHookTagNode(node); } catch (e) { /* 忽略 */ }
+            return native.apply(this, arguments);
+          };
+          try { W.__dshMaImgHook = true; } catch (e2) { /* 忽略 */ }
+          return W;
+        };
+        var wAppend = wrap(nAppend);
+        var wInsert = wrap(nInsert);
+        proto.appendChild = wAppend;
+        if (typeof nInsert === "function") proto.insertBefore = wInsert;
+        maImgHook.nativeAppend = nAppend;
+        maImgHook.nativeInsert = typeof nInsert === "function" ? nInsert : null;
+        maImgHook.on = true;
+      } catch (e3) {
+        /* 补不上去就算了：插入后的观察器这一层仍然在（对支持的引擎/场景有效） */
+        maImgHook.on = false;
+      }
+    }
+    function maRestoreImgInsertHook() {
+      try {
+        if (!maImgHook.on || typeof Node !== "function" || !Node.prototype) { maImgHook.on = false; return; }
+        if (maImgHook.nativeAppend) Node.prototype.appendChild = maImgHook.nativeAppend;
+        if (maImgHook.nativeInsert) Node.prototype.insertBefore = maImgHook.nativeInsert;
+      } catch (e) { /* 忽略 */ }
+      maImgHook.on = false;
+      maImgHook.restored = true;
+    }
+
+    /* 解析期就装上这两层（head 里、官方 bundle 执行之前）：官方 SPA 一渲染出图片就会被处理。
+       不能等第一次看门狗/600ms 补扫 —— 那时候图早就开始拉了（实测微任务都算晚）。 */
+    try { maInstallImgObserver(); } catch (eImgObs0) { /* 忽略 */ }
+    try { maInstallImgInsertHook(); } catch (eImgHook0) { /* 忽略 */ }
 
     /* —— 鲸鱼余额挂件(dsh-whale-widget,第三方插件的浮动组件)窄屏协同 ——
        若挂件记忆的锚点是「左+上」(实测会盖住左上角会话标题/左上菜单按钮),在页面解析期
@@ -2846,6 +3464,17 @@ const SCRIPT = `(() => {
               可拖动，位置按"最近的角 + 距边偏移"记忆 —— 旋转屏幕/换窗口宽度都不会跑到屏幕外。 ---- */
       const FAB_KEY = "dsh-ma-fab-pos";
       const FAB_SIZE = 46, FAB_EDGE = 10;
+      /* 手机键盘弹出时 「window.innerHeight」 **不变**（iOS Safari 尤其），只有 visualViewport
+         才是"用户真正看得见的区域"。用它换算高度，按钮/菜单才不会被算到键盘后面去
+         （用户正在打字、想顺手调字号时，按钮却摸不到 —— 这就是"可视区适配"）。
+         老浏览器没有 visualViewport → 退回 innerHeight，行为与以前完全一致。 */
+      const viewportH = () => {
+        try {
+          const vv = window.visualViewport;
+          if (vv && typeof vv.height === "number" && vv.height > 8) return vv.height;
+        } catch (e) { /* 忽略 */ }
+        return window.innerHeight || 640;
+      };
       const readFabPos = () => {
         try {
           const raw = window.localStorage && window.localStorage.getItem(FAB_KEY);
@@ -2858,14 +3487,14 @@ const SCRIPT = `(() => {
       const defaultFabPos = () => ({ h: "right", v: "top", dx: FAB_EDGE, dy: FAB_EDGE });
       let fabPos = readFabPos() || defaultFabPos();
       const fabXY = (pos) => {
-        const vw = window.innerWidth || 360, vh = window.innerHeight || 640;
+        const vw = window.innerWidth || 360, vh = viewportH();
         return {
           left: pos.h === "left" ? pos.dx : vw - FAB_SIZE - pos.dx,
           top: pos.v === "top" ? pos.dy : vh - FAB_SIZE - pos.dy,
         };
       };
       const clampFabXY = (xy) => {
-        const vw = window.innerWidth || 360, vh = window.innerHeight || 640;
+        const vw = window.innerWidth || 360, vh = viewportH();
         return {
           left: Math.max(4, Math.min(xy.left, vw - FAB_SIZE - 4)),
           top: Math.max(4, Math.min(xy.top, vh - FAB_SIZE - 4)),
@@ -2882,7 +3511,7 @@ const SCRIPT = `(() => {
       };
       /** 拖动落点 → "最近的角 + 偏移"（保留用户的意图，同时保证换尺寸后仍在屏内）。 */
       const fabPosFromXY = (xy) => {
-        const vw = window.innerWidth || 360, vh = window.innerHeight || 640;
+        const vw = window.innerWidth || 360, vh = viewportH();
         const h = xy.left + FAB_SIZE / 2 < vw / 2 ? "left" : "right";
         const v = xy.top + FAB_SIZE / 2 < vh / 2 ? "top" : "bottom";
         return {
@@ -2915,7 +3544,12 @@ const SCRIPT = `(() => {
         const L = applyFsLevel(level);
         if (fsVal) fsVal.textContent = L.name;
         if (fsRange && Number(fsRange.value) !== level) fsRange.value = String(level);
-        if (persist) { try { window.localStorage && window.localStorage.setItem(FS_KEY, String(level)); } catch (e3) { /* 忽略 */ } }
+        if (persist) {
+          try { window.localStorage && window.localStorage.setItem(FS_KEY, String(level)); } catch (e3) { /* 忽略 */ }
+          /* 用户已经自己动过字号了 → 「字太小？」提示的目的已经达到，立刻收起并标记（别重复打扰）。
+             注意：这两句只在 persist 分支里，且此时 fsTipMark/hideFsTip 早已定义（用户交互才会走到这里）。 */
+          try { fsTipMark(); hideFsTip(); } catch (eTip) { /* 忽略 */ }
+        }
       };
       setLevel(readFsLevel(), false);
 
@@ -3041,7 +3675,7 @@ const SCRIPT = `(() => {
       const placeMenu = () => {
         try {
           const r = fab.getBoundingClientRect();
-          const vw = window.innerWidth || 360, vh = window.innerHeight || 640;
+          const vw = window.innerWidth || 360, vh = viewportH();
           const mr = menu.getBoundingClientRect();
           const mw = mr.width || Math.min(vw * 0.86, 320);
           const mh = mr.height || 300;
@@ -3074,6 +3708,69 @@ const SCRIPT = `(() => {
         toggleMenu();                                     // 键盘/老浏览器兜底
       });
       menu.addEventListener("click", (e) => e.stopPropagation());
+
+      /* ===== 首启「字号太小？」提示（2026-10-2x）=====
+         用户原声：「字体太小，因此不用」—— 字号档位其实**早就有**（就是这颗悬浮按钮的菜单里那颗滑块），
+         但用户不知道它存在。所以这里只做「告知」，**复用现有档位能力，不重做**：
+           · 一次性：localStorage 里 dsh-ma-fs-tip-v1 = 1，同一浏览器只提示一次；
+           · 不阻塞：小气泡**挂在 FAB 内部**（不新增 body 级浮层、不占整屏、不拦点击）；
+           · 有用：点气泡 = 直接打开字号菜单（不用先学会点按钮）；✕ = 立刻关掉；
+           · 不打扰：只在手机上、且用户**从没调过字号**时提示；调过就不提示；
+           · 绝不在首屏关键路径上掺和：延迟 1.2 秒才出现，12 秒自动消失。
+         ⚠️ 注入体是模板字符串：本段注释/文案不得出现反引号，一律用「」。 */
+      const FS_TIP_KEY = "dsh-ma-fs-tip-v1";
+      const FS_TIP_DELAY_MS = 1200;
+      const FS_TIP_TTL_MS = 12000;
+      let fsTipEl = null;
+      const fsTipSeen = () => {
+        try { return !!(window.localStorage && window.localStorage.getItem(FS_TIP_KEY) === "1"); }
+        catch (e) { return false; }   // 读不到存储（隐私模式）→ 按"没看过"处理，最多多提示一次
+      };
+      const fsTipMark = () => {
+        try { window.localStorage && window.localStorage.setItem(FS_TIP_KEY, "1"); } catch (e) { /* 忽略 */ }
+      };
+      const hideFsTip = () => {
+        try { if (fsTipEl && fsTipEl.parentNode) fsTipEl.parentNode.removeChild(fsTipEl); } catch (e) { /* 忽略 */ }
+        fsTipEl = null;
+      };
+      const showFsTip = () => {
+        try {
+          if (fsTipEl) return;
+          if (!NARROW()) return;                          // 「字太小」是手机上的诉求；电脑端不打扰
+          if (document.hidden) return;                    // 页面在后台 → 不提示（回来也不打扰）
+          if (fsTipSeen()) return;
+          if (readFsLevel() !== 0) { fsTipMark(); return; } // 用户已经自己调过字号 → 不必告知
+          const tip = document.createElement("span");
+          tip.className = "dsh-ma-fs-tip"
+            + (fabPos.v === "top" ? " dsh-ma-fs-tip-below" : " dsh-ma-fs-tip-above")
+            + (fabPos.h === "left" ? " dsh-ma-fs-tip-left" : " dsh-ma-fs-tip-right");
+          tip.setAttribute("role", "note");
+          tip.setAttribute("aria-label", "字号提示：点这里可以调大字号");
+          tip.innerHTML = '<span class="dsh-ma-fs-tip-txt">字太小？点这里调字号</span>'
+            + '<span class="dsh-ma-fs-tip-x" role="button" aria-label="关闭字号提示">✕</span>';
+          const closeTip = (alsoOpenMenu) => {
+            try { if (alsoOpenMenu) openMenu(); } catch (e) { /* 忽略 */ }
+            fsTipMark();
+            hideFsTip();
+          };
+          /* 气泡在 FAB 内部 → 所有指针事件必须自己截住，否则会被 FAB 的"拖动/轻点开合"逻辑吃掉。 */
+          const stopEv = (e) => { try { e.stopPropagation(); } catch (e2) { /* 忽略 */ } };
+          tip.addEventListener("pointerdown", stopEv);
+          tip.addEventListener("pointerup", stopEv);
+          tip.addEventListener("pointercancel", stopEv);
+          tip.addEventListener("click", (e) => { stopEv(e); closeTip(true); });
+          const xBtn = tip.querySelector(".dsh-ma-fs-tip-x");
+          if (xBtn) xBtn.addEventListener("click", (e) => { stopEv(e); closeTip(false); });
+          fab.appendChild(tip);
+          fsTipEl = tip;
+          fsTipMark();        // 显示即消费：同一浏览器只提示一次（刷新不再打扰）
+          maPerf.tipShown = true;
+          try { maPublishDiag(); } catch (e7) { /* 忽略 */ }
+          try { setTimeout(hideFsTip, FS_TIP_TTL_MS); } catch (e8) { /* 忽略 */ }
+        } catch (e) { /* 提示失败绝不影响 FAB 的任何既有功能 */ }
+      };
+      /* 1.2 秒后再出现：绝不在首屏关键路径上创建节点/触发布局。 */
+      try { setTimeout(showFsTip, FS_TIP_DELAY_MS); } catch (eTipTimer) { /* 忽略 */ }
 
       /* ---- 拖动：pointer 事件 + 指针捕获（手指拖出按钮范围也不断线）；拖动阈值 6px 区分"点击"与"拖动" ---- */
       let fabDrag = null;
@@ -3136,6 +3833,31 @@ const SCRIPT = `(() => {
       try {
         window.addEventListener("resize", () => { applyFabPos(); if (!menu.hidden) placeMenu(); }, { passive: true });
         window.addEventListener("orientationchange", () => { applyFabPos(); if (!menu.hidden) placeMenu(); }, { passive: true });
+        /* 键盘弹出/收起（2026-10-2x）：iOS Safari 上 window 的 resize 不一定发，visualViewport 才是
+           可靠的信号。键盘一起来，原本贴着屏幕底部的按钮就会落到键盘后面、点不到 —— 用户正在
+           打字时想调字号/返回列表却摸不到入口，正是这类"可视区不适配"。
+           处理：一帧只重算一次（rAF 合并），彻底失败也不影响其它功能。 */
+        const vv = window.visualViewport;
+        if (vv && typeof vv.addEventListener === "function") {
+          let vvPending = 0;
+          const onVvChange = () => {
+            try {
+              if (vvPending) return;
+              const run = () => {
+                vvPending = 0;
+                try {
+                  applyFabPos();
+                  maPerf.vvRepositions += 1;
+                  maPublishDiag();
+                } catch (e1) { /* 忽略 */ }
+                try { if (!menu.hidden) placeMenu(); } catch (e2) { /* 忽略 */ }
+              };
+              vvPending = (typeof requestAnimationFrame === "function") ? requestAnimationFrame(run) : setTimeout(run, 16);
+            } catch (e0) { /* 忽略 */ }
+          };
+          vv.addEventListener("resize", onVvChange);
+          vv.addEventListener("scroll", onVvChange);
+        }
       } catch (e9) { /* 忽略 */ }
       const devEl = menu.querySelector(".dsh-ma-menu-dev");
       if (devEl) {
@@ -3230,7 +3952,11 @@ const SCRIPT = `(() => {
     };
 
     let done = false;
-    const boot = () => {
+    /* 首屏自测（2026-10-2x）：boot 是适配层唯一的重活入口，这里统一计时 ——
+       计的是**适配层自己**在当前这一拍花了多少主线程时间（含 HOSTISH/建 FAB/列识别），
+       不含任何异步工作。数字进 __dshMaDiag.perf.bootMs，用来证明"适配层不是首屏慢的原因"，
+       也用来盯住以后不要再往 boot 里塞重活（首屏 p90 21.6s 的锅不能是我们加的）。 */
+    const bootImpl = () => {
       if (!HOSTISH()) return;
       /* 📶 **先**把延迟采样器挂上（2026-10-10）：它必须在"任何请求发生之前"就位。
          即便 buildRemoteMenu() 因为任何原因没能建出菜单（或抛错），采样器也照挂不误 ——
@@ -3241,7 +3967,19 @@ const SCRIPT = `(() => {
       try { maInstallUploadTap(); } catch (eUploadTap0) { /* 忽略 */ }
       /* 悬浮按钮/菜单：任何宽度都要有（电脑端访问镜像页时同样需要返回设备列表的出口）。
          失败也不影响手机端布局适配 —— 两条链路各自独立。 */
-      if (!fabDone) { fabDone = true; try { buildRemoteMenu(); } catch (eFabDone) { /* 忽略 */ } }
+      if (!fabDone) {
+        fabDone = true;
+        try { buildRemoteMenu(); } catch (eFabDone) { /* 忽略 */ }
+        /* 首屏优化（2026-10-2x）：**首屏之后**（600ms 后）再扫一遍图片 + 给输入框打可用性属性。
+           为什么不在这里同步做：boot 发生在官方 SPA 还在渲染的时候，此刻扫全文档/读几何只会
+           和首屏抢主线程。600ms 足够让首屏稳定下来，而"懒加载"本来就是为了之后的滚动。 */
+        try {
+          setTimeout(function () {
+            try { maTagLazyImages(true); } catch (eLazyBoot) { /* 忽略 */ }
+            try { maTagComposer(); } catch (eCompBoot) { /* 忽略 */ }
+          }, 600);
+        } catch (eBootTimer) { /* 忽略 */ }
+      }
       if (done || !NARROW()) return;
       const frame = document.querySelector(".pI_x6G_frame, [data-sidebar-collapsed], [data-details-collapsed], [data-rightbar-collapsed]");
       if (!frame || !frame.querySelector) return;
@@ -3703,6 +4441,18 @@ const SCRIPT = `(() => {
       whaleHookInit();
       watchSettings();
     };
+    const boot = () => {
+      const t0 = maNowMs();
+      try {
+        bootImpl();
+      } finally {
+        try {
+          maPerf.bootCalls += 1;
+          maPerf.bootMs += Math.max(0, maNowMs() - t0);
+          maPublishDiag();
+        } catch (ePerfBoot) { /* 诊断失败绝不影响 boot */ }
+      }
+    };
 
     if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot); else boot();
 
@@ -3750,6 +4500,12 @@ const SCRIPT = `(() => {
       /* 设置面板结构识别(自带节流,幂等):官方每次重新打包都换混淆前缀,
          这一步保证"改名后仍然基本可用",而不是整段静默失效(2026-10-13 根因)。 */
       try { maSettingsMaybeTag(); } catch (eSetTag) { /* 忽略 */ }
+      /* 首屏优化（2026-10-2x）：图片按需加载 + 输入框属性小修补。
+         两者都自带节流/幂等（懒加载 ≤1 次/800ms、输入框只在元素换了才打一次），
+         并且打字/粘贴期间会自动暂停 —— 所以每拍调用是安全的、也是有意义的：
+         聊天里新出现的图片就是靠这一拍被"上锁"的。 */
+      try { maTagLazyImages(); } catch (eImgLazy) { /* 忽略 */ }
+      try { maTagComposer(); } catch (eCompTag) { /* 忽略 */ }
     };
     /* 节流:一次 DOM 变更往往产生几十条记录,逐条 boot() 就是忙轮询。
        统一合并成"本帧最多跑一次"(有 rAF 用 rAF,没有就退化成 0ms 宏任务) —— 天然去重。 */
@@ -3929,6 +4685,8 @@ const SCRIPT = `(() => {
     /* 挂上"叫醒"的两条路。做成可重入(先清旧的再建新的),这样 bfcache 恢复后能重新武装。 */
     const maArm = () => {
       maTorn = false;
+      try { maInstallImgObserver(); } catch (eImgArm) { /* 忽略 */ }
+      try { maInstallImgInsertHook(); } catch (eImgArm2) { /* 忽略 */ }
       maRafPending = false;            // 冻结时若有一帧没跑到,不清掉就会永远挡住后续调度
       try { if (maObserver) maObserver.disconnect(); } catch (eA1) { /* 忽略 */ }
       maObserver = null;
@@ -3952,6 +4710,12 @@ const SCRIPT = `(() => {
       maTorn = true;
       try { if (maObserver) maObserver.disconnect(); } catch (eD1) { /* 忽略 */ }
       maObserver = null;
+      /* 图片"插入即打属性"的观察器也一起断开：bfcache/长驻页面里不许留悬挂回调。 */
+      try { if (maImgMoRef) maImgMoRef.disconnect(); } catch (eDImg) { /* 忽略 */ }
+      maImgMoRef = null;
+      maImgObserverInstalled = false;
+      /* 「插入前」钩子也必须还原：绝不把改写过的 Node.prototype 留在 bfcache 里。 */
+      try { maRestoreImgInsertHook(); } catch (eDHook) { /* 忽略 */ }
       try { if (maInterval) clearInterval(maInterval); } catch (eD2) { /* 忽略 */ }
       maInterval = 0;
       // 加载提示条的秒数刷新也一起停掉（页面卸载/进 bfcache 后不留悬挂回调）

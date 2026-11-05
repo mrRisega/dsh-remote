@@ -123,6 +123,9 @@ class El {
   }
   get className() { return [...this._cls].join(" "); }
   set className(v) { this._cls = new Set(String(v).split(/\s+/).filter(Boolean)); }
+  /* 真实 DOM 里 nodeName 一定存在（大小写语义与 tagName 相同）：适配层的「插入前图片钩子」
+     按 nodeName 判 IMG，假 DOM 缺了这个属性就会把正确实现判成失效（假红）。 */
+  get nodeName() { return this.tagName; }
   set innerHTML(html) {
     this._html = String(html);
     this.children = [];
@@ -1210,4 +1213,173 @@ test("★ C6：scrim 不变量与下闸次数必须进诊断（用户报「又�
   env.tickTimers();                                      // 800ms 看门狗那一拍
   assert.equal(env.html.classList.contains("dsh-ma-scrim-on"), false, "不变量必须摘掉遮罩");
   assert.ok(env.win.__dshMaDiag.scrim.invariantHits >= 1, "摘除次数必须计数（区分「遮罩在拦」与「遮罩早被摘了」）");
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 首屏优化（2026-10-2x）：这几条守的是「适配层自己别成为首屏/打字卡顿的原因」。
+//
+// 现场：手机镜像页首屏 p50 3.9s / p90 21.6s、20.2% ≥12s（生产遥测 n=8903）。
+// 大头（TTFB、官方 13MB 级 bundle、中继带宽）不在适配层手里，但下面两件事是我们自己造的：
+//   ① 旧 HOSTISH() 把 `outerHTML.slice(0, 200000)` 写在或的左边 → 每拍 boot 都先全量序列化一遍；
+//   ② 看门狗每拍要扫全文档（设置面板识别）与全部 <img>（懒加载）→ 用户敲字时在和输入法抢主线程。
+// ══════════════════════════════════════════════════════════════════════════════
+
+test("★ 首屏优化：有官方结构信号时一次全量序列化都不做（旧实现每拍 boot 先 outerHTML.slice(0,200000)）", () => {
+  const { js } = injected();
+  const env = run(harness({ width: 390 }), js);
+  const perf = env.win.__dshMaDiag && env.win.__dshMaDiag.perf;
+  assert.ok(perf, "必须暴露 __dshMaDiag.perf（只本地可读，不上报）");
+  assert.ok(perf.hostishCalls >= 1, "boot 必须走过 HOSTISH（这是主机门）");
+  assert.equal(perf.hostishSerializations, 0,
+    "★ 官方 frame/开合属性已经能证明是官方页面 → 绝不能再把整页序列化一遍（那是最贵的一步）");
+});
+
+test("★ 首屏优化：打字期间暂停自己的后台扫描（别和输入法抢主线程）", () => {
+  const { js } = injected();
+  const env = run(harness({ width: 390 }), js);
+  const far = new El("img");
+  far.setAttribute("src", "/assets/far-below-fold.png");
+  far._rect = { left: 0, top: 2000, right: 300, bottom: 2200, width: 300, height: 200 };
+  env.body.appendChild(far);
+  // 用户正在打字：input 事件冒泡到 document（适配层在捕获阶段记下"忙 1.2 秒"）
+  env.composerChild.dispatchEvent(new Ev("input", {}));
+  env.tickTimers();                                   // 看门狗一拍 = 图片懒加载的一次扫描机会
+  assert.equal(far.getAttribute("loading"), null,
+    "★ 打字期间必须跳过扫描（暂停的是优化，不是交互 —— 页面行为一点不受影响）");
+  assert.ok(env.win.__dshMaDiag.perf.imgScanPaused >= 1, "跳过次数要进诊断（证明它真的让路了）");
+});
+
+test("★ 首屏优化：视口外的图片打 loading=lazy + decoding=async，首屏附近的一个字节都不动", () => {
+  const { js } = injected();
+  const env = run(harness({ width: 390 }), js);       // 该假 DOM 没有 IntersectionObserver → 走批量几何兜底
+  const far = new El("img");
+  far.setAttribute("src", "/assets/far.png");
+  far._rect = { left: 0, top: 2000, right: 300, bottom: 2200, width: 300, height: 200 };
+  const near = new El("img");
+  near.setAttribute("src", "/assets/near.png");
+  near._rect = { left: 0, top: 20, right: 300, bottom: 220, width: 300, height: 200 };
+  env.body.appendChild(far);
+  env.body.appendChild(near);
+  env.tickTimers();                                   // 看门狗一拍 → 扫描新出现的图片
+
+  assert.equal(far.getAttribute("loading"), "lazy", "★ 视口外的图片必须按需加载（首屏少发请求、少抢带宽）");
+  assert.equal(far.getAttribute("decoding"), "async", "解码异步，别阻塞主线程");
+  assert.equal(near.getAttribute("loading"), null, "★ 首屏附近的图片绝不能被改成 lazy");
+  assert.equal(near.getAttribute("decoding"), null, "首屏附近的图片保持官方原样");
+  const perf = env.win.__dshMaDiag.perf;
+  assert.ok(perf.imgLazy >= 1 && perf.imgKept >= 1, "省下的请求数 / 保持原样的张数都要能读出来");
+});
+
+test("★ 护栏：首启字号提示是 FAB 内的绝对定位气泡（不是 body 级浮层、不是全屏层）", () => {
+  // 0.6.14 的教训：一旦在用户页面上放覆盖层，判断错一次就是"永远进不去"。
+  // 字号提示必须遵守同一条纪律：只能挂在 FAB 内部、只能小、只能自己消失。
+  const { css, js } = injected();
+  const rule = /button\.dsh-ma-fab \.dsh-ma-fs-tip\s*\{([\s\S]*?)\}/.exec(css);
+  assert.ok(rule, "应有字号提示的样式规则（且限定在 FAB 内）");
+  assert.match(rule[1], /position:\s*absolute/, "必须是 FAB 内的绝对定位子元素");
+  assert.ok(!/position:\s*fixed/.test(rule[1]), "不得是 fixed 浮层");
+  assert.ok(!/inset:\s*0/.test(rule[1]), "不得铺满屏幕（inset:0 = 全屏层）");
+  assert.match(js, /dsh-ma-fs-tip-v1/, "必须用 localStorage 记住「已提示过」（同一浏览器只提示一次）");
+  assert.match(js, /FS_TIP_DELAY_MS/, "必须是延迟出现（不许在首屏关键路径上创建节点）");
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 「插入前」图片钩子（2026-10-2x，唯一一处会碰官方页面全局对象的地方，必须逐条钉住）
+//
+// 为什么需要它（headless Chrome 实测，同一份 24 张图的页面）：
+//   · append **之前**带 loading="lazy"              → 首屏只发 11 个图片请求
+//   · append **之后**（哪怕只晚一个微任务）补属性     → 24 个请求一个不少（属性有了、请求照发）
+// 所以"插入后观察器"拿不到带宽收益，真正省带宽的是这层极窄的钩子：
+// Node.prototype.appendChild / insertBefore 里，**只对 IMG**、只在插入前，补两个属性。
+// 下面每条都是它的安全边界 —— 破任何一条都可能影响官方页面的现有交互。
+// ══════════════════════════════════════════════════════════════════════════════
+
+/** 给假 DOM 补一个最小的 Node：脚本只在有 Node.prototype 的宿主里才装钩子。 */
+function installFakeNode(env) {
+  function FakeNode() {}
+  const nativeAppend = function (n) { (this._kids || (this._kids = [])).push(n); return n; };
+  const nativeInsert = function (n) { (this._kids || (this._kids = [])).push(n); return n; };
+  FakeNode.prototype.appendChild = nativeAppend;
+  FakeNode.prototype.insertBefore = nativeInsert;
+  FakeNode.nativeAppend = nativeAppend;
+  env.ctx.Node = FakeNode;
+  return FakeNode;
+}
+
+test("★ 图片钩子：插入**前**给 <img> 补 loading=lazy + decoding=async（这是唯一能真的省请求的时机）", () => {
+  const { js } = injected();
+  const env = harness({ width: 390 });
+  const FakeNode = installFakeNode(env);
+  run(env, js);
+
+  assert.equal(typeof FakeNode.prototype.appendChild.__dshMaImgHook, "boolean",
+    "应给 appendChild 包一层钩子（标记便于排障）");
+  const host = {};
+  const img = new El("img");
+  img.setAttribute("src", "/chat/1.png");
+  const ret = FakeNode.prototype.appendChild.call(host, img);
+  assert.equal(ret, img, "返回值必须原样透传（包装不能改变任何调用语义）");
+  assert.equal(host._kids.length, 1, "原生 appendChild 必须照常执行");
+  assert.equal(img.getAttribute("loading"), "lazy", "★ 插入前就必须带上 loading=lazy（晚一步等于没打）");
+  assert.equal(img.getAttribute("decoding"), "async", "解码异步，不阻塞主线程");
+
+  // 非 IMG 节点：一个字节都不碰
+  const div = new El("div");
+  FakeNode.prototype.appendChild.call({}, div);
+  assert.equal(div.getAttribute("loading"), null, "非图片节点不得被改动");
+
+  // 已有 loading 属性（官方自己给的）→ 不动
+  const img2 = new El("img");
+  img2.setAttribute("src", "/chat/2.png");
+  img2.setAttribute("loading", "eager");
+  FakeNode.prototype.appendChild.call({}, img2);
+  assert.equal(img2.getAttribute("loading"), "eager", "官方已经给过 loading 属性 → 必须原样保留");
+});
+
+test("★ 图片钩子：DocumentFragment 批量插入（React 列表常见）也要覆盖到一级 img 子节点", () => {
+  const { js } = injected();
+  const env = harness({ width: 390 });
+  const FakeNode = installFakeNode(env);
+  run(env, js);
+  const a = new El("img"); a.setAttribute("src", "/a.png");
+  const b = new El("img"); b.setAttribute("src", "/b.png");
+  const frag = { nodeType: 11, childNodes: [a, b] };
+  FakeNode.prototype.appendChild.call({}, frag);
+  assert.equal(a.getAttribute("loading"), "lazy", "fragment 里的图片同样要按需加载");
+  assert.equal(b.getAttribute("loading"), "lazy");
+});
+
+test("★ 图片钩子：逃生口 ?dsh_ma_img_lazy=0 生效（线上出问题不用等发版）", () => {
+  const { js } = injected();
+  const env = harness({ width: 390 });
+  const FakeNode = installFakeNode(env);
+  env.win.location.search = "?dsh_ma_img_lazy=0";
+  run(env, js);
+  assert.ok(!FakeNode.prototype.appendChild.__dshMaImgHook,
+    "带逃生口参数时绝不安装钩子（页面行为与今天完全一致）");
+  const img = new El("img");
+  img.setAttribute("src", "/x.png");
+  FakeNode.prototype.appendChild.call({}, img);
+  assert.equal(img.getAttribute("loading"), null, "没装钩子就不许改任何图片属性");
+});
+
+test("★ 图片钩子：pagehide 必须还原 Node.prototype（bfcache 里不留改写过的全局方法）", () => {
+  const { js } = injected();
+  const env = harness({ width: 390 });
+  const FakeNode = installFakeNode(env);
+  run(env, js);
+  assert.ok(FakeNode.prototype.appendChild.__dshMaImgHook, "前提：钩子已装上");
+  // 适配层把 maTeardown 挂在 window 的 pagehide 上（假 DOM 的 window.addEventListener 转发到 document）
+  env.doc.dispatchEvent(new Ev("pagehide", {}));
+  assert.equal(FakeNode.prototype.appendChild, FakeNode.nativeAppend,
+    "★ pagehide 之后 appendChild 必须还原成原生函数（绝不给页面留悬挂改写）");
+});
+
+test("★ 图片钩子只在手机窄屏装（桌面镜像页一个字节都不碰）", () => {
+  const { js } = injected();
+  const env = harness({ width: 1200 });
+  const FakeNode = installFakeNode(env);
+  run(env, js);
+  assert.ok(!FakeNode.prototype.appendChild.__dshMaImgHook,
+    "★ >820px（电脑端镜像页）不得改写 Node.prototype —— 这条优化只属于手机");
 });
