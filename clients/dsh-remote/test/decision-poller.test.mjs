@@ -286,3 +286,43 @@ test("⑭ 401 之后仍会继续轮询（token 刷新后要能恢复）", async 
   assert.ok(f.calls.length >= 2, "401 不应停止轮询（等 token 刷新）");
   p.stop();
 });
+
+test("⑮ 至少一次语义：同一条 id 被重投时只 apply 一次、但仍 ack（幂等去重）", async () => {
+  const applied = [];
+  const item = { id: "dec_same", event_id: "e", request_id: "evt_same", decision: "allow", expires_at: Date.now() + 60000, redeliver_count: 0 };
+  const fetchImpl = makeFetch([
+    { status: 200, body: { ok: true, items: [item] } },
+    { status: 200, body: { ok: true } },
+    // 服务端重投同一条（redeliver_count=1）
+    { status: 200, body: { ok: true, items: [{ ...item, redeliver_count: 1 }] } },
+    { status: 200, body: { ok: true } }
+  ]);
+  const p = createDecisionPoller({
+    apiBase: "https://api.example.com", deviceId: "dev-x", tokenProvider: () => "tok",
+    apply: async (i) => { applied.push(i); }, fetchImpl
+  });
+  await p._tick();
+  await p._tick();
+  assert.equal(applied.length, 1, "重投不应重复 apply");
+  assert.equal(p.status().applied, 1);
+  assert.equal(p.status().skipped, 1);
+  assert.equal(p.status().acked, 2, "两次都应 ack（否则服务端会一直重投）");
+  p.stop();
+});
+
+test("⑯ 重投回执会写 warn 日志留痕（便于排查重复审批）", async () => {
+  const logs = [];
+  const item = { id: "dec_r", event_id: "e", request_id: "evt_r", decision: "deny", expires_at: Date.now() + 60000, redeliver_count: 2 };
+  const fetchImpl = makeFetch([
+    { status: 200, body: { ok: true, items: [item] } },
+    { status: 200, body: { ok: true } }
+  ]);
+  const p = createDecisionPoller({
+    apiBase: "https://api.example.com", deviceId: "dev-x", tokenProvider: () => "tok",
+    apply: async () => {}, fetchImpl,
+    log: (lvl, msg) => logs.push(lvl + ":" + msg)
+  });
+  await p._tick();
+  assert.ok(logs.some((l) => l.startsWith("warn:") && /重投/.test(l)));
+  p.stop();
+});

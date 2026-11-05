@@ -51,7 +51,15 @@ export function createDecisionPoller(options = {}) {
   const intervalMs = Number.isFinite(options.intervalMs) ? options.intervalMs : DEFAULT_POLL_INTERVAL_MS;
   const log = typeof options.log === "function" ? options.log : () => {};
 
-  const stats = { started: false, polls: 0, applied: 0, failed: 0, acked: 0, lastError: "" };
+  const stats = { started: false, polls: 0, applied: 0, skipped: 0, failed: 0, acked: 0, lastError: "" };
+  /**
+   * 已应用过的决策 id（有界 LRU）。
+   *
+   * 为什么需要：服务端是"至少一次"语义 —— 我们 ack 丢了或超时未 ack，同一条回执会被重投。
+   * 若每次都重新 `apply()`，会把同一条审批反复回执给 DSH（服务端虽是幂等的 already_decided，
+   * 但会刷日志、也会让"允许一次"看起来像被允许多次）。所以按 id 去重：见过的只 ack 不再应用。
+   */
+  const appliedIds = new Map();
   let timer = null;
   let stopped = false;
   let ticking = false;
@@ -126,6 +134,12 @@ export function createDecisionPoller(options = {}) {
           if (id) ackIds.push(id);
           continue;
         }
+        if (id && appliedIds.has(id)) {
+          // 重投的同一条：之前已应用过 → 只 ack，不再 apply（幂等）
+          stats.skipped += 1;
+          ackIds.push(id);
+          continue;
+        }
         if (!apply || !requestId) {
           stats.failed += 1;
           if (id) ackIds.push(id);
@@ -140,6 +154,13 @@ export function createDecisionPoller(options = {}) {
             outcome: toDshOutcome(decision)
           });
           stats.applied += 1;
+          if (id) {
+            appliedIds.set(id, now());
+            if (appliedIds.size > 500) {
+              const first = appliedIds.keys().next();
+              if (!first.done) appliedIds.delete(first.value);
+            }
+          }
         } catch (e) {
           // 应用失败（会话已结束/事件已作废）也必须 ack，否则每 3s 重放同一条
           stats.failed += 1;
