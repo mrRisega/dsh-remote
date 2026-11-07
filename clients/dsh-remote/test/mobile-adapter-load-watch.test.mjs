@@ -144,9 +144,25 @@ function harness(opts = {}) {
   const fetches = [];
   const signals = [];            // 被包装的 fetch 收到的 init.signal（C4：在途请求取消的断言入口）
   const winListeners = new Map();// window 上登记的事件监听（C4：资源 error 捕获靠它）
+  const docListeners = new Map();// document 上登记的事件监听（W3：visibilitychange）
   let timerSeq = 0;
   let intervalSeq = 0;
   const clicks = { reload: 0, assign: [], clipboard: [] };
+  /* W3：可控时钟（模拟 iOS 冻结/恢复必须能推进时间）。
+     · wall = Date.now()（startedAt / hiddenMs 用它）；
+     · perf = performance.now()（起点≈导航开始；perfOffsetMs 模拟"注入点落后导航开始"的 TTFB）。
+     默认固定基准值，保证用例可重复；advance() 同时推进两套时钟（挂起也是墙钟推进）。 */
+  const clock = {
+    wall: Number.isFinite(opts.wallNow) ? Number(opts.wallNow) : 1_700_000_000_000,
+    perf: Number.isFinite(opts.perfOffsetMs) ? Number(opts.perfOffsetMs) : 0,
+  };
+  const advance = (ms) => { const d = Math.max(0, Number(ms) || 0); clock.wall += d; clock.perf += d; return d; };
+  /* 注入体只用到 Date.now()（已 grep 确认无 new Date()）；仍给一个真 Date 的派生类兜底。 */
+  const RealDate = Date;
+  class FakeDate extends RealDate {
+    constructor(...args) { if (args.length === 0) super(clock.wall); else super(...args); }
+    static now() { return clock.wall; }
+  }
 
   const html = new El("html");
   /* hostFeature=true 模拟"官方文档已到、但界面还没挂载"的现场（HOSTISH 会读 outerHTML 找官方特征）。
@@ -174,7 +190,8 @@ function harness(opts = {}) {
   const docQS = El.prototype.querySelector.bind(doc);
   doc.querySelector = (sel) => (opts.officialReady ? new El("div") : docQS(sel));
   doc.querySelectorAll = () => [];
-  doc.addEventListener = () => {};
+  doc.visibilityState = "visible";
+  doc.addEventListener = (type, fn) => { const arr = docListeners.get(type) || []; arr.push(fn); docListeners.set(type, arr); };
   doc.removeEventListener = () => {};
 
   const loc = {
@@ -221,8 +238,8 @@ function harness(opts = {}) {
     MutationObserver: win.MutationObserver, ResizeObserver: win.ResizeObserver,
     requestAnimationFrame: win.requestAnimationFrame,
     AbortController, AbortSignal,
-    fetch: win.fetch, performance: { now: () => Date.now() },
-    URL, Date, Math, JSON, Object, Array, String, Number, RegExp, Boolean, Promise, Error, isNaN, parseInt, parseFloat,
+    fetch: win.fetch, performance: { now: () => clock.perf },
+    URL, Date: FakeDate, Math, JSON, Object, Array, String, Number, RegExp, Boolean, Promise, Error, isNaN, parseInt, parseFloat,
     HTMLElement: El,
   });
   ctx.globalThis = ctx;
@@ -234,7 +251,14 @@ function harness(opts = {}) {
   const findWatchTimer = (ms) => timersByMs(ms)[0] || null;
   return {
     ctx, win, doc, body, timers, intervals, fetches, clicks, navigator, signals, store,
-    findBar, barBtn, findWatchTimer,
+    findBar, barBtn, findWatchTimer, clock, advance,
+    /** 触发 document 上的事件（W3：visibilitychange）。 */
+    fireDocumentEvent(type, ev) {
+      const arr = docListeners.get(type) || [];
+      for (const fn of arr) fn(ev);
+    },
+    /** 模拟一次挂起（墙钟/单调钟一起前进，定时器不跑 = iOS 冻结语义）。 */
+    suspend(ms) { advance(ms); return ms; },
     countTimers: (ms) => timersByMs(ms).length,
     /** 触发 window 上的事件（C4：资源 error 在**捕获阶段**被适配层接住）。 */
     fireWindowEvent(type, ev) {
@@ -243,18 +267,31 @@ function harness(opts = {}) {
     },
     /** 触发**所有**同毫秒的 setTimeout（页面里同毫秒的定时器不止一个时用它）。 */
     fireTimers(ms) {
+      advance(ms);
       const list = timersByMs(ms);
       assert.ok(list.length > 0, `应登记了 ${ms}ms 的定时器`);
       for (const t of list) t.fn();
     },
-    /** 触发某个已登记的 setTimeout 回调（用例手工推进时间轴）。 */
+    /** 触发某个已登记的 setTimeout 回调（用例手工推进时间轴；W3 起同时推进可控时钟）。 */
     fireTimer(ms) {
+      advance(ms);
       const t = findWatchTimer(ms);
       assert.ok(t, `应登记了 ${ms}ms 的定时器`);
       t.fn();
     },
-    /** 触发所有 setInterval（秒数刷新 / 自适应兜底）。 */
-    tickIntervals() { for (const fn of [...intervals.values()]) fn(); },
+    /** 触发某个已登记的 setTimeout，但**不推进**时钟（W3：精确构造"活跃时间刚好到 20s"的现场）。 */
+    fireTimerOnly(ms) {
+      const t = findWatchTimer(ms);
+      assert.ok(t, `应登记了 ${ms}ms 的定时器`);
+      t.fn();
+    },
+    /** 触发所有 setInterval（秒数刷新 / 自适应兜底）；每跳推进 1s。 */
+    tickIntervals(seconds = 1) {
+      for (let i = 0; i < seconds; i++) {
+        advance(1000);
+        for (const fn of [...intervals.values()]) fn();
+      }
+    },
   };
 }
 
@@ -456,7 +493,12 @@ test("slow 时照旧上报 mirror_load 兜底样本：字段 ms/outcome/at 不�
   const posts = env.fetches.filter((f) => String(f.input).includes("/dsh-remote/telemetry/mirror-load"));
   assert.equal(posts.length, 1, "slow 兜底样本每次页面只发一条（reported 一次语义）");
   const body = JSON.parse(posts[0].init.body);
-  assert.deepEqual(Object.keys(body).sort(), ["at", "ms", "outcome"], "字段必须仍是 ms/outcome/at（后台契约不动）");
+  /* W3：上报体在 ms/outcome/at 之外**只增** active_ms / hidden_ms（服务端未升级时会静默丢弃，
+     不破坏旧契约）；outcome 仍只允许 ok|slow（插件半会把非 slow 归一成 ok）。 */
+  assert.deepEqual(Object.keys(body).sort(), ["active_ms", "at", "hidden_ms", "ms", "outcome"],
+    "字段 = ms/outcome/at + active_ms/hidden_ms");
+  assert.equal(typeof body.active_ms, "number", "active_ms 必须是数字");
+  assert.equal(typeof body.hidden_ms, "number", "hidden_ms 必须是数字");
   assert.equal(body.outcome, "slow", "看门狗兜底样本的 outcome 必须是 slow");
   assert.ok(Number.isFinite(body.ms) && body.ms >= 0 && body.ms <= 600000, "ms 必须被钳制在 [0,600000]");
   // 再触发一次：reported 已置位 → 不得重复上报
@@ -574,9 +616,13 @@ test("★ 文案分档：受保护 API 5xx（电脑端不可达）→「电脑�
     hostFeature: true,
     fetch: () => Promise.resolve({ ok: false, status: 502, headers: { get: () => null } }),
   }));
+  /* W3：10s 窗口按**活跃时间**算 —— 先把时钟推到活跃 19s，再制造 5xx，然后 tick 到 20s，
+     这样证据确实在"最近 10 秒活跃时间"内（旧 harness 不推进时间，这条断言是假成立的）。 */
+  env.advance(19000);
   env.win.fetch("/api/session/list");
   await new Promise((r) => setImmediate(r));
-  env.fireTimer(20000);
+  env.advance(1000);
+  env.fireTimerOnly(20000);
   assert.match(env.findBar().querySelector('[data-role="loadbar-txt"]').textContent,
     /电脑端可能未连接（已等待 \d+ 秒）/, "5xx = 电脑端/隧道不可达，这时说「电脑端可能未连接」才是对的");
 });
@@ -610,4 +656,157 @@ test("诊断出口：__dshMaDiag / __dshMaRetryStats 暴露 retry / scrim / comp
   assert.equal(typeof env.win.__dshMaDiag.scrim.activations, "number", "scrim 下闸次数（C6 用户上报「又点不动了」时用）");
   assert.equal(env.win.__dshMaDiag.compatOfficial.on, false, "锚点齐全的页面上不得误进 compat-official");
   assert.equal(env.win.__dshMaRetryStats, env.win.__dshMaDiag.retry, "mirror-diag 直接读 __dshMaRetryStats");
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ⑧ W3（2026-11-08）：active-time 口径 / 恢复即补偿 / 诊断串
+//
+// 现场：页面注入后活跃加载约 15s → 被 iOS 冻结 518s（零请求、定时器不跑）→ 恢复瞬间
+// 20s 看门狗才执行，旧实现把墙钟 541.664s 当成加载耗时、提示条显示"已等待 533 秒"。
+// 行为契约：冻结恢复后 ms 仍按 performance.now（541664），但 active_ms/hidden_ms 分开算，
+// 提示条/诊断串的"等待"只用活跃时间；恢复要补判就绪 + 补扫启动失败 + 限量补偿 <link>。
+// ══════════════════════════════════════════════════════════════════════════════
+
+test("★ W3 冻结 518s 后恢复：上报 ms=541664/slow、active≈23664、hidden=518000，复制行含「挂起 518 秒」", async () => {
+  /* perfOffsetMs=8664 模拟"注入脚本落后导航开始 8.664s"（本例 nginx HTML 上游 9.25s 的一部分），
+     于是同一个瞬间：performance.now()=541664，而 Date.now()-startedAt（墙钟等待）=533000。 */
+  const env = runScript(harness({ hostFeature: true, perfOffsetMs: 8664 }));
+  env.advance(15000);                                  // ① 活跃加载 15s
+  env.doc.visibilityState = "hidden";
+  env.fireDocumentEvent("visibilitychange");           // ② 切走/锁屏（记录 hiddenAt）
+  env.suspend(518000);                                 // ③ 冻结 518s：定时器一个都不跑
+  env.doc.visibilityState = "visible";
+  env.fireDocumentEvent("visibilitychange");           // ④ 恢复（结算隐藏时长 + 恢复补偿钩子）
+  env.fireWindowEvent("pageshow", { persisted: true }); // 同一次恢复的第二条路（事件顺序不确定）
+  await new Promise((r) => setImmediate(r));
+
+  const posts = env.fetches.filter((f) => String(f.input).includes("/dsh-remote/telemetry/mirror-load"));
+  assert.equal(posts.length, 1, "整页只上报一次（reported 一次性语义不变）");
+  const body = JSON.parse(posts[0].init.body);
+  assert.equal(body.outcome, "slow", "outcome 仍只允许 ok|slow");
+  assert.equal(body.ms, 541664, "ms = performance.now()（导航开始 → 恢复瞬间）");
+  assert.equal(body.hidden_ms, 518000, "hidden_ms = 挂起时长");
+  assert.ok(Math.abs(body.active_ms - 23664) <= 1000,
+    `active_ms ≈ 23664（541664-518000），实际 ${body.active_ms}`);
+
+  // 提示条/复制句只用活跃时间，并如实标注挂起
+  const barTxt = env.findBar().querySelector('[data-role="loadbar-txt"]').textContent;
+  assert.match(barTxt, /挂起 518 秒/, "提示条要说明「期间被系统挂起 518 秒」");
+  env.barBtn("loadbar-copy").click();
+  await new Promise((r) => setImmediate(r));
+  const line = env.clicks.clipboard[0];
+  assert.match(line, /等待 (23|24) 秒/, "等待秒数按活跃时间，不是墙钟 533 秒");
+  assert.match(line, /挂起 518 秒/);
+  assert.ok(line.length <= 400, "诊断串单行 ≤400 字符");
+});
+
+test("★ W3 恢复补偿：只重建 <link>、每页 ≤2 次，绝不重建 <script>（防插件重复执行）", () => {
+  const env = runScript(harness());
+  const fireFail = (el) => env.fireWindowEvent("error", { target: el });
+  // 3 个 link + 2 个 script 失败（都算首屏关键路径）
+  const links = ["/plugins/??@a/x.js&rev=1", "/assets/a.css", "/assets/b.css"].map((u) => {
+    const el = new El("link"); el.href = u; env.body.appendChild(el); fireFail(el); return el;
+  });
+  const scripts = ["/assets/a.js", "/assets/b.js"].map((u) => {
+    const el = new El("script"); el.src = u; el.setAttribute("type", "module");
+    env.body.appendChild(el); fireFail(el); return el;
+  });
+  assert.equal(links.length + scripts.length, 5, "前提：5 次关键资源失败已登记");
+
+  const hides = (ms) => { env.doc.visibilityState = "hidden"; env.fireDocumentEvent("visibilitychange"); env.suspend(ms); env.doc.visibilityState = "visible"; env.fireDocumentEvent("visibilitychange"); };
+  hides(5000);
+  const retried = () => env.body.children.filter((c) => c.attrs && c.attrs["data-dsh-ma-retry"] === "1");
+  assert.equal(retried().length, 2, "首次恢复最多补偿 2 个");
+  assert.ok(retried().every((c) => c.tagName === "LINK"), "★ 只重建 <link>，不重建 <script>");
+  hides(5000);
+  assert.equal(retried().length, 2, "每页上限 2 次：再次恢复不得继续重建");
+});
+
+test("★ W3 恢复后已就绪：提示条收起、不再补报 ok（reported 一次性）", async () => {
+  const env = runScript(harness());
+  env.fireTimer(20000);                                // 先走完 20s：slow 已上报 + 提示条已出现
+  const posts = () => env.fetches.filter((f) => String(f.input).includes("/dsh-remote/telemetry/mirror-load"));
+  assert.equal(posts().length, 1, "前提：slow 样本已上报一次");
+  // 恢复时官方界面其实已经好了（模拟"冻结期间资源传完、回来才渲染出来"）
+  env.doc.querySelector = (sel) => (/pI_x6G_frame|ma-frame|sidebar-collapsed|details-collapsed|rightbar-collapsed|composer-input|contenteditable|role="textbox"|textarea/.test(String(sel)) ? new El("div") : null);
+  env.doc.visibilityState = "hidden"; env.fireDocumentEvent("visibilitychange");
+  env.suspend(600000);
+  env.doc.visibilityState = "visible"; env.fireDocumentEvent("visibilitychange");
+  await new Promise((r) => setImmediate(r));
+  assert.equal(env.findBar().hidden, true, "认出官方界面后提示条必须收起");
+  assert.equal(posts().length, 1, "★ 不得补报第二条（ok）——reported 一次性语义不变");
+});
+
+test("★ W3 双保险：visibilitychange 与 1s 心跳不重复扣 hiddenMs", () => {
+  /* ① 可见性路径：hidden→518s→visible，hiddenMs 只能记一次 518s（不能变成 1036s） */
+  const env = runScript(harness({ hostFeature: true }));
+  env.advance(15000);
+  env.doc.visibilityState = "hidden"; env.fireDocumentEvent("visibilitychange");
+  env.suspend(518000);
+  env.doc.visibilityState = "visible"; env.fireDocumentEvent("visibilitychange");
+  const h1 = env.win.__dshMaDiag.load.hiddenMs;
+  assert.ok(h1 >= 517000 && h1 <= 519000, `hiddenMs 只记 518s 一次（实际 ${h1}）`);
+  assert.ok(h1 < 600000, "绝不能重复扣成两倍");
+
+  /* ② 心跳路径：visibilitychange 没触发（进程被冻结）——靠 1s 心跳的 gap 兜底识别 */
+  const env2 = runScript(harness({ hostFeature: true }));
+  env2.tickIntervals(1);                               // 建立心跳基准
+  env2.advance(15000);
+  env2.suspend(518000);
+  env2.tickIntervals(1);                               // 恢复后第一跳：gap 巨大 → 记入 hidden
+  const h2 = env2.win.__dshMaDiag.load.hiddenMs;
+  assert.ok(h2 > 500000, `心跳兜底应识别出约 518s 挂起（实际 ${h2}）`);
+  env2.doc.visibilityState = "visible";
+  env2.fireDocumentEvent("visibilitychange");           // 之后再来 visibilitychange 也不得重复扣
+  const h3 = env2.win.__dshMaDiag.load.hiddenMs;
+  assert.ok(h3 - h2 < 5000, `visibilitychange 不得重复扣（${h2} → ${h3}）`);
+});
+
+test("★ W3 两档文案：12s（活跃）出中性「正在准备界面…」，20s 才升级为可操作故障条", () => {
+  const env1 = runScript(harness());
+  env1.fireTimer(12000);
+  const bar1 = env1.findBar();
+  assert.ok(bar1 && bar1.hidden === false, "12s（活跃时间）就应出现中性进度提示（前 20s 不再空白）");
+  const txt1 = bar1.querySelector('[data-role="loadbar-txt"]').textContent;
+  assert.match(txt1, /正在准备界面…（已等待 \d+ 秒）/, "12s 阶段是中性「正在准备」，不是故障归因");
+  assert.ok(!/电脑端可能未连接|页面资源加载失败/.test(txt1), "12s 不得提前做故障归因");
+
+  const env2 = runScript(harness());
+  env2.fireTimer(20000);
+  const txt2 = env2.findBar().querySelector('[data-role="loadbar-txt"]').textContent;
+  assert.match(txt2, /网络较慢（已等待 20 秒）/, "20s 升级为既有故障分档（无失败证据 → 网络较慢）");
+});
+
+test("★ W3 诊断串：page/res 拆分、exhausted、挂起时长、最后失败 URL/tag，且 ≤400 字符", async () => {
+  const env = runScript(harness({ hostFeature: true, perfOffsetMs: 8664 }));
+  // 同一个 URL 连续失败 3 次：两次就地重建后额度用尽（exhausted=true）
+  const el = failingScript("/plugins/??@deepseek-ai/x.js");
+  env.body.appendChild(el);
+  env.fireWindowEvent("error", { target: el });        // 失败 1 → 排 2s 重试
+  env.fireTimers(2000);                                // 重建 1（resRetries=1；同毫秒还有 E2EE 重绘，全部放行）
+  const clone1 = env.body.children.find((c) => c.attrs && c.attrs["data-dsh-ma-retry"] === "1");
+  clone1.src = clone1.getAttribute("src");
+  env.fireWindowEvent("error", { target: clone1 });    // 失败 2 → 排 4s 重试
+  env.fireTimers(4000);                                // 重建 2（resRetries=2）
+  const clones = env.body.children.filter((c) => c.attrs && c.attrs["data-dsh-ma-retry"] === "1");
+  const clone2 = clones[1];
+  clone2.src = clone2.getAttribute("src");
+  env.fireWindowEvent("error", { target: clone2 });    // 失败 3 → 额度用尽
+  assert.equal(env.win.__dshMaDiag.retry.res, 2, "前提：2 次就地重建");
+  // 挂起 518s 后恢复 → 出提示条
+  env.doc.visibilityState = "hidden"; env.fireDocumentEvent("visibilitychange");
+  env.suspend(518000);
+  env.doc.visibilityState = "visible"; env.fireDocumentEvent("visibilitychange");
+  await new Promise((r) => setImmediate(r));
+  env.barBtn("loadbar-copy").click();
+  await new Promise((r) => setImmediate(r));
+  const line = env.clicks.clipboard[0];
+  assert.match(line, /原因=resource/, "有资源失败 → resource");
+  assert.match(line, /首屏资源失败=3/, "失败条数");
+  assert.match(line, /link 0\/script 3/, "按 tag 拆分");
+  assert.match(line, /自动重试=页0\/元素2/, "页/元素拆分（不再只有和值 2）");
+  assert.match(line, /已用尽=是/, "exhausted 要带出去");
+  assert.match(line, /最后 .*plugins\/.* SCRIPT/i, "最后一次失败 URL+tag");
+  assert.match(line, /挂起 518 秒/, "挂起时长");
+  assert.ok(line.length <= 400, `单行 ≤400 字符（实际 ${line.length}）`);
 });

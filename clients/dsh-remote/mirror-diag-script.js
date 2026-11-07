@@ -10,10 +10,15 @@
  *   1. **绝不打扰用户**：不改 DOM、不加 UI、不阻塞渲染；任何异常都在内部吞掉。
  *   2. **只在出错时上报**：没有失败资源/脚本错误 → 一个字节都不发（零流量）。
  *   3. **不泄密**：只上报**路径**（剥掉 query/hash）、状态码、耗时、字节数、错误消息前 500 字；
- *      不上报页面内容、请求体、cookie、token、用户信息。
+ *      不上报页面内容、请求体、cookie、token、用户信息。`page_id` 是**本页随机串**，
+ *      不含设备号/账号/时间派生信息，只用于把同一页的多批上报关联起来。
  *   4. **可关**：`?mirror_diag=0` 或 bridge 环境变量 `DSH_MIRROR_DIAG=0` → 完全不注入。
  *   5. **慢请求也记**：`/plugins/`、`/assets/` 加载超过 8s 记一条（这正是"插件聚合包被
  *      限速拖死 → 浏览器 499"的现场）。
+ *   6. **追加批（2026-11-08）**：同一页面最多 3 批、批间 ≥3s。此前 `sent` 一置位后
+ *      `add()` 直接丢弃 —— 首屏失败后自动重试 2 次的**后续**失败明细全部丢失
+ *      （生产现场：4 项首屏资源失败、2 次重试，服务端只拿到第一批）。现在按批上报，
+ *      每批 ≤20 项（服务端上限）；成功页仍然**一个字节都不发**。
  *
  * 上报地址：`/relay-api/api/mirror-diag`（企业端，需登录态；token 从 localStorage.dsh_token 取）。
  */
@@ -22,13 +27,22 @@
   var W = window, D = document;
   var VERSION = 1;
   var SLOW_MS = 8000;
+  /** 每批最多 20 项：服务端 `POST /api/mirror-diag` 的上限就是 20，多了会被截断。 */
   var MAX_ITEMS = 20;
   var FLUSH_DELAY = 2500;
+  /** 同一页面最多上报批数（服务端还有每 (user,page) 每日 3 行的硬约束）。 */
+  var MAX_FLUSHES = 3;
+  /** 批间最小间隔：防止重试风暴把 3 批在几毫秒内打光。 */
+  var FLUSH_GAP_MS = 3000;
   var ENDPOINT = "/relay-api/api/mirror-diag";
   var items = [];
   var bootFailed = [];
-  var sent = false;
+  var flushCount = 0;
+  var lastFlushAt = 0;
   var timer = null;
+  /** 本页随机 id：只用 Date.now/random，不引 crypto（老 Safari 可能没有 randomUUID），
+   *  不含设备/账号信息，仅用于把同一页的 2~3 批关联（服务端按 (user,page) 限流也够用）。 */
+  var pageId = "p" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
 
   function now() { return Date.now(); }
   function clip(s, n) { s = String(s == null ? "" : s); return s.length > n ? s.slice(0, n) : s; }
@@ -40,10 +54,14 @@
       return clip(x.pathname, 300);
     } catch (e) { return null; }
   }
+  function schedule(delayMs) {
+    if (timer !== null) return;
+    timer = setTimeout(function () { flush(false); }, delayMs);
+  }
   function add(item) {
-    if (!item || items.length >= MAX_ITEMS || sent) return;
+    if (!item || items.length >= MAX_ITEMS || flushCount >= MAX_FLUSHES) return;
     items.push(item);
-    if (timer === null) timer = setTimeout(flush, FLUSH_DELAY);
+    schedule(FLUSH_DELAY);
   }
   function interesting(p) {
     return !!p && (p.indexOf("/plugins/") === 0 || p.indexOf("/assets/") === 0
@@ -105,7 +123,7 @@
         }
       }
       if (bootFailed.length === 0) bootFailed.push("Failed to load plugins（无明细文本）");
-      if (timer === null) timer = setTimeout(flush, 300);
+      schedule(300);
     } catch (x) {}
   }
   try {
@@ -141,19 +159,39 @@
     } catch (e) { return undefined; }
   }
 
-  function flush() {
+  /**
+   * 发送一批。
+   * @param {boolean} force true = pagehide 兜底：跳过批间隔等待，但仍受 MAX_FLUSHES 限制。
+   * 每批只发**尚未发出**的条目（发完即从数组头部移除），所以第 2/3 批带的是重试后的新失败。
+   */
+  function flush(force) {
     timer = null;
-    if (sent || (items.length === 0 && bootFailed.length === 0)) return;
-    sent = true;
+    if (items.length === 0 && bootFailed.length === 0) return;
+    if (flushCount >= MAX_FLUSHES) return;
+    var t = now();
+    // 批间节流：不足间隔就再等一会儿（pagehide 兜底不等，页面要走了）
+    if (!force && flushCount > 0) {
+      var wait = FLUSH_GAP_MS - (t - lastFlushAt);
+      if (wait > 0) { timer = setTimeout(function () { flush(false); }, wait); return; }
+    }
+    var batchItems = items.slice(0, MAX_ITEMS);
+    var batchBoot = bootFailed.slice(0, 10);
+    items = items.slice(batchItems.length);
+    bootFailed = bootFailed.slice(batchBoot.length);
+    flushCount += 1;
+    lastFlushAt = t;
     var tk = token();
     var payload = {
       v: VERSION,
-      kind: bootFailed.length ? "boot" : "runtime",
+      kind: batchBoot.length ? "boot" : "runtime",
       page: clip(W.location.pathname, 200),
       ua: clip(W.navigator && W.navigator.userAgent, 300),
-      items: items.slice(0, MAX_ITEMS),
-      boot_failed: bootFailed.slice(0, 10),
-      at: now()
+      // 追加批标记：b = 第几批(1 起)，page_id = 本页随机串。老服务端不认识就无视（payload 是 JSON）。
+      b: flushCount,
+      page_id: pageId,
+      items: batchItems,
+      boot_failed: batchBoot,
+      at: t
     };
     var ui = uiDiag();
     if (ui) payload.ui = ui;   // 可选字段：老服务端无视即可
@@ -168,6 +206,7 @@
     } catch (e) { /* ignore */ }
   }
 
-  // 页面卸载前兜底发一次（keepalive 允许在卸载后继续）
-  W.addEventListener("pagehide", function () { try { if (!sent) flush(); } catch (x) {} });
+  // 页面卸载前兜底发一次（keepalive 允许在卸载后继续）；多批模式下即使已发过首批也要把
+  // 尚未发出的条目带走 —— 这正是"重试后的失败明细"最容易被丢掉的时刻。
+  W.addEventListener("pagehide", function () { try { flush(true); } catch (x) {} });
 })();

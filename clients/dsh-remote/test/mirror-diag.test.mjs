@@ -152,6 +152,51 @@ test("适配层不在场（旧版本/宽屏/未注入）时：payload 形状不�
   const [payload] = env.payloads();
   assert.ok(payload, "有失败资源时必须上报");
   assert.equal("ui" in payload, false, "没有适配层诊断时不得新增字段（老服务端/老页面兼容）");
-  assert.deepEqual(Object.keys(payload).sort(), ["at", "boot_failed", "items", "kind", "page", "ua", "v"],
-    "既有 payload 字段一个不多一个不少");
+  // v19(2026-11-08)新增 b(批序号)/page_id(本页随机串):用于把同一页的多批上报关联起来。
+  // 两者都是**可选**字段，老服务端无视即可；除它们之外不得再新增字段。
+  assert.deepEqual(Object.keys(payload).sort(), ["at", "b", "boot_failed", "items", "kind", "page", "page_id", "ua", "v"],
+    "既有 payload 字段一个不多一个不少（v19 只允许新增 b/page_id）");
+});
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// v19（2026-11-08）：追加批 —— 同一页最多 3 批，避免"重试后的失败明细"丢掉
+//
+// 现场(dev-62ca4fd91b0b)：首屏资源失败 4 项 + 自动重试 2 次，服务端只拿到第一批，
+// 后续重试到底哪个 URL 还在失败无从判断。采集器改为按批上报（批间 ≥3s、每批 ≤20 项），
+// 页内最多 3 批；成功页仍然**一个字节都不发**。
+// ══════════════════════════════════════════════════════════════════════════════
+
+test("★ v19 追加批：同一页最多 3 批（b=1..3、page_id 一致、条目按批切分），第 4 批不再发", () => {
+  const env = runDiagScript();
+  // 第 1 批：3 条首屏失败
+  for (const u of ["/plugins/??a.js", "/assets/index.js", "/assets/vendor-x.js"]) {
+    env.fire("error", { target: { src: "https://n.risegao.cn:13443" + u, tagName: "SCRIPT" } });
+  }
+  env.runTimers(); // 走完 2500ms flush 延迟 → 第 1 批
+  // 第 2 批：自动重试后又失败 2 条（pagehide 兜底：跳过 3s 批间隔，模拟用户切走页面）
+  env.fire("error", { target: { src: "https://n.risegao.cn:13443/plugins/??a.js", tagName: "SCRIPT" } });
+  env.fire("error", { target: { src: "https://n.risegao.cn:13443/assets/index.js", tagName: "SCRIPT" } });
+  env.fire("pagehide", {});
+  // 第 3 批：再来 1 条
+  env.fire("error", { target: { src: "https://n.risegao.cn:13443/plugins/??a.js", tagName: "SCRIPT" } });
+  env.fire("pagehide", {});
+  // 第 4 条以后：超过 MAX_FLUSHES=3 → 一个字节都不再发
+  env.fire("error", { target: { src: "https://n.risegao.cn:13443/plugins/??a.js", tagName: "SCRIPT" } });
+  env.fire("pagehide", {});
+
+  const payloads = env.payloads();
+  assert.equal(payloads.length, 3, "同一页最多 3 批（第 4 批必须被丢弃）");
+  assert.deepEqual(payloads.map((p) => p.b), [1, 2, 3], "批序号必须递增且从 1 起");
+  assert.deepEqual(payloads.map((p) => p.items.length), [3, 2, 1], "每批只带尚未发出的条目");
+  const pageIds = new Set(payloads.map((p) => p.page_id));
+  assert.equal(pageIds.size, 1, "同一页的多批必须带同一个 page_id（服务端据此关联）");
+  assert.ok([...pageIds][0] && [...pageIds][0].length <= 64, "page_id 必须是非空、≤64 的随机串");
+  // 每批 ≤20 项（服务端上限）
+  for (const p of payloads) assert.ok(p.items.length <= 20, "单批不得超过服务端 20 项上限");
+  // 成功页零上报：没有任何失败项时，定时器/卸载都不发请求
+  const clean = runDiagScript();
+  clean.runTimers();
+  clean.fire("pagehide", {});
+  assert.equal(clean.payloads().length, 0, "成功页必须一个字节都不发（零流量）");
 });

@@ -979,7 +979,12 @@ const SCRIPT = `(() => {
                       // 2026-10-20（C4）：镜像页里**唯一**可靠的"电脑端不可达"信号 ——
                       // 受保护的 /api/* 请求被回 5xx 或直接网络错误（presence 不在镜像页这条链路上；
                       // E2EE 死会话的 502 另带 x-dsh-e2ee-error，不算离线，见 maInstallNetSampler）。
-                      apiFails: 0, apiFailAt: 0, lastApiStatus: 0 };
+                      apiFails: 0, apiFailAt: 0, lastApiStatus: 0,
+                      // 2026-11-08（W3）：active-time 口径。挂起（锁屏/切 App/bfcache/进程冻结）的时长
+                      // 记进 hiddenMs，不再冒充"已等待"；startedAt 仍不重置（老浏览器兜底仍按它算）。
+                      hiddenMs: 0, hiddenAt: 0, lastBeatAt: 0, resumeCount: 0,
+                      progress: false, finished: false, checks: 0,
+                      beatTimer: 0, checkTimer: 0 };
 
   /* ================= 首屏性能自测（2026-10-2x：只写诊断，**不上报**）=================
      背景：手机镜像页首屏 p50 3.9s / p90 21.6s、20.2% 打开 ≥12s（生产遥测 n=8903，事件名 mirror_load）。
@@ -1216,6 +1221,18 @@ const SCRIPT = `(() => {
    *  "电脑端可能未连接"，与代码里"宁可晚一点也别误报"的意图正好相反。20 秒在 p90 之上留了余量，
    *  又远低于用户无法忍耐的 40 秒级。测试按常量断言，不要散落魔法数。 */
   var MA_LOAD_WATCH_MS = 20 * 1000;
+  /* 2026-11-08（W3）active-time 口径的三个补充常量（20s 仍是"可操作故障条"的升级点）：
+     · 12s（活跃时间）→ 中性进度提示"正在准备界面…"，让用户前 20s 不再面对空白；
+     · 20s（活跃时间）之后每 20s 复检一次（更新秒数 + 复核就绪 + 触发补偿），不是只判一次；
+     · 60s（活跃时间）兜底样本：万一任何一路都没报过，补一条 slow，避免样本丢失。
+     心跳 1s；漂移 >3× 期望即判定"被冻结/挂起"（iOS 进程冻结时 visibilitychange 可能不触发）。 */
+  var MA_LOAD_PROGRESS_MS = 12 * 1000;
+  var MA_LOAD_RECHECK_MS = 20 * 1000;
+  var MA_LOAD_FALLBACK_MS = 60 * 1000;
+  var MA_LOAD_BEAT_MS = 1000;
+  var MA_LOAD_BEAT_GAP_MS = 3000;
+  var MA_LOAD_MAX_CHECKS = 30;       // 复检上限（≈10 分钟）；之后只靠恢复钩子/条内 1s 刷新
+  var MA_RESUME_COMPENSATE_MAX = 2;  // 每次打开页面最多补偿重建 2 个 <link>（不重建 <script>）
 
   /* ===== C4：首屏关键资源失败 → 自动重试（2026-10-20 诊断，03 报告 §2.3） =====
      现场：文档 / assets/*.js / plugins 聚合包只要失败一次就**永远卡住** —— 旧实现只弹
@@ -1243,7 +1260,10 @@ const SCRIPT = `(() => {
     pageTimer: 0,       // 排队中的整页重试
     lastRetryClickAt: 0,
     manual: false,      // 用户点过「重试」→ 不再自动排队（避免刚重载又自己重载）
-    exhausted: false
+    exhausted: false,
+    // 2026-11-08（W3）：恢复后补偿重建的次数/最后一次失败（诊断串用）。
+    resumeBonus: 0,
+    lastFail: null
   };
   var maRetryTimers = [];  // 排队中的就地重试（「重试」按钮先清掉它们）
   var maInflight = [];     // 我们跟踪到的在途 fetch（AbortController）——「重试」前取消，避免 499
@@ -1261,7 +1281,11 @@ const SCRIPT = `(() => {
         compatOfficial: maCompatOfficial,
         scrim: maScrimStats,
         retry: maRetryStats,
-        load: { slow: maLoadWatch.slow, apiFails: maLoadWatch.apiFails, lastApiStatus: maLoadWatch.lastApiStatus },
+        load: { slow: maLoadWatch.slow, progress: maLoadWatch.progress, apiFails: maLoadWatch.apiFails,
+                lastApiStatus: maLoadWatch.lastApiStatus,
+                activeMs: (typeof maLoadActiveMs === "function") ? maLoadActiveMs() : -1,
+                hiddenMs: (typeof maLoadHiddenMs === "function") ? maLoadHiddenMs() : -1,
+                resumes: maLoadWatch.resumeCount || 0 },
         // 首屏性能自测（2026-10-2x）：只读、只在本对象里（**不上报**，见上方 maPerf 的说明）。
         perf: (typeof maPerfSnapshot === "function") ? maPerfSnapshot() : null,
         // E2EE 死会话自动恢复 / 回前台重连（2026-10-23）：只作诊断，不参与任何判定。
@@ -1418,6 +1442,8 @@ const SCRIPT = `(() => {
       var n = maRetry.perUrl[key] || 0;
       maRetry.resFails.push({ url: key, tag: String(tag || ""), at: Date.now() });
       if (maRetry.resFails.length > 12) maRetry.resFails.shift();
+      /* 2026-11-08（W3）：最后一次失败单独留一份（跟 resFails 的滚动窗口无关），诊断串用。 */
+      try { maRetry.lastFail = { url: key, tag: String(tag || ""), at: Date.now() }; } catch (eLF) { /* 忽略 */ }
       /* 界面已经就绪 = 这次失败没有卡住首屏。此时重建元素可能让模块/插件**再执行一遍**
          （官方模块加载器是队列式），风险大于收益 —— 只记录、不重试。 */
       if (maLoadReadyNow()) return false;
@@ -1504,10 +1530,11 @@ const SCRIPT = `(() => {
   /** 底部提示条"原因分档"：offline（电脑端不可达）/ resource（首屏资源失败）/ slow（网络慢）。 */
   function maLoadReason() {
     try {
-      var now = Date.now();
       /* 10 秒内的不可达证据才算：过期的失败不能把文案一直钉在"未连接"上（那正是 03 报告
-         说的"文案归因错误"——截图 09 面板同时显示 95ms 顺畅）。 */
-      if ((maLoadWatch.apiFails || 0) > 0 && now - (maLoadWatch.apiFailAt || 0) < 10000) return "offline";
+         说的"文案归因错误"——截图 09 面板同时显示 95ms 顺畅）。
+         W3：窗口改用**活跃时间**——挂起 8 分钟回来不该把"10 秒内有过 5xx"直接判成过期。 */
+      var act = (typeof maLoadActiveMs === "function") ? maLoadActiveMs() : Date.now();
+      if ((maLoadWatch.apiFails || 0) > 0 && act - (maLoadWatch.apiFailAt || 0) < 10000) return "offline";
       if (maRetry.resFails.length > 0) return "resource";
     } catch (e) { /* 落到 slow */ }
     return "slow";
@@ -1531,7 +1558,8 @@ const SCRIPT = `(() => {
   function maNotePresenceFail(status) {
     try {
       maLoadWatch.apiFails = (maLoadWatch.apiFails || 0) + 1;
-      maLoadWatch.apiFailAt = Date.now();
+      /* W3：记录"活跃时间"而不是墙钟——见 maLoadReason 的窗口说明。 */
+      maLoadWatch.apiFailAt = (typeof maLoadActiveMs === "function") ? maLoadActiveMs() : Date.now();
       maLoadWatch.lastApiStatus = Number(status) || 0;
       maPublishDiag();
       if (maLoadWatch.slow) maLoadRenderBar(); // 提示条已经出来了 → 立刻按新原因换文案
@@ -1659,8 +1687,171 @@ const SCRIPT = `(() => {
       return Boolean(document.querySelector('[data-composer-input], [contenteditable="true"], [role="textbox"], textarea'));
     } catch (e) { return false; }
   }
+  /* ===== W3（2026-11-08）：active-time 口径 + 恢复即补偿 =====
+     事故：页面 13:43:51 注入 → 13:44:06 传完最后一个插件包后被 iOS 冻结 → 13:52:44 恢复瞬间
+     20s 看门狗才执行，报 slow(541.664s)、提示条显示"已等待 533 秒"（其中 518s 是挂起）。
+     现在：挂起时长记 hiddenMs，看门狗/文案/上报一律用 activeMs；恢复时补判就绪 + 补扫启动失败 +
+     限量补偿重建（只 link）；startedAt 仍不重置（老浏览器兜底与"墙钟"诊断仍按它算）。
+     所有入口都 try/catch：计时/恢复逻辑坏掉也绝不影响页面。 */
+  /** 已挂起时长（毫秒）：可见性切换/心跳冻结检测的累计值；未结算的 open gap 也计入。 */
+  function maLoadHiddenMs() {
+    try {
+      var h = maLoadWatch.hiddenMs || 0;
+      var a = maLoadWatch.hiddenAt || 0;
+      if (a > 0) h += Math.max(0, Date.now() - a);
+      return Math.max(0, Math.round(h));
+    } catch (e) { return 0; }
+  }
+  /** 活跃加载毫秒 = 墙钟耗时（performance.now，起点≈导航开始）− 挂起时长。 */
+  function maLoadActiveMs() {
+    try { return Math.max(0, Math.round(maLoadElapsedMs() - maLoadHiddenMs())); } catch (e) { return 0; }
+  }
+  /** 已等待秒数（活跃时间；挂起不计入）。 */
   function maLoadWaitedSec() {
-    return Math.max(0, Math.round((Date.now() - maLoadWatch.startedAt) / 1000));
+    return Math.max(0, Math.round(maLoadActiveMs() / 1000));
+  }
+  /** 标记"开始挂起"（可见性变隐藏 / pagehide）；幂等，避免 visibilitychange 与 pagehide 重复记账。 */
+  function maLoadMarkHidden(now) {
+    try {
+      var t = Number(now) || Date.now();
+      if (!(maLoadWatch.hiddenAt > 0)) maLoadWatch.hiddenAt = t;
+      maLoadWatch.lastBeatAt = 0;
+    } catch (e) { /* 忽略 */ }
+  }
+  /** 结算一段挂起（恢复时）：hiddenMs 累加、hiddenAt 清零、心跳基准对齐到恢复时刻。 */
+  function maLoadSettleHidden(now) {
+    try {
+      var t = Number(now) || Date.now();
+      if (maLoadWatch.hiddenAt > 0) {
+        maLoadWatch.hiddenMs = (maLoadWatch.hiddenMs || 0) + Math.max(0, t - maLoadWatch.hiddenAt);
+        maLoadWatch.hiddenAt = 0;
+        try { if (typeof maPublishDiag === "function") maPublishDiag(); } catch (ePub2) { /* 忽略 */ }
+      }
+      maLoadWatch.lastBeatAt = t;
+    } catch (e) { /* 忽略 */ }
+  }
+  /**
+   * 1s 心跳（第二道保险）：进程被冻结后恢复时 heartbeat 间隔会远大于期望，而 visibilitychange
+   * 可能根本没触发（iOS 锁屏/被系统回收时）。把 gap 记进"挂起"，保证 activeMs 不会把冻结时长
+   * 算成"已等待"。已结算过的挂起不会重复扣（hiddenAt 清零 + 心跳基准对齐）。
+   */
+  function maLoadBeat() {
+    try {
+      var now = Date.now();
+      var last = maLoadWatch.lastBeatAt || 0;
+      if (last > 0 && now > last) {
+        var gap = now - last;
+        if (gap > MA_LOAD_BEAT_GAP_MS) {
+          if (maLoadWatch.hiddenAt > 0) {
+            maLoadWatch.hiddenMs = (maLoadWatch.hiddenMs || 0) + Math.max(0, now - maLoadWatch.hiddenAt);
+            maLoadWatch.hiddenAt = 0;
+          } else {
+            maLoadWatch.hiddenMs = (maLoadWatch.hiddenMs || 0) + Math.max(0, gap - MA_LOAD_BEAT_MS);
+          }
+          /* 冻结被心跳识别出来时立刻更新诊断（这是低频事件，不会影响每秒开销）。 */
+          try { if (typeof maPublishDiag === "function") maPublishDiag(); } catch (ePub) { /* 忽略 */ }
+        }
+      }
+      maLoadWatch.lastBeatAt = now;
+    } catch (e) { /* 计时异常绝不影响页面 */ }
+  }
+  /** 加载收尾（就绪）：收提示条、停心跳/复检、按契约上报一次 ok（reported 语义不变）。 */
+  function maLoadFinish() {
+    try {
+      if (maLoadWatch.finished) return;
+      maLoadWatch.finished = true;
+      maLoadWatch.progress = false;
+      maLoadWatch.slow = false;
+      try { maLoadHideBar(); } catch (e1) { /* 忽略 */ }
+      try { maLoadRenderWarn(); } catch (e2) { /* 忽略 */ }
+      try { if (maLoadWatch.checkTimer) { clearTimeout(maLoadWatch.checkTimer); maLoadWatch.checkTimer = 0; } } catch (e3) { /* 忽略 */ }
+      try { if (maLoadWatch.beatTimer) { clearInterval(maLoadWatch.beatTimer); maLoadWatch.beatTimer = 0; } } catch (e4) { /* 忽略 */ }
+      maReportMirrorLoad("ok");
+    } catch (e) { /* 忽略 */ }
+  }
+  /** 排下一次复检（去重 + 上限；active-time 的里程碑由 maLoadCheck 自己判断）。 */
+  function maLoadArmRecheck(ms) {
+    try {
+      if (maLoadWatch.finished || maLoadWatch.checkTimer) return;
+      if ((maLoadWatch.checks || 0) >= MA_LOAD_MAX_CHECKS) return;
+      var delay = Number(ms);
+      if (!isFinite(delay) || delay < 1000) delay = MA_LOAD_RECHECK_MS;
+      maLoadWatch.checkTimer = maSchedule(function () {
+        maLoadWatch.checkTimer = 0;
+        try { maLoadCheck("recheck"); } catch (eC) { /* 忽略 */ }
+      }, delay);
+    } catch (e) { /* 忽略 */ }
+  }
+  /**
+   * 看门狗主判定（active-time，2026-11-08 W3）：
+   *   · 就绪 → 收尾（只报一次，ok）；
+   *   · 活跃 ≥12s → 中性进度条「正在准备界面…」（不再让用户前 20s 面对空白）；
+   *   · 活跃 ≥20s → 升级为现有可操作故障条 + 上报 mirror_load(slow)；
+   *   · 之后每 20s 活跃时间复检（更新秒数 / 复核就绪 / 给恢复补偿留机会）。
+   * 回调可能在"冻结恢复瞬间"才真正执行 —— 一律用 maLoadActiveMs() 复核，不拿墙钟吓人。
+   */
+  function maLoadCheck(why) {
+    try {
+      if (maLoadWatch.finished) return true;
+      maLoadWatch.checks = (maLoadWatch.checks || 0) + 1;
+      maLoadBeat();
+      if (maLoadReadyNow()) { maLoadFinish(); return true; }
+      var active = maLoadActiveMs();
+      if (!maLoadWatch.progress && active >= MA_LOAD_PROGRESS_MS) {
+        maLoadWatch.progress = true;
+        try { maLoadRenderBar(); } catch (eP) { /* 忽略 */ }
+      }
+      if (!maLoadWatch.slow && active >= MA_LOAD_WATCH_MS) {
+        maLoadWatch.slow = true;
+        try { maLoadRenderBar(); } catch (eS) { /* 忽略 */ }
+        maReportMirrorLoad("slow");
+      }
+      maLoadArmRecheck(MA_LOAD_RECHECK_MS);
+      return false;
+    } catch (e) { return false; }
+  }
+  /**
+   * 恢复即补偿：只重建 <link>（样式 / manifest）。
+   * <script> **不重建** —— 官方模块加载器是 queue 模式，克隆后再执行一次插件有重复注册风险；
+   * 脚本的恢复交给「补扫启动失败文案 → 整页受控重试」那条既有通道（额度不变）。
+   */
+  function maLoadCompensate() {
+    try {
+      if (maRetry.manual) return false;      // 用户点过「重试」→ 我们不替他再自愈
+      if (maLoadWatch.finished) return false;
+      var used = Number(maRetry.resumeBonus || 0);
+      var remain = MA_RESUME_COMPENSATE_MAX - used;
+      if (!(remain > 0)) return false;
+      var list = maRetry.resFails || [];
+      var seen = {};
+      var done = 0;
+      for (var i = list.length - 1; i >= 0 && done < remain; i--) {
+        var f = list[i];
+        if (!f || !f.url) continue;
+        if (String(f.tag || "").toLowerCase() !== "link") continue;
+        if (seen[f.url]) continue;
+        seen[f.url] = 1;
+        try { if (maRetryBootResource(null, f.url, "link")) done += 1; } catch (eB) { /* 忽略 */ }
+      }
+      if (done > 0) {
+        maRetry.resumeBonus = used + done;
+        maBumpRetryStats("resume:link");
+        return true;
+      }
+      return false;
+    } catch (e) { return false; }
+  }
+  /** 从后台 / bfcache / 冻结恢复：补判就绪 → 补扫启动失败文案 → 限量补偿重建 → 排复检。 */
+  function maLoadOnResume(src) {
+    try {
+      maLoadWatch.resumeCount = (maLoadWatch.resumeCount || 0) + 1;
+      maLoadBeat();
+      if (maLoadCheck("resume")) return;
+      try { maScanBootFailure(); } catch (eScan) { /* 忽略 */ }
+      maLoadCompensate();
+      if (!maLoadWatch.finished) { try { maLoadRenderBar(); } catch (eBar) { /* 忽略 */ } }
+      maLoadArmRecheck(MA_LOAD_RECHECK_MS);
+    } catch (e) { /* 恢复逻辑异常绝不影响页面 */ }
   }
   /**
    * 单调时钟（performance.now；不可用时退回 Date.now）。
@@ -1714,11 +1905,17 @@ const SCRIPT = `(() => {
       if (!isFinite(ms) || ms < 0) ms = 0;
       if (ms > 600000) ms = 600000;
       maLoadWatch.reportMs = ms;
-      /* 首屏真正可用的时刻也进本地诊断（与上报给服务端的 mirror_load.ms 是同一个数）。
-         上报体**一个字都不改**：服务端契约只看 { ms, outcome, at }。 */
+      /* W3：把 active/hidden 一并带出去（服务端 task-5 落列后即可区分"真慢"与"被挂起"）。
+         outcome 仍只发 ok|slow —— 插件半的 telemetryEventOf 会把非 slow 一律归一成 ok
+         （packages/dsh-remote-web/lib/index.js:6784），所以"suspended"由服务端用 hidden_ms 派生。 */
+      var activeMs = 0, hiddenMs = 0;
+      try { activeMs = Math.max(0, Math.round(maLoadActiveMs())); } catch (eAct) { activeMs = 0; }
+      try { hiddenMs = Math.max(0, Math.round(maLoadHiddenMs())); } catch (eHid) { hiddenMs = 0; }
+      /* 首屏真正可用的时刻也进本地诊断（与上报给服务端的 mirror_load.ms 是同一个数）。 */
       try { maPerf.uiReadyMs = ms; } catch (ePerfUi) { /* 忽略 */ }
       try { maPublishDiag(); } catch (ePerfPub) { /* 忽略 */ }
-      var body = JSON.stringify({ ms: ms, outcome: outcome === "slow" ? "slow" : "ok", at: Date.now() });
+      var body = JSON.stringify({ ms: ms, outcome: outcome === "slow" ? "slow" : "ok", at: Date.now(),
+        active_ms: activeMs, hidden_ms: hiddenMs });
       var p = null;
       try {
         p = fetch("/dsh-remote/telemetry/mirror-load", {
@@ -1732,14 +1929,70 @@ const SCRIPT = `(() => {
       if (p && typeof p.catch === "function") p.catch(function () { /* 忽略 */ });
     } catch (e) { /* 遥测绝不把页面拖挂 */ }
   }
-  /** 给客服看的一句话（含等待时长与 UA，便于直接定位）。 */
+  /** W3 诊断辅助：把失败 URL 缩成"路径尾段"（剥 query/hash，≤60 字符，中文省略号）。 */
+  function maLoadShortUrl(url) {
+    try {
+      var s = String(url || "");
+      var q = s.indexOf("?");
+      if (q >= 0) s = s.slice(0, q);
+      var h = s.indexOf("#");
+      if (h >= 0) s = s.slice(0, h);
+      if (s.length > 60) s = "…" + s.slice(s.length - 59);
+      return s;
+    } catch (e) { return ""; }
+  }
+  /** W3 诊断辅助：首屏失败按 tag 拆分（link / script），供"页/元素"分档与归因。 */
+  function maLoadFailCounts() {
+    var out = { link: 0, script: 0 };
+    try {
+      var list = maRetry.resFails || [];
+      for (var i = 0; i < list.length; i++) {
+        var tag = String((list[i] || {}).tag || "").toLowerCase();
+        if (tag === "link") out.link += 1;
+        else if (tag === "script") out.script += 1;
+      }
+    } catch (e) { /* 忽略 */ }
+    return out;
+  }
+  /** 给客服看的一句话（含等待时长与 UA，便于直接定位）。W3：补 active/hidden/wall 三时长、
+   *  页/元素重试拆分、exhausted、恢复补偿次数、最后失败 URL+tag、apiFails 状态；单行 ≤400 字符。 */
   function maLoadCopyLine() {
     let ua = "";
     try { ua = String((navigator && navigator.userAgent) || "").slice(0, 120); } catch (e) { /* 忽略 */ }
-    return "dsh-remote 手机端加载疑似卡住：等待 " + maLoadWaitedSec() + " 秒后仍未出现对话界面。"
-      + "原因=" + maLoadReason() + "，首屏资源失败=" + maRetry.resFails.length + "，自动重试="
-      + (maRetry.page + maRetry.resRetries) + " 次；scrim 拦截=" + maScrimStats.activations
-      + " 次/不变量摘除=" + maScrimStats.invariantHits + " 次。UA=" + ua;
+    var activeSec = maLoadWaitedSec();
+    var hiddenSec = Math.round(maLoadHiddenMs() / 1000);
+    var wallSec = Math.round(maLoadElapsedMs() / 1000);
+    var cnt = maLoadFailCounts();
+    var lastTxt = "-";
+    try {
+      if (maRetry.lastFail && maRetry.lastFail.url) {
+        lastTxt = maLoadShortUrl(maRetry.lastFail.url) + " " + String(maRetry.lastFail.tag || "");
+      }
+    } catch (eLast) { lastTxt = "-"; }
+    var line = "dsh-remote 手机端加载疑似卡住：等待 " + activeSec + " 秒"
+      + (hiddenSec > 0 ? "（期间页面被系统挂起 " + hiddenSec + " 秒，墙钟 " + wallSec + " 秒）" : "")
+      + "后仍未出现对话界面。原因=" + maLoadReason()
+      + "，首屏资源失败=" + maRetry.resFails.length
+      + "（link " + cnt.link + "/script " + cnt.script + "；最后 " + lastTxt + "）"
+      + "，自动重试=页" + maRetry.page + "/元素" + maRetry.resRetries
+      + "（已用尽=" + (maRetry.exhausted ? "是" : "否") + "，恢复补偿=" + (maRetry.resumeBonus || 0) + "）"
+      + "；scrim 拦截=" + maScrimStats.activations + " 次/不变量摘除=" + maScrimStats.invariantHits + " 次"
+      + "；api失败=" + (maLoadWatch.apiFails || 0) + "(" + (maLoadWatch.lastApiStatus || 0) + ")。UA=" + ua;
+    /* 400 字符上限：先降级冗余细节，再硬截断（保留等待/挂起/原因/UA 这些客服必读项）。 */
+    try {
+      if (line.length > 400) {
+        line = "dsh-remote 手机端加载疑似卡住：等待 " + activeSec + " 秒"
+          + (hiddenSec > 0 ? "（挂起 " + hiddenSec + " 秒/墙钟 " + wallSec + " 秒）" : "")
+          + "后仍未出现对话界面。原因=" + maLoadReason()
+          + "，首屏资源失败=" + maRetry.resFails.length + "（link " + cnt.link + "/script " + cnt.script + "）"
+          + "，自动重试=页" + maRetry.page + "/元素" + maRetry.resRetries
+          + "（已用尽=" + (maRetry.exhausted ? "是" : "否") + "，恢复补偿=" + (maRetry.resumeBonus || 0) + "）"
+          + "；scrim=" + maScrimStats.activations + "/" + maScrimStats.invariantHits
+          + "；api失败=" + (maLoadWatch.apiFails || 0) + "。UA=" + ua;
+      }
+      if (line.length > 400) line = line.slice(0, 400);
+    } catch (eClamp) { /* 忽略 */ }
+    return line;
   }
 
   /* ===== 底部可操作提示条（2026-10-17，见上方看门狗注释）=====
@@ -1755,15 +2008,26 @@ const SCRIPT = `(() => {
    *  现在：· 电脑端不可达（受保护 API 请求 5xx/网络错误）→「电脑端可能未连接」；
    *        · 首屏关键资源失败 →「页面资源加载失败，正在重试…」（重试用尽时如实说明）；
    *        · 其余 →「网络较慢」+ 已等待秒数（不再替用户猜原因）。 */
+  /** 挂起提示后缀（W3）：只在真的挂起过时追加，避免日常文案变长。 */
+  function maLoadHiddenSuffix() {
+    try {
+      var hid = Math.round(maLoadHiddenMs() / 1000);
+      if (hid < 1) return "";
+      return "，期间页面被系统挂起 " + hid + " 秒";
+    } catch (e) { return ""; }
+  }
   function maLoadBarText() {
     var sec = maLoadWaitedSec();
     var reason = maLoadReason();
-    if (reason === "offline") return "电脑端可能未连接（已等待 " + sec + " 秒）";
+    var tail = maLoadHiddenSuffix();
+    /* W3：12s（活跃时间）起先给中性进度——"正在准备界面…"不是故障判定，不吓人。 */
+    if (!maLoadWatch.slow) return "正在准备界面…（已等待 " + sec + " 秒" + tail + "）";
+    if (reason === "offline") return "电脑端可能未连接（已等待 " + sec + " 秒" + tail + "）";
     if (reason === "resource") {
-      if (maRetry.exhausted) return "页面资源加载失败，自动重试已用尽（已等待 " + sec + " 秒）";
-      return "页面资源加载失败，正在重试…（已等待 " + sec + " 秒）";
+      if (maRetry.exhausted) return "页面资源加载失败，自动重试已用尽（已等待 " + sec + " 秒" + tail + "）";
+      return "页面资源加载失败，正在重试…（已等待 " + sec + " 秒" + tail + "）";
     }
-    return "网络较慢（已等待 " + sec + " 秒）";
+    return "网络较慢（已等待 " + sec + " 秒" + tail + "）";
   }
   /** 收起提示条并停掉秒数刷新（不改变 dismissed：用于"认出界面后自动收起"这类临时收起）。 */
   function maLoadHideBar() {
@@ -1857,25 +2121,21 @@ const SCRIPT = `(() => {
       return bar;
     } catch (e) { return null; }
   }
-  /** 按当前状态渲染提示条（slow + 未关闭 → 显示；否则收起）。 */
+  /** 按当前状态渲染提示条（progress 中性 / slow 可操作；未关闭 → 显示；否则收起）。 */
   function maLoadRenderBar() {
     try {
-      if (!maLoadWatch.slow || maLoadWatch.dismissed) { maLoadHideBar(); return; }
+      if ((!maLoadWatch.slow && !maLoadWatch.progress) || maLoadWatch.dismissed) { maLoadHideBar(); return; }
       var bar = maLoadWatch.barEl || maLoadMountBar();
       if (!bar) return;
       if (maLoadWatch.barTxt) maLoadWatch.barTxt.textContent = maLoadBarText();
       bar.hidden = false;
       if (!maLoadWatch.barTimer) {
-        // 每秒刷新「已等待 N 秒」；同时复核"是不是其实早就好了"——好了就自动收起（不长期挂着）。
+        // 每秒刷新「已等待 N 秒」（active 秒数）；同时复核"是不是其实早就好了"——好了就收尾。
         maLoadWatch.barTimer = setInterval(function () {
           try {
-            if (!maLoadWatch.slow || maLoadWatch.dismissed) { maLoadHideBar(); return; }
-            if (maLoadReadyNow()) {
-              maLoadWatch.slow = false;
-              maLoadHideBar();
-              maLoadRenderWarn(); // 菜单那一行也一起收起
-              return;
-            }
+            maLoadBeat(); // 条在显示期间也顺手记心跳：冻结恢复的第一时间就能扣掉挂起
+            if ((!maLoadWatch.slow && !maLoadWatch.progress) || maLoadWatch.dismissed) { maLoadHideBar(); return; }
+            if (maLoadReadyNow()) { maLoadFinish(); return; }
             if (maLoadWatch.barTxt) maLoadWatch.barTxt.textContent = maLoadBarText();
           } catch (e) { /* 忽略 */ }
         }, 1000);
@@ -1921,18 +2181,71 @@ const SCRIPT = `(() => {
       }
     } catch (e) { /* 忽略 */ }
   }
-  // 12 秒后仍认不出官方界面 → 置慢标记 + 懒创建底部提示条（**只在这时才碰 DOM**）。
-  // 同一处顺手把 mirror_load 的**兜底样本**发出去（outcome="slow"）：12 秒没就绪的页面上报的
-  // 必然是"≥12 秒"，这是**删失下限**而不是真实耗时，后台只把它单列，不混进 P50/P90。
+  /* ===== 看门狗与恢复钩子接线（2026-11-08 W3：active-time 口径）=====
+     旧实现：20s 单次 setTimeout，触发即 slow；页面被 iOS 冻结时它直到恢复瞬间才执行，
+     于是拿墙钟（541s）冒充"加载耗时"、提示条显示 533 秒。
+     现在：12s 活跃时间 → 中性进度条；20s 活跃时间 → 现有可操作故障条 + 上报 slow；
+     之后每 20s 活跃时间复检；挂起恢复（pageshow / visibilitychange）→ 补判就绪 + 补扫启动
+     失败文案 + 限量补偿 <link>（补偿逻辑见 maLoadOnResume / maLoadCompensate）。
+     计时全靠 activeMs（扣除 hiddenMs），startedAt 不重置；心跳 1s 也用来兜住"visibilitychange
+     没触发"的进程冻结（漂移 >3× 即记账）。 */
+  try {
+    maLoadWatch.beatTimer = setInterval(function () {
+      try { maLoadBeat(); } catch (eBe) { /* 心跳失败绝不影响页面 */ }
+    }, MA_LOAD_BEAT_MS);
+    try { if (maLoadWatch.beatTimer && maLoadWatch.beatTimer.unref) maLoadWatch.beatTimer.unref(); } catch (eBU) { /* 忽略 */ }
+  } catch (eBeat) { /* 没有 setInterval 也不影响主功能（activeMs 退化为墙钟） */ }
+  maSchedule(function () {
+    try { maLoadCheck("progress"); } catch (eP) { /* 忽略 */ }
+  }, MA_LOAD_PROGRESS_MS);
   setTimeout(function () {
     try {
-      if (maLoadReadyNow()) return;
-      maLoadWatch.slow = true;
-      if (maLoadWatch.wired) maLoadRenderWarn();
-      maLoadRenderBar(); // 底部可操作提示条（重试 / 返回设备列表 / 复制诊断 / 关闭）
-      maReportMirrorLoad("slow");
+      maLoadCheck("watch");
     } catch (e) { /* 忽略 */ }
   }, MA_LOAD_WATCH_MS);
+  /* 60s 兜底样本：任何一路都没报过（例如页面在 12s 前就被隐藏、定时器又被冻结）→ 补一条 slow，
+     避免样本丢失；有 reported 时它是 no-op（reported 一次性语义不变）。 */
+  setTimeout(function () {
+    try {
+      if (!maLoadWatch.finished && !maLoadWatch.reported) maReportMirrorLoad("slow");
+    } catch (eFb) { /* 忽略 */ }
+  }, MA_LOAD_FALLBACK_MS);
+  try {
+    if (typeof document !== "undefined" && document && document.addEventListener) {
+      document.addEventListener("visibilitychange", function () {
+        try {
+          if (document.visibilityState === "hidden") { maLoadMarkHidden(Date.now()); return; }
+          maLoadSettleHidden(Date.now());
+          if (!maLoadWatch.finished) maLoadOnResume("visibilitychange");
+        } catch (eV) { /* 忽略 */ }
+      });
+    }
+  } catch (eVis) { /* 老浏览器没有 visibilitychange：只靠心跳兜底 */ }
+  try {
+    if (typeof window !== "undefined" && window && window.addEventListener) {
+      window.addEventListener("pagehide", function (ev) {
+        try {
+          maLoadMarkHidden(Date.now());
+          if (ev && ev.persisted) return;                 // bfcache：等恢复，不在离开时上报
+          if (maLoadWatch.finished || maLoadWatch.reported) return;
+          /* 真正离开：把"未完成"也算一个样本（只有活跃等待 ≥12s 才发 slow，避免把 5s 就走的
+             样本当成慢加载污染统计）。 */
+          if (maLoadReadyNow()) maReportMirrorLoad("ok");
+          else if (maLoadActiveMs() >= MA_LOAD_PROGRESS_MS) maReportMirrorLoad("slow");
+        } catch (ePh) { /* 忽略 */ }
+      });
+    }
+  } catch (ePage) { /* 忽略 */ }
+  try {
+    if (typeof window !== "undefined" && window && window.addEventListener) {
+      window.addEventListener("pageshow", function () {
+        try {
+          maLoadSettleHidden(Date.now());
+          if (!maLoadWatch.finished) maLoadOnResume("pageshow");
+        } catch (ePs) { /* 忽略 */ }
+      });
+    }
+  } catch (ePs2) { /* 忽略 */ }
 
   /* ============================================================================
    * E2EE 死会话自动恢复 + 回到前台重连（2026-10-23，iOS 断线重连体验）
@@ -4493,7 +4806,9 @@ const SCRIPT = `(() => {
       /* 镜像页就绪探测（mirror_load 的量测终点）：pump 本来就被 MutationObserver(子树) + 1s 兜底表
          驱动，官方 frame/输入框一挂上就会在**这一拍或下一拍**（≤1s）命中 —— 这正是契约要求的
          "终点的时刻"，而且不需要再加任何定时器或观察者。只在还没上报过时判一次（reported 挡重复）。 */
-      if (!maLoadWatch.reported) { try { if (maLoadReadyNow()) maReportMirrorLoad("ok"); } catch (eLoadOk) { /* 忽略 */ } }
+      /* W3：就绪走统一收尾（顺带停掉 1s 心跳/复检，别让已就绪的页面一直空转）；
+         reported 语义不变：slow 已报过就不再补 ok。 */
+      if (!maLoadWatch.finished) { try { if (maLoadReadyNow()) maLoadFinish(); } catch (eLoadOk) { /* 忽略 */ } }
       if (!whaleGuardsOn || !settingsWatchOn) {
         try { whaleHookInit(); watchSettings(); } catch (eHook) { /* 两者内部都自带一次性守卫 */ }
       }
@@ -4732,7 +5047,7 @@ const SCRIPT = `(() => {
         try {
           if (ev && ev.persisted) {
             maArm();
-            if (maLoadWatch.slow && !maLoadWatch.dismissed) maLoadRenderBar();
+            if ((maLoadWatch.slow || maLoadWatch.progress) && !maLoadWatch.dismissed) maLoadRenderBar();
           }
         } catch (ePs) { /* 忽略 */ }
       });

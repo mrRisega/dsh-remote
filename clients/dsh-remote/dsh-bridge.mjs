@@ -1360,13 +1360,15 @@ async function doHttpStream(send, id, method, path, reqHeaders) {
 
   const status = res.status;
   // 头部帧:告诉中继"这是一条流",随后才逐块推 body
+  // 这些帧都带上 `id` 元信息（不进协议字节）—— B2 取消时 `drop(id)` 才能把还没发出去的分片
+  // 整条丢掉（手机断开 SSE 后，别让已入队的块继续占隧道队头）。
   send({
     id,
     type: "http",
     status,
     headers: sanitizeResponseHeaders(Object.fromEntries(res.headers.entries())),
     streaming: true
-  });
+  }, { id });
 
   let seq = 0;
   let bytes = 0;
@@ -1378,7 +1380,7 @@ async function doHttpStream(send, id, method, path, reqHeaders) {
         if (done) break;
         if (!value || value.length === 0) continue;
         bytes += value.length;
-        send({ id, type: "http-chunk", seq: ++seq, body: Buffer.from(value).toString("base64"), bodyBase64: true });
+        send({ id, type: "http-chunk", seq: ++seq, body: Buffer.from(value).toString("base64"), bodyBase64: true }, { id });
       }
     }
   } catch (e) {
@@ -1386,11 +1388,11 @@ async function doHttpStream(send, id, method, path, reqHeaders) {
     // 再写一次 head 会炸)。统一以 http-end 收尾,让 EventSource 按自己的节奏重连。
     const aborted = controller.signal.aborted === true;
     streamAborts.delete(id);
-    send({ id, type: "http-end", seq, ...(aborted ? { aborted: true } : { error: String(e?.message || e) }) });
+    send({ id, type: "http-end", seq, ...(aborted ? { aborted: true } : { error: String(e?.message || e) }) }, { id });
     return { status, chunks: seq, bytes, aborted };
   }
   streamAborts.delete(id);
-  send({ id, type: "http-end", seq });
+  send({ id, type: "http-end", seq }, { id });
   return { status, chunks: seq, bytes };
 }
 
