@@ -7755,7 +7755,36 @@ function imBotsView(relayDir) {
       sessionId: w.sessionId,
       sessionTitle: w.sessionTitle,
     },
-    status: wecomStatusOf(stFile),
+    // 钉钉 / 飞书：与 wecom 同一份文件里的两段（secret 永不回显，只给 hasSecret）
+    dingtalk: {
+      enabled: dingtalkCfgOf(bots).enabled,
+      clientId: dingtalkCfgOf(bots).clientId,
+      hasSecret: dingtalkCfgOf(bots).clientSecret.length > 0,
+      robotCode: dingtalkCfgOf(bots).robotCode,
+      replyMode: dingtalkCfgOf(bots).replyMode,
+      sessionWebhook: dingtalkCfgOf(bots).sessionWebhook,
+      boundChatId: dingtalkCfgOf(bots).boundChatId,
+      allowFrom: dingtalkCfgOf(bots).allowFrom,
+      cardTemplateId: dingtalkCfgOf(bots).cardTemplateId,
+      streamUrl: dingtalkCfgOf(bots).streamUrl,
+    },
+    feishu: {
+      enabled: feishuCfgOf(bots).enabled,
+      appId: feishuCfgOf(bots).appId,
+      hasSecret: feishuCfgOf(bots).appSecret.length > 0,
+      domain: feishuCfgOf(bots).domain,
+      receiveId: feishuCfgOf(bots).receiveId,
+      receiveIdType: feishuCfgOf(bots).receiveIdType,
+      boundChatId: feishuCfgOf(bots).boundChatId,
+      allowFrom: feishuCfgOf(bots).allowFrom,
+      cardApproval: feishuCfgOf(bots).cardApproval,
+      sdkVersion: feishuCfgOf(bots).sdkVersion,
+    },
+    status: Object.assign({}, wecomStatusOf(stFile), {
+      dingtalk: imPlatformStatusOf(stFile, "dingtalk"),
+      feishu: imPlatformStatusOf(stFile, "feishu"),
+      deps: { feishu: feishuDepsInfo(relayDir) },
+    }),
     updatedAt: typeof stFile.updatedAt === "number" ? stFile.updatedAt : 0,
   };
 }
@@ -7842,38 +7871,314 @@ function saveWecomConfig(relayDir, input) {
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+// 钉钉 / 飞书通道（2026-11-08）：与 wecom 同一套文件（im-bots.json / im-bot-status.json），
+// 但配置/状态字段按契约分开。**secret 永不返回浏览器**（只给 hasSecret）。
+// 飞书 SDK 走「按需下载」：~/.dsh-remote/im-deps 下 npm install 一个钉死版本，不随插件打包。
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+const IM_SECTION_MAX = 400;              // 单个字符串字段上限（凭据/ID 都是短串）
+const IM_DEPS_DIR = "im-deps";
+const IM_DEPS_STATUS_FILE = "install-status.json";
+const FEISHU_SDK_PKG = "@larksuiteoapi/node-sdk";
+/** 钉死版本：升级要走发版流程（桥/插件对 SDK 行为有依赖，不能装 latest 漂移）。 */
+const FEISHU_SDK_PIN = "1.40.0";
+const FEISHU_SDK_SPEC = `${FEISHU_SDK_PKG}@${FEISHU_SDK_PIN}`;
+const IM_PLATFORMS = ["wecom", "dingtalk", "feishu"];
+const FEISHU_RECEIVE_ID_TYPES = ["open_id", "chat_id", "email", "user_id"];
+
+const strOf = (v) => (typeof v === "string" ? v : "");
+const numOf = (v) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+const strListOf = (v) => (Array.isArray(v) ? v.slice(0, 50).map((x) => strOf(x).slice(0, IM_SECTION_MAX)).filter(Boolean) : []);
+
+/** 归一化 dingtalk 配置（读/写共用；未知字段由调用方 ...bots 保留）。 */
+function dingtalkCfgOf(bots) {
+  const d = bots && bots.dingtalk && typeof bots.dingtalk === "object" ? bots.dingtalk : {};
+  return {
+    enabled: !!d.enabled,
+    clientId: strOf(d.clientId),
+    clientSecret: strOf(d.clientSecret),
+    robotCode: strOf(d.robotCode),
+    replyMode: strOf(d.replyMode) || "stream",
+    sessionWebhook: strOf(d.sessionWebhook),
+    boundChatId: strOf(d.boundChatId),
+    allowFrom: strListOf(d.allowFrom),
+    cardTemplateId: strOf(d.cardTemplateId),
+    streamUrl: strOf(d.streamUrl),
+  };
+}
+
+/** 归一化 feishu 配置。 */
+function feishuCfgOf(bots) {
+  const f = bots && bots.feishu && typeof bots.feishu === "object" ? bots.feishu : {};
+  const type = strOf(f.receiveIdType);
+  return {
+    enabled: !!f.enabled,
+    appId: strOf(f.appId),
+    appSecret: strOf(f.appSecret),
+    domain: strOf(f.domain) || "https://open.feishu.cn",
+    receiveId: strOf(f.receiveId),
+    receiveIdType: FEISHU_RECEIVE_ID_TYPES.includes(type) ? type : "open_id",
+    boundChatId: strOf(f.boundChatId),
+    allowFrom: strListOf(f.allowFrom),
+    cardApproval: f.cardApproval !== false,
+    sdkVersion: strOf(f.sdkVersion),
+  };
+}
+
+/** 状态文件里 dingtalk/feishu 段 → 契约形状（白名单；桥塞什么都不带出去）。 */
+function imPlatformStatusOf(status, platform) {
+  const p = status && status[platform] && typeof status[platform] === "object" ? status[platform] : {};
+  const connected = !!p.connected;
+  const rawState = strOf(p.state);
+  const states = ["idle", "connecting", "connected", "reconnecting", "failed"];
+  const state = states.includes(rawState) ? rawState
+    : connected ? "connected" : (p.enabled ? "connecting" : "idle");
+  const t = strOf(p.tier);
+  return {
+    enabled: !!p.enabled,
+    state,
+    connected,
+    authenticated: !!p.authenticated,
+    lastError: strOf(p.lastError).slice(0, 500),
+    boundChatId: strOf(p.boundChatId),
+    tier: (t === "free" || t === "pro" || t === "pro_max") ? t : "",
+    caps: strListOf(p.caps).map((x) => x.slice(0, 80)),
+    capsCount: numOf(p.capsCount),
+    bindingGated: !!p.bindingGated,
+    messagesPerMonth: numOf(p.messagesPerMonth),
+    remainingMessages: typeof p.remainingMessages === "number" && Number.isFinite(p.remainingMessages) ? p.remainingMessages : null,
+    usage: (() => {
+      const u = p.usage && typeof p.usage === "object" ? p.usage : null;
+      return u ? { month: strOf(u.month), messages: numOf(u.messages) } : null;
+    })(),
+  };
+}
+
+function imDepsDirOf(relayDir) { return join(relayDir, IM_DEPS_DIR); }
+function imDepsStatusPathOf(relayDir) { return join(relayDir, IM_DEPS_DIR, IM_DEPS_STATUS_FILE); }
+
+/** 飞书 SDK 依赖现状（GET /dsh-remote/im-deps 的数据源；phase 用于面板进度轮询）。 */
+function feishuDepsInfo(relayDir) {
+  const base = imDepsDirOf(relayDir);
+  const pkgDir = join(base, "node_modules", "@larksuiteoapi", "node-sdk");
+  let installed = false;
+  let version = "";
+  try {
+    const pj = JSON.parse(readFileSync(join(pkgDir, "package.json"), "utf8"));
+    installed = true;
+    version = strOf(pj.version);
+  } catch { /* 未安装 */ }
+  const st = readJsonFileSoft(imDepsStatusPathOf(relayDir));
+  const f = st && st.feishu && typeof st.feishu === "object" ? st.feishu : {};
+  const phases = ["idle", "downloading", "installing", "done", "failed"];
+  let phase = phases.includes(strOf(f.phase)) ? strOf(f.phase) : (installed ? "done" : "idle");
+  if (!installed && phase === "done") phase = "idle";
+  return {
+    installed,
+    version: installed ? version : "",
+    path: installed ? pkgDir : "",
+    lastError: strOf(f.lastError).slice(0, 500),
+    phase,
+  };
+}
+
+function writeFeishuDepsPhase(relayDir, patch) {
+  try {
+    const dir = imDepsDirOf(relayDir);
+    mkdirSync(dir, { recursive: true });
+    const file = imDepsStatusPathOf(relayDir);
+    const cur = readJsonFileSoft(file);
+    const next = { ...cur, feishu: { ...(cur.feishu && typeof cur.feishu === "object" ? cur.feishu : {}), ...patch } };
+    const tmp = `${file}.tmp`;
+    writeFileSync(tmp, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
+    try { chmodSync(tmp, 0o600); } catch { /* 非 POSIX */ }
+    renameSync(tmp, file);
+    try { chmodSync(file, 0o600); } catch { /* 忽略 */ }
+  } catch { /* 进度记录失败不致命 */ }
+}
+
+/** npm 安装失败的归因码（面板据此给人话 + 可重试建议）。 */
+function classifySdkInstallError(text) {
+  const t = String(text || "");
+  if (/ENOSPC|no space/i.test(t)) return { code: "disk_full", message: "磁盘空间不足：清出约 200MB 后重试" };
+  if (/EACCES|EPERM|permission denied/i.test(t)) return { code: "permission_denied", message: "没有写入权限：检查 ~/.dsh-remote 目录权限后重试" };
+  if (/ETIMEDOUT|ENOTFOUND|ECONN|EAI_AGAIN|network|socket hang up|registry/i.test(t)) return { code: "network", message: "网络不通：检查能否访问 npm registry（可换镜像后重试）" };
+  return { code: "sdk_install_failed", message: `依赖安装失败：${t.split("\n").filter(Boolean).slice(-3).join(" ").slice(0, 300) || "未知原因"}` };
+}
+
+const feishuInstallTasks = new Map(); // relayDir → { startedAt, running }
+
+/**
+ * 后台下载安装飞书 SDK（POST /dsh-remote/im-deps/feishu）。
+ * 不阻塞请求：立刻回 taskId + 状态，进度由面板轮询 GET /dsh-remote/im-deps 的 phase。
+ * 测试注入：opts.imDepsSpawn(cmd, args, opts) 可替换真实 npm（用例绝不允许真的联网装包）。
+ */
+function startFeishuInstall(relayDir, opts = {}) {
+  const cur = feishuDepsInfo(relayDir);
+  if (cur.installed) return { ok: true, started: false, alreadyInstalled: true, deps: { feishu: cur } };
+  const running = feishuInstallTasks.get(relayDir);
+  if (running && running.running) return { ok: true, started: false, running: true, taskId: running.taskId, deps: { feishu: feishuDepsInfo(relayDir) } };
+  const taskId = `feishu-sdk-${Date.now().toString(36)}`;
+  const task = { running: true, startedAt: Date.now(), taskId };
+  feishuInstallTasks.set(relayDir, task);
+  const finish = (patch) => {
+    task.running = false;
+    task.endedAt = Date.now();
+    writeFeishuDepsPhase(relayDir, { ...patch, endedAt: task.endedAt, startedAt: task.startedAt, taskId });
+  };
+  writeFeishuDepsPhase(relayDir, { phase: "downloading", lastError: "", startedAt: task.startedAt });
+  let child = null;
+  try {
+    const base = imDepsDirOf(relayDir);
+    mkdirSync(base, { recursive: true });
+    const args = ["install", "--prefix", base, "--no-audit", "--no-fund", "--loglevel=error", FEISHU_SDK_SPEC];
+    const spawnImpl = typeof opts.imDepsSpawn === "function"
+      ? opts.imDepsSpawn
+      : (cmd, a, o) => spawn(cmd, a, { ...o, windowsHide: true }); // Windows 不闪黑窗
+    const isWin = isWindows();
+    const cmd = isWin ? "npm.cmd" : "npm";
+    child = spawnImpl(cmd, args, { cwd: base, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    let output = "";
+    const collect = (buf) => { try { output = (output + String(buf)).slice(-4000); } catch { /* 忽略 */ } };
+    try { child.stdout?.on?.("data", collect); child.stderr?.on?.("data", collect); } catch { /* 忽略 */ }
+    const done = (code, err) => {
+      if (feishuInstallTasks.get(relayDir) !== task) return; // 已被新任务取代
+      const after = feishuDepsInfo(relayDir);
+      if (after.installed) return finish({ phase: "done", lastError: "" });
+      const reason = classifySdkInstallError(err || output || `exit ${code}`);
+      finish({ phase: "failed", lastError: reason.message, errorCode: reason.code });
+    };
+    try {
+      child.on?.("exit", (code) => done(code, ""));
+      child.on?.("error", (e) => done(-1, String(e?.message || e)));
+    } catch { done(-1, "无法启动 npm"); }
+  } catch (e) {
+    const reason = classifySdkInstallError(String(e?.message || e));
+    finish({ phase: "failed", lastError: reason.message, errorCode: reason.code });
+    return { ok: true, started: true, taskId, deps: { feishu: feishuDepsInfo(relayDir) } };
+  }
+  return { ok: true, started: true, taskId, deps: { feishu: feishuDepsInfo(relayDir) } };
+}
+
+/** 保存 dingtalk 配置（空 secret = 不修改；凭据完整性在返回里说清）。 */
+function saveDingtalkConfig(relayDir, input) {
+  const src = input && typeof input === "object" ? input : {};
+  const bots = readImBots(relayDir);
+  const cur = dingtalkCfgOf(bots);
+  const next = { ...cur };
+  if (Object.prototype.hasOwnProperty.call(src, "clientId")) next.clientId = strOf(src.clientId).trim();
+  if (Object.prototype.hasOwnProperty.call(src, "clientSecret")) {
+    const v = strOf(src.clientSecret).trim();
+    if (v) next.clientSecret = v; // 空 = 不修改（面板不回显 secret）
+  }
+  if (Object.prototype.hasOwnProperty.call(src, "robotCode")) next.robotCode = strOf(src.robotCode).trim();
+  for (const k of ["replyMode", "sessionWebhook", "boundChatId", "cardTemplateId", "streamUrl"]) {
+    if (Object.prototype.hasOwnProperty.call(src, k)) next[k] = strOf(src[k]).trim();
+  }
+  if (Object.prototype.hasOwnProperty.call(src, "allowFrom")) next.allowFrom = strListOf(src.allowFrom);
+  if (Object.prototype.hasOwnProperty.call(src, "enabled")) next.enabled = !!src.enabled;
+  else if (!next.enabled && next.clientId && next.clientSecret && next.robotCode) next.enabled = true;
+  if (!next.clientId) return { ok: false, code: "missing_client_id", message: "请填写 Client ID（= 钉钉应用的 AppKey）" };
+  if (!next.clientSecret) return { ok: false, code: "missing_client_secret", message: "请填写 Client Secret（= 钉钉应用的 AppSecret，只保存在本机）" };
+  if (!next.robotCode) return { ok: false, code: "missing_robot_code", message: "请填写 Robot Code（机器人编码，在钉钉开放平台机器人页复制）" };
+  const out = { ...bots, version: 1, dingtalk: next };
+  try {
+    writeImBots(relayDir, out);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, code: "write_failed", message: `配置保存失败：${e?.message || e}` };
+  }
+}
+
+/** 保存 feishu 配置。 */
+function saveFeishuConfig(relayDir, input) {
+  const src = input && typeof input === "object" ? input : {};
+  const bots = readImBots(relayDir);
+  const cur = feishuCfgOf(bots);
+  const next = { ...cur };
+  for (const k of ["appId", "domain", "receiveId", "boundChatId", "sdkVersion"]) {
+    if (Object.prototype.hasOwnProperty.call(src, k)) next[k] = strOf(src[k]).trim();
+  }
+  if (Object.prototype.hasOwnProperty.call(src, "appSecret")) {
+    const v = strOf(src.appSecret).trim();
+    if (v) next.appSecret = v; // 空 = 不修改
+  }
+  if (Object.prototype.hasOwnProperty.call(src, "receiveIdType")) {
+    const t = strOf(src.receiveIdType).trim();
+    if (t && !FEISHU_RECEIVE_ID_TYPES.includes(t)) {
+      return { ok: false, code: "invalid_receive_id_type", message: "接收对象类型只能是 open_id / chat_id / email / user_id" };
+    }
+    next.receiveIdType = t || "open_id";
+  }
+  if (Object.prototype.hasOwnProperty.call(src, "allowFrom")) next.allowFrom = strListOf(src.allowFrom);
+  if (Object.prototype.hasOwnProperty.call(src, "cardApproval")) next.cardApproval = !!src.cardApproval;
+  if (Object.prototype.hasOwnProperty.call(src, "enabled")) next.enabled = !!src.enabled;
+  else if (!next.enabled && next.appId && next.appSecret && next.receiveId) next.enabled = true;
+  if (!next.appId) return { ok: false, code: "missing_app_id", message: "请填写 App ID（飞书开放平台应用的 App ID）" };
+  if (!next.appSecret) return { ok: false, code: "missing_app_secret", message: "请填写 App Secret（只保存在本机，不会回显）" };
+  if (!next.receiveId) return { ok: false, code: "missing_receive_id", message: "请填写接收人 open_id（或 chat_id）" };
+  const out = { ...bots, version: 1, feishu: next };
+  try {
+    writeImBots(relayDir, out);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, code: "write_failed", message: `配置保存失败：${e?.message || e}` };
+  }
+}
+
+/** 按平台分发保存（PUT / POST test 共用）。 */
+function saveImPlatformConfig(relayDir, platform, input) {
+  if (platform === "wecom") return saveWecomConfig(relayDir, input);
+  if (platform === "dingtalk") return saveDingtalkConfig(relayDir, input);
+  if (platform === "feishu") return saveFeishuConfig(relayDir, input);
+  return { ok: false, code: "bad_platform", message: `不支持的平台：${platform}` };
+}
+
+/** 各平台「是否已保存 secret」——决定测试前能不能直接连。 */
+function imPlatformHasSecret(relayDir, platform) {
+  const bots = readImBots(relayDir);
+  if (platform === "wecom") return !!wecomCfgOf(bots).secret;
+  if (platform === "dingtalk") return !!dingtalkCfgOf(bots).clientSecret;
+  if (platform === "feishu") return !!feishuCfgOf(bots).appSecret;
+  return false;
+}
+
+/** 状态文件里某平台的连接结论（测试轮询用）。 */
+function imPlatformStatusNow(relayDir, platform) {
+  const st = readImBotStatus(relayDir);
+  if (platform === "wecom") return wecomStatusOf(st);
+  return imPlatformStatusOf(st, platform);
+}
+
 /**
  * POST /dsh-remote/im-bots/test：保存（若带凭据）→ 轮询桥写的状态文件 ≤ waitMs。
  * 返回面板直接可渲染的结论：连接中 / 已连接 / 失败原因（桥的 lastError 原文照登）。
  */
-async function imBotsTest(relayDir, waitMs, input) {
+async function imBotsTest(relayDir, waitMs, input, platform = "wecom") {
+  const plat = IM_PLATFORMS.includes(platform) ? platform : "wecom";
   const hasInput = input && typeof input === "object" && Object.keys(input).length > 0;
   if (hasInput) {
-    const saved = saveWecomConfig(relayDir, input);
+    const saved = saveImPlatformConfig(relayDir, plat, input);
     if (!saved.ok) return { httpCode: 400, body: { ok: false, error: saved.code, message: saved.message } };
   }
-  const w = wecomCfgOf(readImBots(relayDir));
-  if (!w.secret) {
+  if (!imPlatformHasSecret(relayDir, plat)) {
     return { httpCode: 400, body: { ok: false, error: "missing_secret", message: "还没有保存 Secret：请先填写并保存（Secret 只保存在本机）" } };
   }
   const startedAt = Date.now();
   const total = Math.max(200, Number(waitMs) || IM_BOT_STATUS_WAIT_MS);
-  let last = wecomStatusOf(readImBotStatus(relayDir));
+  const okBody = (last) => ({ ok: true, platform: plat, connected: true, authenticated: !!last.authenticated, lastError: last.lastError || "" });
+  let last = imPlatformStatusNow(relayDir, plat);
   while (Date.now() - startedAt < total) {
-    if (last.connected) {
-      return { httpCode: 200, body: { ok: true, connected: true, authenticated: !!last.authenticated, lastError: last.lastError || "" } };
-    }
+    if (last.connected) return { httpCode: 200, body: okBody(last) };
     await new Promise((r) => { const t = setTimeout(r, IM_BOT_STATUS_POLL_MS); try { t.unref?.(); } catch { /* 忽略 */ } });
-    last = wecomStatusOf(readImBotStatus(relayDir));
+    last = imPlatformStatusNow(relayDir, plat);
     if (last.lastError && !last.connected) break; // 桥已经明确报错：不用傻等到超时
   }
-  if (last.connected) {
-    return { httpCode: 200, body: { ok: true, connected: true, authenticated: !!last.authenticated, lastError: last.lastError || "" } };
-  }
+  if (last.connected) return { httpCode: 200, body: okBody(last) };
   if (last.lastError) {
-    return { httpCode: 502, body: { ok: false, error: "connect_failed", lastError: last.lastError, message: `连接失败：${last.lastError}` } };
+    return { httpCode: 502, body: { ok: false, platform: plat, error: "connect_failed", lastError: last.lastError, message: `连接失败：${last.lastError}` } };
   }
-  return { httpCode: 504, body: { ok: false, error: "timeout", message: "等待桥连接超时（10 秒内没有收到连接结果）。请确认电脑端 Bridge 在运行，然后重试。" } };
+  return { httpCode: 504, body: { ok: false, platform: plat, error: "timeout", message: "等待桥连接超时（10 秒内没有收到连接结果）。请确认电脑端 Bridge 在运行，然后重试。" } };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════
@@ -8713,11 +9018,43 @@ function registerRoutes(ctx, relayDir, opts = {}) {
         }
         const body = await readJsonBody(req);
         if (body.__parseError) return sendJson(res, 400, { ok: false, error: "bad_request", message: "请求体不是合法 JSON" });
-        const wecom = body && typeof body.wecom === "object" && body.wecom ? body.wecom : null;
-        if (!wecom) return sendJson(res, 400, { ok: false, error: "bad_request", message: "缺少 wecom 配置" });
-        const saved = saveWecomConfig(relayDir, wecom);
-        if (!saved.ok) return sendJson(res, 400, { ok: false, error: saved.code, message: saved.message });
+        // 三种写法都认（向后兼容）：
+        //   { wecom:{...} } / { dingtalk:{...} } / { feishu:{...} }   —— 面板老写法
+        //   { platform:"dingtalk", config:{...} }                     —— 统一写法
+        // 一次可传多个段；某段校验失败就整体 400（不写半截配置）。
+        const platform = String((body && body.platform) || "");
+        const cfg = body && body.config && typeof body.config === "object" ? body.config : null;
+        const sections = IM_PLATFORMS.filter((k) => body && body[k] && typeof body[k] === "object");
+        if (!sections.length && !(platform && cfg)) {
+          return sendJson(res, 400, { ok: false, error: "bad_request", message: "缺少通道配置（wecom / dingtalk / feishu）" });
+        }
+        if (platform && cfg) {
+          if (!IM_PLATFORMS.includes(platform)) return sendJson(res, 400, { ok: false, error: "bad_platform", message: `不支持的平台：${platform}` });
+          const saved = saveImPlatformConfig(relayDir, platform, cfg);
+          if (!saved.ok) return sendJson(res, 400, { ok: false, error: saved.code, message: saved.message });
+        }
+        for (const plat of sections) {
+          const saved = saveImPlatformConfig(relayDir, plat, body[plat]);
+          if (!saved.ok) return sendJson(res, 400, { ok: false, error: saved.code, message: saved.message });
+        }
         sendJson(res, 200, imBotsView(relayDir));
+      },
+    },
+    {
+      // 飞书 SDK「按需下载」现状（面板据此显示未装/已装/下载中/失败）。
+      method: "GET",
+      path: "/dsh-remote/im-deps",
+      handler: async (_req, res) => {
+        sendJson(res, 200, { ok: true, feishu: feishuDepsInfo(relayDir) });
+      },
+    },
+    {
+      // 触发下载安装（后台执行，立刻返回；进度靠轮询 GET /dsh-remote/im-deps 的 phase）。
+      method: "POST",
+      path: "/dsh-remote/im-deps/feishu",
+      handler: async (_req, res) => {
+        const r = startFeishuInstall(relayDir, { imDepsSpawn: opts.imDepsSpawn });
+        sendJson(res, 200, { ok: true, ...r });
       },
     },
     {
@@ -8731,8 +9068,15 @@ function registerRoutes(ctx, relayDir, opts = {}) {
         }
         const body = await readJsonBody(req);
         // body 可选：不传 = 只测**已保存**的配置；传 = 先保存再测（与面板「保存并连接」一次点完一致）
-        const wecom = body && !body.__parseError && typeof body.wecom === "object" && body.wecom ? body.wecom : null;
-        const r = await imBotsTest(relayDir, opts.imBotsWaitMs, wecom);
+        // platform 默认 wecom（老前端不传时行为不变）；config 支持统一写法与 {wecom} 老写法。
+        const platform = String((body && !body.__parseError && body.platform) || "wecom");
+        let input = null;
+        if (body && !body.__parseError) {
+          if (IM_PLATFORMS.includes(platform) && body[platform] && typeof body[platform] === "object") input = body[platform];
+          else if (body.config && typeof body.config === "object") input = body.config;
+          else if (body.wecom && typeof body.wecom === "object" && platform === "wecom") input = body.wecom;
+        }
+        const r = await imBotsTest(relayDir, opts.imBotsWaitMs, input, platform);
         sendJson(res, r.httpCode, r.body);
       },
     },
@@ -9082,6 +9426,8 @@ export function apply(ctx, config = {}) {
   ctx.effect(() => registerRoutes(ctx, relayDir, {
     // 测试钩子：POST /dsh-remote/im-bots/test 的等待上限（默认 10s，见 imBotsTest 注释）。
     imBotsWaitMs: Number(config.imBotsWaitMs) || undefined,
+    // 测试钩子：飞书 SDK 安装的 npm spawn（用例注入假实现，**绝不真的联网装包**）。
+    imDepsSpawn: typeof config.imDepsSpawn === "function" ? config.imDepsSpawn : undefined,
   }), "dsh-remote-web: /dsh-remote routes");
   // 0.1.2-rc.1+ 浏览器会话代持：换取 Harness 会话 Cookie 供 bridge 上游携带（手机点设备不再 401 白页）
   ctx.effect(() => scheduleHarnessMint(ctx, relayDir), "dsh-remote-web: harness browser-session mint");

@@ -12,7 +12,7 @@
 // 暴露给任何能打开本机 dsh web 页面的人（哪怕它只是一台共享电脑）。
 import assert from "node:assert/strict";
 import http from "node:http";
-import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -199,7 +199,7 @@ test("POST /test：桥写的状态显示已连接 → {ok:true, connected:true, 
     await writeStatus(relayDir, { enabled: true, connected: true, authenticated: true, lastError: "" });
     const r = await postTest(base);   // 不传 body = 测已保存的配置
     assert.equal(r.status, 200);
-    assert.deepEqual(r.body, { ok: true, connected: true, authenticated: true, lastError: "" });
+    assert.deepEqual(r.body, { ok: true, platform: "wecom", connected: true, authenticated: true, lastError: "" });
   });
 });
 
@@ -396,5 +396,227 @@ test("GET：tier 只认三个枚举值；remainingMessages=null 表示不限/未
     await writeStatus(relayDir, { tier: "pro_max", remainingMessages: null });
     st = (await json(`${base}/dsh-remote/im-bots`)).body.status;
     assert.equal(st.tier, "pro_max");
+  });
+});
+
+// ─────────────────── 钉钉 / 飞书通道（2026-11-08） ───────────────────
+
+const putPlatform = (base, platform, config) => json(`${base}/dsh-remote/im-bots`, {
+  method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ platform, config }),
+});
+const postPlatformTest = (base, platform, config) => json(`${base}/dsh-remote/im-bots/test`, {
+  method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(config ? { platform, config } : { platform }),
+});
+const getDeps = async (base) => (await json(`${base}/dsh-remote/im-deps`)).body;
+const post = (base, url) => json(url, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+
+test("GET：dingtalk / feishu 两段都只回脱敏视图（有 hasSecret，绝无 clientSecret/appSecret 值）", async () => {
+  const relayDir = await tmpRelay();
+  await withHost(relayDir, {}, async (base) => {
+    await putPlatform(base, "dingtalk", { clientId: "ding-id", clientSecret: "DING-SECRET", robotCode: "ding-robot" });
+    await putPlatform(base, "feishu", { appId: "cli_1", appSecret: "FS-SECRET", receiveId: "ou_1", receiveIdType: "open_id" });
+    const r = await json(`${base}/dsh-remote/im-bots`);
+    assert.equal(r.body.dingtalk.clientId, "ding-id");
+    assert.equal(r.body.dingtalk.robotCode, "ding-robot");
+    assert.equal(r.body.dingtalk.hasSecret, true);
+    assert.equal(r.body.feishu.appId, "cli_1");
+    assert.equal(r.body.feishu.receiveIdType, "open_id");
+    assert.equal(r.body.feishu.hasSecret, true);
+    const raw = JSON.stringify(r.body);
+    assert.ok(!raw.includes("DING-SECRET"), "★ 钉钉 secret 绝不能出现");
+    assert.ok(!raw.includes("FS-SECRET"), "★ 飞书 secret 绝不能出现");
+    assert.ok(!raw.includes("clientSecret") && !raw.includes("appSecret"), "连字段名都不出现");
+  });
+});
+
+test("PUT：保存钉钉配置（0600 原子写 + 保留未知字段 + 空 secret 不覆盖）；缺字段给人话错误", async () => {
+  const relayDir = await tmpRelay();
+  await withHost(relayDir, {}, async (base) => {
+    // 先写一份带未知字段的旧文件：插件不认识，但不能删掉
+    await writeFile(path.join(relayDir, "im-bots.json"), JSON.stringify({ version: 1, future: { keep: 1 } }));
+    let r = await putPlatform(base, "dingtalk", { clientId: "id1", clientSecret: "sec1", robotCode: "rc1" });
+    assert.equal(r.status, 200);
+    let cfg = JSON.parse(await readFile(path.join(relayDir, "im-bots.json"), "utf8"));
+    assert.equal(cfg.dingtalk.clientId, "id1");
+    assert.equal(cfg.dingtalk.clientSecret, "sec1");
+    assert.equal(cfg.dingtalk.robotCode, "rc1");
+    assert.equal(cfg.dingtalk.enabled, true, "首次保存凭据 = 想让它生效");
+    assert.deepEqual(cfg.future, { keep: 1 }, "未知字段必须保留");
+    const mode = (await stat(path.join(relayDir, "im-bots.json"))).mode & 0o777;
+    assert.equal(mode, 0o600, "配置文件必须 0600");
+
+    // 空 secret = 不修改
+    r = await putPlatform(base, "dingtalk", { clientId: "id2", clientSecret: "", robotCode: "rc2" });
+    assert.equal(r.status, 200);
+    cfg = JSON.parse(await readFile(path.join(relayDir, "im-bots.json"), "utf8"));
+    assert.equal(cfg.dingtalk.clientId, "id2");
+    assert.equal(cfg.dingtalk.clientSecret, "sec1", "空 secret 表示不修改");
+    assert.equal(cfg.dingtalk.robotCode, "rc2");
+
+    // 缺字段
+    r = await putPlatform(base, "dingtalk", { clientId: "id3", clientSecret: "sec3", robotCode: "" });
+    assert.equal(r.status, 400);
+    assert.equal(r.body.error, "missing_robot_code", "三个字段都要：缺 Robot Code 要报出来");
+  });
+});
+
+test("PUT：保存飞书配置（字段锁死 + receiveIdType 校验 + 空 secret 不覆盖）", async () => {
+  const relayDir = await tmpRelay();
+  await withHost(relayDir, {}, async (base) => {
+    let r = await putPlatform(base, "feishu", { appId: "cli_a", appSecret: "fs_a", receiveId: "ou_a", receiveIdType: "chat_id" });
+    assert.equal(r.status, 200);
+    let cfg = JSON.parse(await readFile(path.join(relayDir, "im-bots.json"), "utf8"));
+    assert.equal(cfg.feishu.receiveIdType, "chat_id");
+    assert.equal(cfg.feishu.domain, "https://open.feishu.cn", "domain 默认官方");
+    r = await putPlatform(base, "feishu", { appId: "cli_b", appSecret: "", receiveId: "ou_b" });
+    cfg = JSON.parse(await readFile(path.join(relayDir, "im-bots.json"), "utf8"));
+    assert.equal(cfg.feishu.appSecret, "fs_a", "空 secret 不覆盖");
+    assert.equal(cfg.feishu.receiveIdType, "chat_id", "未传的字段 = 不修改（保留上次的 chat_id）");
+    // 非法 receiveIdType
+    r = await putPlatform(base, "feishu", { appId: "x", appSecret: "y", receiveId: "z", receiveIdType: "userid" });
+    assert.equal(r.status, 400);
+    assert.equal(r.body.error, "invalid_receive_id_type");
+  });
+});
+
+test("POST /test：platform=dingtalk / feishu 各自轮询对应状态（不再混用 wecom 状态）", async () => {
+  const relayDir = await tmpRelay();
+  await withHost(relayDir, {}, async (base) => {
+    await putPlatform(base, "dingtalk", { clientId: "i", clientSecret: "s", robotCode: "r" });
+    await putPlatform(base, "feishu", { appId: "cli_i", appSecret: "fs_s", receiveId: "ou_i" });
+    await writeStatus(relayDir, { connected: false, authenticated: false, lastError: "" }, {
+      dingtalk: { enabled: true, connected: true, authenticated: true, lastError: "" },
+      feishu: { enabled: true, connected: true, authenticated: true, lastError: "" },
+    });
+    let r = await postPlatformTest(base, "dingtalk");
+    assert.equal(r.status, 200);
+    assert.equal(r.body.platform, "dingtalk");
+    assert.equal(r.body.connected, true);
+    r = await postPlatformTest(base, "feishu");
+    assert.equal(r.body.platform, "feishu");
+    assert.equal(r.body.connected, true);
+    // 未保存 secret 的平台：给明确错误，而不是"连不上"
+    await withHost(await tmpRelay(), {}, async (base2) => {
+      const rr = await postPlatformTest(base2, "dingtalk");
+      assert.equal(rr.status, 400);
+      assert.equal(rr.body.error, "missing_secret");
+    });
+  });
+});
+
+test("GET 状态白名单：status.dingtalk / status.feishu 按契约透出（含 tier/caps/usage/state），状态文件敏感字段不外泄", async () => {
+  const relayDir = await tmpRelay();
+  await withHost(relayDir, {}, async (base) => {
+    await writeStatus(relayDir, { connected: false }, {
+      dingtalk: {
+        enabled: true, state: "connected", connected: true, authenticated: true, lastError: "", boundChatId: "chat-9",
+        tier: "pro", caps: ["dingtalk"], capsCount: 1, bindingGated: false, messagesPerMonth: 0, remainingMessages: null,
+        usage: { month: "2026-11", messages: 5 }, clientSecret: "LEAK-D", token: "LEAK-T",
+      },
+      feishu: {
+        enabled: true, state: "failed", connected: false, authenticated: false, lastError: "鉴权失败", boundChatId: "",
+        tier: "free", caps: [], capsCount: 0, bindingGated: true, messagesPerMonth: 20, remainingMessages: 19,
+        usage: { month: "2026-11", messages: 1 }, appSecret: "LEAK-F",
+      },
+    });
+    const r = await json(`${base}/dsh-remote/im-bots`);
+    const d = r.body.status.dingtalk;
+    assert.equal(d.state, "connected");
+    assert.equal(d.tier, "pro");
+    assert.deepEqual(d.caps, ["dingtalk"]);
+    assert.equal(d.remainingMessages, null, "null 必须保持 null（≠0）");
+    assert.deepEqual(d.usage, { month: "2026-11", messages: 5 });
+    const f = r.body.status.feishu;
+    assert.equal(f.state, "failed");
+    assert.equal(f.tier, "free");
+    assert.equal(f.bindingGated, true);
+    assert.equal(f.remainingMessages, 19);
+    assert.ok(!JSON.stringify(r.body).includes("LEAK"), "★ 桥写状态里的敏感字段必须被白名单挡掉");
+    // wecom 老字段仍在（向后兼容）
+    assert.equal(typeof r.body.status.connected, "boolean");
+  });
+});
+
+// 假子进程：测试注入 opts.imDepsSpawn，绝不真的联网 npm install
+function fakeSpawnChild(installed, stderrText) {
+  const handlers = {};
+  return {
+    stdout: { on() {} },
+    stderr: { on(_e, cb) { handlers.data = cb; } },
+    on(ev, cb) { handlers[ev] = cb; },
+    _finish() {
+      if (installed) handlers.installed = true;
+      setTimeout(() => {
+        if (stderrText && handlers.data) handlers.data(Buffer.from(stderrText));
+        if (handlers.exit) handlers.exit(installed ? 0 : 1);
+      }, 20);
+    }
+  };
+}
+
+test("GET /im-deps + POST /im-deps/feishu：后台安装（注入假 spawn，不联网），phase 从 downloading→done", async () => {
+  const relayDir = await tmpRelay();
+  const pkgDir = path.join(relayDir, "im-deps", "node_modules", "@larksuiteoapi", "node-sdk");
+  const spawnCalls = [];
+  const imDepsSpawn = (cmd, args) => {
+    spawnCalls.push({ cmd, args });
+    const child = fakeSpawnChild(true, "");
+    // 模拟 npm 装完后落盘（测试里直接写好 package.json）
+    setTimeout(async () => {
+      await mkdir(pkgDir, { recursive: true });
+      await writeFile(path.join(pkgDir, "package.json"), JSON.stringify({ name: "@larksuiteoapi/node-sdk", version: "1.40.0" }));
+      child._finish();
+    }, 10);
+    return child;
+  };
+  await withHost(relayDir, { imDepsSpawn }, async (base) => {
+    let deps = await getDeps(base);
+    assert.equal(deps.feishu.installed, false);
+    assert.equal(deps.feishu.phase, "idle");
+
+    const r = await post(base, `${base}/dsh-remote/im-deps/feishu`);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.started, true);
+    assert.ok(spawnCalls.length === 1, "应触发一次 npm install");
+    assert.ok(spawnCalls[0].args.join(" ").includes("@larksuiteoapi/node-sdk@1.40.0"), "安装命令必须钉死 SDK 版本");
+
+    // 轮询 phase 直到 done
+    let phase = "";
+    for (let i = 0; i < 50; i++) {
+      deps = await getDeps(base);
+      phase = deps.feishu.phase;
+      if (phase === "done" || phase === "failed") break;
+      await new Promise((r2) => setTimeout(r2, 30));
+    }
+    deps = await getDeps(base);
+    assert.equal(deps.feishu.phase, "done", "安装完成后 phase=done，实际 " + deps.feishu.phase);
+    assert.equal(deps.feishu.installed, true);
+    assert.equal(deps.feishu.version, "1.40.0");
+    assert.ok(deps.feishu.path.includes("node-sdk"));
+  });
+});
+
+test("POST /im-deps/feishu：安装失败 → phase=failed + 人话原因（network/disk/permission/sdk_install_failed）", async () => {
+  const relayDir = await tmpRelay();
+  const imDepsSpawn = () => {
+    const child = fakeSpawnChild(false, "npm ERR! code ETIMEDOUT network registry.npmjs.org");
+    setTimeout(() => child._finish(), 10);
+    return child;
+  };
+  await withHost(relayDir, { imDepsSpawn }, async (base) => {
+    const r = await post(base, `${base}/dsh-remote/im-deps/feishu`);
+    assert.equal(r.status, 200);
+    let deps = null;
+    for (let i = 0; i < 60; i++) {
+      deps = await getDeps(base);
+      if (deps.feishu.phase === "failed") break;
+      await new Promise((r2) => setTimeout(r2, 30));
+    }
+    assert.equal(deps.feishu.phase, "failed", "失败必须落到 failed 而不是永远 downloading");
+    assert.match(deps.feishu.lastError, /网络不通/, "网络类错误要翻成人话");
+    // 已失败后重试：再次触发安装
+    const r2 = await post(base, `${base}/dsh-remote/im-deps/feishu`);
+    assert.equal(r2.body.started, true, "失败后允许重试");
   });
 });

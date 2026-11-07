@@ -122,6 +122,10 @@ import { createAgentRuntime } from "./agent/index.mjs";
 // 电脑在线即可双向联动。**默认关闭**：没有 `im-bots.json` / 未启用 / 缺凭据时什么都不起。
 // 与微信机器人通道（iLink 长轮询）互相独立：两条通道可同时开，也可以都不开。
 import { createWecomBotController } from "./wecom-bot.mjs";
+// 钉钉 Stream 模式长连接（2026-11-08）：与企微同构、零新增依赖；默认关闭，配置在 im-bots.json 的 dingtalk 段。
+import { createDingtalkBotController } from "./dingtalk-bot.mjs";
+// 飞书通道：官方 SDK 按需下载（41MB，不随包分发）、懒加载；未启用时零副作用
+import { createFeishuBotController } from "./feishu-bot.mjs";
 
 // ---------- 强制直连:清除代理环境变量 ----------
 // 家庭网络常配 Clash 等代理(127.0.0.1:7890),node 的 ws/fetch 会继承
@@ -768,6 +772,19 @@ export function tunnelBulkOptionsFromEnv(env = process.env) {
   };
 }
 
+// ---------- B0：慢响应日志（2026-11-08） ----------
+// 阈值/窗口读 env（DSH_BRIDGE_SLOW_RESP_MS / DSH_BRIDGE_SLOW_LOG_MS，见 slowRespLogOptions）。
+// 全局节流避免"很多大响应同时慢"时把日志刷爆（工作区的日志铁律同样要求有界）。
+const SLOW_RESP = slowRespLogOptions();
+let slowRespLogLast = -Infinity;
+function slowRespLogAllow() {
+  if (SLOW_RESP.windowMs <= 0) return true;
+  const t = Date.now();
+  if (t - slowRespLogLast < SLOW_RESP.windowMs) return false;
+  slowRespLogLast = t;
+  return true;
+}
+
 /**
  * 构造「控制帧优先」的隧道发送器。返回 { send, close, stats, hasBacklog }。
  *
@@ -797,12 +814,19 @@ export function makePrioritySender({
   //   客户端的游标推进到了前面，重连时服务端按该游标回放就触发 cursor 错乱。
   //   现在：控制帧仍可插队（它们是协议控制帧，不承载有序数据）；**数据帧只有一个队列**，
   //   大帧按片就地推进，绝不因大小/类型被后来的帧超越。
-  const dataQ = []; // { frames: string[], i: number }；frames.length===1 = 未分片小帧
-  const stats = { controlSent: 0, dataSent: 0, bigFrames: 0, bigChunks: 0, waits: 0, dropped: 0 };
+  const dataQ = []; // { frames: string[], i: number, id?: string|number, onFlushed?: Function, cancelled?: boolean }；frames.length===1 = 未分片小帧
+  const stats = { controlSent: 0, dataSent: 0, bigFrames: 0, bigChunks: 0, waits: 0, dropped: 0, droppedQueued: 0 };
 
-  function enqueueData(text) {
+  /** 条目彻底发完时回调（B0 慢响应计时用）。观测回调**绝不允许**影响发送本身。 */
+  function notifyFlushed(entry) {
+    try { entry?.onFlushed?.(); } catch { /* 观测失败绝不影响发送 */ }
+  }
+
+  function enqueueData(text, meta = {}) {
+    const id = meta.id ?? null;
+    const onFlushed = typeof meta.onFlushed === "function" ? meta.onFlushed : null;
     if (text.length <= chunkSize) {
-      dataQ.push({ frames: [text], i: 0 });
+      dataQ.push({ frames: [text], i: 0, id, onFlushed });
       return;
     }
     const cid = `c${++chunkSeq}`;
@@ -812,7 +836,7 @@ export function makePrioritySender({
       frames[i] = JSON.stringify({ __chunk: { id: cid, n, i, data: text.slice(i * chunkSize, (i + 1) * chunkSize) } });
     }
     stats.bigFrames += 1;
-    dataQ.push({ frames, i: 0 });
+    dataQ.push({ frames, i: 0, id, onFlushed });
   }
 
   function scheduleNext(waitMs) {
@@ -837,17 +861,27 @@ export function makePrioritySender({
       for (;;) {
         // ① 控制车道永远先走：哪怕大帧正传着 16MB，控制帧也在**下一轮**第一时间出去。
         while (controlQ.length > 0) {
-          const frame = controlQ.shift();
-          try { rawSend(frame); stats.controlSent += 1; } catch { closed = true; }
+          const item = controlQ.shift();
+          let ok = true;
+          try { rawSend(item.text); stats.controlSent += 1; } catch { ok = false; closed = true; }
+          if (!ok) break;
+          notifyFlushed(item);
         }
         if (closed) { yieldMode = ""; break; }
+        // ② 已取消的条目整条丢出队头（B2：手机已放弃这条响应，别再把剩余分片塞进隧道）。
+        //    只做"删除"，**绝不重排** —— 其余条目的相对顺序原样保留（数据帧严格 FIFO）。
+        while (dataQ.length > 0 && dataQ[0].cancelled) {
+          dataQ.shift();
+          stats.droppedQueued += 1;
+        }
         if (dataQ.length === 0) { yieldMode = ""; break; }
         if (budget <= 0) { yieldMode = "schedule"; break; }
         const head = dataQ[0];
         if (head.frames.length === 1) {
           // 未分片小帧：可连着多发几条，但绝不越过队头（保证 FIFO）
           try { rawSend(head.frames[0]); stats.dataSent += 1; } catch { closed = true; break; }
-          dataQ.shift();
+          const done = dataQ.shift();
+          notifyFlushed(done);
           budget -= 1;
           continue; // 回环顶先查控制车道
         }
@@ -857,7 +891,10 @@ export function makePrioritySender({
         if (pending > bulkHighWater) { stats.waits += 1; yieldMode = "poll"; break; }
         try { rawSend(head.frames[head.i]); stats.dataSent += 1; stats.bigChunks += 1; } catch { closed = true; break; }
         head.i += 1;
-        if (head.i >= head.frames.length) dataQ.shift();
+        if (head.i >= head.frames.length) {
+          const done = dataQ.shift();
+          notifyFlushed(done);
+        }
         yieldMode = "schedule";
         break;
       }
@@ -872,14 +909,41 @@ export function makePrioritySender({
     }
   }
 
-  function send(obj) {
+  /**
+   * 发送一帧。
+   * @param {object} obj 帧对象（协议字节不变）
+   * @param {{id?:string|number, onFlushed?:Function}} [opts] **仅本进程内使用**的元信息，
+   *        不进协议：`id` 用于取消（B2），`onFlushed` 在真正发完时回调（B0 计时）。
+   */
+  function send(obj, opts = {}) {
     let text;
     try { text = JSON.stringify(obj); } catch { return false; }
     if (closed) { stats.dropped += 1; return false; }
-    if (isControlFrame(obj)) controlQ.push(text);
-    else enqueueData(text);
+    const onFlushed = typeof opts?.onFlushed === "function" ? opts.onFlushed : null;
+    if (isControlFrame(obj)) controlQ.push({ text, onFlushed });
+    else enqueueData(text, { id: opts?.id ?? null, onFlushed });
     pump();
     return true;
+  }
+
+  /**
+   * 丢弃某条响应的**未发分片**（2026-11-08，B2：手机已放弃的响应不许再占隧道）。
+   *
+   * 只做"标记取消 + 随后整条移出队列"，**绝不重排** —— 数据帧严格 FIFO 的语义不变
+   * （被取消的条目整条消失，其余条目的相对顺序原样保留）。已被 `rawSend` 发出的分片无法回收。
+   * @returns {number} 被标记取消的条目数（0 = 该 id 已不在队列里/已经发完）
+   */
+  function drop(id) {
+    if (id === undefined || id === null) return 0;
+    let n = 0;
+    for (let i = dataQ.length - 1; i >= 0; i -= 1) {
+      if (dataQ[i].id === id) { dataQ[i].cancelled = true; n += 1; }
+    }
+    if (n > 0) {
+      // 队头若正好是它，立刻腾出来（其余条目顺序不变）；否则等轮到它时在 pump 顶部整条丢。
+      pump();
+    }
+    return n;
   }
 
   /** 隧道断开：丢掉未发内容并停止调度（否则重连后旧分片会发到新连接上）。 */
@@ -891,13 +955,22 @@ export function makePrioritySender({
 
   return {
     send,
+    drop,
     close,
-    stats: () => ({
-      ...stats,
-      queued: dataQ.length,
-      controlQueued: controlQ.length,
-      closed
-    }),
+    stats: () => {
+      // queuedBytes = 队列里**还没发出去**的字节（含未发分片）—— 排障时这是"队头有多厚"的直接证据。
+      let queuedBytes = 0;
+      for (const e of dataQ) {
+        for (let i = e.i; i < e.frames.length; i += 1) queuedBytes += e.frames[i].length;
+      }
+      return {
+        ...stats,
+        queued: dataQ.length,
+        queuedBytes,
+        controlQueued: controlQ.length,
+        closed
+      };
+    },
     hasBacklog: () => dataQ.length > 0 || controlQ.length > 0
   };
 }
@@ -913,6 +986,23 @@ function toSender(dchOrSend) {
  *   const recv = makeFrameReceiver();
  *   dch.onmessage = (ev) => recv(ev.data, (frame) => handleFrame(dch, frame));
  */
+/**
+ * 隧道入站分发器：**连接级**单实例的 `makeFrameReceiver()`（2026-11-08，P0-1）。
+ *
+ * 为什么要有这层包装：`__chunk` 的 n 片是 n 条**独立 WS 消息**，攒片状态（bufs）必须跟
+ * **连接**同生命周期。旧写法在 `ws.on("message")` 里每条消息都 `new` 一个接收器 ⇒ 状态随
+ * 消息一起丢 ⇒ 跨消息分片永远拼不齐，中继发来的大帧（≥`DSH_ROUTER_BIG_YIELD_MB`，含大
+ * 请求体）在桥侧被静默丢弃。中继侧一直是连接级（index.mjs 在 connection 回调里建一次），
+ * 这里对齐。协议字节不变，只改状态生命周期。
+ *
+ * 导出给用例行为级锁住这条契约（test/bridge-tunnel-receiver.test.mjs）：
+ * 一个 dispatcher 喂多条消息 → 能还原一条完整帧。
+ */
+export function createTunnelFrameDispatcher(onFrame) {
+  const receive = makeFrameReceiver();
+  return (raw) => receive(raw, onFrame);
+}
+
 export function makeFrameReceiver() {
   const bufs = new Map(); // chunkId → { n, parts: string[] }
   return function receive(raw, onFrame) {
@@ -992,6 +1082,17 @@ export async function handleFrame(dchOrSend, frame) {
     if (c) {
       streamAborts.delete(id);
       try { c.abort(); } catch { /* ignore */ }
+    }
+    // B2（2026-11-08）：普通 HTTP 响应也取消 —— 手机已走人，别再把整包读完/gzip/灌进隧道
+    // 占住数据队列队头（2026-11-07 事故的放大器）。老中继从不发这帧 ⇒ 对老链路零行为。
+    if (ABORT_DEAD_ENABLED) {
+      const ha = httpAborts.get(id);
+      if (ha) {
+        httpAborts.delete(id);
+        try { ha.abort(); } catch { /* ignore */ }
+      }
+      // 丢掉隧道里还没发的分片：只删这个 id 的条目，**其余条目顺序原样保留**（FIFO 不破）。
+      try { dchOrSend?.drop?.(id); } catch { /* ignore */ }
     }
     return;
   }
@@ -1184,6 +1285,31 @@ export function downloadDispositionOf({ method = "GET", path = "", status = 200,
 const streamAborts = new Map();
 
 /**
+ * 进行中的**普通** HTTP 请求:frameId → AbortController（B2，2026-11-08）。
+ *
+ * 为什么需要:以前只有 SSE 能被取消。普通大响应（`/plugins/` 聚合包、大文件预览）在手机
+ * 放弃（nginx 499 / 切页 / 锁屏）之后，桥仍然会把整包读完、gzip 完、**继续往隧道里灌**，
+ * 占住数据队列队头把同设备后续请求堵在后面 —— 2026-11-07 事故里 77 次 499 每次都这么放大。
+ * 现在 `http-abort` 同时掐上游 fetch（AbortController）并调用发送器的 `drop(id)` 丢掉未发分片。
+ * 回滚:`DSH_BRIDGE_ABORT_DEAD=0`（旧中继从不发这个帧，所以默认开对老链路也是零行为）。
+ */
+const httpAborts = new Map();
+
+/** `http-abort` 是否也取消普通 HTTP 请求（纯函数，便于用例钉住；默认开，`0`=关）。 */
+export function abortDeadEnabled(env = process.env) {
+  const raw = env?.DSH_BRIDGE_ABORT_DEAD;
+  if (raw === undefined || raw === null || raw === "") return true;
+  const v = String(raw).trim().toLowerCase();
+  return !["0", "false", "off", "no", "disabled"].includes(v);
+}
+const ABORT_DEAD_ENABLED = abortDeadEnabled();
+
+/** 测试钩子：当前在飞的普通 HTTP 请求数（不改变任何行为）。 */
+export function __httpInflightForTest() {
+  return httpAborts.size;
+}
+
+/**
  * 中继在 `tunnel-register-ok` 里声明支持的**追加帧能力**。
  *
  * 为什么必须协商:browser→中继→bridge 是两段**独立升级**的链路。
@@ -1268,7 +1394,53 @@ async function doHttpStream(send, id, method, path, reqHeaders) {
   return { status, chunks: seq, bytes };
 }
 
-async function doHttp(method, path, reqHeaders, body, isB64) {
+/** 从环境变量读「慢响应日志」参数（B0；纯函数，便于用例钉住）。 */
+export function slowRespLogOptions(env = process.env) {
+  const num = (name, dflt) => {
+    const raw = env?.[name];
+    if (raw === undefined || raw === null || raw === "") return dflt;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 0 ? n : dflt;
+  };
+  return {
+    thresholdMs: num("DSH_BRIDGE_SLOW_RESP_MS", 2000), // 总耗时 ≥ 该值才记一条
+    windowMs: num("DSH_BRIDGE_SLOW_LOG_MS", 3000)      // 全局节流窗口（0 = 每次都记，排障用）
+  };
+}
+
+/**
+ * 慢响应日志行（B0，2026-11-08）。
+ *
+ * 为什么必须单独一行：线上"卡 20 分钟"的真问题是**首屏资源从 PC 出来只有 3–16KB/s**，
+ * 而原日志只有 "→ 200 (3200ms, 1700KB)" 这种粒度 —— 分不清慢在
+ * ①宿主拼包/首包、②读上游响应体、③gzip、④注入、⑤**排队等隧道**。
+ * 这条行把五段摊开，是判断"流式化/取消/字节削减"谁该先做的直接依据。
+ * 纯函数（便于单测行格式；不碰任何业务语义）。
+ */
+export function formatSlowResponse({
+  method = "GET", path = "/", status = 0, totalMs = 0,
+  timings = {}, queueWaitMs = -1, queue = null, outBytes = 0
+} = {}) {
+  const ms = (n) => (Number.isFinite(Number(n)) && Number(n) >= 0 ? `${Math.round(Number(n))}ms` : "-");
+  const kb = (n) => (Number.isFinite(Number(n)) && Number(n) >= 0 ? `${(Number(n) / 1024).toFixed(0)}KB` : "-");
+  const q = queue && Number.isFinite(Number(queue.queued))
+    ? `${Number(queue.queued)}条/${Number(queue.queuedBytes) || 0}B`
+    : "-";
+  return `[bridge] 慢响应: ${String(method || "GET")} ${String(path || "/").split("?")[0]} → ${Number(status) || 0} `
+    + `总 ${ms(totalMs)} | 上游首包 ${ms(timings.ttfbMs)} 读体 ${ms(timings.readMs)} 注入 ${ms(timings.injectMs)} gzip ${ms(timings.gzipMs)} `
+    + `| 入队→发完 ${ms(queueWaitMs)} | 队列 ${q} | 下行 ${kb(outBytes)}`;
+}
+
+/** 取隧道发送器挂在 send 上的进程内 stats()（DataChannel 路径没有 → null）。 */
+function senderStatsOf(dchOrSend) {
+  try {
+    return typeof dchOrSend?.stats === "function" ? dchOrSend.stats() : null;
+  } catch {
+    return null;
+  }
+}
+
+async function doHttp(method, path, reqHeaders, body, isB64, opts = {}) {
   const safe = safePath(path);
   if (safe === null) throw new Error("非法路径");
   const url = `${UPSTREAM}${safe}`;
@@ -1280,8 +1452,23 @@ async function doHttp(method, path, reqHeaders, body, isB64) {
     // 新协议 http 帧的 body 一律 base64;旧协议 body 是原始文本
     init.body = isB64 ? Buffer.from(String(body), "base64") : String(body);
   }
-  let res = await fetch(url, { ...init, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
+  // B0 计时：首包 / 读体 / 注入 / gzip 四段分开记（慢响应日志要能一眼看出是谁慢）。
+  // ⚠️ timings 用**不可枚举**属性挂回结果对象：`JSON.stringify(reply)` 不会把它带进协议帧
+  //    （隧道帧字节必须与改动前逐字节一致）。
+  // B2：可被中继的 `http-abort` 取消（手机已放弃这条响应）。
+  //   仍然保留 120s 上游超时语义：两个信号任一触发都中止 fetch。
+  const abortSignal = opts?.signal
+    ? (typeof AbortSignal.any === "function"
+      ? AbortSignal.any([opts.signal, AbortSignal.timeout(HTTP_TIMEOUT_MS)])
+      : opts.signal) // 极老 Node 没有 AbortSignal.any：退化成"只受取消控制"（超时由中继兜底）
+    : AbortSignal.timeout(HTTP_TIMEOUT_MS);
+  const timings = { ttfbMs: -1, readMs: -1, injectMs: -1, gzipMs: -1 };
+  let tMark = Date.now();
+  let res = await fetch(url, { ...init, signal: abortSignal });
+  timings.ttfbMs = Date.now() - tMark;
+  tMark = Date.now();
   let buf = Buffer.from(await res.arrayBuffer());
+  timings.readMs = Date.now() - tMark;
   // 手机端 401「dsh web authentication required」自愈:
   //   dsh web 每次重启都会换签名密钥 → 插件代持的旧 Cookie 立即失效。撞到该 401 时
   //   ① 写「作废」标记(插件在面板轮询时秒级重换 Cookie);
@@ -1296,8 +1483,12 @@ async function doHttp(method, path, reqHeaders, body, isB64) {
         console.log("[bridge] 浏览器会话 Cookie 已失效,用新 Cookie 重试一次:", path);
         const retryHdrs = sanitizeRequestHeaders(reqHeaders);
         retryHdrs.Cookie = fresh;
-        res = await fetch(url, { ...init, headers: retryHdrs, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
+        tMark = Date.now();
+        res = await fetch(url, { ...init, headers: retryHdrs, signal: abortSignal });
+        timings.ttfbMs = Date.now() - tMark;
+        tMark = Date.now();
         buf = Buffer.from(await res.arrayBuffer());
+        timings.readMs = Date.now() - tMark;
       } else {
         console.warn("[bridge] 浏览器会话 Cookie 已失效(已标记,等待插件重换):", path);
       }
@@ -1317,6 +1508,7 @@ async function doHttp(method, path, reqHeaders, body, isB64) {
     if (disposition) headers["content-disposition"] = disposition;
   }
   if (!contentType.includes("text/event-stream")) { // SSE 长连不缓冲不注入(见模块注释)
+    tMark = Date.now();
     const m = maybeInjectMobileAdapter({ buf, contentType });
     if (m.injected) {
       console.log(`[bridge] mobile-adapter 注入 ${path}: ${(buf.length / 1024).toFixed(0)}KB → ${(m.buf.length / 1024).toFixed(0)}KB`);
@@ -1340,7 +1532,9 @@ async function doHttp(method, path, reqHeaders, body, isB64) {
         buf = s.buf;
       }
     }
+    timings.injectMs = Date.now() - tMark;
   }
+  tMark = Date.now();
   const compressed = await maybeCompressResponse({
     buf,
     contentType,
@@ -1361,12 +1555,17 @@ async function doHttp(method, path, reqHeaders, body, isB64) {
     buf = compressed.buf;
     Object.assign(headers, compressed.headers);
   }
-  return {
+  timings.gzipMs = Date.now() - tMark;
+  const reply = {
     status: res.status,
     headers,
     body: buf.toString("base64"),
     bodyBase64: true
   };
+  // ⚠️ 不可枚举：`JSON.stringify(reply)`（= 真正发出去的隧道帧）不会带上 timings，
+  //    协议字节与改动前逐字节一致；只有本进程的慢响应日志/用例看得到它。
+  Object.defineProperty(reply, "timings", { value: timings, enumerable: false });
+  return reply;
 }
 
 /**
@@ -1437,6 +1636,10 @@ export async function handleHttpFrame(dchOrSend, frame) {
   if (method === "POST" && path === "/_e2ee/intro") {
     return answerIntro(send, id);
   }
+  // B2（2026-11-08）：每个上游请求一个可取消信号。中继在手机放弃（499/切页/锁屏）时会发
+  // `http-abort`；以前只有 SSE 能被取消，普通大响应会在手机走人后继续读完/gzip/灌隧道。
+  const httpAc = new AbortController();
+  httpAborts.set(id, httpAc);
   // E2EE 信封标记即信号(§4.3):有标记=加密,无标记=明文 v1。
   // 解封失败绝不静默降级 → 明文错误 + x-dsh-e2ee-error 头 + 日志。
   if (hasEnvelopeMarker(headers)) {
@@ -1462,7 +1665,7 @@ export async function handleHttpFrame(dchOrSend, frame) {
       //   （哪怕客户端给了个我们看不懂的值，也不能原样漏给 dsh web）。
       const wantBinPlain = wantsBinaryResponsePlain(req.headers);
       const upstreamHeaders = stripPlainWantHeader(req.headers);
-      const reply = await doHttp(req.method, req.path, upstreamHeaders, req.bodyB64, true);
+      const reply = await doHttp(req.method, req.path, upstreamHeaders, req.bodyB64, true, { signal: httpAc.signal });
       const bodyBuffer = Buffer.from(reply.body, "base64");
       const plain = encodeHttpResponsePlain({ status: reply.status, headers: reply.headers, bodyBuffer, binary: wantBinPlain });
       // 响应压缩已发生在 doHttp(明文侧,gzip 在加密前 §4.7);信封用 http-resp kind
@@ -1472,8 +1675,15 @@ export async function handleHttpFrame(dchOrSend, frame) {
       console.log(`[bridge] e2ee http ${req.method} ${req.path} → ${reply.status} (${Date.now() - t0}ms, 信封 ${(reply.body.length * 3 / 4 / 1024).toFixed(0)}KB)`);
       return;
     } catch (e) {
+      if (httpAc.signal.aborted) {
+        // 手机已放弃：不是上游故障，不要打"解封失败"，也不要回错误帧（中继侧 pending 已删）。
+        console.log(`[bridge] e2ee http ${method} ${path} 已取消(手机断开)`);
+        return;
+      }
       console.error(`[bridge] e2ee http ${method} ${path} 解封失败: ${e.message || e}(不回退明文)`);
       return sendE2eeHttpError(send, id, e);
+    } finally {
+      httpAborts.delete(id);
     }
   }
   try {
@@ -1484,12 +1694,32 @@ export async function handleHttpFrame(dchOrSend, frame) {
       console.log(`[bridge] ${method} ${path} → SSE ${s.status} (${Date.now() - t0}ms, ${s.chunks} 块 / ${(s.bytes / 1024).toFixed(1)}KB${s.aborted ? ", 手机已断开" : ""})`);
       return;
     }
-    const reply = await doHttp(method, path, headers, body, !!isB64);
+    const reply = await doHttp(method, path, headers, body, !!isB64, { signal: httpAc.signal });
     reply.id = id;
     reply.type = "http";
-    const sent = send(reply);
     const ms = Date.now() - t0;
     const outBytes = Math.floor((reply.body.length * 3) / 4);
+    // B0：入队前先取一次队头厚度（"排队等隧道"是 3–16KB/s 现象里最需要被看见的一段）。
+    const queueAtEnqueue = senderStatsOf(dchOrSend);
+    const tEnqueue = Date.now();
+    let queueWaitMs = -1;
+    const sent = send(reply, {
+      id, // B2：让发送器能按 id 取消这条响应的未发分片
+      onFlushed: () => {
+        // 只有真正发完才记"入队→发完"；中途被取消/断线不会走到这里（不会假装成功）。
+        queueWaitMs = Date.now() - tEnqueue;
+        const totalMs = Date.now() - t0;
+        if (totalMs < SLOW_RESP.thresholdMs) return;
+        if (!slowRespLogAllow()) return;
+        console.log(formatSlowResponse({
+          method, path, status: reply.status, totalMs,
+          timings: reply.timings || {},
+          queueWaitMs,
+          queue: queueAtEnqueue,
+          outBytes
+        }));
+      }
+    });
     if (isLongRequest) {
       // 长请求(大文件上传)单独记:上行字节、总耗时、状态码 —— 客服排查"上传失败"最需要这三样。
       console.log(`[bridge] ${method} ${path} → ${reply.status} (${ms}ms, 上行 ${(bytesIn / 1024 / 1024).toFixed(2)}MB, 下行 ${(outBytes / 1024).toFixed(0)}KB)`);
@@ -1498,6 +1728,12 @@ export async function handleHttpFrame(dchOrSend, frame) {
     }
     reportUndelivered(sent, { method, path, phase: "reply", ms, bytesIn, outBytes });
   } catch (e) {
+    // B2：被中继取消（手机已放弃）不是上游故障 —— 不要触发"重新发现上游"，也不要回 502 帧
+    // （中继侧 pending 已删，回了也没人收）。只留一行证据。
+    if (httpAc.signal.aborted) {
+      console.log(`[bridge] ${method} ${path} 已取消(手机断开): ${Date.now() - t0}ms, 上行 ${bytesIn}B`);
+      return;
+    }
     // 上游不可达是「端口可能变了」的最强信号（Desktop 换端口 / dsh web 重启到别的端口）：
     // 触发一次带冷却的重新发现，后续请求自动跟上，不必重启 bridge。
     void refreshUpstream("上游请求失败");
@@ -1533,6 +1769,8 @@ export async function handleHttpFrame(dchOrSend, frame) {
       bodyBase64: true
     });
     reportUndelivered(sent, { method, path, phase: "502", ms, bytesIn, outBytes: 0 });
+  } finally {
+    httpAborts.delete(id); // B2：无论成功/失败/取消，都别把 controller 留在表里
   }
 }
 
@@ -2536,7 +2774,12 @@ function connectTunnel(token) {
     bufferedAmount: () => ws.bufferedAmount,
     ...tunnelBulkOptionsFromEnv()
   });
-  const send = sender.send;
+  // 把两个**进程内**能力挂到 send 函数上（不是协议字段）：
+  //   · stats() —— B0 慢响应日志/排障要报"队头有多厚"（queued/queuedBytes）；
+  //   · drop(id) —— B2 取消：手机已放弃的响应，剩余分片不许再占隧道。
+  // 用函数属性而不是改 handleXxx 签名，是为了不影响 DataChannel 那条调用路径
+  // （`toSender` 对函数输入原样返回，属性自然带得过去）。
+  const send = Object.assign(sender.send, { stats: sender.stats, drop: sender.drop });
   let heartbeat;
   let pongReceived = true;
   let missedPongs = 0;
@@ -2594,33 +2837,36 @@ function connectTunnel(token) {
       rttEma = rttEma === null ? rtt : Math.round(rttEma * 0.7 + rtt * 0.3);
     }
   });
+  // 🔴 2026-11-08（P0-1）：接收器是**连接级单实例**（见 createTunnelFrameDispatcher 注释）。
+  //   以前这条 handler 里每收到一条消息就 new 一个 makeFrameReceiver() ⇒ 跨消息 `__chunk`
+  //   永远拼不齐 ⇒ 中继方向的大帧（大请求体等）被静默丢弃。
+  const onTunnelMessage = createTunnelFrameDispatcher((frame) => {
+    if (frame?.type === "tunnel-register-ok") {
+      // 记下中继声明的追加帧能力(旧中继不带 caps → 空集合 → 退回整包缓冲,见 routerCaps 注释)
+      routerCaps.clear();
+      for (const c of Array.isArray(frame.caps) ? frame.caps : []) routerCaps.add(String(c));
+      // 中继注册成功 = 手机端此刻真的能进这台电脑:面板据此把阶段推进到 online(已连接 ✅)
+      persistBridgeState({ device_id: DEVICE_ID, tunnel_registered_at: Date.now(), phase: "online", last_error: null });
+      console.log(`[bridge] ✅ router 注册成功: ${DEVICE_ID},等待手机访问 /remote/${DEVICE_ID}/`);
+      return;
+    }
+    if (frame?.type === "tunnel-register-err") {
+      if (frame.code === "device_locked") {
+        // 契约 §6.1：服务端按套餐额度判定本机不可用。**不退出进程**，关掉这条隧道后进入
+        // 解锁轮询（30s 一次 GET /api/devices）；期间不重连、不发心跳（close 处理器见等待态直接 return）。
+        enterLockedWait(token, { message: frame.message, plan: frame.plan, limit: frame.limit, upgrade_to: frame.upgrade_to });
+        try { ws.close(4009, "device locked"); } catch { /* 对端可能已经关了 */ }
+        return;
+      }
+      persistBridgeState({ phase: "error", last_error: { code: frame.code || "register_err", message: frame.message || "router 拒绝注册" } });
+      console.error(`[bridge] router 拒绝注册: ${frame.code} ${frame.message || ""}`);
+      return;
+    }
+    handleFrame(send, frame);
+  });
   ws.on("message", (raw) => {
-    const receive = makeFrameReceiver();
     try {
-      receive(raw, (frame) => {
-        if (frame?.type === "tunnel-register-ok") {
-          // 记下中继声明的追加帧能力(旧中继不带 caps → 空集合 → 退回整包缓冲,见 routerCaps 注释)
-          routerCaps.clear();
-          for (const c of Array.isArray(frame.caps) ? frame.caps : []) routerCaps.add(String(c));
-          // 中继注册成功 = 手机端此刻真的能进这台电脑:面板据此把阶段推进到 online(已连接 ✅)
-          persistBridgeState({ device_id: DEVICE_ID, tunnel_registered_at: Date.now(), phase: "online", last_error: null });
-          console.log(`[bridge] ✅ router 注册成功: ${DEVICE_ID},等待手机访问 /remote/${DEVICE_ID}/`);
-          return;
-        }
-        if (frame?.type === "tunnel-register-err") {
-          if (frame.code === "device_locked") {
-            // 契约 §6.1：服务端按套餐额度判定本机不可用。**不退出进程**，关掉这条隧道后进入
-            // 解锁轮询（30s 一次 GET /api/devices）；期间不重连、不发心跳（close 处理器见等待态直接 return）。
-            enterLockedWait(token, { message: frame.message, plan: frame.plan, limit: frame.limit, upgrade_to: frame.upgrade_to });
-            try { ws.close(4009, "device locked"); } catch { /* 对端可能已经关了 */ }
-            return;
-          }
-          persistBridgeState({ phase: "error", last_error: { code: frame.code || "register_err", message: frame.message || "router 拒绝注册" } });
-          console.error(`[bridge] router 拒绝注册: ${frame.code} ${frame.message || ""}`);
-          return;
-        }
-        handleFrame(send, frame);
-      });
+      onTunnelMessage(raw);
     } catch (e) { console.log(`[bridge] 隧道帧错误: ${e.message}`); }
   });
   ws.on("close", (code, reason) => {
@@ -3097,52 +3343,118 @@ async function stopWeChat() {
  * 配置热更新由 controller 自己 fs.watchFile(2s) 完成（改凭据/停用都不需要重启 bridge）；
  * 任何异常都只记日志 —— 绝不影响远程访问主链路。
  */
-let imBots = null;
+let imBots = null;          // 企业微信控制器
+let imBotsDingtalk = null;  // 钉钉控制器（两路独立：任一失败不影响另一个）
+let imBotsFeishu = null;    // 飞书控制器（同理；SDK 未下载时只写 sdk_missing 状态）
+
+/** IM 机器人日志（两路共用同一前缀规则）。 */
+function imBotLog(level, message) {
+  try {
+    if (level === "warn" || level === "error") console.warn(message);
+    else console.log(message);
+  } catch { /* 忽略 */ }
+}
 
 function startImBots() {
+  // ① 企业微信（现有）
   try {
-    if (imBots) return;
-    imBots = createWecomBotController({
-      relayDir: RELAY_DIR,
-      // 订阅器要连的本机 dsh web：传取值器，宿主换端口时下一次重连能跟上
-      botOptions: {
-        upstream: () => currentUpstreamForChannel(),
-        cookie: harnessCookieOf,
-        // 会员判定（2026-11-07 业主拍板：通知免费 / 审批免费 / 互动半阉割）：
-        // 直接复用微信通道那份档位解析（/api/me → 服务端权益包，含 caps/limits/rev），
-        // 拿不到就由 wecom-bot 按 free fail-closed 处理。
-        capsProvider: resolveWechatTier,
-        // 免费用户越界时的转化入口（与微信通道同一个 App 地址；wecom-bot 拼 /app/promo）
-        appUrl: wechatAppUrl()
-      },
-      // 企微审批卡片点按钮 → 与手机拍板同一条路（协调器 → DSH 回执）；失败返回 {ok:false} 让卡片显示"没送达"
-      onApprovalDecision: (requestId, decision) => applyApprovalDecision(requestId, decision),
-      log: (level, message) => {
-        try {
-          if (level === "warn" || level === "error") console.warn(message);
-          else console.log(message);
-        } catch { /* 忽略 */ }
-      }
-    });
-    // 不 await：配置读取/连接都是可选增强，失败绝不影响隧道
-    void imBots.start().catch((e) => {
-      console.warn(`[bridge] 企业微信机器人通道启动失败(不影响远程访问): ${redactText(e)}`);
-    });
+    if (!imBots) {
+      imBots = createWecomBotController({
+        relayDir: RELAY_DIR,
+        // 订阅器要连的本机 dsh web：传取值器，宿主换端口时下一次重连能跟上
+        botOptions: {
+          upstream: () => currentUpstreamForChannel(),
+          cookie: harnessCookieOf,
+          // 会员判定（2026-11-07 业主拍板：通知免费 / 审批免费 / 互动半阉割）：
+          // 直接复用微信通道那份档位解析（/api/me → 服务端权益包，含 caps/limits/rev），
+          // 拿不到就由 wecom-bot 按 free fail-closed 处理。
+          capsProvider: resolveWechatTier,
+          // 免费用户越界时的转化入口（与微信通道同一个 App 地址；wecom-bot 拼 /app/promo）
+          appUrl: wechatAppUrl()
+        },
+        // 企微审批卡片点按钮 → 与手机拍板同一条路（协调器 → DSH 回执）；失败返回 {ok:false} 让卡片显示"没送达"
+        onApprovalDecision: (requestId, decision) => applyApprovalDecision(requestId, decision),
+        log: imBotLog
+      });
+      // 不 await：配置读取/连接都是可选增强，失败绝不影响隧道
+      void imBots.start().catch((e) => {
+        console.warn(`[bridge] 企业微信机器人通道启动失败(不影响远程访问): ${redactText(e)}`);
+      });
+    }
   } catch (e) {
     console.warn(`[bridge] 企业微信机器人通道初始化失败(不影响远程访问): ${redactText(e)}`);
     imBots = null;
   }
+  // ② 钉钉 Stream（2026-11-08）：默认关闭；与企微共用 im-bots.json / im-bot-status.json，
+  //    配置各自的段（dingtalk）。任一失败不影响企微通道与远程访问主链路。
+  try {
+    if (!imBotsDingtalk) {
+      imBotsDingtalk = createDingtalkBotController({
+        relayDir: RELAY_DIR,
+        capsProvider: resolveWechatTier,
+        appUrl: wechatAppUrl(),
+        log: imBotLog,
+        botOptions: {
+          upstream: () => currentUpstreamForChannel(),
+          cookie: harnessCookieOf
+        }
+      });
+      void imBotsDingtalk.start().catch((e) => {
+        console.warn(`[bridge] 钉钉机器人通道启动失败(不影响远程访问): ${redactText(e)}`);
+      });
+    }
+  } catch (e) {
+    console.warn(`[bridge] 钉钉机器人通道初始化失败(不影响远程访问): ${redactText(e)}`);
+    imBotsDingtalk = null;
+  }
+  // ③ 飞书（2026-11-08）：默认关闭；官方 SDK 按需下载（不随包分发），未下载时控制器只写
+  //    status=sdk_missing（面板据此显示「下载依赖」），不建连、不崩、不影响其它通道。
+  try {
+    if (!imBotsFeishu) {
+      imBotsFeishu = createFeishuBotController({
+        relayDir: RELAY_DIR,
+        capsProvider: resolveWechatTier,
+        appUrl: wechatAppUrl(),
+        log: imBotLog,
+        // 飞书卡片点按钮 → 与企微/手机拍板同一条路（协调器 → DSH 回执）
+        onApprovalDecision: (requestId, decision) => applyApprovalDecision(requestId, decision),
+        botOptions: {
+          upstream: () => currentUpstreamForChannel(),
+          cookie: harnessCookieOf
+        }
+      });
+      void imBotsFeishu.start().catch((e) => {
+        console.warn(`[bridge] 飞书机器人通道启动失败(不影响远程访问): ${redactText(e)}`);
+      });
+    }
+  } catch (e) {
+    console.warn(`[bridge] 飞书机器人通道初始化失败(不影响远程访问): ${redactText(e)}`);
+    imBotsFeishu = null;
+  }
 }
 
-/** 优雅退出企业微信机器人通道（关长连接 + 停配置监听）。失败只记日志。 */
+/** 优雅退出 IM 机器人通道（企微 + 钉钉，互不影响）。失败只记日志。 */
 async function stopImBots() {
-  const c = imBots;
+  const wecom = imBots;
+  const dingtalk = imBotsDingtalk;
+  const feishu = imBotsFeishu;
   imBots = null;
-  if (!c) return;
-  try {
-    await c.stop();
-  } catch (e) {
-    console.warn(`[bridge] 企业微信机器人通道停止失败(忽略): ${redactText(e)}`);
+  imBotsDingtalk = null;
+  imBotsFeishu = null;
+  if (wecom) {
+    try { await wecom.stop(); } catch (e) {
+      console.warn(`[bridge] 企业微信机器人通道停止失败(忽略): ${redactText(e)}`);
+    }
+  }
+  if (dingtalk) {
+    try { await dingtalk.stop(); } catch (e) {
+      console.warn(`[bridge] 钉钉机器人通道停止失败(忽略): ${redactText(e)}`);
+    }
+  }
+  if (feishu) {
+    try { await feishu.stop(); } catch (e) {
+      console.warn(`[bridge] 飞书机器人通道停止失败(忽略): ${redactText(e)}`);
+    }
   }
 }
 

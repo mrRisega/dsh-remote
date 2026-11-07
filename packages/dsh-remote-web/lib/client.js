@@ -675,6 +675,9 @@ window.__ModuleLoader__.load({
       ".dru-ia-tier-link:hover{text-decoration:underline}",
       ".dru-ia-badge{display:inline-flex;align-items:center;padding:1px 6px;border-radius:999px;font-size:11px;font-weight:600;line-height:1.4;color:var(--dru-accent-fg);background:var(--dru-accent-tint);border:1px solid var(--dru-accent-tint-border);cursor:help}",
       "select.dru-ia-input[disabled]{opacity:.6;cursor:not-allowed;background:var(--dru-surface-3)}",
+      // 飞书 8 步向导：编号列表紧凑可读（一屏内可滚，不撑破弹层）
+      ".dru-ia-steps{margin:6px 0 8px;padding-left:20px;font-size:12px;line-height:1.7;color:var(--dsw-alias-label-secondary,var(--dru-fg-muted))}",
+      ".dru-ia-steps li{margin:2px 0}",
       // A3/A6（2026-11-07 业主逐条 UI 修正）：状态头右侧按钮组 / 后台服务横向紧凑布局 / 卸载反馈单选行
       ".dru-ia-head-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}",
       ".dru-bridge-keep{display:flex;align-items:center;gap:6px;margin:8px 0 10px;padding:7px 10px;border-radius:8px;font-size:12px;line-height:1.5;color:var(--dru-warn-fg);background:var(--dru-warn-soft);border:1px solid var(--dru-warn-border)}",
@@ -3584,6 +3587,21 @@ window.__ModuleLoader__.load({
       // 未登录守卫：为什么弹登录（A4/A5）+ 登录后自动回到哪个流程（"手机访问"登录完继续生成访问码）。
       var iaLoginWhyArr = useState(""); var iaLoginWhy = iaLoginWhyArr[0]; var setIaLoginWhy = iaLoginWhyArr[1];
       var iaAfterLoginArr = useState(""); var iaAfterLogin = iaAfterLoginArr[0]; var setIaAfterLogin = iaAfterLoginArr[1];
+      // ── 钉钉 / 飞书（2026-11-08）：与 wecom 并列的两条通道 ──
+      var imDingIdArr = useState(""); var imDingId = imDingIdArr[0]; var setImDingId = imDingIdArr[1];
+      var imDingSecretArr = useState(""); var imDingSecret = imDingSecretArr[0]; var setImDingSecret = imDingSecretArr[1];
+      var imDingRobotArr = useState(""); var imDingRobot = imDingRobotArr[0]; var setImDingRobot = imDingRobotArr[1];
+      var imFeishuAppIdArr = useState(""); var imFeishuAppId = imFeishuAppIdArr[0]; var setImFeishuAppId = imFeishuAppIdArr[1];
+      var imFeishuSecretArr = useState(""); var imFeishuSecret = imFeishuSecretArr[0]; var setImFeishuSecret = imFeishuSecretArr[1];
+      var imFeishuRecvArr = useState(""); var imFeishuRecv = imFeishuRecvArr[0]; var setImFeishuRecv = imFeishuRecvArr[1];
+      var imFeishuTypeArr = useState("open_id"); var imFeishuType = imFeishuTypeArr[0]; var setImFeishuType = imFeishuTypeArr[1];
+      // 平台级消息/错误/忙碌（与 wecom 的 imBotsMsg 分开：切平台时不会串台）
+      var imPlatMsgArr = useState(null); var imPlatMsg = imPlatMsgArr[0]; var setImPlatMsg = imPlatMsgArr[1];   // {kind,text}
+      var imPlatErrArr = useState({}); var imPlatErr = imPlatErrArr[0]; var setImPlatErr = imPlatErrArr[1];     // {field: msg}
+      var imPlatBusyArr = useState(""); var imPlatBusy = imPlatBusyArr[0]; var setImPlatBusy = imPlatBusyArr[1]; // ""|"save"|"test"|"deps"
+      // 飞书 SDK 依赖（按需下载）：installed/version/phase/lastError
+      var imDepsArr = useState(null); var imDeps = imDepsArr[0]; var setImDeps = imDepsArr[1];
+      var imFeishuWizardArr = useState(false); var imFeishuWizard = imFeishuWizardArr[0]; var setImFeishuWizard = imFeishuWizardArr[1];
 
       /** 读通道配置（GET 只回脱敏视图：botId/hasSecret/url/targetChatId + 桥写的状态）。 */
       function loadImBots() {
@@ -5989,6 +6007,21 @@ window.__ModuleLoader__.load({
             setImBotsSessionTitle(String(w.sessionTitle || ""));
             setImBotsWhyOpen(false);
             setImBotsUrl(String(w.url || ""));
+            var d = (b && b.dingtalk) || {};
+            setImDingId(String(d.clientId || ""));
+            setImDingSecret("");
+            setImDingRobot(String(d.robotCode || ""));
+            var f = (b && b.feishu) || {};
+            setImFeishuAppId(String(f.appId || ""));
+            setImFeishuSecret("");
+            setImFeishuRecv(String(f.receiveId || ""));
+            setImFeishuType(String(f.receiveIdType || "open_id"));
+            setImFeishuWizard(false);
+            setImPlatMsg(null);
+            setImPlatErr({});
+            var deps = b && b.status && b.status.deps && b.status.deps.feishu;
+            if (deps) setImDeps(deps);
+            loadImDeps();
           });
         }
         // 数据加载交给下面的 effect（按"弹层是否打开"触发）：
@@ -6554,6 +6587,283 @@ window.__ModuleLoader__.load({
                 }, "去登录"))] }));
       }
 
+      // ══════════════════════════════════════════════════════════════════════════════════
+      // 钉钉 / 飞书（2026-11-08）：与 wecom 并列的两条通道；飞书 SDK 走「按需下载」。
+      // ══════════════════════════════════════════════════════════════════════════════════
+
+      /** 飞书官方文档（配置页顶部固定展示；外链一律 target=_blank + rel=noopener）。 */
+      var FEISHU_DOCS = {
+        createApp: "https://open.feishu.cn/document/develop-an-app/create-an-app",
+        longConn: "https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/event-subscription-configure-/long-connection"
+      };
+      /** 8 步向导（业主/文档要求；顺序坑单独强调，见 renderFeishuStep 的提示）。 */
+      var FEISHU_STEPS = [
+        "创建企业自建应用：飞书开放平台 → 开发者后台 → 创建企业自建应用",
+        "复制 App ID / App Secret（应用详情 → 凭证与基础信息）",
+        "开通机器人能力：应用功能 → 机器人 → 启用",
+        "申请权限：收 p2p / 群@消息，发 im:message:send_as_bot",
+        "事件配置：订阅方式选「长连接」，添加「接收消息 v2.0」",
+        "回调配置：订阅方式选「长连接」，添加 card.action.trigger",
+        "发布版本：版本管理与发布 → 创建版本 → 申请发布（管理员审核）",
+        "回本插件填 App ID / Secret / 接收人并点「保存并连接」"
+      ];
+
+      /** GET /dsh-remote/im-deps：飞书 SDK 是否已装 + phase（下载进度轮询用）。 */
+      function loadImDeps() {
+        return api("/dsh-remote/im-deps").then(function (b) {
+          var f = b && b.feishu;
+          if (f) setImDeps(f);
+          return f || null;
+        }).catch(function () { return null; });
+      }
+
+      /** 触发飞书 SDK 下载（后台 npm install；进度靠轮询 im-deps 的 phase）。 */
+      function startFeishuDownload() {
+        if (imPlatBusy) return;
+        setImPlatBusy("deps");
+        setImPlatMsg({ kind: "ok", text: "正在下载依赖（约 41MB，仅装一次）…" });
+        post("/dsh-remote/im-deps/feishu", {}).then(function (b) {
+          if (b && b.deps && b.deps.feishu) setImDeps(b.deps.feishu);
+          loadImDeps();
+        }).catch(function (e) {
+          setImPlatMsg({ kind: "err", text: "下载失败：" + ((e && e.message) || e) + "（可重试）" });
+        }).finally(function () { setImPlatBusy(""); });
+      }
+
+      /** 依赖下载中：每 ~900ms 轮询一次 phase；失败/完成后自动停。 */
+      useEffect(function () {
+        if (iaModal !== "channel" || iaChStep !== "feishu") return undefined;
+        var phase = imDeps && imDeps.phase;
+        if (phase !== "downloading" && phase !== "installing") return undefined;
+        var t = null;
+        try {
+          t = setTimeout(function () { loadImDeps(); }, 900);
+        } catch (e) { /* 忽略 */ }
+        return function () { try { if (t) clearTimeout(t); } catch (e) { /* 忽略 */ } };
+      }, [iaModal, iaChStep, imDeps]);
+
+      /** 钉钉表单提交体（空 secret = 不修改，与 wecom 一致）。 */
+      function imDingPayload() {
+        return {
+          clientId: String(imDingId || "").trim(),
+          clientSecret: String(imDingSecret || ""),
+          robotCode: String(imDingRobot || "").trim()
+        };
+      }
+      /** 飞书表单提交体。 */
+      function imFeishuPayload() {
+        return {
+          appId: String(imFeishuAppId || "").trim(),
+          appSecret: String(imFeishuSecret || ""),
+          receiveId: String(imFeishuRecv || "").trim(),
+          receiveIdType: String(imFeishuType || "open_id")
+        };
+      }
+      function imPlatFieldErrOf(code) {
+        var map = {
+          missing_client_id: "clientId", missing_client_secret: "clientSecret", missing_robot_code: "robotCode",
+          missing_app_id: "appId", missing_app_secret: "appSecret", missing_receive_id: "receiveId",
+          invalid_receive_id_type: "receiveIdType"
+        };
+        return map[String(code || "")] || "";
+      }
+      var IM_PLAT_FIELD_NAMES = {
+        clientId: "Client ID", clientSecret: "Client Secret", robotCode: "Robot Code",
+        appId: "App ID", appSecret: "App Secret", receiveId: "接收人", receiveIdType: "接收对象类型"
+      };
+
+      /**
+       * 保存 / 测试（钉钉·飞书共用）。
+       * @param {"dingtalk"|"feishu"} platform
+       * @param {"save"|"test"} mode  save=只保存；test=先保存再连接测试（「保存并连接」）
+       */
+      function saveImPlatform(platform, mode) {
+        if (imPlatBusy) return;
+        var cfg = platform === "dingtalk" ? imDingPayload() : imFeishuPayload();
+        setImPlatBusy(mode === "test" ? "test" : "save");
+        setImPlatMsg(null);
+        setImPlatErr({});
+        // ⚠️ 必须是 PUT：/dsh-remote/im-bots 在节点半按 method 分发（GET/PUT），POST 会被 405。
+        api("/dsh-remote/im-bots", {
+          method: "PUT", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ platform: platform, config: cfg })
+        }, 15000).then(function () {
+          if (mode !== "test") {
+            setImPlatMsg({ kind: "ok", text: "已保存（配置只在本机，Secret 不会回显）" });
+            return loadImBots();
+          }
+          return post("/dsh-remote/im-bots/test", { platform: platform, config: cfg }, 15000).then(function (r) {
+            if (r && r.connected) setImPlatMsg({ kind: "ok", text: "已连接，消息可以正常收发了" });
+            else setImPlatMsg({ kind: "warn", text: "已保存，但连接还没成功" + (r && r.lastError ? "：" + r.lastError : "（稍后自动重试）") });
+            return loadImBots();
+          });
+        }).catch(function (e) {
+          var body = (e && e.body) || {};
+          var code = String(body.error || "");
+          var field = imPlatFieldErrOf(code);
+          if (field) {
+            var errs = {}; errs[field] = String(body.message || "请填写完整");
+            setImPlatErr(errs);
+            setImPlatMsg({ kind: "err", text: "请补全：" + IM_PLAT_FIELD_NAMES[field] });
+          } else {
+            setImPlatMsg({ kind: "err", text: "保存失败：" + (body.message || (e && e.message) || "未知错误") });
+          }
+          return null;
+        }).finally(function () { setImPlatBusy(""); });
+      }
+
+      /** 平台状态行（连接中 / 已连接 / 失败；文案面向非技术用户）。 */
+      function imPlatStateLine(st) {
+        if (imPlatBusy === "test") return h("div", { className: "dru-ia-state", role: "status" }, h("span", { className: "dru-spin" }), "正在连接…（最多 10 秒）");
+        if (imPlatMsg) return h("div", { className: "dru-ia-state " + (imPlatMsg.kind === "ok" ? "is-ok" : imPlatMsg.kind === "warn" ? "is-warn" : "is-err"), role: "status" }, imPlatMsg.text);
+        if (st && st.connected) return h("div", { className: "dru-ia-state is-ok", role: "status" }, druIcon("check"), "已连接");
+        if (st && st.lastError) return h("div", { className: "dru-ia-state is-err", role: "status" }, "上次连接失败：" + st.lastError);
+        return null;
+      }
+
+      /** 钉钉配置页：Client ID / Client Secret / Robot Code（三个都要）。 */
+      function renderDingtalkStep(close) {
+        var d = (imBots && imBots.dingtalk) || {};
+        var st = imBots && imBots.status && imBots.status.dingtalk;
+        var err = imPlatErr || {};
+        return iaDialog(Object.assign({}, {
+          title: "钉钉机器人",
+          sub: "Client ID / Secret 就是钉钉应用的 AppKey / AppSecret；Robot Code 是机器人编码",
+          onClose: close,
+          foot: [
+            h("button", { type: "button", className: "dru-ia-btn is-primary", disabled: imPlatBusy !== "", onClick: function () { saveImPlatform("dingtalk", "test"); } },
+              imPlatBusy === "test" ? "连接中…" : "保存并连接"),
+            h("button", { type: "button", className: "dru-ia-btn", disabled: imPlatBusy !== "", onClick: function () { saveImPlatform("dingtalk", "save"); } },
+              imPlatBusy === "save" ? "保存中…" : "仅保存"),
+            h("button", { type: "button", className: "dru-ia-btn is-ghost", disabled: imPlatBusy !== "", onClick: function () {
+              if (imPlatBusy) return;
+              setImPlatBusy("test"); setImPlatMsg(null);
+              post("/dsh-remote/im-bots/test", { platform: "dingtalk" }, 15000).then(function (r) {
+                setImPlatMsg({ kind: r && r.connected ? "ok" : "warn", text: r && r.connected ? "已连接" : ("连接失败" + (r && r.lastError ? "：" + r.lastError : "（稍后自动重试）")) });
+              }).catch(function (e) { setImPlatMsg({ kind: "err", text: "测试失败：" + ((e && e.message) || e) }); })
+                .finally(function () { setImPlatBusy(""); });
+            } }, "测试")
+          ]
+        }, { children: [
+          h("div", { className: "dru-ia-state" }, druIcon("send"), d.hasSecret ? "已保存凭据（Secret 不回显）" : "还没有保存凭据"),
+          iaField("Client ID（= AppKey）", "dru-ding-client", h("input", {
+            id: "dru-ding-client", className: "dru-ia-input", type: "text", value: imDingId, autoComplete: "off", spellCheck: false,
+            placeholder: "钉钉应用 AppKey", "aria-invalid": err.clientId ? "true" : "false",
+            onChange: function (e) { setImDingId(e.target.value); }
+          }), err.clientId || ""),
+          iaField("Client Secret（= AppSecret）", "dru-ding-secret", h("input", {
+            id: "dru-ding-secret", className: "dru-ia-input", type: "password", value: imDingSecret, autoComplete: "new-password", spellCheck: false,
+            placeholder: d.hasSecret ? "已保存（留空表示不修改）" : "钉钉应用 AppSecret", "aria-invalid": err.clientSecret ? "true" : "false",
+            onChange: function (e) { setImDingSecret(e.target.value); }
+          }), err.clientSecret || "", "只保存在本机；已保存的 Secret 永远不回显。"),
+          iaField("Robot Code", "dru-ding-robot", h("input", {
+            id: "dru-ding-robot", className: "dru-ia-input", type: "text", value: imDingRobot, autoComplete: "off", spellCheck: false,
+            placeholder: "机器人编码（开放平台 → 机器人页复制）", "aria-invalid": err.robotCode ? "true" : "false",
+            onChange: function (e) { setImDingRobot(e.target.value); }
+          }), err.robotCode || "", "三个字段都要填：Client ID/Secret 建应用时给，Robot Code 在机器人页。"),
+          imPlatStateLine(st)
+        ] }));
+      }
+
+      /** 飞书 SDK 依赖未安装时的那一屏（按需下载，不装也能用其它通道）。 */
+      function renderFeishuDepsGate(close) {
+        var deps = imDeps || {};
+        var running = deps.phase === "downloading" || deps.phase === "installing";
+        return iaDialog(Object.assign({}, {
+          title: "飞书机器人",
+          sub: "首次使用需要先下载依赖（约 41MB，仅装一次）",
+          onClose: close,
+          foot: [
+            h("button", { type: "button", className: "dru-ia-btn is-primary", disabled: imPlatBusy !== "" || running, onClick: startFeishuDownload },
+              running ? "下载中…" : (deps.phase === "failed" ? "重试下载" : "下载依赖")),
+            h("button", { type: "button", className: "dru-ia-btn", onClick: function () { setIaChStep("list"); } }, "返回平台列表")
+          ]
+        }, { children: [
+          h("div", { className: "dru-ia-state" }, druIcon("bell"),
+            running ? "正在下载并安装（约 41MB，仅装一次）…" : (deps.phase === "failed" ? "上次下载失败" : "还没有安装飞书依赖")),
+          deps.lastError ? h("div", { className: "dru-ia-state is-err", role: "alert" }, deps.lastError) : null,
+          h("div", { className: "dru-ia-hint" }, "下载的是飞书官方 Node SDK，仅装在这个插件自己的目录里，不影响其它插件和系统环境。"),
+          h("div", { className: "dru-ia-hint" }, "不下载也能用其它通道：企业微信、钉钉都可正常配置；飞书随时回来装即可，不会影响已有通知。")
+        ] }));
+      }
+
+      /** 飞书配置页（依赖已装）：官方文档 + 8 步向导 + 三个字段。 */
+      function renderFeishuStep(close) {
+        var deps = imDeps || {};
+        if (deps.installed !== true) return renderFeishuDepsGate(close);
+        var f = (imBots && imBots.feishu) || {};
+        var st = imBots && imBots.status && imBots.status.feishu;
+        var err = imPlatErr || {};
+        return iaDialog(Object.assign({}, {
+          title: "飞书机器人",
+          sub: "依赖已就绪（v" + (deps.version || f.sdkVersion || "?") + "）；填 App ID / Secret / 接收人即可",
+          onClose: close,
+          foot: [
+            h("button", { type: "button", className: "dru-ia-btn is-primary", disabled: imPlatBusy !== "", onClick: function () { saveImPlatform("feishu", "test"); } },
+              imPlatBusy === "test" ? "连接中…" : "保存并连接"),
+            h("button", { type: "button", className: "dru-ia-btn", disabled: imPlatBusy !== "", onClick: function () { saveImPlatform("feishu", "save"); } },
+              imPlatBusy === "save" ? "保存中…" : "仅保存"),
+            h("button", { type: "button", className: "dru-ia-btn is-ghost", disabled: imPlatBusy !== "", onClick: function () {
+              if (imPlatBusy) return;
+              setImPlatBusy("test"); setImPlatMsg(null);
+              post("/dsh-remote/im-bots/test", { platform: "feishu" }, 15000).then(function (r) {
+                setImPlatMsg({ kind: r && r.connected ? "ok" : "warn", text: r && r.connected ? "已连接" : ("连接失败" + (r && r.lastError ? "：" + r.lastError : "（稍后自动重试）")) });
+              }).catch(function (e) { setImPlatMsg({ kind: "err", text: "测试失败：" + ((e && e.message) || e) }); })
+                .finally(function () { setImPlatBusy(""); });
+            } }, "测试")
+          ]
+        }, { children: [
+          // 官方文档固定放顶部（两个外链）
+          h("div", { className: "dru-ia-hint" },
+            "官方文档：",
+            h("a", { className: "dru-ia-tier-link", href: FEISHU_DOCS.createApp, target: "_blank", rel: "noopener" }, "飞书怎么创建应用"),
+            " · ",
+            h("a", { className: "dru-ia-tier-link", href: FEISHU_DOCS.longConn, target: "_blank", rel: "noopener" }, "长连接事件订阅")),
+          // 8 步向导（折叠；默认收起，避免一屏文字堆砌）
+          h("div", { className: "dru-ia-field" },
+            h("button", {
+              type: "button", className: "dru-ia-disclose", "aria-expanded": imFeishuWizard ? "true" : "false",
+              onClick: function () { setImFeishuWizard(!imFeishuWizard); }
+            }, "配置步骤（8 步）", druIcon(imFeishuWizard ? "left" : "right")),
+            imFeishuWizard
+              ? h("div", null,
+                  h("ol", { className: "dru-ia-steps" }, FEISHU_STEPS.map(function (t, i) {
+                    return h("li", { key: String(i) }, t);
+                  })),
+                  // 顺序坑（必须写明）：事件配置保存时「长连接必须已在线」
+                  h("div", { className: "dru-ia-state is-warn", role: "note" },
+                    "顺序很重要：保存事件/回调配置时飞书的「长连接必须已在线」——",
+                    "所以请**先在第 8 步填凭据让插件连上**，再回飞书后台保存事件配置；顺序反了会保存失败。"))
+              : null),
+          h("div", { className: "dru-ia-state" }, druIcon("send"), f.hasSecret ? "已保存凭据（Secret 不回显）" : "还没有保存凭据"),
+          iaField("App ID", "dru-fs-appid", h("input", {
+            id: "dru-fs-appid", className: "dru-ia-input", type: "text", value: imFeishuAppId, autoComplete: "off", spellCheck: false,
+            placeholder: "cli_xxxxxxxx", "aria-invalid": err.appId ? "true" : "false",
+            onChange: function (e) { setImFeishuAppId(e.target.value); }
+          }), err.appId || ""),
+          iaField("App Secret", "dru-fs-secret", h("input", {
+            id: "dru-fs-secret", className: "dru-ia-input", type: "password", value: imFeishuSecret, autoComplete: "new-password", spellCheck: false,
+            placeholder: f.hasSecret ? "已保存（留空表示不修改）" : "从应用详情 → 凭证与基础信息复制",
+            "aria-invalid": err.appSecret ? "true" : "false",
+            onChange: function (e) { setImFeishuSecret(e.target.value); }
+          }), err.appSecret || "", "只保存在本机；已保存的 Secret 永远不回显。"),
+          iaField("接收人（open_id 或 chat_id）", "dru-fs-recv", h("input", {
+            id: "dru-fs-recv", className: "dru-ia-input", type: "text", value: imFeishuRecv, autoComplete: "off", spellCheck: false,
+            placeholder: "ou_xxxxxxxx 或 oc_xxxxxxxx", "aria-invalid": err.receiveId ? "true" : "false",
+            onChange: function (e) { setImFeishuRecv(e.target.value); }
+          }), err.receiveId || ""),
+          iaField("接收对象类型", "dru-fs-rtype",
+            h("select", {
+              id: "dru-fs-rtype", className: "dru-ia-input", value: imFeishuType,
+              onChange: function (e) { setImFeishuType(e.target.value); }
+            },
+              h("option", { value: "open_id" }, "个人 open_id（ou_ 开头）"),
+              h("option", { value: "chat_id" }, "群 chat_id（oc_ 开头）")),
+            err.receiveIdType || "", "发给个人选 open_id；发到群选 chat_id。"),
+          imPlatStateLine(st)
+        ] }));
+      }
+
       /** 还没支持的平台：只给**诚实**的空状态（说明 + 反馈入口），绝不放假表单/假入口。 */
       function renderComingSoonStep(close, kind) {
         var meta = {
@@ -6600,12 +6910,30 @@ window.__ModuleLoader__.load({
         if (iaModal !== "channel") return null;
         if (iaChStep === "wecom") return renderWecomStep(closeIAModal);
         if (iaChStep === "wechat") return renderWechatStep(closeIAModal);
-        if (iaChStep === "feishu" || iaChStep === "dingtalk" || iaChStep === "webhook") return renderComingSoonStep(closeIAModal, iaChStep);
+        if (iaChStep === "dingtalk") return renderDingtalkStep(closeIAModal);
+        if (iaChStep === "feishu") return renderFeishuStep(closeIAModal);
+        if (iaChStep === "webhook") return renderComingSoonStep(closeIAModal, "webhook");
         var w = (imBots && imBots.wecom) || {};
         var ws = (imBots && imBots.status) || {};
         var wecomSub = ws.connected
           ? "已连接 · 推送消息到企业微信"
           : (w.enabled || w.hasSecret ? "已配置，等待连接" : "未配置 · 填 Bot ID 与 Secret 即可");
+        var d = (imBots && imBots.dingtalk) || {};
+        var f = (imBots && imBots.feishu) || {};
+        var dst = (imBots && imBots.status && imBots.status.dingtalk) || {};
+        var fst = (imBots && imBots.status && imBots.status.feishu) || {};
+        var dingSub = dst.connected
+          ? "已连接 · 推送消息到钉钉"
+          : (d.enabled || d.hasSecret ? "已配置，等待连接" : "未配置 · 填 Client ID / Secret / Robot Code");
+        var feishuSub = !(imDeps && imDeps.installed)
+          ? "需要先下载依赖（约 41MB，仅装一次）"
+          : (fst.connected ? "已连接 · 推送消息到飞书" : (f.enabled || f.hasSecret ? "已配置，等待连接" : "依赖已就绪 · 填 App ID / Secret / 接收人"));
+        var resetPlatStep = function (step) {
+          setIaChStep(step);
+          setImPlatMsg(null);
+          setImPlatErr({});
+          if (step === "feishu") loadImDeps();
+        };
         return iaDialog(Object.assign({}, {
           title: "通知与消息通道",
           sub: "选一个平台，让电脑端在任务完成、出错或需要拍板时主动通知你",
@@ -6613,10 +6941,10 @@ window.__ModuleLoader__.load({
           foot: h("button", { type: "button", className: "dru-ia-btn", onClick: closeIAModal }, "关闭")
         }, { children: [h("div", { className: "dru-ia-list" },
             iaChannelRow("chat", "企业微信智能机器人", wecomSub, function () { setIaChStep("wecom"); setImBotsMsg(null); setImBotsFieldErr({}); }, "配置"),
+            iaChannelRow("send", "钉钉机器人", dingSub, function () { resetPlatStep("dingtalk"); }, "配置"),
+            iaChannelRow("send", "飞书机器人", feishuSub, function () { resetPlatStep("feishu"); }, imDeps && imDeps.installed ? "配置" : "下载依赖"),
             iaChannelRow("chat", "微信机器人（扫码绑定）", "扫码绑定 · 在微信里收通知 / 回数字拍板", function () { setIaChStep("wechat"); }, "打开"),
-            iaChannelRow("send", "飞书机器人", "即将支持 · 需要企业管理员配置应用", function () { setIaChStep("feishu"); }, "查看"),
-            iaChannelRow("send", "钉钉机器人", "即将支持 · 需要企业管理员创建应用", function () { setIaChStep("dingtalk"); }, "查看"),
-            iaChannelRow("code", "高级 · Webhook", "高级用法 · 自备公网端点", function () { setIaChStep("webhook"); }, "查看")
+            iaChannelRow("code", "高级 · Webhook", "免费 · 高级用法：自备公网端点", function () { setIaChStep("webhook"); }, "查看")
           )] }));
       }
 

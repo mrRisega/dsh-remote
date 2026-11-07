@@ -99,6 +99,8 @@ function loadPlugin(opts = {}) {
   const injects = new Map();
   const requests = [];
   const clipboard = [];
+  const depsCalls = [];
+  const depsInstalls = [];
   let unmounted = false;
 
   // ── 迷你 React：真实 useState/useEffect + 递归展开**函数子组件** ──
@@ -192,6 +194,7 @@ function loadPlugin(opts = {}) {
   let imBotsGetReply = { ok: true, wecom: { enabled: false, botId: "", hasSecret: false, url: "", targetChatId: "" }, status: { connected: false, authenticated: false, lastError: "" }, updatedAt: 0 };
   let imBotsPutReply = { status: 200, body: { ok: true, wecom: { enabled: true, botId: "aibdemo1234", hasSecret: true, url: "", targetChatId: "" }, status: { connected: false, authenticated: false, lastError: "" }, updatedAt: 0 } };
   let imBotsTestReply = { status: 200, body: { ok: true, connected: true, authenticated: true, lastError: "" } };
+  let imDepsReply = { installed: false, phase: "idle", version: "", lastError: "" };
   const nextPoll = () => (pollReplies.length > 1 ? pollReplies.shift() : pollReplies[0]);
 
   const makeEl = () => ({
@@ -254,6 +257,15 @@ function loadPlugin(opts = {}) {
       if (path === "/dsh-remote/im-bots/test") {
         imBotsCalls.push({ method: "POST", body: options.body ? JSON.parse(options.body) : null });
         return response(imBotsTestReply.status, imBotsTestReply.body);
+      }
+      if (path === "/dsh-remote/im-deps") {
+        depsCalls.push(Date.now());
+        return response(200, { ok: true, feishu: imDepsReply });
+      }
+      if (path === "/dsh-remote/im-deps/feishu") {
+        depsInstalls.push(Date.now());
+        imDepsReply = { ...imDepsReply, phase: "downloading", installed: false };
+        return response(200, { ok: true, started: true, deps: { feishu: imDepsReply } });
       }
       return response(200, { ok: true });
     },
@@ -321,6 +333,9 @@ function loadPlugin(opts = {}) {
     setImBotsGet(body) { imBotsGetReply = body; },
     setImBotsPut(body, status = 200) { imBotsPutReply = { status, body }; },
     setImBotsTest(body, status = 200) { imBotsTestReply = { status, body }; },
+    setImDeps(body) { imDepsReply = body; },
+    depsCalls() { return depsCalls.slice(); },
+    depsInstalls() { return depsInstalls.slice(); },
     imBotsCalls() { return imBotsCalls.slice(); },
     /** 向 document 派发键盘事件（测试 Esc / Tab 的弹层契约）。 */
     fireKey(key, init = {}) {
@@ -667,47 +682,168 @@ test("会保存：选中某会话 → PUT 带 sessionId + sessionTitle；选回�
   assert.equal(sent.body.wecom.sessionTitle, "", "★ 清空时标题也必须清空（否则 UI 会显示错目标）");
 });
 
-// ───────────────────── ⑥ 飞书 / 钉钉：诚实的「即将支持」 ─────────────────────
+// ───────────────────── ⑥ 钉钉 / 飞书通道（2026-11-08 本轮支持） ─────────────────────
 
-test("平台列表：飞书 / 钉钉都标注「即将支持」，不放进假表单", async () => {
+test("平台列表：企业微信 / 钉钉 / 飞书 / Webhook 都是真入口（不再有「即将支持」），Webhook 注明免费", async () => {
   const plugin = loadPlugin();
   let tree = await plugin.settle();
   openEntry(tree, "channel");
   tree = await plugin.settle();
-  const rows = byClass(tree, "dru-ia-row");
-  const texts = rows.map((r) => textOf(r));
-  assert.ok(texts.some((t) => t.includes("飞书机器人") && t.includes("即将支持")), "飞书行必须标注即将支持");
-  assert.ok(texts.some((t) => t.includes("钉钉机器人") && t.includes("即将支持")), "钉钉行必须标注即将支持");
-  assert.ok(texts.some((t) => t.includes("企业微信智能机器人") && !t.includes("即将支持")), "企微行是已支持（主推）");
+  const texts = byClass(tree, "dru-ia-row").map((r) => textOf(r));
+  assert.ok(texts.some((t) => t.includes("企业微信智能机器人")), "企业微信在列表里（已支持）");
+  assert.ok(texts.some((t) => t.includes("钉钉机器人")), "钉钉机器人必须在列表里（本轮支持）");
+  assert.ok(texts.some((t) => t.includes("飞书机器人")), "飞书机器人必须在列表里（本轮支持，按需下载依赖）");
+  assert.ok(texts.some((t) => t.includes("Webhook") && t.includes("免费")), "高级 Webhook 保留并注明免费");
+  assert.ok(!texts.some((t) => t.includes("钉钉机器人") && t.includes("即将支持")), "钉钉不再是即将支持");
+  assert.ok(!texts.some((t) => t.includes("飞书机器人") && t.includes("即将支持")), "飞书不再是即将支持");
 });
 
-test("飞书/钉钉：点进去只有说明 + 「告诉我，优先支持」；**没有输入框、没有提交**，点优先支持走现有反馈", async () => {
+test("钉钉配置页：Client ID / Client Secret / Robot Code + 保存并连接/测试；提交体字段锁死", async () => {
   const plugin = loadPlugin();
-  for (const [row, name] of [["飞书机器人", "飞书机器人"], ["钉钉机器人", "钉钉机器人"]]) {
-    const p = loadPlugin();
-    let tree = await p.settle();
-    openEntry(tree, "channel");
-    tree = await p.settle();
-    assert.ok(clickChannelRow(tree, row), "应能点开 " + row);
-    tree = await p.settle();
-    const dlg = dialogOf(tree);
-    assert.ok(dlg, row + " 必须打开弹层（不是假入口）");
-    const text = textOf(dlg);
-    assert.ok(text.includes("即将支持"), row + " 必须标注「即将支持」");
-    assert.ok(text.includes("企业管理员"), row + " 说明要写清为什么现在还接不了（企业管理员配置应用）");
-    assert.equal(find(dlg, (n) => n.type === "input" || n.type === "select"), undefined,
-      "★ 不许放任何输入框/下拉（假表单）");
-    const tell = btnWith(dlg, "告诉我，优先支持");
-    assert.ok(tell, "必须有「告诉我，优先支持」按钮（复用反馈通道）");
-    const before = p.imBotsCalls().length;
-    tell.props.onClick();
-    tree = await p.settle();
-    assert.equal(dialogOf(tree), undefined, "点「优先支持」后关闭弹层");
-    assert.equal(p.imBotsCalls().length, before, "★ 不得调用 im-bots 写接口（不新增后端）");
-    const dbgText = textOf(tree);
-    assert.ok(dbgText.includes("想要 " + name), "反馈视图应带一句引导（告知用户写什么）；实际视图文本片段=" + dbgText.slice(0, 200));
-    void plugin;
+  plugin.setImBotsGet({
+    ok: true,
+    wecom: { enabled: false, botId: "", hasSecret: false, url: "", targetChatId: "", sessionId: "", sessionTitle: "" },
+    dingtalk: { enabled: false, clientId: "", hasSecret: false, robotCode: "" },
+    feishu: { enabled: false, appId: "", hasSecret: false, receiveId: "", receiveIdType: "open_id" },
+    status: { connected: false, sessions: [], activeSessionId: "", boundSessionId: "", dingtalk: {}, feishu: {}, deps: { feishu: { installed: false, phase: "idle" } } },
+  });
+  let tree = await plugin.settle();
+  openEntry(tree, "channel");
+  tree = await plugin.settle();
+  assert.ok(clickChannelRow(tree, "钉钉机器人"), "应能进钉钉配置页");
+  tree = await plugin.settle();
+  const dlg = find(tree, (n) => String(n.props?.className || "").split(/\s+/).includes("dru-ia-dialog"));
+  assert.ok(dlg, "钉钉配置页应打开");
+  for (const id of ["dru-ding-client", "dru-ding-secret", "dru-ding-robot"]) {
+    assert.ok(find(dlg, (n) => n.type === "input" && n.props?.id === id), "缺字段: " + id);
   }
+  assert.ok(textOf(dlg).includes("AppKey") && textOf(dlg).includes("AppSecret") && textOf(dlg).includes("机器人编码"),
+    "说明要写清 Client ID/Secret = AppKey/AppSecret、Robot Code 是机器人编码");
+  assert.ok(btnWith(dlg, "保存并连接"), "要有「保存并连接」");
+  assert.ok(btnWith(dlg, "测试"), "要有「测试」");
+
+  find(dlg, (n) => n.props?.id === "dru-ding-client").props.onChange({ target: { value: "ding-client-1" } });
+  find(dlg, (n) => n.props?.id === "dru-ding-secret").props.onChange({ target: { value: "ding-secret-1" } });
+  find(dlg, (n) => n.props?.id === "dru-ding-robot").props.onChange({ target: { value: "ding-robot-1" } });
+  tree = await plugin.settle();
+  btnWith(tree, "仅保存").props.onClick();
+  await flush(); await flush();
+  const put = plugin.imBotsCalls().filter((c) => c.method === "PUT").pop();
+  assert.ok(put, "应 PUT /dsh-remote/im-bots");
+  assert.equal(put.body.platform, "dingtalk", "提交体要带 platform=dingtalk");
+  assert.deepEqual(put.body.config, { clientId: "ding-client-1", clientSecret: "ding-secret-1", robotCode: "ding-robot-1" },
+    "★ 钉钉提交体字段必须锁死为 clientId/clientSecret/robotCode");
+});
+
+test("飞书：依赖未装 → 41MB 下载入口 + 「不下载也能用其它通道」；已装 → 表单/官方链接/8 步向导/顺序坑", async () => {
+  // 未装依赖
+  const p1 = loadPlugin();
+  p1.setImDeps({ installed: false, phase: "idle", version: "", lastError: "" });
+  p1.setImBotsGet({
+    ok: true, wecom: {}, dingtalk: {}, feishu: {},
+    status: { deps: { feishu: { installed: false, phase: "idle", version: "", lastError: "" } } },
+  });
+  let tree = await p1.settle();
+  openEntry(tree, "channel");
+  tree = await p1.settle();
+  assert.ok(clickChannelRow(tree, "飞书机器人"), "应能进飞书页");
+  tree = await p1.settle();
+  assert.ok(textOf(tree).includes("41MB"), "未装依赖要说明约 41MB、仅装一次");
+  const dlBtn = btnWith(tree, "下载依赖");
+  assert.ok(dlBtn, "要有「下载依赖」按钮");
+  assert.ok(textOf(tree).includes("不下载也能用其它通道"), "要说明不下载也能用其它通道");
+  assert.equal(find(tree, (n) => n.props?.id === "dru-fs-appid"), undefined, "未装依赖时不放配置表单");
+  dlBtn.props.onClick();
+  await flush(); await flush();
+  assert.ok(p1.requests.some((r) => r.path === "/dsh-remote/im-deps/feishu" && r.method === "POST"),
+    "点下载必须 POST /dsh-remote/im-deps/feishu");
+
+  // 已装依赖
+  const p2 = loadPlugin();
+  p2.setImDeps({ installed: true, phase: "done", version: "1.40.0", lastError: "" });
+  p2.setImBotsGet({
+    ok: true, wecom: {}, dingtalk: {},
+    feishu: { enabled: false, appId: "", hasSecret: false, receiveId: "", receiveIdType: "open_id" },
+    status: { deps: { feishu: { installed: true, phase: "done", version: "1.40.0", lastError: "" } } },
+  });
+  tree = await p2.settle();
+  openEntry(tree, "channel");
+  tree = await p2.settle();
+  clickChannelRow(tree, "飞书机器人");
+  tree = await p2.settle();
+  let dlg = find(tree, (n) => String(n.props?.className || "").split(/\s+/).includes("dru-ia-dialog"));
+  assert.ok(dlg, "已装依赖应打开飞书配置页");
+  assert.ok(textOf(dlg).includes("1.40.0"), "应显示依赖版本");
+  for (const id of ["dru-fs-appid", "dru-fs-secret", "dru-fs-recv", "dru-fs-rtype"]) {
+    assert.ok(find(dlg, (n) => (n.type === "input" || n.type === "select") && n.props?.id === id), "缺字段: " + id);
+  }
+  const links = findAll(dlg, (n) => n.type === "a");
+  assert.equal(links.length, 2, "配置页顶部要有两个官方文档外链，实际 " + links.length);
+  for (const a of links) {
+    assert.equal(a.props.target, "_blank");
+    assert.equal(a.props.rel, "noopener");
+    assert.match(String(a.props.href), /^https:\/\/open\.feishu\.cn\//, "外链必须是飞书官方文档");
+  }
+  const wizard = find(dlg, (n) => n.type === "button" && (n.children || []).some((c) => typeof c === "string" && c.includes("配置步骤（8 步）")));
+  assert.ok(wizard, "要有 8 步配置向导（可折叠）");
+  assert.equal(wizard.props["aria-expanded"], "false", "默认收起，避免文字堆砌");
+  wizard.props.onClick();
+  tree = await p2.settle();
+  dlg = find(tree, (n) => String(n.props?.className || "").split(/\s+/).includes("dru-ia-dialog"));
+  const steps = findAll(dlg, (n) => n.type === "li");
+  assert.equal(steps.length, 8, "向导必须正好 8 步，实际 " + steps.length);
+  assert.ok(textOf(dlg).includes("长连接必须已在线"), "必须写明顺序坑：保存事件配置时长连接必须已在线");
+  assert.ok(textOf(dlg).includes("先在第 8 步填凭据"), "必须写明正确顺序：先填凭据连上，再去后台保存事件配置");
+});
+
+test("飞书依赖：失败状态可重试，失败原因人话展示", async () => {
+  const plugin = loadPlugin();
+  plugin.setImDeps({ installed: false, phase: "failed", version: "", lastError: "网络不通：检查能否访问 npm registry" });
+  plugin.setImBotsGet({
+    ok: true, wecom: {}, dingtalk: {}, feishu: {},
+    status: { deps: { feishu: { installed: false, phase: "failed", version: "", lastError: "网络不通：检查能否访问 npm registry" } } },
+  });
+  let tree = await plugin.settle();
+  openEntry(tree, "channel");
+  tree = await plugin.settle();
+  clickChannelRow(tree, "飞书机器人");
+  tree = await plugin.settle();
+  assert.ok(textOf(tree).includes("网络不通"), "失败原因要人话展示");
+  assert.ok(btnWith(tree, "重试下载"), "失败后按钮变为「重试下载」");
+  btnWith(tree, "重试下载").props.onClick();
+  await flush(); await flush();
+  assert.ok(plugin.requests.some((r) => r.path === "/dsh-remote/im-deps/feishu" && r.method === "POST"), "重试必须再次触发安装");
+});
+
+test("飞书表单提交体：appId/appSecret/receiveId/receiveIdType；secret 不回显", async () => {
+  const plugin = loadPlugin();
+  plugin.setImDeps({ installed: true, phase: "done", version: "1.40.0", lastError: "" });
+  plugin.setImBotsGet({
+    ok: true, wecom: {}, dingtalk: {},
+    feishu: { enabled: true, appId: "cli_old", hasSecret: true, receiveId: "ou_old", receiveIdType: "open_id" },
+    status: { deps: { feishu: { installed: true, phase: "done", version: "1.40.0", lastError: "" } } },
+  });
+  let tree = await plugin.settle();
+  openEntry(tree, "channel");
+  tree = await plugin.settle();
+  clickChannelRow(tree, "飞书机器人");
+  tree = await plugin.settle();
+  const dlg = find(tree, (n) => String(n.props?.className || "").split(/\s+/).includes("dru-ia-dialog"));
+  // 已保存的 secret 不回显：password 输入框初始为空 + 占位提示
+  const sec = find(dlg, (n) => n.props?.id === "dru-fs-secret");
+  assert.equal(sec.props.value, "", "★ 已保存的 Secret 绝不能回显到输入框");
+  assert.ok(String(sec.props.placeholder || "").includes("已保存"), "要提示「已保存（留空表示不修改）」");
+  find(dlg, (n) => n.props?.id === "dru-fs-appid").props.onChange({ target: { value: "cli_new" } });
+  find(dlg, (n) => n.props?.id === "dru-fs-recv").props.onChange({ target: { value: "oc_chat_1" } });
+  find(dlg, (n) => n.props?.id === "dru-fs-rtype").props.onChange({ target: { value: "chat_id" } });
+  tree = await plugin.settle();
+  btnWith(tree, "仅保存").props.onClick();
+  await flush(); await flush();
+  const put = plugin.imBotsCalls().filter((c) => c.method === "PUT").pop();
+  assert.ok(put, "应 PUT /dsh-remote/im-bots");
+  assert.equal(put.body.platform, "feishu");
+  assert.deepEqual(put.body.config, { appId: "cli_new", appSecret: "", receiveId: "oc_chat_1", receiveIdType: "chat_id" },
+    "★ 飞书提交体字段锁死；空 secret = 不修改（不覆盖已保存的）");
 });
 
 // ───────────────────── ⑦ 配置页收口：说明折叠 + 统一字段结构 ─────────────────────
@@ -993,4 +1129,33 @@ test("版本与更新：有一行可复制的安装/更新命令 npx @mrrisega/d
   assert.deepEqual(plugin.clipboard, ["npx @mrrisega/dsh-remote@latest"], "★ 点复制必须把安装命令写进剪贴板");
   tree = await plugin.settle();
   assert.ok(textOf(tree).includes("✅ 已复制"), "复制成功要有与其它复制按钮一致的反馈");
+});
+
+test("飞书依赖下载：点下载 → POST 安装 → 轮询 /im-deps，装好后页面自动切到配置表单（无需重开弹层）", async () => {
+  const plugin = loadPlugin();
+  plugin.setImDeps({ installed: false, phase: "idle", version: "", lastError: "" });
+  plugin.setImBotsGet({
+    ok: true, wecom: {}, dingtalk: {}, feishu: {},
+    status: { deps: { feishu: { installed: false, phase: "idle", version: "", lastError: "" } } },
+  });
+  let tree = await plugin.settle();
+  openEntry(tree, "channel");
+  tree = await plugin.settle();
+  clickChannelRow(tree, "飞书机器人");
+  tree = await plugin.settle();
+  assert.ok(btnWith(tree, "下载依赖"), "未装依赖先给下载入口");
+
+  btnWith(tree, "下载依赖").props.onClick();
+  await flush(); await flush();
+  assert.equal(plugin.depsInstalls().length, 1, "★ 点下载必须触发一次后台安装");
+
+  // 先渲染一次让"下载中"的轮询 effect 挂上定时器，再模拟安装完成
+  tree = await plugin.settle(2);
+  plugin.setImDeps({ installed: true, phase: "done", version: "1.40.0", lastError: "" });
+  await plugin.advance(1000);   // 触发轮询定时器（真实环境 900ms 一次）
+  await flush(); await flush();
+  tree = await plugin.settle(4);
+  assert.ok(plugin.depsCalls().length >= 1, "应轮询 /dsh-remote/im-deps 拿进度");
+  assert.ok(textOf(tree).includes("1.40.0"), "装好后面板直接显示版本（用户不需要重开弹层）");
+  assert.ok(find(tree, (n) => n.props?.id === "dru-fs-appid"), "装好后应出现飞书配置表单");
 });

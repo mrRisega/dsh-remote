@@ -149,7 +149,7 @@ function findDepWs(startDir) {
  * 漏同步就会出现「入口脚本在、依赖不在」的半装运行时（插件半据此判定「运行环境已就绪」，
  * 却永远起不来 bridge —— 2026-09-23 用户反馈的现场）。`src/channel-ref.mjs` 同理（本安装器也 import）。
  */
-const RUNTIME_CLIENT_FILES = ["mobile-adapter.mjs", "dsh-bridge.mjs", "e2ee-shim.mjs", "e2ee-client.mjs", "e2ee-shim-script.js", "mobile-adapter.test.mjs", "wechat-channel.mjs", "dsh-events.mjs", "wechat-runtime.mjs", "wecom-bot.mjs", "src/lifecycle.mjs", "src/channel-ref.mjs"];
+const RUNTIME_CLIENT_FILES = ["mobile-adapter.mjs", "dsh-bridge.mjs", "e2ee-shim.mjs", "e2ee-client.mjs", "e2ee-shim-script.js", "mobile-adapter.test.mjs", "wechat-channel.mjs", "dsh-events.mjs", "wechat-runtime.mjs", "wecom-bot.mjs", "im-format.mjs", "dingtalk-bot.mjs", "feishu-bot.mjs", "src/lifecycle.mjs", "src/channel-ref.mjs"];
 
 /**
  * 把"客户端脚本"补齐到配置目录。
