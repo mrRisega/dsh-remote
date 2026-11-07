@@ -117,7 +117,7 @@ test("PUT：保存 Bot ID + Secret + targetChatId；文件 0600（仅本机可�
     const file = path.join(relayDir, "im-bots.json");
     const cfg = JSON.parse(await readFile(file, "utf8"));
     assert.equal(cfg.version, 1);
-    assert.deepEqual(cfg.wecom, { enabled: true, botId: "aibdemo1234", secret: "s3cret", url: "", targetChatId: "chat-9", sessionId: "", sessionTitle: "" });
+    assert.deepEqual(cfg.wecom, { enabled: true, botId: "aibdemo1234", secret: "s3cret", url: "", targetChatId: "chat-9", sessionId: "", sessionTitle: "", previewCardAt: 0 });
     if (process.platform !== "win32") {
       const st = await stat(file);
       assert.equal(st.mode & 0o777, 0o600, "★ 配置文件必须 0600（含明文 secret）");
@@ -310,5 +310,50 @@ test("PUT：会话 ID 过长 → 400 invalid_session_id（不写半成品）", a
     assert.equal(r.body.error, "invalid_session_id");
     const cfg = await readCfg(relayDir);
     assert.equal(cfg.wecom.sessionId, "", "校验失败不得落盘");
+  });
+});
+
+// ─────────────────── 发送预览卡片（2026-11-07，task-25 尾） ───────────────────
+//
+// 契约：桥监听 im-bots.json 的 wecom.previewCardAt（ms；值变大桥就发一张预览审批卡），
+// 处理完把 wecom.lastPreviewCardAt 写回状态文件。插件只负责"把时间戳写大"。
+
+test("GET：白名单透出 status.wecom.lastPreviewCardAt（桥写的已处理时间戳）", async () => {
+  const relayDir = await tmpRelay();
+  await withHost(relayDir, {}, async (base) => {
+    await writeStatus(relayDir, { enabled: true, connected: true, authenticated: true, lastError: "", lastPreviewCardAt: 1_700_000_123_456 });
+    const r = await json(`${base}/dsh-remote/im-bots`);
+    assert.equal(r.body.status.lastPreviewCardAt, 1_700_000_123_456, "lastPreviewCardAt 必须在白名单里");
+  });
+});
+
+test("PUT previewCardAt：写数字时间戳，且**不丢** botId/secret/会话绑定/接收会话（覆盖写不许冲掉其它字段）", async () => {
+  const relayDir = await tmpRelay();
+  await withHost(relayDir, {}, async (base) => {
+    await put(base, { botId: "aibdemo1234", secret: "keep-me", targetChatId: "chat-9", sessionId: "sess-1", sessionTitle: "修复登录" });
+    const before = await readCfg(relayDir);
+    const r = await put(base, { previewCardAt: 1_700_000_999_000 });
+    assert.equal(r.status, 200);
+    const cfg = await readCfg(relayDir);
+    assert.equal(cfg.wecom.previewCardAt, 1_700_000_999_000, "★ previewCardAt 必须落盘（桥只认这个数变大）");
+    assert.equal(cfg.wecom.botId, before.wecom.botId, "Bot ID 不能被冲掉");
+    assert.equal(cfg.wecom.secret, "keep-me", "★ Secret 不能被冲掉（面板不回显，丢了用户都不知道）");
+    assert.equal(cfg.wecom.targetChatId, "chat-9", "接收会话 ID 不能被冲掉");
+    assert.equal(cfg.wecom.sessionId, "sess-1", "会话绑定不能被冲掉");
+    assert.equal(cfg.wecom.sessionTitle, "修复登录", "会话标题不能被冲掉");
+  });
+});
+
+test("PUT previewCardAt：非法值（非数字 / 0 / 负数）→ 400 invalid_preview_card_at，且不写半成品", async () => {
+  const relayDir = await tmpRelay();
+  await withHost(relayDir, {}, async (base) => {
+    await put(base, { botId: "aibdemo1234", secret: "x" });
+    for (const bad of ["not-a-number", 0, -5]) {
+      const r = await put(base, { previewCardAt: bad });
+      assert.equal(r.status, 400, "非法值必须 400：" + String(bad));
+      assert.equal(r.body.error, "invalid_preview_card_at");
+    }
+    const cfg = await readCfg(relayDir);
+    assert.equal(cfg.wecom.previewCardAt, 0, "非法触发值绝不能写进文件（桥会永久失效且难排查）");
   });
 });

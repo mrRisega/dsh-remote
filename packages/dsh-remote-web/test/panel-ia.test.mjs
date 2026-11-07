@@ -726,3 +726,73 @@ test("配置页收口：说明默认折叠（「为什么要填这些」），�
     assert.ok(label, "每个字段必须有可见 label: " + id);
   }
 });
+
+// ───────────────────── ⑧ 发送预览卡片（task-25 尾，桥侧已就绪） ─────────────────────
+
+test("发送预览卡片：次要按钮在「测试」旁边；点击 PUT 带 previewCardAt 且不丢 botId/sessionId/targetChatId", async () => {
+  const plugin = loadPlugin();
+  plugin.setImBotsGet({
+    ok: true,
+    wecom: { enabled: true, botId: "aibdemo1234", hasSecret: true, url: "", targetChatId: "chat-9", sessionId: "", sessionTitle: "" },
+    status: {
+      connected: true, authenticated: true, lastError: "", boundChatId: "chat-9",
+      sessions: [{ id: "sess-1-abcdef123456", title: "修复登录问题", updatedAt: 1 }],
+      activeSessionId: "sess-1-abcdef123456", activeSessionTitle: "修复登录问题", boundSessionId: "",
+    },
+  });
+  let tree = await openWecom(plugin);
+  const previewBtn = btnWith(tree, "发送预览卡片");
+  assert.ok(previewBtn, "配置页必须有次要按钮「发送预览卡片」");
+  // 次要按钮：不是 primary（不抢主操作）、与「测试」同组摆在底部
+  assert.ok(!String(previewBtn.props.className || "").includes("is-primary"), "「发送预览卡片」不能是主按钮");
+  assert.ok(btnWith(tree, "测试"), "「测试」按钮仍在（两者并列）");
+
+  // 先选一个会话，验证预览请求会带上会话绑定
+  const sel = find(tree, (n) => n.type === "select" && n.props?.id === "dru-wecom-session");
+  sel.props.onChange({ target: { value: "sess-1-abcdef123456" } });
+  tree = await plugin.settle();
+
+  const before = Date.now();
+  btnWith(tree, "发送预览卡片").props.onClick();
+  await flush(); await flush();
+  tree = await plugin.settle();
+
+  const sent = plugin.imBotsCalls().filter((c) => c.method === "PUT").pop();
+  assert.ok(sent, "★ 点击必须 PUT /dsh-remote/im-bots（桥监听 previewCardAt）");
+  assert.equal(typeof sent.body.wecom.previewCardAt, "number", "previewCardAt 必须是数字（ms 时间戳）");
+  assert.ok(sent.body.wecom.previewCardAt >= before, "previewCardAt 应是本次点击的时间戳（值变大才会触发）");
+  assert.equal(sent.body.wecom.botId, "aibdemo1234", "★ 不丢 Bot ID（覆盖写不许冲掉）");
+  assert.equal(sent.body.wecom.targetChatId, "chat-9", "★ 不丢接收会话 ID");
+  assert.equal(sent.body.wecom.sessionId, "sess-1-abcdef123456", "★ 不丢会话绑定");
+  assert.equal(sent.body.wecom.sessionTitle, "修复登录问题");
+  assert.ok(!("secret" in sent.body.wecom), "空 Secret 不提交（= 保留已保存的）");
+  // 成功状态行
+  assert.ok(textOf(tree).includes("已发送预览卡片，去企业微信看看"), "发送成功要有状态行");
+});
+
+test("发送预览卡片：没有接收方（boundChatId 与 targetChatId 都空）→ 行内提示，但仍允许点击", async () => {
+  const plugin = loadPlugin();
+  plugin.setImBotsGet({
+    ok: true,
+    wecom: { enabled: true, botId: "aibdemo1234", hasSecret: true, url: "", targetChatId: "", sessionId: "", sessionTitle: "" },
+    status: { connected: true, authenticated: true, lastError: "", boundChatId: "", sessions: [], activeSessionId: "", boundSessionId: "" },
+  });
+  const tree = await openWecom(plugin);
+  assert.ok(textOf(tree).includes("先在企微里给机器人发一句话完成绑定"), "未绑定给机器人时要有行内提示");
+  const btn = btnWith(tree, "发送预览卡片");
+  assert.ok(btn, "按钮必须存在");
+  assert.notEqual(btn.props.disabled, true, "★ 仍允许点击（桥会记日志跳过，不拦用户）");
+});
+
+test("发送预览卡片：已绑定（boundChatId 非空）→ 不显示未绑定提示；有 lastPreviewCardAt → 显示「上次预览：HH:MM」", async () => {
+  const plugin = loadPlugin();
+  const ts = new Date(2026, 0, 2, 9, 7, 0).getTime();
+  plugin.setImBotsGet({
+    ok: true,
+    wecom: { enabled: true, botId: "aibdemo1234", hasSecret: true, url: "", targetChatId: "", sessionId: "", sessionTitle: "" },
+    status: { connected: true, authenticated: true, lastError: "", boundChatId: "chat-9", lastPreviewCardAt: ts, sessions: [], activeSessionId: "", boundSessionId: "" },
+  });
+  const tree = await openWecom(plugin);
+  assert.ok(!textOf(tree).includes("先在企微里给机器人发一句话完成绑定"), "已绑定就不该再提示未绑定");
+  assert.ok(textOf(tree).includes("上次预览：09:07"), "应显示上次预览时间（HH:MM）");
+});

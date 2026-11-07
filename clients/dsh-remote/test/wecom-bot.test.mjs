@@ -35,7 +35,10 @@ import {
   atomicWriteJson,
   buildApprovalCard,
   buildDecidedCard,
+  buildPreviewCard,
+  buildPreviewDecidedCard,
   createScopedLogger,
+  isPreviewCardEvent,
   createWecomBot,
   createWecomBotController,
   extractInboundText,
@@ -1006,6 +1009,149 @@ test("★ 审批回调失败：卡片显示「没能送达电脑端」+ 提示�
   }
 });
 
+// ─────────────────────────── ⑩e 预览卡片（自检/演示）───────────────────────────
+
+test("★ 预览卡片：报文结构 / 点击只更新卡+说明 / **不调 onApprovalDecision** / 可重复点 / 不污染真实审批", async () => {
+  // 纯函数先钉死
+  const ts = 1699999999123;
+  const pure = buildPreviewCard(ts);
+  assert.equal(pure.card_type, "button_interaction");
+  assert.equal(pure.task_id, "apr_preview_9999999123", "task_id = apr_preview_ + 时间戳后 10 位");
+  assert.equal(pure.main_title.title, "预览：需要你在电脑上拍板");
+  assert.equal(pure.main_title.desc, "这是一张预览卡片，不会真的执行操作");
+  assert.deepEqual(pure.button_list.map((b) => b.key), ["allow:preview:9999999123", "deny:preview:9999999123"]);
+  assert.equal(pure.button_list[0].style, 1);
+  assert.equal(pure.button_list[1].style, 2);
+  assert.equal(isPreviewCardEvent("preview:123", ""), true);
+  assert.equal(isPreviewCardEvent("", "apr_preview_123"), true);
+  assert.equal(isPreviewCardEvent("ev-real", "apr_abc"), false);
+  assert.match(buildPreviewDecidedCard({ decision: "deny", who: "业主", ts }).main_title.title, /预览卡片 · 已收到你的选择（拒绝）/);
+  assert.equal(buildPreviewDecidedCard({ decision: "allow", ts }).main_title.desc, "这是预览卡片，没有对应的真实操作");
+
+  const rt = await setupCardBot();
+  try {
+    await rt.start();
+    const r = rt.bot.sendPreviewCard("user-a", ts);
+    assert.equal(r.ok, true);
+    assert.equal(r.taskId, "apr_preview_9999999123");
+    const frame = await waitFor(() => rt.cards()[0], { label: "预览卡片帧" });
+    assert.equal(frame.body.chatid, "user-a");
+    assert.equal(frame.body.msgtype, "template_card");
+    assert.deepEqual(frame.body.template_card, pure, "线上报文与纯函数构造完全一致");
+
+    // 点「允许」：只更新卡 + 一句说明，绝不调 onApprovalDecision
+    pushCardClick(rt.server, { reqId: "pv-1", taskId: r.taskId, eventKey: "allow:preview:9999999123", userid: "user-preview" });
+    const upd = await waitFor(() => rt.updates().find((f) => f.headers.req_id === "pv-1"), { label: "预览卡更新" });
+    assert.equal(upd.body.response_type, "update_template_card");
+    assert.match(upd.body.template_card.main_title.title, /预览卡片 · 已收到你的选择（允许）/);
+    assert.equal(upd.body.template_card.main_title.desc, "这是预览卡片，没有对应的真实操作");
+    assert.equal(upd.body.template_card.card_type, "text_notice");
+    const txt = await waitFor(() => rt.texts().find((f) => /这是预览卡片，没有对应的真实操作/.test(f.body.markdown.content)), { label: "预览说明文本" });
+    assert.equal(txt.body.chatid, "user-a");
+    assert.equal(rt.decisions.length, 0, "★ 预览卡点击绝不调 onApprovalDecision（没有真实操作）");
+    // 再点「拒绝」→ 允许重复点（预览不是幂等的一次性卡）
+    pushCardClick(rt.server, { reqId: "pv-2", taskId: r.taskId, eventKey: "deny:preview:9999999123", userid: "user-preview" });
+    const upd2 = await waitFor(() => rt.updates().find((f) => f.headers.req_id === "pv-2"), { label: "第二次预览点击" });
+    assert.match(upd2.body.template_card.main_title.title, /（拒绝）/);
+    assert.equal(rt.decisions.length, 0);
+    assert.equal(rt.bot.status().previewClicks, 2);
+    assert.equal(rt.bot.status().previews, 1);
+
+    // 预览卡不污染真实审批：随后真实审批卡点击仍走回调
+    const real = rt.bot.sendApprovalCard("user-a", { requestId: "ev-real" });
+    await waitFor(() => rt.cards().length === 2, { label: "真实审批卡" });
+    pushCardClick(rt.server, { reqId: "real-1", taskId: real.taskId, eventKey: "allow:ev-real" });
+    await waitFor(() => rt.decisions.length === 1, { label: "真实审批回调" });
+    assert.equal(rt.decisions[0].requestId, "ev-real");
+    // 操作人 userid 不进日志（只 hash）
+    assert.ok(!rt.lines.join("\n").includes("user-preview"), "★ 预览点击的操作人 userid 也不得进日志");
+  } finally {
+    await rt.close();
+  }
+});
+
+test("★ 控制器：previewCardAt 变大 → 发一次预览卡（不重建连接）；相同值不重复；无接收方跳过", async () => {
+  const relayDir = tmpRelayDir();
+  const logs = [];
+  const server = await startFakeServer({ onFrame: (f, ws) => { autoAckAuth(f, ws); autoAckPing(f, ws); autoAckSend(f, ws); } });
+  const created = [];
+  const writeCfg = (extra = {}) => fs.writeFileSync(path.join(relayDir, IM_BOTS_FILE), JSON.stringify({
+    version: 1, wecom: { enabled: true, botId: BOT_ID, secret: SECRET, ...extra }
+  }), { mode: 0o600 });
+  const cards = () => server.state.frames.filter((f) => f.cmd === "aibot_send_msg" && f.body && f.body.msgtype === "template_card");
+  const controller = createWecomBotController({
+    relayDir, configPollMs: 30, env: {},
+    log: (level, line) => logs.push(line),
+    createBot: (opts) => {
+      const b = createWecomBot({ ...opts, url: server.url, logger: (level, line) => logs.push(line) });
+      created.push(b);
+      return b;
+    }
+  });
+  try {
+    writeCfg(); // 无 previewCardAt
+    await controller.start();
+    await waitFor(() => controller.status().bot && controller.status().bot.authenticated, { timeoutMs: 5000, label: "连上" });
+    const bot = controller._bot();
+    // 先绑定接收方（入站一句即可；没有 subscriber 也能绑定 chat）
+    server.push({ cmd: "aibot_msg_callback", headers: { req_id: "bind-pv" }, body: { msgid: "mpv1", msgtype: "text", text: { content: "hi" }, from: { userid: "user-a" } } });
+    await waitFor(() => bot.status().boundChatId === "user-a", { label: "绑定接收方" });
+    assert.equal(cards().length, 0);
+
+    // ① previewCardAt 变大 → 发一张，且不重建连接
+    writeCfg({ previewCardAt: 1111 });
+    await waitFor(() => cards().some((f) => f.body.template_card.task_id === "apr_preview_1111"), { timeoutMs: 5000, label: "预览卡 1111" });
+    assert.equal(created.length, 1, "★ 只改 previewCardAt 不得重建连接（连接配置没变）");
+    assert.equal(cards().length, 1);
+
+    // ② 相同值（哪怕 mtime 变了）不重复发
+    writeCfg({ previewCardAt: 1111 });
+    await sleep(250);
+    assert.equal(cards().length, 1, "★ 相同 previewCardAt 不得重复发");
+
+    // ③ 再变大 → 再发一张
+    writeCfg({ previewCardAt: 2222 });
+    await waitFor(() => cards().some((f) => f.body.template_card.task_id === "apr_preview_2222"), { timeoutMs: 5000, label: "预览卡 2222" });
+    assert.equal(cards().length, 2);
+
+    // ④ 状态文件回写「已处理的 previewCardAt」（跨重启防重复）
+    await waitFor(() => { const st = readStatus(relayDir); return st && st.wecom && st.wecom.lastPreviewCardAt === 2222; }, { label: "预览标记" });
+  } finally {
+    await controller.stop();
+    await server.close();
+    fs.rmSync(relayDir, { recursive: true, force: true });
+  }
+
+  // ⑤ 没有接收方 → 跳过并记日志（不报错、不发卡）
+  {
+    const relayDir2 = tmpRelayDir();
+    const logs2 = [];
+    const server2 = await startFakeServer({ onFrame: (f, ws) => { autoAckAuth(f, ws); autoAckPing(f, ws); autoAckSend(f, ws); } });
+    try {
+      fs.writeFileSync(path.join(relayDir2, IM_BOTS_FILE), JSON.stringify({
+        version: 1, wecom: { enabled: true, botId: BOT_ID, secret: SECRET, previewCardAt: 3333 }
+      }), { mode: 0o600 });
+      const controller2 = createWecomBotController({
+        relayDir: relayDir2, configPollMs: 30, env: {},
+        log: (level, line) => logs2.push(line),
+        createBot: (opts) => createWecomBot({ ...opts, url: server2.url, logger: (level, line) => logs2.push(line) })
+      });
+      try {
+        await controller2.start();
+        await waitFor(() => controller2.status().bot && controller2.status().bot.authenticated, { timeoutMs: 5000, label: "连上2" });
+        await sleep(200);
+        assert.equal(server2.state.frames.filter((f) => f.cmd === "aibot_send_msg").length, 0, "没有接收方不得发卡");
+        assert.ok(logs2.join("\n").includes("预览卡片跳过"), "要记一条可排查的跳过日志（不报错）");
+      } finally {
+        await controller2.stop();
+      }
+    } finally {
+      await server2.close();
+      fs.rmSync(relayDir2, { recursive: true, force: true });
+    }
+  }
+});
+
 // ─────────────────────────── ⑩d 会话可选绑定（task-24）───────────────────────────
 
 test("★ 会话绑定优先级：配置固定 → 最近活跃 → sessions[0]；状态文件 sessions/activeSessionId/boundSessionId", async () => {
@@ -1160,6 +1306,12 @@ test("配置契约：normalizeImBotsConfig 缺字段补默认、非法值当未�
     assert.equal(read.wecom.sessionId, "sid-1", "task-24：配置支持固定会话");
     assert.equal(read.wecom.sessionTitle, "我的会话");
     assert.equal(normalizeImBotsConfig({ wecom: {} }).wecom.sessionId, "", "缺省 = 跟随活跃会话");
+    // 预览卡片触发时间戳（task-25/小改动）：number 保留；非法/缺失 → 0
+    assert.equal(normalizeImBotsConfig({ wecom: {} }).wecom.previewCardAt, 0);
+    assert.equal(normalizeImBotsConfig({ wecom: { previewCardAt: 1700000000123 } }).wecom.previewCardAt, 1700000000123);
+    assert.equal(normalizeImBotsConfig({ wecom: { previewCardAt: "1700000000123" } }).wecom.previewCardAt, 1700000000123, "数字字符串也认");
+    assert.equal(normalizeImBotsConfig({ wecom: { previewCardAt: -5 } }).wecom.previewCardAt, 0, "非法值当未配置");
+    assert.equal(normalizeImBotsConfig({ wecom: { previewCardAt: "abc" } }).wecom.previewCardAt, 0);
   } finally {
     fs.rmSync(relayDir, { recursive: true, force: true });
   }

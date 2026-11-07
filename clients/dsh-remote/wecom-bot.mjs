@@ -107,6 +107,8 @@ export const APPROVAL_CARD_TASK_ID_MAX = 128;
 export const APPROVAL_CARD_MAX = 50;
 /** 状态文件 `sessions[]` 上限（task-24：≤10，只含 id/title/updatedAt）。 */
 export const SESSION_LIST_MAX = 10;
+/** 预览卡片（自检/演示）：内存里最多记住几张（独立于真实审批，绝不进幂等表）。 */
+export const PREVIEW_CARD_MAX = 10;
 /** 会话列表（含标题/updatedAt）的刷新节流；会话事件很密，避免每来一条就查一次 DSH。 */
 export const SESSION_LIST_REFRESH_MS = 30_000;
 /** 入站 msgid 去重表上限 / TTL（重连后官方可能补发同一条）。 */
@@ -291,14 +293,15 @@ export function fileMode(file) {
  *     "targetChatId": "",       // 可选：主动推送的兜底接收方（userid 或群 chatid）
  *     "allowFrom": [],          // 可选：入站白名单（userid / chatid），空 = 首次发送者自动绑定
  *     "sessionId": "",          // 可选：**固定转发目标会话**（空 = 跟随当前活跃会话）
- *     "sessionTitle": ""        // 可选：上面那个会话的显示名（只用于状态文件/面板展示）
+ *     "sessionTitle": "",       // 可选：上面那个会话的显示名（只用于状态文件/面板展示）
+ *     "previewCardAt": 0        // 可选：**发送预览卡片**的触发时间戳（ms；插件写、桥读）
  *   },
  *   "feishu": { "enabled": false, "appId": "", "appSecret": "" }
  * }
  * ```
  *
  * @param {any} raw
- * @returns {{version:number, wecom:{enabled:boolean,botId:string,secret:string,url:string,targetChatId:string,allowFrom:string[],sessionId:string,sessionTitle:string}, feishu:{enabled:boolean,appId:string,appSecret:string}}}
+ * @returns {{version:number, wecom:{enabled:boolean,botId:string,secret:string,url:string,targetChatId:string,allowFrom:string[],sessionId:string,sessionTitle:string,previewCardAt:number}, feishu:{enabled:boolean,appId:string,appSecret:string}}}
  */
 export function normalizeImBotsConfig(raw) {
   const src = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
@@ -316,7 +319,9 @@ export function normalizeImBotsConfig(raw) {
       allowFrom: normalizeAllowList(w.allowFrom),
       // 会话可选绑定（task-24）：空 = 跟随「最近活跃会话」
       sessionId: str(w.sessionId),
-      sessionTitle: str(w.sessionTitle)
+      sessionTitle: str(w.sessionTitle),
+      // 预览卡片触发时间戳（ms）：插件每点一次「发送预览」就写一个新值
+      previewCardAt: Number.isFinite(Number(w.previewCardAt)) && Number(w.previewCardAt) > 0 ? Number(w.previewCardAt) : 0
     },
     feishu: {
       enabled: f.enabled === true,
@@ -568,6 +573,54 @@ export function buildDecidedCard(info = {}) {
   };
 }
 
+/**
+ * 预览审批卡（button_interaction）：让业主不用等真实审批就能看到卡片长什么样、按钮能不能点。
+ * task_id / 按钮 key 都带 `preview` 且以时间戳结尾 —— 点击时能一眼识别，**绝不会走进真实审批**。
+ * @param {number} ts 触发时间戳（ms；来自 im-bots.json 的 previewCardAt）
+ */
+export function buildPreviewCard(ts) {
+  const stamp = String(Number(ts) || 0).slice(-10);
+  return {
+    card_type: "button_interaction",
+    task_id: `apr_preview_${stamp}`,
+    main_title: {
+      title: "预览：需要你在电脑上拍板",
+      desc: "这是一张预览卡片，不会真的执行操作"
+    },
+    sub_title_text: "点一下下面的按钮试试：只会更新这张卡片，不会执行任何操作",
+    button_list: [
+      { text: "允许一次", key: `allow:preview:${stamp}`, style: 1 },
+      { text: "拒绝", key: `deny:preview:${stamp}`, style: 2 }
+    ]
+  };
+}
+
+/** 预览卡点击后的结果卡（text_notice；按钮消失、说明这是演示）。 */
+export function buildPreviewDecidedCard(info = {}) {
+  const decision = info.decision === "allow" ? "允许" : "拒绝";
+  const who = truncateText(info.who || "", 40);
+  const whenText = typeof info.at === "number" && info.at > 0 ? fmtClockFromMs(info.at) : "";
+  const parts = [];
+  if (who) parts.push(`操作人：${who}`);
+  if (whenText) parts.push(`时间：${whenText}`);
+  return {
+    card_type: "text_notice",
+    task_id: typeof info.taskId === "string" && info.taskId ? info.taskId : `apr_preview_${String(Number(info.ts) || 0).slice(-10)}`,
+    main_title: {
+      title: `预览卡片 · 已收到你的选择（${decision}）`,
+      desc: "这是预览卡片，没有对应的真实操作"
+    },
+    sub_title_text: parts.join(" ｜ ")
+  };
+}
+
+/** 是否是预览卡的按钮（`allow:preview:<ts>` / `deny:preview:<ts>` 或 task_id 前缀）。 */
+export function isPreviewCardEvent(requestId, taskId) {
+  if (/^preview:/.test(String(requestId || ""))) return true;
+  if (/^apr_preview_/.test(String(taskId || ""))) return true;
+  return false;
+}
+
 /** 毫秒时间戳 → HH:MM:SS（本地时区；只用于卡片确认文案）。 */
 function fmtClockFromMs(ms) {
   try {
@@ -682,7 +735,9 @@ export function createWecomBot(options = {}) {
     sendFailed: 0,
     answers: 0,
     cards: 0,
-    approvalDecisions: 0
+    approvalDecisions: 0,
+    previews: 0,
+    previewClicks: 0
   };
 
   let ws = null;
@@ -720,6 +775,11 @@ export function createWecomBot(options = {}) {
   /** 审批卡片：内存登记（task_id → 记录 / requestId → 记录），用于幂等与 TTL 判定。 */
   const cardsByTask = new Map();
   const cardsByRequest = new Map();
+  /**
+   * 预览卡**独立集合**：只用于识别点击来源与重放结果卡。
+   * ⚠️ 绝不进 cardsByTask/cardsByRequest —— 避免污染真实审批的幂等表与 90s TTL 语义。
+   */
+  const previewCards = new Map(); // taskId -> {ts, chatid, sentAt}
   const pending = new Map();   // reqId -> {kind, timer, onAck}
   const seenMsgs = new Map();  // msgid -> at
   const notifiedKeys = new Map(); // dedupe key -> at
@@ -1414,6 +1474,68 @@ export function createWecomBot(options = {}) {
     return { ok: true, taskId: record.taskId, reqId: r.reqId };
   }
 
+  /**
+   * 发一张**预览审批卡**（自检/演示）：业主不用等真实审批就能看到卡片样式、验证按钮能不能点。
+   *
+   * 与 sendApprovalCard 的区别：按钮 key 带 `preview:`，点击时只更新卡片、**不调 onApprovalDecision**，
+   * 也不进真实审批的幂等表/TTL 集合（独立 previewCards）。
+   *
+   * @param {string} chatid
+   * @param {number} ts 触发时间戳（来自 im-bots.json 的 previewCardAt）
+   */
+  function sendPreviewCard(chatid, ts) {
+    const to = String(chatid || "").trim();
+    const stamp = Number(ts) || 0;
+    if (!to) return { ok: false, reason: "no_chatid" };
+    if (!stamp) return { ok: false, reason: "no_ts" };
+    if (!state.authenticated) return { ok: false, reason: "not_authenticated" };
+    const card = buildPreviewCard(stamp);
+    const r = sendWithAck("send", "aibot_send_msg", {
+      chatid: to,
+      msgtype: "template_card",
+      template_card: card
+    }, (ack) => {
+      if (ack && ack.ok !== true && ack.timeout !== true) {
+        state.sendFailed += 1;
+        log.warn(`预览卡片被拒绝（errcode=${ack.errcode}）`);
+      }
+    });
+    if (!r.ok) return r;
+    state.sent += 1;
+    state.previews += 1;
+    previewCards.set(card.task_id, { ts: stamp, chatid: to, sentAt: now() });
+    while (previewCards.size > PREVIEW_CARD_MAX) {
+      const first = previewCards.keys().next();
+      if (first.done) break;
+      previewCards.delete(first.value);
+    }
+    log.info(`预览卡片已发出 chat=${chatIdHash(to)} ts=${String(stamp).slice(-10)}`);
+    return { ok: true, taskId: card.task_id, reqId: r.reqId };
+  }
+
+  /** 预览卡点击：只更新这张卡 + 回一句说明；**绝不调 onApprovalDecision**（没有真实操作）。 */
+  function handlePreviewCardClick(frame, parsed, info = {}) {
+    const who = info.fromUser || info.chatid || "企微用户";
+    const taskId = String(info.taskId || "");
+    const ts = Number((parsed.requestId.match(/^preview:(\d+)$/) || [])[1]) || 0;
+    const card = buildPreviewDecidedCard({ decision: parsed.decision, who, at: now(), taskId, ts });
+    const headers = frame && frame.headers && typeof frame.headers === "object" ? frame.headers : {};
+    const reqId = typeof headers.req_id === "string" ? headers.req_id : typeof headers.reqId === "string" ? headers.reqId : "";
+    if (reqId) {
+      rawSend({
+        cmd: "aibot_respond_update_msg",
+        headers: { req_id: reqId },
+        body: { response_type: "update_template_card", template_card: card }
+      });
+    }
+    const replyChat = info.chatid || state.boundChatId || targetChatId;
+    if (replyChat) sendMarkdown(replyChat, "这是预览卡片，没有对应的真实操作。");
+    state.previewClicks += 1;
+    log.info(`预览卡片点击 decision=${parsed.decision} from=${chatIdHash(who) || "?"}`);
+    emitter.emit("preview-clicked", { decision: parsed.decision, taskId, fromUser: info.fromUser || "", at: now() });
+    return { ok: true };
+  }
+
   /** 用事件帧的 req_id 更新卡片（按钮消失 → text_notice 结果卡）。 */
   function updateApprovalCard(frame, record, stateOverride) {
     const headers = frame && frame.headers && typeof frame.headers === "object" ? frame.headers : {};
@@ -1474,6 +1596,11 @@ export function createWecomBot(options = {}) {
       return;
     }
     const requestId = parsed.requestId;
+    // 预览卡：独立分支（不回调、不进幂等表、不受 90s TTL 约束；可反复点着看）
+    if (isPreviewCardEvent(requestId, taskId) || previewCards.has(taskId)) {
+      handlePreviewCardClick(frame, parsed, { taskId, fromUser, chatid, isGroup });
+      return;
+    }
     const record = (taskId && cardsByTask.get(taskId)) || cardsByRequest.get(requestId) || null;
     const who = fromUser || chatid || "企微用户";
 
@@ -1884,8 +2011,11 @@ export function createWecomBot(options = {}) {
       activeSessionId: activeSession.id || "",
       activeSessionTitle: titleOfSession(activeSession.id, activeSession.title),
       boundSessionId: boundSessionId || "",
+      previews: state.previews,
       cards: state.cards,
-      approvalDecisions: state.approvalDecisions
+      approvalDecisions: state.approvalDecisions,
+      previews: state.previews,
+      previewClicks: state.previewClicks
     };
   }
 
@@ -1937,6 +2067,7 @@ export function createWecomBot(options = {}) {
 
     sendMarkdown,
     sendApprovalCard,
+    sendPreviewCard,
     replyStream,
     status,
     /** 事件：message / bot-event / authenticated / auth-failed / status / inbound-*（EventEmitter 语义）。 */
@@ -2014,6 +2145,17 @@ export function createWecomBotController(options = {}) {
   let currentDigest = "";
   let listener = null;
   let reloading = false;
+  /**
+   * 「预览卡片」已处理到的 previewCardAt（跨重启从状态文件 `wecom.lastPreviewCardAt` 恢复，
+   * 保证**相同值不重复发**；插件每点一次「发送预览」写一个新时间戳）。
+   */
+  let lastPreviewAt = 0;
+  if (relayDir) {
+    try {
+      const st = readJsonFile(statusFile);
+      lastPreviewAt = Number(st && st.wecom && st.wecom.lastPreviewCardAt) || 0;
+    } catch { /* 忽略 */ }
+  }
 
   function notifyAllowed() {
     if (String(env.DSH_IM_BOT_NOTIFY || "") === "0") return false;
@@ -2077,7 +2219,77 @@ export function createWecomBotController(options = {}) {
     }
   }
 
-  /** 按当前配置应用（幂等：摘要没变就什么都不做）。 */
+  /** 把「已处理的 previewCardAt」写进状态文件（跨重启防重复；面板只读，不依赖它）。 */
+  function writePreviewMarker(at) {
+    if (!relayDir) return;
+    try {
+      const prev = readJsonFile(statusFile);
+      const base = prev && typeof prev === "object" && !Array.isArray(prev) ? prev : {};
+      atomicWriteJson(statusFile, {
+        ...base,
+        version: 1,
+        updatedAt: Number(now()) || Date.now(),
+        wecom: { ...(base.wecom && typeof base.wecom === "object" ? base.wecom : {}), lastPreviewCardAt: Number(at) || 0 }
+      }, { onWarn: (m) => log.warn(m) });
+    } catch (e) {
+      log.warn(`预览标记写入失败（忽略）：${truncateText(e && e.message ? e.message : e, 120)}`);
+    }
+  }
+
+  /** 认证后按当前绑定关系发预览卡（无接收方 → 只记日志，不报错）。 */
+  function sendPreviewNow(targetBot, at) {
+    if (targetBot !== bot) return; // 等待期间连接被重建/停用 → 不再发
+    const st = typeof targetBot.status === "function" ? targetBot.status() : {};
+    const to = String(st.boundChatId || st.targetChatId || "");
+    if (!to) {
+      log.info("预览卡片跳过：还没有绑定接收方（先在企业微信里给机器人发一句话，再点一次「发送预览」）");
+      return;
+    }
+    const r = targetBot.sendPreviewCard(to, at);
+    if (r && r.ok) log.info(`预览卡片已按配置发送 chat=${chatIdHash(to)}`);
+    else log.warn(`预览卡片发送失败（${(r && r.reason) || "?"}）`);
+  }
+
+  /**
+   * 处理「发送预览卡片」信号（im-bots.json 的 wecom.previewCardAt）。
+   *
+   * 规则：previewCardAt > 上次已处理值（且 >0）→ 向 boundChatId || targetChatId 发一张预览卡；
+   * 相同值绝不重复发（先记再发，watchFile 抖动也只会处理一次）。连接配置没变时**不重建连接**。
+   * bot 还没认证时最多等 20s（认证事件驱动），超时放弃（下次插件再点一次即可）。
+   */
+  async function handlePreview(cfg) {
+    try {
+      const w = cfg && cfg.wecom && typeof cfg.wecom === "object" ? cfg.wecom : null;
+      if (!w || w.enabled !== true || !w.botId || !w.secret) return;
+      const at = Number(w.previewCardAt) || 0;
+      if (!(at > lastPreviewAt)) return;
+      lastPreviewAt = at; // 先记账：同一值不重复发
+      writePreviewMarker(at);
+      const b = bot;
+      if (!b || typeof b.sendPreviewCard !== "function") return;
+      const st = typeof b.status === "function" ? b.status() : {};
+      if (st.authenticated === true) { sendPreviewNow(b, at); return; }
+      await new Promise((resolve) => {
+        let done = false;
+        let off = null;
+        const timer = setTimeout(finish, 20_000);
+        if (timer && typeof timer.unref === "function") timer.unref();
+        function finish() {
+          if (done) return;
+          done = true;
+          try { clearTimeout(timer); } catch { /* 忽略 */ }
+          try { if (typeof off === "function") off(); } catch { /* 忽略 */ }
+          sendPreviewNow(b, at);
+          resolve();
+        }
+        try { off = typeof b.on === "function" ? b.on("authenticated", finish) : null; } catch { off = null; }
+      });
+    } catch (e) {
+      log.warn(`预览卡片处理失败（忽略）：${truncateText(e && e.message ? e.message : e, 120)}`);
+    }
+  }
+
+  /** 按当前配置应用（幂等：连接配置没变就只处理预览等"不重建连接"的信号）。 */
   async function applyConfig() {
     if (reloading) return; // 单飞：watch 回调可能连着触两次
     reloading = true;
@@ -2090,8 +2302,12 @@ export function createWecomBotController(options = {}) {
       }
       const cfg = readImBotsConfig(relayDir);
       state.configFound = cfg !== null;
-      const digest = digestOf(cfg);
-      if (digest === currentDigest) return; // 没变（watchFile 会因 mtime 变化反复触发）
+      const digest = digestOf(cfg); // 只含"连接配置"（不含 previewCardAt：预览不需要重建连接）
+      if (digest === currentDigest) {
+        // 连接配置没变（watchFile 会因 mtime 反复触发）→ 仍要处理「发送预览」信号
+        await handlePreview(cfg);
+        return;
+      }
       currentDigest = digest;
       await stopBot();
       if (!cfg) {
@@ -2146,6 +2362,7 @@ export function createWecomBotController(options = {}) {
       state.lastError = "";
       bot.start();
       log.info(`IM 机器人通道已启动（chat 兜底=${w.targetChatId ? chatIdHash(w.targetChatId) : "未配置"}，通知=${notifyAllowed() ? "开" : "关"}）`);
+      await handlePreview(cfg);
     } catch (e) {
       state.enabled = false;
       state.reason = "apply_failed";

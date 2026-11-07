@@ -3574,6 +3574,36 @@ window.__ModuleLoader__.load({
         }).finally(function () { setImBotsBusy(""); });
       }
       /** 「测试」= 用**已保存**配置重连并等结果（不重写配置；想改字段请先「保存」/「保存并连接」）。 */
+      /** 「发送预览卡片」= 给绑定的企微会话发一张**演示用**审批卡（按钮不会真的执行）。
+       *  触发方式：PUT 一个更大的 wecom.previewCardAt（桥监听这个时间戳）；**必须带上表单里的
+       *  全部既有字段**，否则 PUT 的覆盖写会把 botId/secret/会话绑定一起冲掉。
+       *  空 secret 仍表示"不修改"，所以只在用户填了新 Secret 时才提交 secret。 */
+      function sendPreviewCard() {
+        if (imBotsBusy !== "") return undefined;
+        setImBotsBusy("preview");
+        setImBotsMsg(null);
+        setImBotsFieldErr({});
+        var payload = { wecom: imBotsFormPayload() };
+        // 桥只认"值变大"：同一毫秒连点两次也要保证严格递增（否则第二次点了没反应，用户以为坏了）。
+        var prevAt = Number((imBots && imBots.wecom && imBots.wecom.previewCardAt) || 0);
+        payload.wecom.previewCardAt = Math.max(Date.now(), prevAt + 1);
+        return api("/dsh-remote/im-bots", {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload)
+        }, 10000).then(function () {
+          setImBotsMsg({ kind: "ok", text: "已发送预览卡片，去企业微信看看" });
+          return loadImBots();   // 拉回 status.wecom.lastPreviewCardAt → 显示「上次预览：HH:MM」
+        }).catch(function (e) {
+          var body = (e && e.body) || {};
+          var code = String(body.error || "");
+          var text = String(body.message || (e && e.message) || "发送失败");
+          if (code === "invalid_preview_card_at") setImBotsMsg({ kind: "err", text: text });
+          else setImBotsMsg({ kind: code === "timeout" ? "warn" : "err", text: "发送失败：" + text });
+          return null;
+        }).finally(function () { setImBotsBusy(""); });
+      }
+
       function testImBots() {
         if (imBotsBusy !== "") return undefined;
         setImBotsBusy("test");
@@ -6090,6 +6120,16 @@ window.__ModuleLoader__.load({
         if (!s2) return "未命名会话";
         return s2.length > 24 ? (s2.slice(0, 24) + "…") : s2;
       }
+      /** 时间戳 → 本地 HH:MM（拿不到就空串，绝不显示 Invalid Date）。 */
+      function iaHHMM(ms) {
+        var n = Number(ms);
+        if (!Number.isFinite(n) || n <= 0) return "";
+        try {
+          var d = new Date(n);
+          var p = function (v) { return String(v).padStart(2, "0"); };
+          return p(d.getHours()) + ":" + p(d.getMinutes());
+        } catch (e) { return ""; }
+      }
       /** 当前实际转发目标的一句话（绑定会话：<title or 跟随活跃>）。 */
       function iaBoundSessionText() {
         var ws = (imBots && imBots.status) || {};
@@ -6158,11 +6198,23 @@ window.__ModuleLoader__.load({
             }, imBotsBusy === "test" ? "连接中…" : "保存并连接"),
             h("button", { type: "button", className: "dru-ia-btn", disabled: imBotsBusy !== "", onClick: function () { saveImBots(false); } },
               imBotsBusy === "save" ? "保存中…" : "仅保存"),
-            h("button", { type: "button", className: "dru-ia-btn is-ghost", disabled: imBotsBusy !== "", onClick: function () { testImBots(); } }, "测试")
+            h("button", { type: "button", className: "dru-ia-btn is-ghost", disabled: imBotsBusy !== "", onClick: function () { testImBots(); } }, "测试"),
+            // 次要动作：发一张演示卡（按钮不会真的执行），不抢主操作。
+            h("button", {
+              type: "button", className: "dru-ia-btn is-ghost", disabled: imBotsBusy !== "",
+              onClick: function () { sendPreviewCard(); }
+            }, imBotsBusy === "preview" ? "发送中…" : "发送预览卡片")
           ]
         }, { children: [
           // 当前实际转发目标：一行说清楚（状态不只靠颜色/图标）
           h("div", { className: "dru-ia-state" }, druIcon("chat"), "绑定会话：" + iaBoundSessionText()),
+          // 没有接收方时如实提示（不拦着点：桥会记日志跳过，用户自己能看到结果）
+          (!ws.boundChatId && !String(imBotsChat || "").trim() && !String(w.targetChatId || "").trim())
+            ? h("div", { className: "dru-ia-hint" }, "还没有接收方：先在企微里给机器人发一句话完成绑定（现在点也能发，桥会跳过）。")
+            : null,
+          iaHHMM(ws.lastPreviewCardAt)
+            ? h("div", { className: "dru-ia-hint" }, "上次预览：" + iaHHMM(ws.lastPreviewCardAt))
+            : null,
           iaField("转接到哪个会话", "dru-wecom-session", sessionSelect,
             fieldErr.session || "",
             sessions.length

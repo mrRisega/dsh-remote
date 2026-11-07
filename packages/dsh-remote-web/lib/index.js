@@ -7549,7 +7549,8 @@ export function localRequestBlocked(req) {
 // 凭据让桥主动推送消息」的第二种通道，配置面就两个文件（契约与桥半约定，字段名**不要改**）：
 //
 //   <relayDir>/im-bots.json        插件写、桥读
-//     { version:1, wecom:{ enabled, botId, secret, url, targetChatId, sessionId, sessionTitle } }
+//     { version:1, wecom:{ enabled, botId, secret, url, targetChatId, sessionId, sessionTitle, previewCardAt } }
+//     previewCardAt：**发送预览卡片**的触发时间戳（ms；插件写、桥读，值变大桥就发一张预览审批卡）
 //   <relayDir>/im-bot-status.json  桥写、插件**只读**
 //     { updatedAt, wecom:{ enabled, connected, authenticated, lastError,
 //                          lastConnectedAt, lastMessageAt, boundChatId } }
@@ -7600,6 +7601,8 @@ function wecomCfgOf(bots) {
     // 「转接到哪个会话」：空串 = 跟随当前活跃会话（桥侧默认）。
     sessionId: typeof w.sessionId === "string" ? w.sessionId : "",
     sessionTitle: typeof w.sessionTitle === "string" ? w.sessionTitle : "",
+    // 「发送预览卡片」触发时间戳：插件写、桥读；0/缺失 = 从未触发过。
+    previewCardAt: Number.isFinite(Number(w.previewCardAt)) && Number(w.previewCardAt) > 0 ? Number(w.previewCardAt) : 0,
   };
 }
 
@@ -7622,6 +7625,8 @@ function wecomStatusOf(status) {
     activeSessionId: str(w.activeSessionId),
     activeSessionTitle: str(w.activeSessionTitle),
     boundSessionId: str(w.boundSessionId),
+    // 「上次预览卡片」已处理到的时间戳（桥写；面板只用来显示「上次预览：HH:MM」）
+    lastPreviewCardAt: num(w.lastPreviewCardAt),
     sessions: (Array.isArray(w.sessions) ? w.sessions : []).slice(0, 50).map(function (it) {
       const o = it && typeof it === "object" ? it : {};
       return {
@@ -7687,6 +7692,7 @@ function saveWecomConfig(relayDir, input) {
     targetChatId: cur.targetChatId,
     sessionId: cur.sessionId,
     sessionTitle: cur.sessionTitle,
+    previewCardAt: cur.previewCardAt,
   };
 
   if (Object.prototype.hasOwnProperty.call(src, "botId")) {
@@ -7719,6 +7725,15 @@ function saveWecomConfig(relayDir, input) {
     // 空串 = **跟随当前活跃会话** → 同时清掉标题（保留一个"孤零零的标题"只会让 UI 说错话）
     next.sessionId = sid;
     next.sessionTitle = sid ? String(src.sessionTitle ?? "").trim().slice(0, 200) : "";
+  }
+  if (Object.prototype.hasOwnProperty.call(src, "previewCardAt")) {
+    // 触发信号：必须是数字/可转数字（前端传 Date.now()）。非法值直接拒绝，绝不写进文件 ——
+    // 桥只认"数字变大"，写个 NaN 进去会让这条信号永久失效且很难排查。
+    const n = Number(src.previewCardAt);
+    if (!Number.isFinite(n) || n <= 0) {
+      return { ok: false, code: "invalid_preview_card_at", message: "预览卡片触发时间戳必须是正整数（毫秒）" };
+    }
+    next.previewCardAt = Math.floor(n);
   }
   if (Object.prototype.hasOwnProperty.call(src, "enabled")) next.enabled = !!src.enabled;
   else if (!next.enabled && next.botId && next.secret) next.enabled = true; // 首次保存凭据 = 想让它生效
