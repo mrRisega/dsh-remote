@@ -3593,7 +3593,7 @@ window.__ModuleLoader__.load({
       var imDingIdArr = useState(""); var imDingId = imDingIdArr[0]; var setImDingId = imDingIdArr[1];
       var imDingSecretArr = useState(""); var imDingSecret = imDingSecretArr[0]; var setImDingSecret = imDingSecretArr[1];
       var imDingRobotArr = useState(""); var imDingRobot = imDingRobotArr[0]; var setImDingRobot = imDingRobotArr[1];
-      // 钉钉扫码一键创建（2026-11-08）：authId/授权链接/等待态；手动配置默认折叠
+      // 钉钉扫码一键创建（2026-11-08，委托桥侧持久化授权）：本地只留等待态/链接/剩余时间；手动配置默认折叠
       var imDingAuthArr = useState(null); var imDingAuth = imDingAuthArr[0]; var setImDingAuth = imDingAuthArr[1];
       var imDingManualArr = useState(false); var imDingManual = imDingManualArr[0]; var setImDingManual = imDingManualArr[1];
       var imFeishuAppIdArr = useState(""); var imFeishuAppId = imFeishuAppIdArr[0]; var setImFeishuAppId = imFeishuAppIdArr[1];
@@ -6027,6 +6027,16 @@ window.__ModuleLoader__.load({
             var deps = b && b.status && b.status.deps && b.status.deps.feishu;
             if (deps) setImDeps(deps);
             loadImDeps();
+            // 授权会话在桥里持久化：重开面板时若仍在等待，恢复展示（URL/剩余时间从状态文件读）
+            api("/dsh-remote/im-dingtalk-auth/status").then(function (a) {
+              if (a && a.state === "waiting") {
+                setImDingAuth({
+                  phase: "waiting", url: String(a.url || ""), startedAt: Date.now(),
+                  expiresAt: Number(a.expiresAt) || (Date.now() + 15 * 60 * 1000),
+                  remainingSec: Number(a.remainingSec) || 0, error: ""
+                });
+              }
+            }).catch(function () { /* 忽略 */ });
           });
         }
         // 数据加载交给下面的 effect（按"弹层是否打开"触发）：
@@ -6745,28 +6755,24 @@ window.__ModuleLoader__.load({
         return IM_HUMAN_ERR[c] || "操作失败，请稍后重试";
       }
 
-      /** 钉钉扫码授权：开始（POST begin）→ 拿授权链接；deviceCode 只在服务端，不落浏览器。
-       *  轮询由**节点半后台**跑（关面板/刷新不影响），这里只查状态。 */
+      /** 钉钉扫码授权（2026-11-08 架构修正：委托桥侧持久化授权）。
+       *  面板只做三件事：写 begin 命令 → 轮询状态文件 → 展示。授权会话在桥那边落盘续轮询，
+       *  关面板/宿主重启都不会丢（用户"钉钉说成功、我们没接住"的根因）。 */
       function startDingAuth() {
         if (imPlatBusy) return;
         setImPlatBusy("auth");
         setImPlatMsg(null);
         setImPlatErr({});
         post("/dsh-remote/im-dingtalk-auth/begin", {}).then(function (b) {
-          if (!b || b.ok !== true || !b.url) {
+          if (!b || b.ok !== true) {
             setImDingAuth(null);
             setImPlatMsg({ kind: "err", text: "发起授权失败：" + imHumanErr(b && b.code, b && b.message) });
             return;
           }
-          var expiresIn = Math.max(60, Math.min(7200, Number(b.expiresIn) || 7200));
+          // begin 只写命令文件；URL/剩余时间要等桥跑完写进状态文件 → 由轮询拿
           setImDingAuth({
-            authId: String(b.authId || ""),
-            url: String(b.url || ""),
-            interval: Math.max(1, Math.min(10, Number(b.interval) || 3)),
-            expiresAt: Date.now() + expiresIn * 1000,
-            startedAt: Date.now(),
-            phase: "waiting",
-            error: ""
+            phase: "waiting", url: "", startedAt: Date.now(),
+            expiresAt: Date.now() + 15 * 60 * 1000, remainingSec: 0, error: ""
           });
         }).catch(function (e) {
           setImDingAuth(null);
@@ -6774,13 +6780,13 @@ window.__ModuleLoader__.load({
           setImPlatMsg({ kind: "err", text: "发起授权失败：" + imHumanErr(body.code || (e && e.code), body.message || (e && e.message)) });
         }).finally(function () { setImPlatBusy(""); });
       }
-      /** 查询一次授权状态；manual=true = 用户点「我已完成授权，检查一下」（立刻让服务端补轮一次）。 */
+      /** 读一次桥写的授权进度（GET status → 状态文件；不自己 poll 钉钉）。 */
       function pollDingAuth(manual) {
         var a = imDingAuth;
-        if (!a || !a.authId || a.phase !== "waiting") return;
-        var qs = "?id=" + encodeURIComponent(a.authId) + (manual ? "&check=1" : "");
-        api("/dsh-remote/im-dingtalk-auth/status" + qs).then(function (b) {
-          if (b && b.status === "success") {
+        if (!a || a.phase !== "waiting") return;
+        api("/dsh-remote/im-dingtalk-auth/status").then(function (b) {
+          var st2 = String((b && b.state) || "idle");
+          if (st2 === "success") {
             setImDingAuth(null);   // 成功后自动收起授权块
             setImPlatMsg({
               kind: "ok",
@@ -6789,30 +6795,48 @@ window.__ModuleLoader__.load({
             loadImBots();
             return;
           }
-          if (b && (b.status === "failed" || b.status === "expired")) {
-            setImDingAuth({ authId: a.authId, url: a.url, interval: a.interval, expiresAt: a.expiresAt, startedAt: a.startedAt, phase: "failed", error: imHumanErr(b.code, b.message) });
+          if (st2 === "failed" || st2 === "expired") {
+            setImDingAuth({
+              phase: "failed", url: a.url, startedAt: a.startedAt, expiresAt: a.expiresAt,
+              remainingSec: 0, error: imHumanErr(st2, b && b.message)
+            });
             return;
           }
-          // waiting：换新对象触发下一轮（服务端后台仍在推进，这里只负责刷新展示）
-          setImDingAuth({ authId: a.authId, url: a.url, interval: a.interval, expiresAt: a.expiresAt, startedAt: a.startedAt, phase: "waiting", error: "", polledAt: Date.now() });
+          // waiting / idle（桥还没开始）：刷新 url 与剩余时间，继续等
+          setImDingAuth({
+            phase: "waiting",
+            url: String((b && b.url) || a.url || ""),
+            startedAt: a.startedAt || Date.now(),
+            expiresAt: Number(b && b.expiresAt) || a.expiresAt || (Date.now() + 15 * 60 * 1000),
+            remainingSec: Number(b && b.remainingSec) || 0,
+            error: "", polledAt: Date.now()
+          });
         }).catch(function (e) {
-          // 网络抖动：不打断等待（手动按钮仍在），仅在自动轮询里静默
           if (manual) {
             var body = (e && e.body) || {};
             setImPlatMsg({ kind: "warn", text: "检查失败：" + imHumanErr(body.code, body.message || (e && e.message)) + "（可再试）" });
           }
         });
       }
-      /** 等待确认中：自动轮询 ~3s/次；**最多自动轮 10 分钟**，之后保留状态由用户手动检查。 */
+      /** 等待确认中：每 2s 读一次状态（桥后台在推进）；**最多自动看 15 分钟后停止**，手动按钮仍在。 */
       useEffect(function () {
         if (iaModal !== "channel" || iaChStep !== "dingtalk") return undefined;
         if (!imDingAuth || imDingAuth.phase !== "waiting") return undefined;
         var waited = Date.now() - (imDingAuth.startedAt || Date.now());
-        if (waited > 10 * 60 * 1000) return undefined;   // 停止自动轮询（不再"2 分钟就判死"）
+        if (waited > 15 * 60 * 1000) return undefined;
         var t = null;
-        try { t = setTimeout(function () { pollDingAuth(false); }, Math.max(1000, (imDingAuth.interval || 3) * 1000)); } catch (e) { /* 忽略 */ }
+        try { t = setTimeout(function () { pollDingAuth(false); }, 2000); } catch (e) { /* 忽略 */ }
         return function () { try { if (t) clearTimeout(t); } catch (e) { /* 忽略 */ } };
       }, [iaModal, iaChStep, imDingAuth]);
+
+      /** 取消授权：写 cancel 命令（桥停轮询 + 删持久化会话）。 */
+      function cancelDingAuth() {
+        post("/dsh-remote/im-dingtalk-auth/cancel", {}).catch(function () { /* 桥不在也不影响面板收起 */ })
+          .finally(function () {
+            setImDingAuth(null);
+            setImPlatMsg({ kind: "ok", text: "已取消本次扫码授权" });
+          });
+      }
 
       /** 钉钉手动创建 7 步（2026-11-08 业主给的官方链接；每步一句 + 链接）。 */
       var DINGTALK_STEPS = [
@@ -6849,6 +6873,7 @@ window.__ModuleLoader__.load({
         var st = (imBots && imBots.status && imBots.status.dingtalk) || {};
         var err = imPlatErr || {};
         var auth = imDingAuth;
+        var authStatus = st.auth || {};
         var sourceText = (st.credentialSource || d.credentialSource) === "scan" ? "扫码创建"
           : (st.credentialSource || d.credentialSource) === "manual" ? "手动填写" : "";
         var clientTail = String(d.clientId || "").length > 4 ? String(d.clientId).slice(-4) : String(d.clientId || "");
@@ -6881,6 +6906,13 @@ window.__ModuleLoader__.load({
           //   · 有凭据/已连接 → 「已连接 · Client ID 尾号 · 来源：…」
           (function () {
             var configured = !!d.enabled || !!d.hasSecret || !!String(d.credentialSource || "").trim();
+            // 授权会话状态优先：failed/expired 是"授权"失败，不是"连接"失败（措辞不能混）
+            if (authStatus.state === "failed") {
+              return h("div", { className: "dru-ia-state is-err", role: "status" }, "授权失败：" + imHumanErr("", String(authStatus.message || "")));
+            }
+            if (authStatus.state === "expired") {
+              return h("div", { className: "dru-ia-state is-warn", role: "status" }, "授权已过期：" + imHumanErr("expired", String(authStatus.message || "")) + "（点下方按钮可重新获取链接）");
+            }
             var failState = st.state === "failed" || st.state === "error";
             if (!configured) return h("div", { className: "dru-ia-state" }, druIcon("chat"), "未配置：点下方按钮扫码创建机器人");
             if (failState) {
@@ -6892,38 +6924,43 @@ window.__ModuleLoader__.load({
             if (st.connected) return h("div", { className: "dru-ia-state is-ok" }, druIcon("check"), "已连接" + tailBit + srcBit);
             return h("div", { className: "dru-ia-state" }, druIcon("chat"), "已保存凭据，等待连接…" + tailBit + srcBit);
           })(),
-          // 扫码授权中：链接 + 提示 + 复制/打开（无 QR 库 → 降级，明确告知用手机钉钉扫码）
+          // 扫码授权中（桥侧持久化：begin 只写命令，URL 等桥跑完写进状态 → 轮询拿）
           (auth && auth.phase === "waiting")
             ? h("div", { className: "dru-ia-field" },
                 h("div", { className: "dru-ia-state", role: "status" }, h("span", { className: "dru-spin" }),
-                  "等待你在钉钉里确认…（用手机钉钉扫下方链接，或复制到手机打开）"),
+                  !auth.url
+                    ? "正在生成授权链接…（桥正在创建，约需几秒）"
+                    : (auth.remainingSec > 0
+                        ? "等待你在钉钉里确认…（剩余约 " + Math.max(1, Math.round(auth.remainingSec / 60)) + " 分钟；用手机钉钉扫码或打开链接）"
+                        : "等待你在钉钉里确认…（用手机钉钉扫码，或复制链接到手机打开）")),
+                h("div", { className: "dru-ia-hint" }, "关掉面板也不影响：桥会继续等你在钉钉里确认，回来点「我已完成授权，检查一下」即可。"),
                 (function () {
                   var waitedMin = Math.floor((Date.now() - (auth.startedAt || Date.now())) / 60000);
-                  return h("div", { className: "dru-ia-hint" },
-                    waitedMin >= 10
-                      ? "已等待 " + waitedMin + " 分钟：自动刷新先停下（后台仍在继续），完成授权后点「我已完成授权，检查一下」。"
-                      : "授权链接 2 小时内有效；关掉面板也不影响，回来点「我已完成授权，检查一下」即可。");
+                  return waitedMin >= 15
+                    ? h("div", { className: "dru-ia-hint" }, "已等待 " + waitedMin + " 分钟：自动刷新先停下（桥仍在继续），完成确认后点「我已完成授权，检查一下」。")
+                    : null;
                 })(),
-                h("button", {
-                  type: "button", className: "dru-ia-btn is-primary", style: { alignSelf: "flex-start" },
-                  onClick: function () { pollDingAuth(true); }
-                }, "我已完成授权，检查一下"),
-                h("div", { className: "dru-copy-row" },
-                  h("div", { className: "dru-copy-box" },
-                    h("span", { className: "dru-link-val" }, auth.url),
-                    h("button", {
-                      type: "button", className: "dru-copy-btn", "aria-label": "复制授权链接",
-                      onClick: function () {
-                        copyText(auth.url).then(function (ok) { if (!ok) setImPlatMsg({ kind: "err", text: "复制失败：请手动选中链接复制" }); });
-                      }
-                    }, "复制授权链接")),
-                  h("div", { className: "dru-actions", style: { marginTop: 8 } },
-                    h("a", { className: "dru-ia-btn is-primary", href: auth.url, target: "_blank", rel: "noopener" }, "在浏览器打开授权页"),
-                    h("button", { type: "button", className: "dru-ia-btn", onClick: function () { setImDingAuth(null); setImPlatMsg({ kind: "ok", text: "已取消本次扫码授权" }); } }, "取消授权"))))
+                auth.url
+                  ? h("div", { className: "dru-copy-row" },
+                      h("div", { className: "dru-copy-box" },
+                        h("span", { className: "dru-link-val" }, auth.url),
+                        h("button", {
+                          type: "button", className: "dru-copy-btn", "aria-label": "复制授权链接",
+                          onClick: function () {
+                            copyText(auth.url).then(function (ok) { if (!ok) setImPlatMsg({ kind: "err", text: "复制失败：请手动选中链接复制" }); });
+                          }
+                        }, "复制授权链接")),
+                      h("div", { className: "dru-actions", style: { marginTop: 8 } },
+                        h("a", { className: "dru-ia-btn is-primary", href: auth.url, target: "_blank", rel: "noopener" }, "在浏览器打开授权页"),
+                        h("button", { type: "button", className: "dru-ia-btn is-primary", onClick: function () { pollDingAuth(true); } }, "我已完成授权，检查一下"),
+                        h("button", { type: "button", className: "dru-ia-btn", onClick: cancelDingAuth }, "取消授权")))
+                  : h("div", { className: "dru-actions", style: { marginTop: 8 } },
+                      h("button", { type: "button", className: "dru-ia-btn is-primary", onClick: function () { pollDingAuth(true); } }, "我已完成授权，检查一下"),
+                      h("button", { type: "button", className: "dru-ia-btn", onClick: cancelDingAuth }, "取消授权")))
             : null,
           (auth && auth.phase === "failed")
             ? h("div", { className: "dru-ia-field" },
-                h("div", { className: "dru-ia-state is-err", role: "alert" }, auth.error || "授权失败"),
+                h("div", { className: "dru-ia-state is-err", role: "alert" }, "授权失败：" + (imHumanErr("", auth.error) || "请重试")),
                 h("button", { type: "button", className: "dru-ia-btn", onClick: function () { startDingAuth(); } }, "重试扫码授权"))
             : null,
           // 能力：主动推送 / 卡片（缺 Robot Code 时置灰，提示补 Robot Code）

@@ -124,6 +124,15 @@ import { createAgentRuntime } from "./agent/index.mjs";
 import { createWecomBotController } from "./wecom-bot.mjs";
 // 钉钉 Stream 模式长连接（2026-11-08）：与企微同构、零新增依赖；默认关闭，配置在 im-bots.json 的 dingtalk 段。
 import { createDingtalkBotController } from "./dingtalk-bot.mjs";
+// 钉钉「扫码一键创建机器人」授权会话：**持久化 + 断点续轮询**（2026-11-08）。
+// 根因：device_code 只存在插件进程内存 → 面板关/宿主重启就丢，而凭据只在 poll SUCCESS 那次返回。
+// 现在授权会话落盘在 <relayDir>/im-dingtalk-auth.json，bridge 启动即续轮询，桥在跑就能接住。
+import {
+  resumeDingtalkAuth,
+  startDingtalkAuthCommandWatcher,
+  stopDingtalkAuthCommandWatcher,
+  stopDingtalkAuthPolling
+} from "./dingtalk-auth.mjs";
 // 飞书通道：官方 SDK 按需下载（41MB，不随包分发）、懒加载；未启用时零副作用
 import { createFeishuBotController } from "./feishu-bot.mjs";
 
@@ -3358,6 +3367,29 @@ function imBotLog(level, message) {
 }
 
 function startImBots() {
+  // ⓪ 钉钉扫码授权断点续轮询（fire-and-forget，绝不阻塞隧道/连接主链路）：
+  //    上次没等到用户确认就重启/关面板也没关系 —— 会话在磁盘上，桥一跑就继续 poll，
+  //    成功后自动写 im-bots.json（credentialSource:"scan"）→ controller 热更新把机器人连上。
+  try {
+    void resumeDingtalkAuth({
+      relayDir: RELAY_DIR,
+      logger: imBotLog,
+      onWarn: (m) => imBotLog("warn", m),
+      onSuccess: () => { try { startImBots(); } catch { /* 忽略 */ } }
+    }).catch((e) => {
+      console.warn(`[bridge] 钉钉扫码授权续轮询失败(不影响远程访问): ${redactText(e)}`);
+    });
+    // 控制命令文件：插件写 <relayDir>/im-dingtalk-auth-cmd.json（begin/cancel），桥读并执行。
+    // 插件不需要 device_code，也不需要 HTTP 端点 —— 只表达意图；桥在跑就能接住。
+    startDingtalkAuthCommandWatcher({
+      relayDir: RELAY_DIR,
+      logger: imBotLog,
+      onWarn: (m) => imBotLog("warn", m),
+      onSuccess: () => { try { startImBots(); } catch { /* 忽略 */ } }
+    });
+  } catch (e) {
+    console.warn(`[bridge] 钉钉扫码授权续轮询初始化失败(忽略): ${redactText(e)}`);
+  }
   // ① 企业微信（现有）
   try {
     if (!imBots) {
@@ -3437,6 +3469,9 @@ function startImBots() {
 
 /** 优雅退出 IM 机器人通道（企微 + 钉钉，互不影响）。失败只记日志。 */
 async function stopImBots() {
+  // 先停扫码授权轮询/命令监听（**保留** auth 文件：下次启动能续轮询；用户显式取消才删文件）
+  try { stopDingtalkAuthCommandWatcher(); } catch { /* 忽略 */ }
+  try { stopDingtalkAuthPolling(); } catch { /* 忽略 */ }
   const wecom = imBots;
   const dingtalk = imBotsDingtalk;
   const feishu = imBotsFeishu;

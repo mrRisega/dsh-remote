@@ -196,8 +196,8 @@ function loadPlugin(opts = {}) {
   let imBotsPutReply = { status: 200, body: { ok: true, wecom: { enabled: true, botId: "aibdemo1234", hasSecret: true, url: "", targetChatId: "" }, status: { connected: false, authenticated: false, lastError: "" }, updatedAt: 0 } };
   let imBotsTestReply = { status: 200, body: { ok: true, connected: true, authenticated: true, lastError: "" } };
   let imDepsReply = { installed: false, phase: "idle", version: "", lastError: "" };
-  let dingAuthBeginReply = { status: 200, body: { ok: true, authId: "auth-1", url: "https://oapi.dingtalk.com/x?nonce=1", interval: 2, expiresIn: 120 } };
-  let dingAuthStatusReplies = [];
+  let dingAuthBeginReply = { status: 200, body: { ok: true } };
+  let dingAuthStatusReply = { ok: true, state: "idle", url: "", remainingSec: 0, message: "" };
   const nextPoll = () => (pollReplies.length > 1 ? pollReplies.shift() : pollReplies[0]);
 
   const makeEl = () => ({
@@ -265,10 +265,13 @@ function loadPlugin(opts = {}) {
         dingAuthCalls.push({ kind: "begin", method: options.method || "POST" });
         return response(dingAuthBeginReply.status, dingAuthBeginReply.body);
       }
+      if (path === "/dsh-remote/im-dingtalk-auth/cancel") {
+        dingAuthCalls.push({ kind: "cancel", method: options.method || "POST" });
+        return response(200, { ok: true });
+      }
       if (path.startsWith("/dsh-remote/im-dingtalk-auth/status")) {
         dingAuthCalls.push({ kind: "status", path });
-        const next = dingAuthStatusReplies.length ? dingAuthStatusReplies.shift() : { status: "waiting" };
-        return response(200, next);
+        return response(200, dingAuthStatusReply);
       }
       if (path === "/dsh-remote/im-deps") {
         depsCalls.push(Date.now());
@@ -347,7 +350,7 @@ function loadPlugin(opts = {}) {
     setImBotsTest(body, status = 200) { imBotsTestReply = { status, body }; },
     setImDeps(body) { imDepsReply = body; },
     setDingAuthBegin(body, status = 200) { dingAuthBeginReply = { status, body }; },
-    setDingAuthStatus(list) { dingAuthStatusReplies = (list || []).slice(); },
+    setDingAuthStatus(body) { dingAuthStatusReply = body || { ok: true, state: "idle" }; },
     dingAuthCalls() { return dingAuthCalls.slice(); },
     depsCalls() { return depsCalls.slice(); },
     depsInstalls() { return depsInstalls.slice(); },
@@ -713,7 +716,7 @@ test("平台列表：企业微信 / 钉钉 / 飞书 / Webhook 都是真入口（
   assert.ok(!texts.some((t) => t.includes("飞书机器人") && t.includes("即将支持")), "飞书不再是即将支持");
 });
 
-test("钉钉主路径：扫码一键创建（begin→等待→轮询→自动成功）+ 顶部「不用去后台」说明；手动配置折叠", async () => {
+test("钉钉主路径：点扫码→begin→轮询桥状态：先生成链接、再等待确认、成功自动切已连接", async () => {
   const plugin = loadPlugin();
   plugin.setImBotsGet({
     ok: true,
@@ -721,7 +724,8 @@ test("钉钉主路径：扫码一键创建（begin→等待→轮询→自动成
     dingtalk: { enabled: false, clientId: "", hasSecret: false, robotCode: "", credentialSource: "" },
     status: { dingtalk: { connected: false }, feishu: {}, deps: { feishu: { installed: false, phase: "idle" } } },
   });
-  plugin.setDingAuthStatus([{ status: "waiting" }, { status: "success", clientIdTail: "8899", credentialSource: "scan", hasSecret: true }]);
+  // 桥还没跑完 begin：状态是 idle → 面板显示"正在生成授权链接…"
+  plugin.setDingAuthStatus({ ok: true, state: "idle", url: "", remainingSec: 0 });
   let tree = await plugin.settle();
   openEntry(tree, "channel");
   tree = await plugin.settle();
@@ -729,41 +733,43 @@ test("钉钉主路径：扫码一键创建（begin→等待→轮询→自动成
   tree = await plugin.settle();
   let dlg = find(tree, (n) => String(n.props?.className || "").split(/\s+/).includes("dru-ia-dialog"));
   assert.ok(dlg, "钉钉配置页应打开");
-  // 主路径：一句说明 + 扫码按钮
-  assert.ok(textOf(dlg).includes("不用去开发者后台创建应用") || textOf(dlg).includes("不需要去开发者后台创建应用"),
-    "顶部要说明不需要去开发者后台创建应用");
+  assert.ok(textOf(dlg).includes("不用去开发者后台创建应用"), "顶部要说明不需要去开发者后台创建应用");
   const scanBtn = btnWith(dlg, "用钉钉扫码，一键创建机器人");
   assert.ok(scanBtn, "主路径必须是一个「扫码一键创建」按钮");
-  // 手动配置默认折叠（不占主路径）
-  assert.equal(find(dlg, (n) => n.props?.id === "dru-ding-client"), undefined, "手动字段默认不应出现（折叠在高级里）");
+  assert.equal(find(dlg, (n) => n.props?.id === "dru-ding-client"), undefined, "手动字段默认折叠");
 
-  // 点扫码 → begin
+  // 点扫码 → begin；此时还没有 URL（桥正在创建）
   scanBtn.props.onClick();
   await flush(); await flush();
   tree = await plugin.settle(3);
-  assert.ok(plugin.dingAuthCalls().some((c) => c.kind === "begin"), "★ 点扫码必须 POST begin");
+  assert.ok(plugin.dingAuthCalls().some((c) => c.kind === "begin"), "★ 点扫码必须 POST begin（写命令文件）");
   dlg = find(tree, (n) => String(n.props?.className || "").split(/\s+/).includes("dru-ia-dialog"));
-  assert.ok(textOf(dlg).includes("等待你在钉钉里确认"), "要显示等待确认中");
-  assert.ok(textOf(dlg).includes("用手机钉钉扫"), "没有二维码库时要提示用手机钉钉扫链接");
+  assert.ok(textOf(dlg).includes("正在生成授权链接"), "URL 未就绪时如实显示正在生成（不瞎编链接）");
+
+  // 桥写回 waiting + url/remainingSec → 面板轮询拿到并展示
+  plugin.setDingAuthStatus({ ok: true, state: "waiting", url: "https://oapi.dingtalk.com/x?nonce=1", remainingSec: 300, expiresAt: Date.now() + 300000 });
+  await plugin.advance(2100);
+  await flush(); await flush();
+  tree = await plugin.settle(3);
+  dlg = find(tree, (n) => String(n.props?.className || "").split(/\s+/).includes("dru-ia-dialog"));
+  assert.ok(textOf(dlg).includes("等待你在钉钉里确认"), "有 URL 后显示等待确认");
+  assert.ok(textOf(dlg).includes("剩余约 5 分钟"), "要显示剩余分钟（remainingSec/60）");
   const link = find(dlg, (n) => n.type === "a" && String(n.props?.href || "").includes("oapi.dingtalk.com"));
   assert.ok(link, "要给出可点击的授权链接");
   assert.equal(link.props.target, "_blank");
   assert.equal(link.props.rel, "noopener");
   assert.ok(btnWith(dlg, "复制授权链接"), "要有复制授权链接按钮");
+  assert.ok(btnWith(dlg, "我已完成授权，检查一下"), "要有手动检查按钮");
+  assert.ok(btnWith(dlg, "取消授权"), "要有取消授权（写 cancel 命令）");
 
-  // 轮询：waiting → success（fake timers 推进 2 轮）
-  await plugin.advance(2100);
-  await flush(); await flush();
-  tree = await plugin.settle(3);
+  // 桥把进度推进到 success → 面板下一次轮询自动切已连接并收起授权块
+  plugin.setDingAuthStatus({ ok: true, state: "success", clientIdTail: "8899", message: "" });
   await plugin.advance(2100);
   await flush(); await flush();
   tree = await plugin.settle(4);
-  assert.ok(plugin.dingAuthCalls().filter((c) => c.kind === "status").length >= 1, "要轮询授权状态");
   assert.ok(textOf(tree).includes("来源：扫码创建"), "成功后自动切到已连接状态（显示来源）");
   assert.ok(textOf(tree).includes("8899"), "成功提示要带 Client ID 尾号");
-  dlg = find(tree, (n) => String(n.props?.className || "").split(/\s+/).includes("dru-ia-dialog"));
-  assert.ok(dlg, "成功后弹层仍开着（用户能直接看到结果/去钉钉试）");
-  assert.ok(!textOf(dlg).includes("等待你在钉钉里确认"), "成功后不再显示等待态");
+  assert.equal(btnWith(tree, "我已完成授权，检查一下"), undefined, "成功后授权块自动收起");
 });
 
 test("钉钉手动模式：折叠展开后 7 步 + 三个坑 + 三字段；官方链接全部 target=_blank rel=noopener 且提交体字段锁死", async () => {
@@ -1291,31 +1297,54 @@ test("飞书依赖下载：点下载 → POST 安装 → 轮询 /im-deps，装�
 
 // ─────────── ⑫ 钉钉授权修正（2026-11-08 生产踩坑：TTL/人话/未配置措辞） ───────────
 
-test("钉钉等待中：「我已完成授权，检查一下」手动触发 status?check=1（不再 2 分钟判死）", async () => {
+test("钉钉等待中：「我已完成授权，检查一下」再读一次桥状态；成功即切已连接（关面板也不丢）", async () => {
   const plugin = loadPlugin();
   plugin.setImBotsGet({
     ok: true, wecom: {}, feishu: {}, dingtalk: {},
     status: { dingtalk: { connected: false }, feishu: {}, deps: { feishu: { installed: false } } },
   });
-  // 用户点「检查」时服务端后台已经推进到 success（手动检查只是立刻取一次结论）
-  plugin.setDingAuthStatus([{ status: "success", clientIdTail: "0001", credentialSource: "scan", hasSecret: true }]);
+  plugin.setDingAuthStatus({ ok: true, state: "idle", url: "", remainingSec: 0 });
   let tree = await plugin.settle();
   openEntry(tree, "channel");
   tree = await plugin.settle();
   clickChannelRow(tree, "钉钉机器人");
   tree = await plugin.settle();
   btnWith(tree, "用钉钉扫码，一键创建机器人").props.onClick();
+  plugin.setDingAuthStatus({ ok: true, state: "waiting", url: "https://oapi.dingtalk.com/z", remainingSec: 120 });
+  await flush(); await flush();
+  tree = await plugin.settle(3);
+  await plugin.advance(2100);   // 让轮询读到 waiting（url 到位）
   await flush(); await flush();
   tree = await plugin.settle(3);
   const checkBtn = btnWith(tree, "我已完成授权，检查一下");
   assert.ok(checkBtn, "等待中要有「我已完成授权，检查一下」按钮");
+  const before = plugin.dingAuthCalls().filter((c) => c.kind === "status").length;
+  // 用户已在手机钉钉确认 → 桥把状态写成 success；手动检查只再读一次状态
+  plugin.setDingAuthStatus({ ok: true, state: "success", clientIdTail: "0001", message: "" });
   checkBtn.props.onClick();
   await flush(); await flush();
   tree = await plugin.settle(3);
-  const calls = plugin.dingAuthCalls().filter((c) => c.kind === "status");
-  assert.ok(calls.some((c) => String(c.path).includes("check=1")), "★ 手动检查必须触发一次 status?check=1（让服务端立刻补轮）");
+  const after = plugin.dingAuthCalls().filter((c) => c.kind === "status").length;
+  assert.ok(after > before, "手动检查必须再读一次 status（桥持久化，不需要面板传 check 参数）");
   assert.ok(textOf(tree).includes("来源：扫码创建"), "手动检查成功后自动切已连接并收起授权块");
   assert.equal(btnWith(tree, "我已完成授权，检查一下"), undefined, "成功后授权块自动收起");
+});
+
+test("钉钉授权失败/过期：显示「授权失败：<中文人话>」+ 重试按钮（绝不裸渲染）", async () => {
+  const plugin = loadPlugin();
+  plugin.setImBotsGet({
+    ok: true, wecom: {}, feishu: {}, dingtalk: {},
+    status: { dingtalk: { connected: false, auth: { state: "failed", message: "ok" } }, feishu: {}, deps: { feishu: { installed: false } } },
+  });
+  let tree = await plugin.settle();
+  openEntry(tree, "channel");
+  tree = await plugin.settle();
+  clickChannelRow(tree, "钉钉机器人");
+  tree = await plugin.settle();
+  const t = textOf(tree);
+  assert.ok(t.includes("授权失败"), "桥报 failed 要显示授权失败");
+  assert.ok(t.includes("操作失败，请稍后重试"), "裸 ok 要兜底成中文人话");
+  assert.ok(!/授权失败：\s*ok\s*/m.test(t), "绝不裸渲染 ok");
 });
 
 test("钉钉未配置措辞：enabled=false 显示「未配置」，不是「连接失败」", async () => {
@@ -1352,4 +1381,28 @@ test("钉钉连接失败：只有 state=failed 才显示「连接失败：<中�
   assert.ok(t.includes("连接失败"), "state=failed 时才显示连接失败");
   assert.ok(t.includes("操作失败，请稍后重试"), "后端给了裸 ok 时要兜底成中文人话");
   assert.ok(!/连接失败：\s*ok\s*$/m.test(t), "绝不把裸 ok 渲染出来");
+});
+
+test("钉钉等待中：点「取消授权」写 cancel 命令并收起授权块", async () => {
+  const plugin = loadPlugin();
+  plugin.setImBotsGet({
+    ok: true, wecom: {}, feishu: {}, dingtalk: {},
+    status: { dingtalk: { connected: false }, feishu: {}, deps: { feishu: { installed: false } } },
+  });
+  plugin.setDingAuthStatus({ ok: true, state: "idle", url: "", remainingSec: 0 });
+  let tree = await plugin.settle();
+  openEntry(tree, "channel");
+  tree = await plugin.settle();
+  clickChannelRow(tree, "钉钉机器人");
+  tree = await plugin.settle();
+  btnWith(tree, "用钉钉扫码，一键创建机器人").props.onClick();
+  await flush(); await flush();
+  tree = await plugin.settle(3);
+  const cancel = btnWith(tree, "取消授权");
+  assert.ok(cancel, "等待中要有「取消授权」");
+  cancel.props.onClick();
+  await flush(); await flush();
+  tree = await plugin.settle(3);
+  assert.ok(plugin.dingAuthCalls().some((c) => c.kind === "cancel"), "取消授权必须写 cancel 命令（桥停轮询）");
+  assert.equal(btnWith(tree, "取消授权"), undefined, "取消后授权块收起");
 });
