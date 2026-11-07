@@ -259,12 +259,25 @@ test("mirror_load 事件形状：ms / at / outcome 三个字段，且越界由 e
   // 缺 at → 保留默认时刻（绝不发 0，0 会被读成 1970 年）
   const noAt = TELEMETRY.eventOf("mirror_load", { ms: 10 });
   assert.ok(noAt.at > 0, "没给 at 时必须退回事件构造时刻，绝不发 0");
-  assert.equal(noAt.outcome, "ok", "outcome 只认 slow，其余一律 ok");
+  assert.equal(noAt.outcome, "", "2026-11-08：缺省 outcome 发 ''（未知），不再谎报 ok");
   // 越界 / 非法 ms：不写入该字段（路由层已先挡掉，这是第二道防线）
   const bad = TELEMETRY.eventOf("mirror_load", { ms: "abc" });
   assert.equal("ms" in bad, false, "非法 ms 不得进 payload");
   const huge = TELEMETRY.eventOf("mirror_load", { ms: 10 ** 9 });
   assert.equal(huge.ms, 600000, "越界 ms 钳到契约上限");
+  // 2026-11-08 新口径：四枚举透传 + 活跃时长三字段 + active<=ms
+  const sus = TELEMETRY.eventOf("mirror_load", { ms: 541664, outcome: "suspended", active_ms: 23664, hidden_ms: 518000, frozen_ms: 0 });
+  assert.equal(sus.outcome, "suspended");
+  assert.equal(sus.active_ms, 23664);
+  assert.equal(sus.hidden_ms, 518000);
+  assert.equal(sus.frozen_ms, 0);
+  const weird = TELEMETRY.eventOf("mirror_load", { ms: 10, outcome: "wat", active_ms: 999 });
+  assert.equal(weird.outcome, "", "白名单外 outcome → ''");
+  assert.equal(weird.active_ms, 10, "active_ms 不得超过墙钟 ms");
+  const clamp = TELEMETRY.eventOf("mirror_load", { ms: 100, active_ms: 10 ** 9 });
+  assert.equal(clamp.active_ms, 100, "active_ms 先钳到契约上限，再被墙钟 ms 压回");
+  const cap = TELEMETRY.eventOf("mirror_load", { ms: 600000, active_ms: 10 ** 9 });
+  assert.equal(cap.active_ms, 600000, "墙钟也到上限时 active_ms 钳到 600000");
 });
 
 test("POST /dsh-remote/telemetry/mirror-load：合法/非法入参都回 200 {ok:true}，非法**静默丢弃**", async () => {

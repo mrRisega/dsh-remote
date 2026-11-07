@@ -6529,6 +6529,15 @@ const TELEMETRY_FAIL_CODES = new Set([
   "npx_cmd_unavailable", "registry_timeout", "install_script_missing", "npx_exit_nonzero", "npx_output_encoding", "update_stalled",
   "unknown",
 ]);
+/**
+ * mirror_load 的 outcome 枚举（2026-11-08，与服务端 TELEMETRY_OUTCOME 逐字对齐）：
+ *   ok        = 就绪（真实活跃耗时）
+ *   slow      = 20s 未就绪（删失样本）
+ *   suspended = 页面被系统挂起/冻结（旧客户端不会发，新客户端也暂不发；服务端按 hidden/active 派生）
+ *   abandoned = 用户关页/切走时仍未就绪
+ * 缺省/未知一律发 ""（未知），**不再默认谎报 ok** —— 否则旧客户端的挂起样本会被记成正常。
+ */
+const TELEMETRY_OUTCOMES = new Set(["ok", "slow", "suspended", "abandoned"]);
 /** node 半只发 source=plugin。 */
 const TELEMETRY_SOURCE = "plugin";
 const TELEMETRY_INSTALL_ID_FILE = ".telemetry-install-id";
@@ -6849,7 +6858,18 @@ function telemetryEventOf(name, extra = {}) {
   if (name === "mirror_load") {
     if (Number.isFinite(Number(extra.at)) && Number(extra.at) > 0) ev.at = Math.round(Number(extra.at));
     if (Number.isFinite(Number(extra.ms))) ev.ms = Math.max(0, Math.min(600000, Math.round(Number(extra.ms))));
-    ev.outcome = extra.outcome === "slow" ? "slow" : "ok";
+    // 2026-11-08：outcome 四枚举透传；active_ms/hidden_ms/frozen_ms 是"活跃加载时间"口径。
+    // 旧客户端不带这些字段 → outcome=""、数值字段缺省；旧服务端忽略未知字段，零破坏。
+    const oc = String(extra.outcome || "");
+    ev.outcome = TELEMETRY_OUTCOMES.has(oc) ? oc : "";
+    for (const k of ["active_ms", "hidden_ms", "frozen_ms"]) {
+      const v = Number(extra[k]);
+      if (Number.isFinite(v) && v >= 0) ev[k] = Math.max(0, Math.min(600000, Math.round(v)));
+    }
+    // 防御：活跃耗时不可能超过墙钟耗时（取整/时钟差可能造出 1ms 级倒挂）
+    if (Number.isFinite(Number(ev.active_ms)) && Number.isFinite(Number(ev.ms))) {
+      ev.active_ms = Math.min(ev.active_ms, ev.ms);
+    }
   }
   return ev;
 }
@@ -8367,8 +8387,10 @@ function registerRoutes(ctx, relayDir, opts = {}) {
       },
     },
     // 镜像页就绪耗时（D1 在 clients/dsh-remote/mobile-adapter.mjs 里量，经此入队）：
-    //   body = { ms: 耗时毫秒, at: 事件时刻 epoch ms, outcome: "ok"|"slow" }
-    // 契约（926 迭代 §2）：事件名固定 mirror_load，ms 钳制 [0, 600000]，outcome ∈ {ok, slow}。
+    //   body = { ms: 耗时毫秒, at: 事件时刻 epoch ms, outcome: "ok"|"slow"|"suspended"|"abandoned",
+    //            active_ms?, hidden_ms?, frozen_ms? }
+    // 契约（926 迭代 §2 + 2026-11-08 活跃时间口径）：事件名固定 mirror_load，ms 钳制 [0, 600000]，
+    // outcome 只认四枚举（非法/缺省发 ""，**不再默认 ok**），三个时长字段可选、越界丢弃。
     //
     // 🔒 入参校验失败**静默丢弃**但仍回 200 {ok:true}：这条上报是手机镜像页加载路径上的
     //    fire-and-forget，任何 4xx 都可能被页面当成"功能坏了"而冒泡给用户；统计丢一条无所谓，
@@ -8386,11 +8408,17 @@ function registerRoutes(ctx, relayDir, opts = {}) {
           if (body && Number.isFinite(ms) && ms >= 0 && ms <= 600000) {
             const atRaw = Number(body.at);
             const at = Number.isFinite(atRaw) && atRaw > 0 ? Math.round(atRaw) : 0;
-            telemetryRecord(relayDir, "mirror_load", {
+            const oc = String(body.outcome || "");
+            const rec = {
               ms: Math.round(ms),
               at,
-              outcome: body.outcome === "slow" ? "slow" : "ok",
-            });
+              outcome: TELEMETRY_OUTCOMES.has(oc) ? oc : "",
+            };
+            for (const k of ["active_ms", "hidden_ms", "frozen_ms"]) {
+              const v = Number(body[k]);
+              if (Number.isFinite(v) && v >= 0) rec[k] = Math.max(0, Math.min(600000, Math.round(v)));
+            }
+            telemetryRecord(relayDir, "mirror_load", rec);
           }
         } catch { /* 体读不到/超限：静默 */ }
         sendJson(res, 200, { ok: true });
