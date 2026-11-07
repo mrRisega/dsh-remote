@@ -648,7 +648,7 @@ function makeAuthFetch(plan = {}) {
     }
     if (u.endsWith("/begin")) {
       if (plan.beginRejected) return resp({ errmsg: "rejected" }, false, 400);
-      return resp(plan.begin || { device_code: "dc-secret", verification_uri_complete: "https://oapi.dingtalk.com/auth?x=1", interval: 2, expires_in: 120 });
+      return resp(plan.begin || { device_code: "dc-secret", verification_uri_complete: "https://oapi.dingtalk.com/auth?x=1", interval: 2, expires_in: 7200 });
     }
     if (u.endsWith("/poll")) {
       if (plan.pollThrows) throw new Error("ETIMEDOUT");
@@ -670,7 +670,7 @@ test("POST /im-dingtalk-auth/begin：返回 authId/url/interval/expiresIn；devi
     assert.ok(r.body.authId, "必须给浏览器一个 authId 句柄");
     assert.equal(r.body.url, "https://oapi.dingtalk.com/auth?x=1");
     assert.equal(r.body.interval, 2);
-    assert.equal(r.body.expiresIn, 120);
+    assert.equal(r.body.expiresIn, 7200, "★ TTL 必须按钉钉 expires_in（7200s），不能再是写死的 2 分钟");
     const raw = JSON.stringify(r.body);
     assert.ok(!raw.includes("dc-secret"), "★ device_code 不能下发给浏览器");
   });
@@ -679,7 +679,7 @@ test("POST /im-dingtalk-auth/begin：返回 authId/url/interval/expiresIn；devi
 test("POST begin 限流：同一时间只允许一个授权，旧 authId 查询回 cancelled", async () => {
   const relayDir = await tmpRelay();
   const imAuthFetch = makeAuthFetch();
-  await withHost(relayDir, { imAuthFetch }, async (base) => {
+  await withHost(relayDir, { imAuthFetch, imAuthPollMs: 60000 }, async (base) => {
     const a = await post(base, `${base}/dsh-remote/im-dingtalk-auth/begin`);
     const b = await post(base, `${base}/dsh-remote/im-dingtalk-auth/begin`);
     assert.ok(a.body.authId && b.body.authId && a.body.authId !== b.body.authId);
@@ -699,12 +699,12 @@ test("GET status：waiting → success 时把凭据写入 im-bots.json（0600、
       { status: "SUCCESS", client_id: "ding-client-8899", client_secret: "DING-SCAN-SECRET" },
     ],
   });
-  await withHost(relayDir, { imAuthFetch }, async (base) => {
+  await withHost(relayDir, { imAuthFetch, imAuthPollMs: 60000 }, async (base) => {
     const begin = await post(base, `${base}/dsh-remote/im-dingtalk-auth/begin`);
     const id = encodeURIComponent(begin.body.authId);
-    let st = await json(`${base}/dsh-remote/im-dingtalk-auth/status?id=${id}`);
+    let st = await json(`${base}/dsh-remote/im-dingtalk-auth/status?id=${id}&check=1`);
     assert.equal(st.body.status, "waiting", "用户还没确认 → waiting");
-    st = await json(`${base}/dsh-remote/im-dingtalk-auth/status?id=${id}`);
+    st = await json(`${base}/dsh-remote/im-dingtalk-auth/status?id=${id}&check=1`);
     assert.equal(st.body.status, "success");
     assert.equal(st.body.credentialSource, "scan");
     assert.equal(st.body.hasSecret, true);
@@ -737,22 +737,21 @@ test("GET status：未知/过期 authId → expired；钉钉拒绝 → failed(di
     // 钉钉拒绝 poll
     const rejDir = await tmpRelay();
     const rejFetch = makeAuthFetch({ polls: [{ status: "DENIED", message: "用户取消了创建" }] });
-    await withHost(rejDir, { imAuthFetch: rejFetch }, async (base2) => {
+    await withHost(rejDir, { imAuthFetch: rejFetch, imAuthPollMs: 60000 }, async (base2) => {
       const b = await post(base2, `${base2}/dsh-remote/im-dingtalk-auth/begin`);
-      const st = await json(`${base2}/dsh-remote/im-dingtalk-auth/status?id=${encodeURIComponent(b.body.authId)}`);
+      const st = await json(`${base2}/dsh-remote/im-dingtalk-auth/status?id=${encodeURIComponent(b.body.authId)}&check=1`);
       assert.equal(st.body.status, "failed");
       assert.equal(st.body.code, "dingtalk_api_rejected");
       assert.ok(st.body.message.includes("用户取消"), "钉钉原文原因要带给用户");
     });
 
-    // 网络错误（poll 抛错）
+    // 网络抖动的 poll：**不放失败**（后台继续重试直到 expires_in），状态仍 waiting
     const netDir = await tmpRelay();
     const netFetch = makeAuthFetch({ pollThrows: true });
-    await withHost(netDir, { imAuthFetch: netFetch }, async (base3) => {
+    await withHost(netDir, { imAuthFetch: netFetch, imAuthPollMs: 60000 }, async (base3) => {
       const b = await post(base3, `${base3}/dsh-remote/im-dingtalk-auth/begin`);
-      const st = await json(`${base3}/dsh-remote/im-dingtalk-auth/status?id=${encodeURIComponent(b.body.authId)}`);
-      assert.equal(st.body.status, "failed");
-      assert.equal(st.body.code, "network_error");
+      const st = await json(`${base3}/dsh-remote/im-dingtalk-auth/status?id=${encodeURIComponent(b.body.authId)}&check=1`);
+      assert.equal(st.body.status, "waiting", "网络抖动不该判死授权（用户还在扫码）");
     });
   });
 });
@@ -764,11 +763,59 @@ test("POST begin：钉钉接口不可用 → network_error / dingtalk_api_reject
     assert.equal(r.status, 502);
     assert.equal(r.body.ok, false);
     assert.equal(r.body.code, "network_error");
-    assert.match(r.body.message, /网络不通/);
+    assert.match(r.body.message, /连不上钉钉接口/, "错误 message 必须是中文人话");
   });
   const dir2 = await tmpRelay();
   await withHost(dir2, { imAuthFetch: makeAuthFetch({ beginRejected: true }) }, async (base) => {
     const r = await post(base, `${base}/dsh-remote/im-dingtalk-auth/begin`);
     assert.equal(r.body.code, "dingtalk_api_rejected");
+  });
+});
+
+test("钉钉授权：后台轮询在**无人查询**时也继续前进（关面板/刷新不影响），TTL 按 expires_in=7200s", async () => {
+  const relayDir = await tmpRelay();
+  const imAuthFetch = makeAuthFetch({
+    polls: [{ status: "WAITING" }, { status: "SUCCESS", client_id: "ding-bg-1", client_secret: "BG-SECRET" }],
+  });
+  // 后台轮询间隔压到 20ms（生产 3s），验证"不靠面板/HTTP 查询也会成功"
+  await withHost(relayDir, { imAuthFetch, imAuthPollMs: 20 }, async (base) => {
+    const begin = await post(base, `${base}/dsh-remote/im-dingtalk-auth/begin`);
+    assert.equal(begin.body.expiresIn, 7200, "★ TTL 必须是钉钉的 expires_in（7200s），不是 2 分钟");
+    // 不调用任何 status 接口，等后台轮询把 SUCCESS 落盘
+    let cfg = null;
+    for (let i = 0; i < 100; i++) {
+      try { cfg = JSON.parse(await readFile(path.join(relayDir, "im-bots.json"), "utf8")); } catch { cfg = null; }
+      if (cfg && cfg.dingtalk && cfg.dingtalk.clientId === "ding-bg-1") break;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.ok(cfg && cfg.dingtalk.clientId === "ding-bg-1", "★ 后台轮询必须在没有面板查询时也把凭据写盘");
+    assert.equal(cfg.dingtalk.credentialSource, "scan");
+    assert.equal(cfg.dingtalk.enabled, true, "扫码成功自动 enabled");
+    // 之后查询直接拿到 success（脱敏）
+    const st = await json(`${base}/dsh-remote/im-dingtalk-auth/status?id=${encodeURIComponent(begin.body.authId)}`);
+    assert.equal(st.body.status, "success");
+    assert.ok(!JSON.stringify(st.body).includes("BG-SECRET"));
+  });
+});
+
+test("钉钉授权错误：message 永远是中文人话（绝不裸 code / ok）", async () => {
+  const dir1 = await tmpRelay();
+  await withHost(dir1, { imAuthFetch: makeAuthFetch({ initThrows: true }) }, async (base) => {
+    const r = await post(base, `${base}/dsh-remote/im-dingtalk-auth/begin`);
+    assert.equal(r.body.code, "network_error");
+    assert.notEqual(r.body.message, r.body.code, "message 不能等于裸 code");
+    assert.match(r.body.message, /[\u4e00-\u9fa5]/, "message 必须含中文");
+  });
+  const dir2 = await tmpRelay();
+  await withHost(dir2, { imAuthFetch: makeAuthFetch({ beginRejected: true }) }, async (base) => {
+    const r = await post(base, `${base}/dsh-remote/im-dingtalk-auth/begin`);
+    assert.match(r.body.message, /[\u4e00-\u9fa5]/);
+    assert.ok(!/^\s*(ok|error|https?:)/i.test(r.body.message), "不得裸渲染 ok/errcode/URL");
+  });
+  const dir3 = await tmpRelay();
+  await withHost(dir3, { imAuthFetch: makeAuthFetch() }, async (base) => {
+    const st = await json(`${base}/dsh-remote/im-dingtalk-auth/status?id=nope`);
+    assert.equal(st.body.code, "expired");
+    assert.match(st.body.message, /授权已过期/, "过期也要中文人话");
   });
 });

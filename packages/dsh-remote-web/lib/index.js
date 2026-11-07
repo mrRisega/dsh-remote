@@ -8100,11 +8100,34 @@ function startFeishuInstall(relayDir, opts = {}) {
 //   POST .../app/registration/init  {source:"DING_DWS_CLAW"} → {nonce}
 //   POST .../app/registration/begin {nonce}                 → {device_code, verification_uri_complete, interval, expires_in}
 //   POST .../app/registration/poll  {device_code}           → {status:"WAITING"|"SUCCESS", client_id, client_secret}
-// 安全：浏览器只拿 authId + 授权链接；clientSecret 只在 success 时直接写进 0600 的 im-bots.json，绝不回显。
+//
+// ★ 2026-11-08 生产实测修正（业主）：**轮询必须在节点半后台跑**，面板只查状态。
+//   原实现让面板每 2s 轮询、还把 TTL 设成 2 分钟 —— 但钉钉 device-flow 的 expires_in 是 7200 秒，
+//   用户「点按钮→手机扫码→页面加载→点一键创建」很容易超过 2 分钟 → 被误判过期。
+//   现在：begin 即启动 setInterval(~3s) 后台轮询，关闭面板/刷新页面都不影响；TTL 按钉钉 expires_in。
 const DINGTALK_REG_BASE = "https://oapi.dingtalk.com/app/registration";
-const DINGTALK_AUTH_TTL_MS = 2 * 60 * 1000;        // 面板最长轮询 2 分钟
-const dingtalkAuthSessions = new Map();            // authId → {relayDir, deviceCode, url, interval, createdAt, expiresAt}
+const DINGTALK_AUTH_TTL_MS = 7200 * 1000;          // 兜底上限：钉钉 device-flow 的 expires_in（7200s）
+const DINGTALK_AUTH_POLL_MS = 3000;                // 后台轮询间隔（测试可用 config.imAuthPollMs 覆盖）
+const dingtalkAuthSessions = new Map();            // authId → session（含后台 timer，绝不落盘）
 const dingtalkAuthSuperseded = new Map();          // 被新授权作废的 authId → at（查询时回 cancelled）
+
+/** 面向用户的中文人话（错误里**绝不出现裸 code / 裸 ok**）。 */
+const DINGTALK_AUTH_MSG = {
+  network_error: "连不上钉钉接口，请检查网络后重试",
+  dingtalk_api_rejected: "钉钉拒绝了请求，请稍后重试",
+  expired: "授权已过期，请点「重试扫码」生成新的授权链接",
+  cancelled: "这次授权已被新的授权取代，请用最新链接完成确认",
+  write_failed: "拿到的凭据保存失败（磁盘/权限问题），请检查后重试"
+};
+function dingTalkHumanMessage(code, fallbackMessage) {
+  const c = String(code || "");
+  const msg = String(fallbackMessage || "").trim();
+  // 只接受"看起来是人话"的 message：含中文、且不是裸 code/ok/JSON 片段
+  const looksHuman = /[\u4e00-\u9fa5]/.test(msg) && !/^\s*[{[]/.test(msg);
+  if (looksHuman) return msg;
+  if (DINGTALK_AUTH_MSG[c]) return DINGTALK_AUTH_MSG[c];
+  return "操作失败，请稍后重试";
+}
 
 function jsonPostForAuth(fetchImpl, url, payload) {
   return fetchImpl(url, {
@@ -8119,20 +8142,72 @@ function jsonPostForAuth(fetchImpl, url, payload) {
   });
 }
 
+/** 后台轮询一次（同一 session 不并发；成功后写盘并停表）。 */
+async function dingtalkAuthPollOnce(authId, opts = {}) {
+  const sess = dingtalkAuthSessions.get(String(authId || ""));
+  if (!sess || sess.inFlight) return sess;
+  if (sess.state !== "waiting") return sess;
+  if (Date.now() > sess.expiresAt) {
+    sess.state = "expired";
+    sess.message = dingTalkHumanMessage("expired");
+    stopDingAuthTimer(sess);
+    return sess;
+  }
+  const fetchImpl = typeof opts.imAuthFetch === "function" ? opts.imAuthFetch : fetch;
+  sess.inFlight = true;
+  try {
+    const r = await jsonPostForAuth(fetchImpl, `${DINGTALK_REG_BASE}/poll`, { device_code: sess.deviceCode });
+    const b = r.body || {};
+    const st = String(b.status || "").toUpperCase();
+    if (st === "WAITING" || st === "PENDING") return sess;
+    if (st === "SUCCESS" || (b.client_id && b.client_secret)) {
+      const saved = saveDingtalkScannedCredentials(sess.relayDir, b.client_id, b.client_secret);
+      if (!saved.ok) {
+        sess.state = "failed";
+        sess.message = dingTalkHumanMessage(saved.code, saved.message);
+      } else {
+        const cid = String(b.client_id || "");
+        sess.state = "success";
+        sess.clientIdTail = cid.length > 4 ? cid.slice(-4) : cid;
+        sess.credentialSource = "scan";
+      }
+      stopDingAuthTimer(sess);
+      return sess;
+    }
+    // 钉钉明确拒绝（创建被取消/参数过期等）：用中文人话，绝不把 errmsg 裸值直接渲染
+    sess.state = "failed";
+    sess.message = dingTalkHumanMessage("dingtalk_api_rejected", b.message || b.errmsg);
+    stopDingAuthTimer(sess);
+    return sess;
+  } catch (e) {
+    // 网络抖动**不作废授权**（后台继续轮询直到 expires_in）—— 只有明确拒绝/过期才终止。
+    return sess;
+  } finally {
+    sess.inFlight = false;
+  }
+}
+
+function stopDingAuthTimer(sess) {
+  if (!sess) return;
+  try { if (sess.timer) clearInterval(sess.timer); } catch { /* 忽略 */ }
+  sess.timer = null;
+}
+
 /**
  * 开始一次钉钉扫码授权（POST /dsh-remote/im-dingtalk-auth/begin）。
- * 同一 relayDir 同时只保留一个会话：begin 时把旧的作废（旧 authId 后续 poll 只会得到 expired）。
+ * 同一 relayDir 同时只保留一个会话：begin 时把旧的作废（旧 authId 后续查询回 cancelled）。
+ * TTL 按钉钉返回的 expires_in（生产实测 7200s），后台 setInterval 轮询，关闭面板不影响。
  */
 async function beginDingtalkAuth(relayDir, opts = {}) {
   const fetchImpl = typeof opts.imAuthFetch === "function" ? opts.imAuthFetch : fetch;
-  // 作废旧会话（同一时间只允许一个进行中的授权；旧 authId 后续查询回 cancelled）
+  // 作废旧会话（同时停掉它们的后台轮询表）
   for (const [id, sess] of dingtalkAuthSessions) {
     if (sess.relayDir === relayDir) {
+      stopDingAuthTimer(sess);
       dingtalkAuthSessions.delete(id);
       dingtalkAuthSuperseded.set(id, Date.now());
     }
   }
-  // 有界：只留最近 20 个作废标记，避免长期运行内存增长
   while (dingtalkAuthSuperseded.size > 20) {
     const first = dingtalkAuthSuperseded.keys().next().value;
     dingtalkAuthSuperseded.delete(first);
@@ -8140,37 +8215,45 @@ async function beginDingtalkAuth(relayDir, opts = {}) {
   let init;
   try {
     init = await jsonPostForAuth(fetchImpl, `${DINGTALK_REG_BASE}/init`, { source: "DING_DWS_CLAW" });
-  } catch (e) {
-    return { ok: false, code: "network_error", message: `网络不通：无法连接钉钉接口（${e?.message || e}）` };
+  } catch {
+    return { ok: false, code: "network_error", message: dingTalkHumanMessage("network_error") };
   }
   const nonce = init.ok && init.body && typeof init.body.nonce === "string" ? init.body.nonce : "";
-  if (!nonce) {
-    return { ok: false, code: "dingtalk_api_rejected", message: "钉钉接口拒绝了初始化请求（请稍后重试）" };
-  }
+  if (!nonce) return { ok: false, code: "dingtalk_api_rejected", message: dingTalkHumanMessage("dingtalk_api_rejected") };
   let begin;
   try {
     begin = await jsonPostForAuth(fetchImpl, `${DINGTALK_REG_BASE}/begin`, { nonce });
-  } catch (e) {
-    return { ok: false, code: "network_error", message: `网络不通：无法连接钉钉接口（${e?.message || e}）` };
+  } catch {
+    return { ok: false, code: "network_error", message: dingTalkHumanMessage("network_error") };
   }
   const b = begin.body || {};
   const deviceCode = typeof b.device_code === "string" ? b.device_code : "";
   const url = typeof b.verification_uri_complete === "string" ? b.verification_uri_complete : "";
   if (!begin.ok || !deviceCode || !url) {
-    return { ok: false, code: "dingtalk_api_rejected", message: "钉钉接口没有返回授权链接（请稍后重试）" };
+    return { ok: false, code: "dingtalk_api_rejected", message: dingTalkHumanMessage("dingtalk_api_rejected") };
   }
   const authId = `ding-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-  const interval = Math.max(1, Math.min(10, Number(b.interval) || 2));
-  const expiresIn = Math.max(10, Math.min(600, Number(b.expires_in) || 120));
+  const interval = Math.max(1, Math.min(10, Number(b.interval) || 3));
+  // ★ TTL 用钉钉的 expires_in（生产 7200s），不再用以前写死的 2 分钟
+  const expiresIn = Math.max(60, Math.min(7200, Number(b.expires_in) || 7200));
   const now = Date.now();
-  dingtalkAuthSessions.set(authId, {
+  const sess = {
     relayDir, deviceCode, url, interval,
-    createdAt: now, expiresAt: Math.min(now + expiresIn * 1000, now + DINGTALK_AUTH_TTL_MS),
-  });
+    createdAt: now,
+    expiresAt: Math.min(now + expiresIn * 1000, now + DINGTALK_AUTH_TTL_MS),
+    state: "waiting", message: "", inFlight: false, timer: null, clientIdTail: "", credentialSource: ""
+  };
+  // 启动后台轮询：面板关掉/刷新都不影响，用户 2 小时内确认都能成功
+  const pollMs = Math.max(10, Number(opts.imAuthPollMs) || DINGTALK_AUTH_POLL_MS);
+  try {
+    sess.timer = setInterval(() => { void dingtalkAuthPollOnce(authId, opts); }, pollMs);
+    sess.timer.unref?.();
+  } catch { sess.timer = null; }
+  dingtalkAuthSessions.set(authId, sess);
   return { ok: true, authId, url, interval, expiresIn };
 }
 
-/** 把扫码拿到的凭据写进 im-bots.json 的 dingtalk 段（0600 原子写；保留其它字段）。 */
+/** 把扫码拿到的凭据写进 im-bots.json 的 dingtalk 段（0600 原子写；保留其它字段，自动 enabled）。 */
 function saveDingtalkScannedCredentials(relayDir, clientId, clientSecret) {
   const bots = readImBots(relayDir);
   const cur = dingtalkCfgOf(bots);
@@ -8186,13 +8269,14 @@ function saveDingtalkScannedCredentials(relayDir, clientId, clientSecret) {
     writeImBots(relayDir, { ...bots, version: 1, dingtalk: next });
     return { ok: true };
   } catch (e) {
-    return { ok: false, code: "write_failed", message: `保存扫码凭据失败：${e?.message || e}` };
+    return { ok: false, code: "write_failed", message: dingTalkHumanMessage("write_failed", `保存扫码凭据失败：${e?.message || e}`) };
   }
 }
 
 /**
- * 查询一次扫码授权状态（GET /dsh-remote/im-dingtalk-auth/status?id=...）。
- * 返回 status: waiting | success | failed | expired；success 时**已**把凭据写盘，只回脱敏信息。
+ * 查询扫码授权状态（GET /dsh-remote/im-dingtalk-auth/status?id=...&check=1）。
+ * 默认只读后台轮询的结论；check=1（面板「我已完成授权，检查一下」）会**立刻补轮一次**再返回。
+ * success 时凭据已经写盘，响应只回脱敏信息（绝不回 secret）。
  */
 async function dingtalkAuthStatus(authId, opts = {}) {
   const key = String(authId || "");
@@ -8200,38 +8284,22 @@ async function dingtalkAuthStatus(authId, opts = {}) {
   if (!sess) {
     if (dingtalkAuthSuperseded.has(key)) {
       dingtalkAuthSuperseded.delete(key);
-      return { ok: false, status: "failed", code: "cancelled", message: "已开始新的授权，这次已取消" };
+      return { ok: false, status: "failed", code: "cancelled", message: dingTalkHumanMessage("cancelled") };
     }
-    return { ok: false, status: "expired", code: "expired", message: "授权会话不存在或已超时，请重新发起" };
+    return { ok: false, status: "expired", code: "expired", message: dingTalkHumanMessage("expired") };
   }
-  const now = Date.now();
-  if (now > sess.expiresAt) {
-    dingtalkAuthSessions.delete(String(authId));
-    return { ok: false, status: "expired", code: "expired", message: "授权已超时（2 分钟内未确认），请重新发起" };
+  if (opts.check === true && sess.state === "waiting") {
+    await dingtalkAuthPollOnce(key, opts);
   }
-  const fetchImpl = typeof opts.imAuthFetch === "function" ? opts.imAuthFetch : fetch;
-  let r;
-  try {
-    r = await jsonPostForAuth(fetchImpl, `${DINGTALK_REG_BASE}/poll`, { device_code: sess.deviceCode });
-  } catch (e) {
-    return { ok: false, status: "failed", code: "network_error", message: `网络不通：查询授权状态失败（${e?.message || e}）` };
-  }
-  const b = r.body || {};
-  const st = String(b.status || "").toUpperCase();
-  if (st === "WAITING" || st === "PENDING") return { ok: true, status: "waiting" };
-  if (st === "SUCCESS" || (b.client_id && b.client_secret)) {
-    const saved = saveDingtalkScannedCredentials(sess.relayDir, b.client_id, b.client_secret);
-    dingtalkAuthSessions.delete(String(authId));
-    if (!saved.ok) return { ok: false, status: "failed", code: saved.code, message: saved.message };
-    const cid = String(b.client_id || "");
+  if (sess.state === "waiting") return { ok: true, status: "waiting" };
+  if (sess.state === "success") {
     return {
       ok: true, status: "success", credentialSource: "scan",
-      clientIdTail: cid.length > 4 ? cid.slice(-4) : cid,
-      hasSecret: true
+      clientIdTail: sess.clientIdTail || "", hasSecret: true
     };
   }
-  // 钉钉明确拒绝（创建被取消/参数过期等）
-  return { ok: false, status: "failed", code: "dingtalk_api_rejected", message: String(b.message || b.errmsg || "钉钉授权被拒绝，请重试") };
+  if (sess.state === "expired") return { ok: false, status: "expired", code: "expired", message: dingTalkHumanMessage("expired", sess.message) };
+  return { ok: false, status: "failed", code: "dingtalk_api_rejected", message: dingTalkHumanMessage("dingtalk_api_rejected", sess.message) };
 }
 
 /** 保存 dingtalk 配置（空 secret = 不修改；凭据完整性在返回里说清）。 */
@@ -9232,7 +9300,7 @@ function registerRoutes(ctx, relayDir, opts = {}) {
       method: "POST",
       path: "/dsh-remote/im-dingtalk-auth/begin",
       handler: async (_req, res) => {
-        const r = await beginDingtalkAuth(relayDir, { imAuthFetch: opts.imAuthFetch });
+        const r = await beginDingtalkAuth(relayDir, { imAuthFetch: opts.imAuthFetch, imAuthPollMs: opts.imAuthPollMs });
         sendJson(res, r.ok ? 200 : 502, r);
       },
     },
@@ -9242,7 +9310,10 @@ function registerRoutes(ctx, relayDir, opts = {}) {
       path: "/dsh-remote/im-dingtalk-auth/status",
       handler: async (req, res) => {
         const url = new URL(req.url ?? "/", "http://x");
-        const r = await dingtalkAuthStatus(url.searchParams.get("id") || "", { imAuthFetch: opts.imAuthFetch });
+        const r = await dingtalkAuthStatus(url.searchParams.get("id") || "", {
+          imAuthFetch: opts.imAuthFetch,
+          check: url.searchParams.get("check") === "1"
+        });
         sendJson(res, 200, r);
       },
     },
@@ -9634,8 +9705,9 @@ export function apply(ctx, config = {}) {
     imBotsWaitMs: Number(config.imBotsWaitMs) || undefined,
     // 测试钩子：飞书 SDK 安装的 npm spawn（用例注入假实现，**绝不真的联网装包**）。
     imDepsSpawn: typeof config.imDepsSpawn === "function" ? config.imDepsSpawn : undefined,
-    // 测试钩子：钉钉扫码授权的 fetch（用例注入假实现，**绝不真的打钉钉接口**）。
+    // 测试钩子：钉钉扫码授权的 fetch（用例注入假实现，**绝不真的打钉钉接口**）+ 后台轮询间隔。
     imAuthFetch: typeof config.imAuthFetch === "function" ? config.imAuthFetch : undefined,
+    imAuthPollMs: Number(config.imAuthPollMs) || undefined,
   }), "dsh-remote-web: /dsh-remote routes");
   // 0.1.2-rc.1+ 浏览器会话代持：换取 Harness 会话 Cookie 供 bridge 上游携带（手机点设备不再 401 白页）
   ctx.effect(() => scheduleHarnessMint(ctx, relayDir), "dsh-remote-web: harness browser-session mint");

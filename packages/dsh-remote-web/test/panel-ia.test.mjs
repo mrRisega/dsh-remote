@@ -759,7 +759,7 @@ test("钉钉主路径：扫码一键创建（begin→等待→轮询→自动成
   await flush(); await flush();
   tree = await plugin.settle(4);
   assert.ok(plugin.dingAuthCalls().filter((c) => c.kind === "status").length >= 1, "要轮询授权状态");
-  assert.ok(textOf(tree).includes("已创建机器人并建立连接"), "成功后要自动切到已连接状态");
+  assert.ok(textOf(tree).includes("来源：扫码创建"), "成功后自动切到已连接状态（显示来源）");
   assert.ok(textOf(tree).includes("8899"), "成功提示要带 Client ID 尾号");
   dlg = find(tree, (n) => String(n.props?.className || "").split(/\s+/).includes("dru-ia-dialog"));
   assert.ok(dlg, "成功后弹层仍开着（用户能直接看到结果/去钉钉试）");
@@ -1287,4 +1287,69 @@ test("飞书依赖下载：点下载 → POST 安装 → 轮询 /im-deps，装�
   assert.ok(plugin.depsCalls().length >= 1, "应轮询 /dsh-remote/im-deps 拿进度");
   assert.ok(textOf(tree).includes("1.40.0"), "装好后面板直接显示版本（用户不需要重开弹层）");
   assert.ok(find(tree, (n) => n.props?.id === "dru-fs-appid"), "装好后应出现飞书配置表单");
+});
+
+// ─────────── ⑫ 钉钉授权修正（2026-11-08 生产踩坑：TTL/人话/未配置措辞） ───────────
+
+test("钉钉等待中：「我已完成授权，检查一下」手动触发 status?check=1（不再 2 分钟判死）", async () => {
+  const plugin = loadPlugin();
+  plugin.setImBotsGet({
+    ok: true, wecom: {}, feishu: {}, dingtalk: {},
+    status: { dingtalk: { connected: false }, feishu: {}, deps: { feishu: { installed: false } } },
+  });
+  // 用户点「检查」时服务端后台已经推进到 success（手动检查只是立刻取一次结论）
+  plugin.setDingAuthStatus([{ status: "success", clientIdTail: "0001", credentialSource: "scan", hasSecret: true }]);
+  let tree = await plugin.settle();
+  openEntry(tree, "channel");
+  tree = await plugin.settle();
+  clickChannelRow(tree, "钉钉机器人");
+  tree = await plugin.settle();
+  btnWith(tree, "用钉钉扫码，一键创建机器人").props.onClick();
+  await flush(); await flush();
+  tree = await plugin.settle(3);
+  const checkBtn = btnWith(tree, "我已完成授权，检查一下");
+  assert.ok(checkBtn, "等待中要有「我已完成授权，检查一下」按钮");
+  checkBtn.props.onClick();
+  await flush(); await flush();
+  tree = await plugin.settle(3);
+  const calls = plugin.dingAuthCalls().filter((c) => c.kind === "status");
+  assert.ok(calls.some((c) => String(c.path).includes("check=1")), "★ 手动检查必须触发一次 status?check=1（让服务端立刻补轮）");
+  assert.ok(textOf(tree).includes("来源：扫码创建"), "手动检查成功后自动切已连接并收起授权块");
+  assert.equal(btnWith(tree, "我已完成授权，检查一下"), undefined, "成功后授权块自动收起");
+});
+
+test("钉钉未配置措辞：enabled=false 显示「未配置」，不是「连接失败」", async () => {
+  const plugin = loadPlugin();
+  plugin.setImBotsGet({
+    ok: true, wecom: {}, feishu: {},
+    dingtalk: { enabled: false, clientId: "", hasSecret: false, robotCode: "", credentialSource: "" },
+    status: { dingtalk: { connected: false, enabled: false, state: "idle", lastError: "未启用（配置里 dingtalk.enabled=false）" }, feishu: {}, deps: { feishu: { installed: false } } },
+  });
+  let tree = await plugin.settle();
+  openEntry(tree, "channel");
+  tree = await plugin.settle();
+  clickChannelRow(tree, "钉钉机器人");
+  tree = await plugin.settle();
+  const t = textOf(tree);
+  assert.ok(t.includes("未配置"), "没有任何凭据时显示「未配置」");
+  assert.ok(!t.includes("连接失败"), "未配置 ≠ 连接失败（业主明确要求）");
+  assert.ok(!t.includes("未启用（配置里 dingtalk.enabled=false）"), "不得把底层 enabled=false 原文透给用户");
+});
+
+test("钉钉连接失败：只有 state=failed 才显示「连接失败：<中文人话>」，绝不裸渲染 code/ok", async () => {
+  const plugin = loadPlugin();
+  plugin.setImBotsGet({
+    ok: true, wecom: {}, feishu: {},
+    dingtalk: { enabled: true, clientId: "ding-x", hasSecret: true, robotCode: "rc", credentialSource: "scan" },
+    status: { dingtalk: { connected: false, enabled: true, state: "failed", lastError: "ok" }, feishu: {}, deps: { feishu: { installed: false } } },
+  });
+  let tree = await plugin.settle();
+  openEntry(tree, "channel");
+  tree = await plugin.settle();
+  clickChannelRow(tree, "钉钉机器人");
+  tree = await plugin.settle();
+  const t = textOf(tree);
+  assert.ok(t.includes("连接失败"), "state=failed 时才显示连接失败");
+  assert.ok(t.includes("操作失败，请稍后重试"), "后端给了裸 ok 时要兜底成中文人话");
+  assert.ok(!/连接失败：\s*ok\s*$/m.test(t), "绝不把裸 ok 渲染出来");
 });
