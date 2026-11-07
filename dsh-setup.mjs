@@ -2963,7 +2963,8 @@ function copyPluginIntoProfile(profileDir, pluginDir) {
  * 这里只认 dsh 自己那条解析路径能不能走通：
  *   ① 读得到 package.json 且 name 正确（cordis 加载器 + @deepseek-ai/dsh-client-modules 靠它读 dsh.client）；
  *   ② 读得到 lib/index.js（节点半入口）；
- *   ③ 要么 realpath 指回本地拷贝目录（链接形态），要么入口内容与本地拷贝逐字节一致（整目录拷贝形态）。
+ *   ③ 要么 realpath 指回本地拷贝目录（链接形态），要么**整目录拷贝**且
+ *      `lib/index.js` 与 `package.json` 都与本地拷贝逐字节一致（拷贝形态）。
  */
 function pluginLinkUsable(nmPlugin, pluginLocalDir) {
   try {
@@ -2977,9 +2978,23 @@ function pluginLinkUsable(nmPlugin, pluginLocalDir) {
   if (real) {
     try { if (real === fs.realpathSync(pluginLocalDir)) return true; } catch { /* 本地目录不在 → 看内容 */ }
   }
+  /**
+   * ★ 2026-11-07（桌面端实测）：拷贝形态**必须连 package.json 一起比对**，只看入口会漏掉旧版残留。
+   *
+   * 桌面 profile 用 pnpm `nodeLinker: hoisted`，`file:` 依赖会被**复制**进 profile 的
+   * `node_modules/<id>`（不是链接）。npx 安装器随后只替换了 `dsh-remote-web-plugin/`
+   * （file: 的源目录）—— 那份复制品还是上一版。而版本号只写在 package.json 里，
+   * 相邻 beta 之间的 `lib/index.js` 往往逐字节相同 ⇒ 旧判据判「已就绪」，
+   * 桌面端继续 import 旧的 package.json：面板版本号是旧的、`/self/update-check` 一直
+   * `outdated:true`，用户反复 npx 都"装不上新版"（实测 beta.3 → beta.10 复现）。
+   * 拷贝形态本就该与源目录完全一致，逐字节比对 package.json 即可识别，代价是一次 re-link。
+   */
   try {
-    return fs.readFileSync(path.join(nmPlugin, "lib", "index.js"), "utf8")
+    const sameEntry = fs.readFileSync(path.join(nmPlugin, "lib", "index.js"), "utf8")
       === fs.readFileSync(path.join(pluginLocalDir, "lib", "index.js"), "utf8");
+    if (!sameEntry) return false;
+    return fs.readFileSync(path.join(nmPlugin, "package.json"))
+      .equals(fs.readFileSync(path.join(pluginLocalDir, "package.json")));
   } catch { return false; }
 }
 

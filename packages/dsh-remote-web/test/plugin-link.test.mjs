@@ -107,6 +107,59 @@ test("pluginLinkUsable：空目录/畸形链接一律判为不可用（不能只
   }
 });
 
+// ─────────────── ①-b 拷贝形态的版本漂移：桌面端 pnpm hoisted 残留（2026-11-07 实测）───────────────
+
+/**
+ * 背景：桌面 profile 用 pnpm `nodeLinker: hoisted`，`file:` 依赖被**复制**进 profile 的
+ * `node_modules/<id>`（不是链接）。npx 安装器只替换 `dsh-remote-web-plugin/`（file: 的源目录），
+ * 那份复制品还是上一版；相邻 beta 之间 `lib/index.js` 往往逐字节相同，只有 package.json 的版本号变了。
+ * 旧判据只看入口 ⇒ 判「已就绪」⇒ 宿主继续 import 旧 package.json：
+ * 面板版本号是旧的、`/self/update-check` 一直 outdated，用户反复 npx 都"装不上新版"。
+ */
+
+test("pluginLinkUsable：入口相同但 package.json 是旧版 → 判为不可用（版本号永远旧的根因）", () => {
+  const { pluginLinkUsable } = loadLinkFns();
+  const root = tmpDir();
+  try {
+    const local = makePluginDir(path.join(root, "local"));
+    fs.writeFileSync(path.join(local, "package.json"), JSON.stringify({ name: PLUGIN_ID, version: "0.7.10-beta.10" }));
+    const nm = path.join(root, "node_modules", PLUGIN_ID);
+    fs.mkdirSync(path.dirname(nm), { recursive: true });
+
+    // 与源目录完全一致的整目录拷贝 → 可用
+    fs.cpSync(local, nm, { recursive: true });
+    assert.equal(pluginLinkUsable(nm, local), true, "同版本整目录拷贝 → 可用");
+
+    // ★ 桌面端实测形态：hoisted 复制品还是上一版，入口逐字节相同
+    fs.writeFileSync(path.join(nm, "package.json"), JSON.stringify({ name: PLUGIN_ID, version: "0.7.10-beta.3" }));
+    assert.equal(pluginLinkUsable(nm, local), false,
+      "★旧版 package.json 的拷贝不得判为已就绪（否则宿主 import 旧 package.json，版本号永远旧）");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("ensurePluginLinked：旧版整目录拷贝会被重建，装载版本随之更新", () => {
+  const { ensurePluginLinked } = loadLinkFns();
+  const root = tmpDir();
+  try {
+    const local = makePluginDir(path.join(root, "local"));
+    fs.writeFileSync(path.join(local, "package.json"), JSON.stringify({ name: PLUGIN_ID, version: "0.7.10-beta.10" }));
+    const profile = path.join(root, "profile");
+    const nm = path.join(profile, "node_modules", PLUGIN_ID);
+    fs.mkdirSync(path.dirname(nm), { recursive: true });
+    fs.cpSync(local, nm, { recursive: true });
+    fs.writeFileSync(path.join(nm, "package.json"), JSON.stringify({ name: PLUGIN_ID, version: "0.7.10-beta.3" }));
+
+    const changed = ensurePluginLinked(profile, local);
+    assert.equal(changed, true, "旧版拷贝必须被判为需要重建（幂等判据不得放行）");
+    assert.equal(JSON.parse(fs.readFileSync(path.join(nm, "package.json"), "utf8")).version, "0.7.10-beta.10",
+      "★重建后 node_modules/<id>/package.json 必须与源目录同版");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 // ─────────────── ② 注入 Windows 的失败形态：不抛错但落盘是空壳 ───────────────
 
 /** 造一个 fs 代理：可按需让某个策略"静默失败"（不抛错、也不产出任何东西）。 */
