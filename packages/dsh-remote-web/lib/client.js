@@ -675,6 +675,8 @@ window.__ModuleLoader__.load({
       ".dru-ia-tier-link:hover{text-decoration:underline}",
       ".dru-ia-badge{display:inline-flex;align-items:center;padding:1px 6px;border-radius:999px;font-size:11px;font-weight:600;line-height:1.4;color:var(--dru-accent-fg);background:var(--dru-accent-tint);border:1px solid var(--dru-accent-tint-border);cursor:help}",
       "select.dru-ia-input[disabled]{opacity:.6;cursor:not-allowed;background:var(--dru-surface-3)}",
+      // 能力行置灰（缺 Robot Code 时不可用，但仍可读 + 有提示）
+      ".dru-ia-state.is-disabled{opacity:.6;background:var(--dru-surface-3);cursor:not-allowed}",
       // 飞书 8 步向导：编号列表紧凑可读（一屏内可滚，不撑破弹层）
       ".dru-ia-steps{margin:6px 0 8px;padding-left:20px;font-size:12px;line-height:1.7;color:var(--dsw-alias-label-secondary,var(--dru-fg-muted))}",
       ".dru-ia-steps li{margin:2px 0}",
@@ -3591,6 +3593,9 @@ window.__ModuleLoader__.load({
       var imDingIdArr = useState(""); var imDingId = imDingIdArr[0]; var setImDingId = imDingIdArr[1];
       var imDingSecretArr = useState(""); var imDingSecret = imDingSecretArr[0]; var setImDingSecret = imDingSecretArr[1];
       var imDingRobotArr = useState(""); var imDingRobot = imDingRobotArr[0]; var setImDingRobot = imDingRobotArr[1];
+      // 钉钉扫码一键创建（2026-11-08）：authId/授权链接/等待态；手动配置默认折叠
+      var imDingAuthArr = useState(null); var imDingAuth = imDingAuthArr[0]; var setImDingAuth = imDingAuthArr[1];
+      var imDingManualArr = useState(false); var imDingManual = imDingManualArr[0]; var setImDingManual = imDingManualArr[1];
       var imFeishuAppIdArr = useState(""); var imFeishuAppId = imFeishuAppIdArr[0]; var setImFeishuAppId = imFeishuAppIdArr[1];
       var imFeishuSecretArr = useState(""); var imFeishuSecret = imFeishuSecretArr[0]; var setImFeishuSecret = imFeishuSecretArr[1];
       var imFeishuRecvArr = useState(""); var imFeishuRecv = imFeishuRecvArr[0]; var setImFeishuRecv = imFeishuRecvArr[1];
@@ -6593,19 +6598,23 @@ window.__ModuleLoader__.load({
 
       /** 飞书官方文档（配置页顶部固定展示；外链一律 target=_blank + rel=noopener）。 */
       var FEISHU_DOCS = {
-        createApp: "https://open.feishu.cn/document/develop-an-app/create-an-app",
-        longConn: "https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/event-subscription-configure-/long-connection"
+        // 业主给的两个官方入口（必须出现在配置流程里）
+        createApp: "https://open.feishu.cn/app?lang=zh-CN",
+        cardBot: "https://open.feishu.cn/document/uAjLw4CM/ukzMukzMukzM/feishu-cards/quick-start/develop-a-card-interactive-bot"
       };
-      /** 8 步向导（业主/文档要求；顺序坑单独强调，见 renderFeishuStep 的提示）。 */
-      var FEISHU_STEPS = [
-        "创建企业自建应用：飞书开放平台 → 开发者后台 → 创建企业自建应用",
-        "复制 App ID / App Secret（应用详情 → 凭证与基础信息）",
+      /** 主路径只有 3 件事（业主：接收人参数用户根本不知道怎么获取，别让用户配）。 */
+      var FEISHU_MAIN_STEPS = [
+        "创建企业自建应用（打开上面的「创建应用」链接）",
+        "复制应用凭证里的 App ID / App Secret",
+        "填到下面两个框，点「保存并连接」——接收群/私聊会自动发现，不用你配"
+      ];
+      /** 细步骤（折叠）：开机器人能力 / 权限 / 事件与回调切长连接 / 发布。 */
+      var FEISHU_DETAIL_STEPS = [
         "开通机器人能力：应用功能 → 机器人 → 启用",
         "申请权限：收 p2p / 群@消息，发 im:message:send_as_bot",
         "事件配置：订阅方式选「长连接」，添加「接收消息 v2.0」",
         "回调配置：订阅方式选「长连接」，添加 card.action.trigger",
-        "发布版本：版本管理与发布 → 创建版本 → 申请发布（管理员审核）",
-        "回本插件填 App ID / Secret / 接收人并点「保存并连接」"
+        "发布版本：版本管理与发布 → 创建版本 → 申请发布（管理员审核）"
       ];
 
       /** GET /dsh-remote/im-deps：飞书 SDK 是否已装 + phase（下载进度轮询用）。 */
@@ -6652,11 +6661,10 @@ window.__ModuleLoader__.load({
       }
       /** 飞书表单提交体。 */
       function imFeishuPayload() {
+        // 只提交两个凭据：接收群/私聊由桥侧自动发现（业主：不让用户填不知道怎么获取的 ID）。
         return {
           appId: String(imFeishuAppId || "").trim(),
-          appSecret: String(imFeishuSecret || ""),
-          receiveId: String(imFeishuRecv || "").trim(),
-          receiveIdType: String(imFeishuType || "open_id")
+          appSecret: String(imFeishuSecret || "")
         };
       }
       function imPlatFieldErrOf(code) {
@@ -6721,46 +6729,202 @@ window.__ModuleLoader__.load({
         return null;
       }
 
-      /** 钉钉配置页：Client ID / Client Secret / Robot Code（三个都要）。 */
+      /** 钉钉扫码授权：开始（POST begin）→ 拿授权链接；deviceCode 只在服务端，不落浏览器。 */
+      function startDingAuth() {
+        if (imPlatBusy) return;
+        setImPlatBusy("auth");
+        setImPlatMsg(null);
+        setImPlatErr({});
+        post("/dsh-remote/im-dingtalk-auth/begin", {}).then(function (b) {
+          if (!b || b.ok !== true || !b.url) {
+            setImDingAuth(null);
+            setImPlatMsg({ kind: "err", text: "发起授权失败：" + ((b && b.message) || "请稍后重试") });
+            return;
+          }
+          setImDingAuth({
+            authId: String(b.authId || ""),
+            url: String(b.url || ""),
+            interval: Math.max(1, Math.min(10, Number(b.interval) || 2)),
+            expiresAt: Date.now() + Math.max(10, Math.min(600, Number(b.expiresIn) || 120)) * 1000,
+            phase: "waiting",
+            error: ""
+          });
+        }).catch(function (e) {
+          setImDingAuth(null);
+          var body = (e && e.body) || {};
+          setImPlatMsg({ kind: "err", text: "发起授权失败：" + (body.message || (e && e.message) || "网络错误") });
+        }).finally(function () { setImPlatBusy(""); });
+      }
+      /** 查询一次授权状态；成功后凭据已由服务端写盘 → 刷新面板即"已连接"。 */
+      function pollDingAuth() {
+        var a = imDingAuth;
+        if (!a || !a.authId || a.phase !== "waiting") return;
+        api("/dsh-remote/im-dingtalk-auth/status?id=" + encodeURIComponent(a.authId)).then(function (b) {
+          if (b && b.status === "success") {
+            setImDingAuth(null);
+            setImPlatMsg({ kind: "ok", text: "已创建机器人并建立连接" + (b.clientIdTail ? "（Client ID 尾号 " + b.clientIdTail + "）" : "") + "，去钉钉里发条消息试试" });
+            loadImBots();
+            return;
+          }
+          if (b && (b.status === "failed" || b.status === "expired")) {
+            setImDingAuth({ authId: a.authId, url: a.url, interval: a.interval, expiresAt: a.expiresAt, phase: "failed", error: String(b.message || "授权失败，请重试") });
+            return;
+          }
+          if (Date.now() > a.expiresAt) {
+            setImDingAuth({ authId: a.authId, url: a.url, interval: a.interval, expiresAt: a.expiresAt, phase: "failed", error: "授权已超时（2 分钟内未确认），请重新发起" });
+            return;
+          }
+          // waiting：**换一个新对象** → 轮询 effect 依赖变化 → 继续排下一次（否则只会轮询一次）。
+          setImDingAuth({ authId: a.authId, url: a.url, interval: a.interval, expiresAt: a.expiresAt, phase: "waiting", error: "", polledAt: Date.now() });
+        }).catch(function () { /* 网络抖动：下一轮再试（轮询期内不打断用户） */ });
+      }
+      /** 等待确认中：每 ~2s 轮询一次 status（最长到 expiresAt）。 */
+      useEffect(function () {
+        if (iaModal !== "channel" || iaChStep !== "dingtalk") return undefined;
+        if (!imDingAuth || imDingAuth.phase !== "waiting") return undefined;
+        var t = null;
+        try { t = setTimeout(pollDingAuth, Math.max(1000, (imDingAuth.interval || 2) * 1000)); } catch (e) { /* 忽略 */ }
+        return function () { try { if (t) clearTimeout(t); } catch (e) { /* 忽略 */ } };
+      }, [iaModal, iaChStep, imDingAuth]);
+
+      /** 钉钉手动创建 7 步（2026-11-08 业主给的官方链接；每步一句 + 链接）。 */
+      var DINGTALK_STEPS = [
+        { t: "用钉钉账号登录开发者后台", url: "https://open-dev.dingtalk.com/" },
+        { t: "「应用开发 → 企业内部应用 → 钉钉应用 → 创建应用」，起个名字保存", url: "https://open.dingtalk.com/document/orgapp/create-an-application" },
+        { t: "「基础信息 → 凭证与基础信息」复制 Client ID / Client Secret（Secret 只显示一次，丢了要重置）", url: "" },
+        { t: "「应用能力 → 机器人」开启机器人配置（名称/图标/简介/预览图）", url: "https://open.dingtalk.com/document/orgapp/add-application-capabilities" },
+        { t: "「消息接收模式」必须选 Stream 模式（不要选 HTTP、不要填地址），保存并发布机器人", url: "https://open.dingtalk.com/document/orgapp/configure-the-robot-application" },
+        { t: "同一页找到 Robot Code（一般与 Client ID 相同）一起填", url: "https://open.dingtalk.com/document/orgapp/faq-robot" },
+        { t: "「应用发布 → 版本管理与发布 → 创建新版本 → 发布」，回来点「测试连接」", url: "https://open.dingtalk.com/document/orgapp/robot-receive-message" }
+      ];
+      /** 三个高频坑（折叠底部，警示样式）。 */
+      var DINGTALK_PITFALLS = [
+        "建错机器人：群设置里加的「自定义机器人」只有 webhook 地址，没有 Client ID/Secret，也不可能长连接",
+        "只保存没发布：机器人发布 + 应用版本发布是两步，漏任一步会 400 或群里搜不到机器人",
+        "模式选错/凭证脏：消息接收模式留 HTTP、Secret 复制带空格、开了 IP 白名单 → 都会「连不上但报错含糊」；建议「连接成功才放行」"
+      ];
+
+      /** 钉钉能力行：缺 Robot Code 时置灰并提示（业主：补 Robot Code 可开启）。 */
+      function dingCapabilityRow(label, enabled, hint) {
+        return h("div", {
+          className: "dru-ia-state" + (enabled ? "" : " is-disabled"),
+          "aria-disabled": enabled ? "false" : "true",
+          title: enabled ? "" : hint
+        },
+          druIcon(enabled ? "check" : "alert"),
+          label,
+          enabled ? null : h("span", { className: "dru-ia-badge" }, hint));
+      }
+
+      /** 钉钉配置页：主路径 = 扫码一键创建；手动创建 7 步 + 三个坑折叠在「高级」。 */
       function renderDingtalkStep(close) {
         var d = (imBots && imBots.dingtalk) || {};
-        var st = imBots && imBots.status && imBots.status.dingtalk;
+        var st = (imBots && imBots.status && imBots.status.dingtalk) || {};
         var err = imPlatErr || {};
+        var auth = imDingAuth;
+        var sourceText = (st.credentialSource || d.credentialSource) === "scan" ? "扫码创建"
+          : (st.credentialSource || d.credentialSource) === "manual" ? "手动填写" : "";
+        var clientTail = String(d.clientId || "").length > 4 ? String(d.clientId).slice(-4) : String(d.clientId || "");
+        // Robot Code 是否已配置：优先用桥状态；旧桥没这个字段时退回配置里的 robotCode。
+        var robotCodeOk = st.robotCodeConfigured === true || !!String(d.robotCode || "").trim();
+        var caps = st.capabilities || null;
         return iaDialog(Object.assign({}, {
           title: "钉钉机器人",
-          sub: "Client ID / Secret 就是钉钉应用的 AppKey / AppSecret；Robot Code 是机器人编码",
+          sub: "不用去开发者后台创建应用：扫码点一下就会自动创建机器人",
           onClose: close,
           foot: [
-            h("button", { type: "button", className: "dru-ia-btn is-primary", disabled: imPlatBusy !== "", onClick: function () { saveImPlatform("dingtalk", "test"); } },
-              imPlatBusy === "test" ? "连接中…" : "保存并连接"),
-            h("button", { type: "button", className: "dru-ia-btn", disabled: imPlatBusy !== "", onClick: function () { saveImPlatform("dingtalk", "save"); } },
-              imPlatBusy === "save" ? "保存中…" : "仅保存"),
-            h("button", { type: "button", className: "dru-ia-btn is-ghost", disabled: imPlatBusy !== "", onClick: function () {
-              if (imPlatBusy) return;
-              setImPlatBusy("test"); setImPlatMsg(null);
-              post("/dsh-remote/im-bots/test", { platform: "dingtalk" }, 15000).then(function (r) {
-                setImPlatMsg({ kind: r && r.connected ? "ok" : "warn", text: r && r.connected ? "已连接" : ("连接失败" + (r && r.lastError ? "：" + r.lastError : "（稍后自动重试）")) });
-              }).catch(function (e) { setImPlatMsg({ kind: "err", text: "测试失败：" + ((e && e.message) || e) }); })
-                .finally(function () { setImPlatBusy(""); });
-            } }, "测试")
+            h("button", {
+              type: "button", className: "dru-ia-btn is-primary", disabled: imPlatBusy !== "",
+              onClick: function () { if (!auth || auth.phase !== "waiting") startDingAuth(); }
+            }, imPlatBusy === "auth" ? "正在生成授权链接…" : (auth && auth.phase === "waiting" ? "重新发起扫码" : "用钉钉扫码，一键创建机器人")),
+            h("button", { type: "button", className: "dru-ia-btn is-ghost", onClick: function () { close(); } }, "关闭")
           ]
         }, { children: [
-          h("div", { className: "dru-ia-state" }, druIcon("send"), d.hasSecret ? "已保存凭据（Secret 不回显）" : "还没有保存凭据"),
-          iaField("Client ID（= AppKey）", "dru-ding-client", h("input", {
-            id: "dru-ding-client", className: "dru-ia-input", type: "text", value: imDingId, autoComplete: "off", spellCheck: false,
-            placeholder: "钉钉应用 AppKey", "aria-invalid": err.clientId ? "true" : "false",
-            onChange: function (e) { setImDingId(e.target.value); }
-          }), err.clientId || ""),
-          iaField("Client Secret（= AppSecret）", "dru-ding-secret", h("input", {
-            id: "dru-ding-secret", className: "dru-ia-input", type: "password", value: imDingSecret, autoComplete: "new-password", spellCheck: false,
-            placeholder: d.hasSecret ? "已保存（留空表示不修改）" : "钉钉应用 AppSecret", "aria-invalid": err.clientSecret ? "true" : "false",
-            onChange: function (e) { setImDingSecret(e.target.value); }
-          }), err.clientSecret || "", "只保存在本机；已保存的 Secret 永远不回显。"),
-          iaField("Robot Code", "dru-ding-robot", h("input", {
-            id: "dru-ding-robot", className: "dru-ia-input", type: "text", value: imDingRobot, autoComplete: "off", spellCheck: false,
-            placeholder: "机器人编码（开放平台 → 机器人页复制）", "aria-invalid": err.robotCode ? "true" : "false",
-            onChange: function (e) { setImDingRobot(e.target.value); }
-          }), err.robotCode || "", "三个字段都要填：Client ID/Secret 建应用时给，Robot Code 在机器人页。"),
+          // 判断口诀（醒目）：帮用户尽早排除"群 webhook 机器人"这个错误方向
+          h("div", { className: "dru-ia-state is-warn", role: "note" },
+            "要你填「消息接收地址」的，就是群 webhook 机器人——那种不能长连接，请退出重来"),
+          h("div", { className: "dru-ia-hint" },
+            "官方入口：",
+            h("a", { className: "dru-ia-tier-link", href: "https://open.dingtalk.com/", target: "_blank", rel: "noopener" }, "钉钉开放平台"),
+            " · ",
+            h("a", { className: "dru-ia-tier-link", href: "https://open-dev.dingtalk.com/", target: "_blank", rel: "noopener" }, "开发者后台")),
+          // 已连接状态：clientId 尾号 + 来源
+          (st.connected || d.hasSecret)
+            ? h("div", { className: "dru-ia-state is-ok" }, druIcon("check"),
+                (st.connected ? "已连接" : "已保存凭据") + (clientTail ? "（Client ID 尾号 " + clientTail + "）" : "")
+                + (sourceText ? " · 来源：" + sourceText : ""))
+            : h("div", { className: "dru-ia-state" }, druIcon("chat"), "还没有连接：点下方按钮扫码创建机器人"),
+          // 扫码授权中：链接 + 提示 + 复制/打开（无 QR 库 → 降级，明确告知用手机钉钉扫码）
+          (auth && auth.phase === "waiting")
+            ? h("div", { className: "dru-ia-field" },
+                h("div", { className: "dru-ia-state", role: "status" }, h("span", { className: "dru-spin" }),
+                  "等待你在钉钉里确认…（用手机钉钉扫下方链接，或复制到手机打开）"),
+                h("div", { className: "dru-copy-row" },
+                  h("div", { className: "dru-copy-box" },
+                    h("span", { className: "dru-link-val" }, auth.url),
+                    h("button", {
+                      type: "button", className: "dru-copy-btn", "aria-label": "复制授权链接",
+                      onClick: function () {
+                        copyText(auth.url).then(function (ok) { if (!ok) setImPlatMsg({ kind: "err", text: "复制失败：请手动选中链接复制" }); });
+                      }
+                    }, "复制授权链接")),
+                  h("div", { className: "dru-actions", style: { marginTop: 8 } },
+                    h("a", { className: "dru-ia-btn is-primary", href: auth.url, target: "_blank", rel: "noopener" }, "在浏览器打开授权页"),
+                    h("button", { type: "button", className: "dru-ia-btn", onClick: function () { setImDingAuth(null); setImPlatMsg({ kind: "ok", text: "已取消本次扫码授权" }); } }, "取消授权"))))
+            : null,
+          (auth && auth.phase === "failed")
+            ? h("div", { className: "dru-ia-field" },
+                h("div", { className: "dru-ia-state is-err", role: "alert" }, auth.error || "授权失败"),
+                h("button", { type: "button", className: "dru-ia-btn", onClick: function () { startDingAuth(); } }, "重试扫码授权"))
+            : null,
+          // 能力：主动推送 / 卡片（缺 Robot Code 时置灰，提示补 Robot Code）
+          h("div", { className: "dru-ia-field" },
+            h("div", { className: "dru-ia-label" }, "机器人能力"),
+            dingCapabilityRow("主动推送（任务完成/出错通知）", robotCodeOk && (!caps || caps.openapi !== false), "补 Robot Code 可开启"),
+            dingCapabilityRow("卡片交互（审批卡片，点按钮放行/拒绝）", robotCodeOk && (!caps || caps.card !== false), "补 Robot Code 可开启")),
+          // 高级：手动创建（7 步 + 三个坑 + 手动填凭据；默认折叠）
+          h("div", { className: "dru-ia-field" },
+            h("button", {
+              type: "button", className: "dru-ia-disclose", "aria-expanded": imDingManual ? "true" : "false",
+              onClick: function () { setImDingManual(!imDingManual); }
+            }, "高级：去开发者后台手动创建（或手动填凭据）", druIcon(imDingManual ? "left" : "right")),
+            imDingManual
+              ? h("div", null,
+                  h("ol", { className: "dru-ia-steps" }, DINGTALK_STEPS.map(function (stp, i) {
+                    return h("li", { key: "dt" + i }, stp.t,
+                      stp.url
+                        ? h("a", { className: "dru-ia-tier-link", href: stp.url, target: "_blank", rel: "noopener", style: { marginLeft: 6 } }, "官方文档")
+                        : null);
+                  })),
+                  // 三个高频坑（警示）
+                  h("div", { className: "dru-ia-state is-warn", role: "alert" },
+                    h("div", null, "三个高频坑："),
+                    h("ol", { className: "dru-ia-steps" }, DINGTALK_PITFALLS.map(function (t, i) {
+                      return h("li", { key: "pf" + i }, t);
+                    }))),
+                  // 手动填三层字段（已有应用的兜底）
+                  h("div", { className: "dru-ia-hint" }, "已有钉钉应用的话可以手填：Client ID/Secret 就是 AppKey/AppSecret；Robot Code 在机器人页复制。"),
+                  iaField("Client ID（= AppKey）", "dru-ding-client", h("input", {
+                    id: "dru-ding-client", className: "dru-ia-input", type: "text", value: imDingId, autoComplete: "off", spellCheck: false,
+                    placeholder: "钉钉应用 AppKey", "aria-invalid": err.clientId ? "true" : "false",
+                    onChange: function (e) { setImDingId(e.target.value); }
+                  }), err.clientId || ""),
+                  iaField("Client Secret（= AppSecret）", "dru-ding-secret", h("input", {
+                    id: "dru-ding-secret", className: "dru-ia-input", type: "password", value: imDingSecret, autoComplete: "new-password", spellCheck: false,
+                    placeholder: d.hasSecret ? "已保存（留空表示不修改）" : "钉钉应用 AppSecret", "aria-invalid": err.clientSecret ? "true" : "false",
+                    onChange: function (e) { setImDingSecret(e.target.value); }
+                  }), err.clientSecret || "", "只保存在本机；已保存的 Secret 永远不回显。"),
+                  iaField("Robot Code", "dru-ding-robot", h("input", {
+                    id: "dru-ding-robot", className: "dru-ia-input", type: "text", value: imDingRobot, autoComplete: "off", spellCheck: false,
+                    placeholder: "机器人编码（开放平台 → 机器人页复制）", "aria-invalid": err.robotCode ? "true" : "false",
+                    onChange: function (e) { setImDingRobot(e.target.value); }
+                  }), err.robotCode || "", "三个字段都要填。"),
+                  h("div", { className: "dru-actions", style: { marginTop: 8 } },
+                    h("button", { type: "button", className: "dru-ia-btn is-primary", disabled: imPlatBusy !== "", onClick: function () { saveImPlatform("dingtalk", "test"); } },
+                      imPlatBusy === "test" ? "连接中…" : "保存并连接"),
+                    h("button", { type: "button", className: "dru-ia-btn", disabled: imPlatBusy !== "", onClick: function () { saveImPlatform("dingtalk", "save"); } },
+                      imPlatBusy === "save" ? "保存中…" : "仅保存")))
+              : null),
           imPlatStateLine(st)
         ] }));
       }
@@ -6787,16 +6951,29 @@ window.__ModuleLoader__.load({
         ] }));
       }
 
-      /** 飞书配置页（依赖已装）：官方文档 + 8 步向导 + 三个字段。 */
+      /** 飞书配置页（依赖已装）：官方文档 + 3 步主路径（细步骤折叠）+ 只有 App ID / App Secret。 */
       function renderFeishuStep(close) {
         var deps = imDeps || {};
         if (deps.installed !== true) return renderFeishuDepsGate(close);
         var f = (imBots && imBots.feishu) || {};
-        var st = imBots && imBots.status && imBots.status.feishu;
+        var st = (imBots && imBots.status && imBots.status.feishu) || {};
         var err = imPlatErr || {};
+        // 自动绑定状态（业主：接收人不需要用户填，由插件自动发现）
+        var bindLine = (function () {
+          var bound = String(st.boundChatId || "").trim();
+          if (!bound) return h("div", { className: "dru-ia-state" }, druIcon("chat"),
+            "连接后会自动绑定你的机器人所在群/你与机器人的私聊（不需要操作）");
+          var type = String(st.boundChatType || "").toLowerCase();
+          var src = String(st.receiveIdSource || "").toLowerCase();
+          var isP2p = type === "p2p" || src === "p2p" || src === "private";
+          var name = isP2p ? "私聊" : (/^oc_/.test(bound) || /^ou_/.test(bound) ? ("群 " + iaShortId(bound)) : bound);
+          return h("div", { className: "dru-ia-state is-ok" }, druIcon("check"),
+            "已自动绑定：" + name,
+            src ? h("span", { className: "dru-ia-hint", style: { marginLeft: 6 } }, "（自动发现，无需配置）") : null);
+        })();
         return iaDialog(Object.assign({}, {
           title: "飞书机器人",
-          sub: "依赖已就绪（v" + (deps.version || f.sdkVersion || "?") + "）；填 App ID / Secret / 接收人即可",
+          sub: "依赖已就绪（v" + (deps.version || f.sdkVersion || "?") + "）；只需填 App ID 与 App Secret",
           onClose: close,
           foot: [
             h("button", { type: "button", className: "dru-ia-btn is-primary", disabled: imPlatBusy !== "", onClick: function () { saveImPlatform("feishu", "test"); } },
@@ -6813,29 +6990,33 @@ window.__ModuleLoader__.load({
             } }, "测试")
           ]
         }, { children: [
-          // 官方文档固定放顶部（两个外链）
+          // 官方入口固定顶部（业主给的两个链接）
           h("div", { className: "dru-ia-hint" },
-            "官方文档：",
-            h("a", { className: "dru-ia-tier-link", href: FEISHU_DOCS.createApp, target: "_blank", rel: "noopener" }, "飞书怎么创建应用"),
+            "官方入口：",
+            h("a", { className: "dru-ia-tier-link", href: FEISHU_DOCS.createApp, target: "_blank", rel: "noopener" }, "创建企业自建应用"),
             " · ",
-            h("a", { className: "dru-ia-tier-link", href: FEISHU_DOCS.longConn, target: "_blank", rel: "noopener" }, "长连接事件订阅")),
-          // 8 步向导（折叠；默认收起，避免一屏文字堆砌）
+            h("a", { className: "dru-ia-tier-link", href: FEISHU_DOCS.cardBot, target: "_blank", rel: "noopener" }, "卡片交互机器人文档")),
+          // 主路径只有 3 件事；细步骤折叠（业主：别让用户读 8 步才敢动手）
           h("div", { className: "dru-ia-field" },
+            h("div", { className: "dru-ia-hint" }, "三步就能用："),
+            h("ol", { className: "dru-ia-steps" }, FEISHU_MAIN_STEPS.map(function (t, i) {
+              return h("li", { key: "m" + i }, t);
+            })),
             h("button", {
               type: "button", className: "dru-ia-disclose", "aria-expanded": imFeishuWizard ? "true" : "false",
               onClick: function () { setImFeishuWizard(!imFeishuWizard); }
-            }, "配置步骤（8 步）", druIcon(imFeishuWizard ? "left" : "right")),
+            }, "细步骤（机器人能力 / 权限 / 长连接 / 发布）", druIcon(imFeishuWizard ? "left" : "right")),
             imFeishuWizard
               ? h("div", null,
-                  h("ol", { className: "dru-ia-steps" }, FEISHU_STEPS.map(function (t, i) {
-                    return h("li", { key: String(i) }, t);
+                  h("ol", { className: "dru-ia-steps" }, FEISHU_DETAIL_STEPS.map(function (t, i) {
+                    return h("li", { key: "d" + i }, t);
                   })),
-                  // 顺序坑（必须写明）：事件配置保存时「长连接必须已在线」
                   h("div", { className: "dru-ia-state is-warn", role: "note" },
                     "顺序很重要：保存事件/回调配置时飞书的「长连接必须已在线」——",
-                    "所以请**先在第 8 步填凭据让插件连上**，再回飞书后台保存事件配置；顺序反了会保存失败。"))
+                    "请**先在上面填凭据点「保存并连接」让插件连上**，再回飞书后台保存事件配置；顺序反了会保存失败。"))
               : null),
-          h("div", { className: "dru-ia-state" }, druIcon("send"), f.hasSecret ? "已保存凭据（Secret 不回显）" : "还没有保存凭据"),
+          // 自动绑定状态行（不再让用户填接收人）
+          bindLine,
           iaField("App ID", "dru-fs-appid", h("input", {
             id: "dru-fs-appid", className: "dru-ia-input", type: "text", value: imFeishuAppId, autoComplete: "off", spellCheck: false,
             placeholder: "cli_xxxxxxxx", "aria-invalid": err.appId ? "true" : "false",
@@ -6847,19 +7028,6 @@ window.__ModuleLoader__.load({
             "aria-invalid": err.appSecret ? "true" : "false",
             onChange: function (e) { setImFeishuSecret(e.target.value); }
           }), err.appSecret || "", "只保存在本机；已保存的 Secret 永远不回显。"),
-          iaField("接收人（open_id 或 chat_id）", "dru-fs-recv", h("input", {
-            id: "dru-fs-recv", className: "dru-ia-input", type: "text", value: imFeishuRecv, autoComplete: "off", spellCheck: false,
-            placeholder: "ou_xxxxxxxx 或 oc_xxxxxxxx", "aria-invalid": err.receiveId ? "true" : "false",
-            onChange: function (e) { setImFeishuRecv(e.target.value); }
-          }), err.receiveId || ""),
-          iaField("接收对象类型", "dru-fs-rtype",
-            h("select", {
-              id: "dru-fs-rtype", className: "dru-ia-input", value: imFeishuType,
-              onChange: function (e) { setImFeishuType(e.target.value); }
-            },
-              h("option", { value: "open_id" }, "个人 open_id（ou_ 开头）"),
-              h("option", { value: "chat_id" }, "群 chat_id（oc_ 开头）")),
-            err.receiveIdType || "", "发给个人选 open_id；发到群选 chat_id。"),
           imPlatStateLine(st)
         ] }));
       }

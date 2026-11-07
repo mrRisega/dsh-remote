@@ -210,7 +210,11 @@ export function normalizeDingtalkConfig(raw) {
     enabled: src.enabled === true,
     clientId: str(src.clientId),
     clientSecret: typeof src.clientSecret === "string" ? src.clientSecret : "",
+    // robotCode **可选**（扫码一键创建机器人可能不返回 robot_code）：只影响 openapi 主动发送/卡片；
+    // 接收消息 + sessionWebhook 回复完全不需要它（capabilities 里会如实降级）。
     robotCode: str(src.robotCode),
+    // 凭据来源（插件扫码授权流程写入 "scan"，手工填默认 "manual"）——仅用于状态排障/面板展示
+    credentialSource: str(src.credentialSource).toLowerCase() === "scan" ? "scan" : "manual",
     replyMode,
     sessionWebhook: str(src.sessionWebhook),
     boundChatId: str(src.boundChatId),
@@ -239,7 +243,10 @@ export function readDingtalkConfig(relayDir) {
 
 /**
  * @param {{
- *   clientId: string, clientSecret: string, robotCode?: string,
+ *   clientId: string, clientSecret: string,
+ *   robotCode?: string,                 // 可选：只影响 openapi 主动发送/卡片；缺省时降级（接收+sessionWebhook 回复仍可用）
+ *   cardTemplateId?: string,            // 可选：卡片拍板模板（缺省 card 能力降级）
+ *   credentialSource?: "scan"|"manual", // 凭据来源（状态透出；扫码授权写入 scan）
  *   replyMode?: "sessionWebhook"|"openapi",
  *   gatewayUrl?: string,                 // 覆盖 open 端点（私有化/测试）
  *   tokenUrl?: string, o2oSendUrl?: string, groupSendUrl?: string,
@@ -260,6 +267,8 @@ export function createDingtalkBot(options = {}) {
   const clientId = String(options.clientId || "").trim();
   const clientSecret = typeof options.clientSecret === "string" ? options.clientSecret : "";
   const robotCode = String(options.robotCode || "").trim();
+  const cardTemplateId = String(options.cardTemplateId || "").trim();
+  const credentialSource = String(options.credentialSource || "").toLowerCase() === "scan" ? "scan" : "manual";
   const replyMode = String(options.replyMode || "sessionWebhook").toLowerCase() === "openapi" ? "openapi" : "sessionWebhook";
   const gatewayUrl = String(options.gatewayUrl || "").trim() || DINGTALK_OPEN_URL;
   const tokenUrl = String(options.tokenUrl || "").trim() || DINGTALK_TOKEN_URL;
@@ -316,6 +325,17 @@ export function createDingtalkBot(options = {}) {
     gated: 0
   };
   const membership = { tier: "", entitlements: null, checkedAt: 0, usage: { month: "", count: 0 } };
+
+  /**
+   * 能力降级表（写进状态，插件面板据此禁用按钮 + 提示去补配置）：
+   *   · openapi：主动发送需要 robotCode（扫码授权不一定返回 robot_code）→ 缺省 = false
+   *   · card：卡片拍板需要 robotCode + 卡片平台模板 ID → 缺一即 false
+   * ⚠️ 接收消息 / sessionWebhook 回复**不依赖**这两项，所以机器人仍可正常用（产品主链路不受影响）。
+   */
+  function capabilitiesNow() {
+    const openapi = Boolean(robotCode);
+    return { openapi, card: Boolean(openapi && cardTemplateId) };
+  }
 
   let ws = null;
   let stopped = true;
@@ -478,6 +498,10 @@ export function createDingtalkBot(options = {}) {
       connectedAt: Number(state.lastConnectedAt) || 0,
       openCount: Number(state.openCount) || 0,
       reconnectAttempts: Number(state.reconnectAttempts) || 0,
+      // 凭据来源 + 能力降级（robotCode 可选：缺省时只降级 openapi/卡片）
+      credentialSource,
+      robotCodeConfigured: Boolean(robotCode),
+      capabilities: capabilitiesNow(),
       // 会员 + 用量（与企微对齐）
       tier: tierNow(),
       caps: capsNow().slice(),
@@ -884,14 +908,23 @@ export function createDingtalkBot(options = {}) {
 
   /** 主动发消息（openapi 模式；标 UNVERIFIED：msgKey/msgParam 形状来自官方文档，未经真机核验）。 */
   async function sendOpenapi(text, { title } = {}) {
-    if (!state.authenticated) return { ok: false, reason: "not_connected" };
+    // ★ robotCode 可选：缺省时明确拒绝（不崩、不白打 token 请求），并说清"哪些能力不可用/怎么恢复"
+    if (!robotCode) {
+      return {
+        ok: false,
+        reason: "no_robot_code",
+        detail: "未配置 robotCode：openapi 主动发送与卡片拍板不可用（接收消息、sessionWebhook 回复不受影响）。"
+          + "请在插件「钉钉机器人」里补 robotCode，或改用 sessionWebhook 接收回复。",
+        capabilities: capabilitiesNow()
+      };
+    }
+    if (!state.authenticated) return { ok: false, reason: "not_connected", capabilities: capabilitiesNow() };
     const token = await getAccessToken();
-    if (!token) return { ok: false, reason: "no_access_token" };
+    if (!token) return { ok: false, reason: "no_access_token", capabilities: capabilitiesNow() };
     const formatted = formatForChannel(formatChannel, { title, text: text == null ? "" : String(text) });
     const msgParam = JSON.stringify({ title: truncateText(title || "DeepSeek Harness", 64), text: formatted });
     const isGroup = state.boundConversationId && state.boundChatId === state.boundConversationId;
-    const useRobot = robotCode || "";
-    if (!useRobot) return { ok: false, reason: "no_robot_code" };
+    const useRobot = robotCode;
     const url = isGroup ? groupSendUrl : o2oSendUrl;
     const body = isGroup
       ? { robotCode: useRobot, openConversationId: state.boundConversationId, msgKey: "sampleMarkdown", msgParam }
@@ -1094,6 +1127,10 @@ export function createDingtalkBot(options = {}) {
       openCount: Number(state.openCount) || 0,
       reconnectAttempts: Number(state.reconnectAttempts) || 0,
       nextRetryInMs: state.nextRetryInMs,
+      // 凭据来源 + 能力降级（robotCode 可选：缺省时只降级 openapi/卡片）
+      credentialSource,
+      robotCodeConfigured: Boolean(robotCode),
+      capabilities: capabilitiesNow(),
       subscriptions: subscriptions.map((s) => String(s.topic || "")).filter(Boolean),
       messages: state.messages,
       gated: state.gated,
@@ -1121,6 +1158,10 @@ export function createDingtalkBot(options = {}) {
       stopped = false;
       state.running = true;
       state.phase = "connecting";
+      if (!robotCode) {
+        log.info("未配置 robotCode：机器人仍可正常接收消息并用 sessionWebhook 回复；"
+          + "openapi 主动发送/卡片拍板降级为不可用（状态 capabilities 会如实标记）");
+      }
       writeStatus();
       ensureSubscriber();
       void connect().catch((e) => {
@@ -1199,7 +1240,7 @@ export function createDingtalkBotController(options = {}) {
   function digestOf(cfg) {
     if (!cfg) return "missing";
     const secretHash = cfg.clientSecret ? crypto.createHash("sha1").update(String(cfg.clientSecret)).digest("hex") : "";
-    return JSON.stringify([cfg.enabled, cfg.clientId || "", secretHash, cfg.robotCode || "", cfg.replyMode || "", cfg.sessionId || "", cfg.sessionTitle || "", cfg.allowFrom || [], notifyAllowed()]);
+    return JSON.stringify([cfg.enabled, cfg.clientId || "", secretHash, cfg.robotCode || "", cfg.cardTemplateId || "", cfg.credentialSource || "", cfg.replyMode || "", cfg.sessionId || "", cfg.sessionTitle || "", cfg.allowFrom || [], notifyAllowed()]);
   }
   function writeDisabledStatus(reason) {
     if (!relayDir) return;
@@ -1247,6 +1288,8 @@ export function createDingtalkBotController(options = {}) {
         clientId: cfg.clientId,
         clientSecret: cfg.clientSecret,
         robotCode: cfg.robotCode,
+        cardTemplateId: cfg.cardTemplateId,
+        credentialSource: cfg.credentialSource,
         replyMode: cfg.replyMode,
         gatewayUrl: cfg.streamUrl || undefined,
         relayDir,

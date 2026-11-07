@@ -100,6 +100,7 @@ function loadPlugin(opts = {}) {
   const requests = [];
   const clipboard = [];
   const depsCalls = [];
+  const dingAuthCalls = [];
   const depsInstalls = [];
   let unmounted = false;
 
@@ -195,6 +196,8 @@ function loadPlugin(opts = {}) {
   let imBotsPutReply = { status: 200, body: { ok: true, wecom: { enabled: true, botId: "aibdemo1234", hasSecret: true, url: "", targetChatId: "" }, status: { connected: false, authenticated: false, lastError: "" }, updatedAt: 0 } };
   let imBotsTestReply = { status: 200, body: { ok: true, connected: true, authenticated: true, lastError: "" } };
   let imDepsReply = { installed: false, phase: "idle", version: "", lastError: "" };
+  let dingAuthBeginReply = { status: 200, body: { ok: true, authId: "auth-1", url: "https://oapi.dingtalk.com/x?nonce=1", interval: 2, expiresIn: 120 } };
+  let dingAuthStatusReplies = [];
   const nextPoll = () => (pollReplies.length > 1 ? pollReplies.shift() : pollReplies[0]);
 
   const makeEl = () => ({
@@ -257,6 +260,15 @@ function loadPlugin(opts = {}) {
       if (path === "/dsh-remote/im-bots/test") {
         imBotsCalls.push({ method: "POST", body: options.body ? JSON.parse(options.body) : null });
         return response(imBotsTestReply.status, imBotsTestReply.body);
+      }
+      if (path === "/dsh-remote/im-dingtalk-auth/begin") {
+        dingAuthCalls.push({ kind: "begin", method: options.method || "POST" });
+        return response(dingAuthBeginReply.status, dingAuthBeginReply.body);
+      }
+      if (path.startsWith("/dsh-remote/im-dingtalk-auth/status")) {
+        dingAuthCalls.push({ kind: "status", path });
+        const next = dingAuthStatusReplies.length ? dingAuthStatusReplies.shift() : { status: "waiting" };
+        return response(200, next);
       }
       if (path === "/dsh-remote/im-deps") {
         depsCalls.push(Date.now());
@@ -334,6 +346,9 @@ function loadPlugin(opts = {}) {
     setImBotsPut(body, status = 200) { imBotsPutReply = { status, body }; },
     setImBotsTest(body, status = 200) { imBotsTestReply = { status, body }; },
     setImDeps(body) { imDepsReply = body; },
+    setDingAuthBegin(body, status = 200) { dingAuthBeginReply = { status, body }; },
+    setDingAuthStatus(list) { dingAuthStatusReplies = (list || []).slice(); },
+    dingAuthCalls() { return dingAuthCalls.slice(); },
     depsCalls() { return depsCalls.slice(); },
     depsInstalls() { return depsInstalls.slice(); },
     imBotsCalls() { return imBotsCalls.slice(); },
@@ -698,30 +713,108 @@ test("平台列表：企业微信 / 钉钉 / 飞书 / Webhook 都是真入口（
   assert.ok(!texts.some((t) => t.includes("飞书机器人") && t.includes("即将支持")), "飞书不再是即将支持");
 });
 
-test("钉钉配置页：Client ID / Client Secret / Robot Code + 保存并连接/测试；提交体字段锁死", async () => {
+test("钉钉主路径：扫码一键创建（begin→等待→轮询→自动成功）+ 顶部「不用去后台」说明；手动配置折叠", async () => {
   const plugin = loadPlugin();
   plugin.setImBotsGet({
     ok: true,
-    wecom: { enabled: false, botId: "", hasSecret: false, url: "", targetChatId: "", sessionId: "", sessionTitle: "" },
-    dingtalk: { enabled: false, clientId: "", hasSecret: false, robotCode: "" },
-    feishu: { enabled: false, appId: "", hasSecret: false, receiveId: "", receiveIdType: "open_id" },
-    status: { connected: false, sessions: [], activeSessionId: "", boundSessionId: "", dingtalk: {}, feishu: {}, deps: { feishu: { installed: false, phase: "idle" } } },
+    wecom: {}, feishu: {},
+    dingtalk: { enabled: false, clientId: "", hasSecret: false, robotCode: "", credentialSource: "" },
+    status: { dingtalk: { connected: false }, feishu: {}, deps: { feishu: { installed: false, phase: "idle" } } },
   });
+  plugin.setDingAuthStatus([{ status: "waiting" }, { status: "success", clientIdTail: "8899", credentialSource: "scan", hasSecret: true }]);
   let tree = await plugin.settle();
   openEntry(tree, "channel");
   tree = await plugin.settle();
   assert.ok(clickChannelRow(tree, "钉钉机器人"), "应能进钉钉配置页");
   tree = await plugin.settle();
-  const dlg = find(tree, (n) => String(n.props?.className || "").split(/\s+/).includes("dru-ia-dialog"));
+  let dlg = find(tree, (n) => String(n.props?.className || "").split(/\s+/).includes("dru-ia-dialog"));
   assert.ok(dlg, "钉钉配置页应打开");
-  for (const id of ["dru-ding-client", "dru-ding-secret", "dru-ding-robot"]) {
-    assert.ok(find(dlg, (n) => n.type === "input" && n.props?.id === id), "缺字段: " + id);
-  }
-  assert.ok(textOf(dlg).includes("AppKey") && textOf(dlg).includes("AppSecret") && textOf(dlg).includes("机器人编码"),
-    "说明要写清 Client ID/Secret = AppKey/AppSecret、Robot Code 是机器人编码");
-  assert.ok(btnWith(dlg, "保存并连接"), "要有「保存并连接」");
-  assert.ok(btnWith(dlg, "测试"), "要有「测试」");
+  // 主路径：一句说明 + 扫码按钮
+  assert.ok(textOf(dlg).includes("不用去开发者后台创建应用") || textOf(dlg).includes("不需要去开发者后台创建应用"),
+    "顶部要说明不需要去开发者后台创建应用");
+  const scanBtn = btnWith(dlg, "用钉钉扫码，一键创建机器人");
+  assert.ok(scanBtn, "主路径必须是一个「扫码一键创建」按钮");
+  // 手动配置默认折叠（不占主路径）
+  assert.equal(find(dlg, (n) => n.props?.id === "dru-ding-client"), undefined, "手动字段默认不应出现（折叠在高级里）");
 
+  // 点扫码 → begin
+  scanBtn.props.onClick();
+  await flush(); await flush();
+  tree = await plugin.settle(3);
+  assert.ok(plugin.dingAuthCalls().some((c) => c.kind === "begin"), "★ 点扫码必须 POST begin");
+  dlg = find(tree, (n) => String(n.props?.className || "").split(/\s+/).includes("dru-ia-dialog"));
+  assert.ok(textOf(dlg).includes("等待你在钉钉里确认"), "要显示等待确认中");
+  assert.ok(textOf(dlg).includes("用手机钉钉扫"), "没有二维码库时要提示用手机钉钉扫链接");
+  const link = find(dlg, (n) => n.type === "a" && String(n.props?.href || "").includes("oapi.dingtalk.com"));
+  assert.ok(link, "要给出可点击的授权链接");
+  assert.equal(link.props.target, "_blank");
+  assert.equal(link.props.rel, "noopener");
+  assert.ok(btnWith(dlg, "复制授权链接"), "要有复制授权链接按钮");
+
+  // 轮询：waiting → success（fake timers 推进 2 轮）
+  await plugin.advance(2100);
+  await flush(); await flush();
+  tree = await plugin.settle(3);
+  await plugin.advance(2100);
+  await flush(); await flush();
+  tree = await plugin.settle(4);
+  assert.ok(plugin.dingAuthCalls().filter((c) => c.kind === "status").length >= 1, "要轮询授权状态");
+  assert.ok(textOf(tree).includes("已创建机器人并建立连接"), "成功后要自动切到已连接状态");
+  assert.ok(textOf(tree).includes("8899"), "成功提示要带 Client ID 尾号");
+  dlg = find(tree, (n) => String(n.props?.className || "").split(/\s+/).includes("dru-ia-dialog"));
+  assert.ok(dlg, "成功后弹层仍开着（用户能直接看到结果/去钉钉试）");
+  assert.ok(!textOf(dlg).includes("等待你在钉钉里确认"), "成功后不再显示等待态");
+});
+
+test("钉钉手动模式：折叠展开后 7 步 + 三个坑 + 三字段；官方链接全部 target=_blank rel=noopener 且提交体字段锁死", async () => {
+  const plugin = loadPlugin();
+  plugin.setImBotsGet({
+    ok: true, wecom: {}, feishu: {},
+    dingtalk: { enabled: false, clientId: "", hasSecret: false, robotCode: "", credentialSource: "" },
+    status: { dingtalk: { connected: false, robotCodeConfigured: false }, feishu: {}, deps: { feishu: { installed: false, phase: "idle" } } },
+  });
+  let tree = await plugin.settle();
+  openEntry(tree, "channel");
+  tree = await plugin.settle();
+  clickChannelRow(tree, "钉钉机器人");
+  tree = await plugin.settle();
+  let dlg = find(tree, (n) => String(n.props?.className || "").split(/\s+/).includes("dru-ia-dialog"));
+  const toggle = find(dlg, (n) => n.type === "button" && (n.children || []).some((c) => typeof c === "string" && c.includes("高级：去开发者后台手动创建")));
+  assert.ok(toggle, "折叠标题应为「高级：去开发者后台手动创建（或手动填凭据）」");
+  assert.equal(toggle.props["aria-expanded"], "false", "手动配置默认收起");
+  toggle.props.onClick();
+  tree = await plugin.settle();
+  dlg = find(tree, (n) => String(n.props?.className || "").split(/\s+/).includes("dru-ia-dialog"));
+
+  // 7 步（第一步在「步骤」列表里）+ 三个坑
+  const steps = findAll(dlg, (n) => n.type === "li");
+  assert.ok(steps.length >= 7, "手动创建要有 7 步（列表项 " + steps.length + "）");
+  const allText = textOf(dlg);
+  for (const bit of ["登录开发者后台", "创建应用", "凭证与基础信息", "机器人配置", "Stream 模式", "Robot Code", "版本管理与发布"]) {
+    assert.ok(allText.includes(bit), "7 步缺内容: " + bit);
+  }
+  for (const pit of ["建错机器人", "只保存没发布", "模式选错/凭证脏"]) {
+    assert.ok(allText.includes(pit), "三个高频坑缺: " + pit);
+  }
+  // 官方链接：全部新窗口 + noopener
+  const links = findAll(dlg, (n) => n.type === "a");
+  const hrefs = links.map((a) => a.props.href);
+  for (const u of ["https://open.dingtalk.com/document/orgapp/create-an-application",
+    "https://open.dingtalk.com/document/orgapp/add-application-capabilities",
+    "https://open.dingtalk.com/document/orgapp/configure-the-robot-application",
+    "https://open.dingtalk.com/document/orgapp/faq-robot",
+    "https://open.dingtalk.com/document/orgapp/robot-receive-message"]) {
+    assert.ok(hrefs.includes(u), "缺官方链接: " + u);
+  }
+  for (const a of links) {
+    assert.equal(a.props.target, "_blank", "官方链接必须新窗口打开");
+    assert.equal(a.props.rel, "noopener");
+  }
+
+  // 三字段仍在（兜底手填）
+  for (const id of ["dru-ding-client", "dru-ding-secret", "dru-ding-robot"]) {
+    assert.ok(find(dlg, (n) => n.type === "input" && n.props?.id === id), "展开后缺字段: " + id);
+  }
   find(dlg, (n) => n.props?.id === "dru-ding-client").props.onChange({ target: { value: "ding-client-1" } });
   find(dlg, (n) => n.props?.id === "dru-ding-secret").props.onChange({ target: { value: "ding-secret-1" } });
   find(dlg, (n) => n.props?.id === "dru-ding-robot").props.onChange({ target: { value: "ding-robot-1" } });
@@ -730,12 +823,89 @@ test("钉钉配置页：Client ID / Client Secret / Robot Code + 保存并连接
   await flush(); await flush();
   const put = plugin.imBotsCalls().filter((c) => c.method === "PUT").pop();
   assert.ok(put, "应 PUT /dsh-remote/im-bots");
-  assert.equal(put.body.platform, "dingtalk", "提交体要带 platform=dingtalk");
+  assert.equal(put.body.platform, "dingtalk");
   assert.deepEqual(put.body.config, { clientId: "ding-client-1", clientSecret: "ding-secret-1", robotCode: "ding-robot-1" },
-    "★ 钉钉提交体字段必须锁死为 clientId/clientSecret/robotCode");
+    "★ 手动提交体字段锁死为 clientId/clientSecret/robotCode");
 });
 
-test("飞书：依赖未装 → 41MB 下载入口 + 「不下载也能用其它通道」；已装 → 表单/官方链接/8 步向导/顺序坑", async () => {
+test("钉钉顶部判断口诀 + Robot Code 缺失时「主动推送/卡片」置灰提示", async () => {
+  const plugin = loadPlugin();
+  plugin.setImBotsGet({
+    ok: true, wecom: {}, feishu: {},
+    dingtalk: { enabled: true, clientId: "ding-client-8899", hasSecret: true, robotCode: "", credentialSource: "scan" },
+    status: { dingtalk: { connected: true, robotCodeConfigured: false, capabilities: { openapi: true, card: true } }, feishu: {}, deps: { feishu: { installed: false } } },
+  });
+  let tree = await plugin.settle();
+  openEntry(tree, "channel");
+  tree = await plugin.settle();
+  clickChannelRow(tree, "钉钉机器人");
+  tree = await plugin.settle();
+  const dlg = find(tree, (n) => String(n.props?.className || "").split(/\s+/).includes("dru-ia-dialog"));
+  const t = textOf(dlg);
+  // 判断口诀（醒目）
+  assert.ok(t.includes("消息接收地址"), "顶部要有判断口诀");
+  assert.ok(t.includes("群 webhook 机器人"), "口诀要指出群 webhook 机器人不能长连接");
+  // 缺 Robot Code：两个能力置灰 + 提示
+  assert.ok(t.includes("补 Robot Code 可开启"), "缺 Robot Code 要提示「补 Robot Code 可开启」");
+  const disabled = findAll(dlg, (n) => String(n.props?.className || "").includes("is-disabled"));
+  assert.ok(disabled.length >= 2, "主动推送 / 卡片都应为置灰态，实际 " + disabled.length);
+  for (const row of disabled) assert.equal(row.props["aria-disabled"], "true", "置灰能力要 aria-disabled=true");
+});
+
+test("钉钉能力：Robot Code 已配置 → 能力可用（不再置灰/提示）", async () => {
+  const plugin = loadPlugin();
+  plugin.setImBotsGet({
+    ok: true, wecom: {}, feishu: {},
+    dingtalk: { enabled: true, clientId: "ding-client-8899", hasSecret: true, robotCode: "rc-1", credentialSource: "manual" },
+    status: { dingtalk: { connected: true, robotCodeConfigured: true, capabilities: { openapi: true, card: true } }, feishu: {}, deps: { feishu: { installed: false } } },
+  });
+  let tree = await plugin.settle();
+  openEntry(tree, "channel");
+  tree = await plugin.settle();
+  clickChannelRow(tree, "钉钉机器人");
+  tree = await plugin.settle();
+  const dlg = find(tree, (n) => String(n.props?.className || "").split(/\s+/).includes("dru-ia-dialog"));
+  assert.ok(!textOf(dlg).includes("补 Robot Code 可开启"), "已配置 Robot Code 就不该再提示补齐");
+  assert.equal(findAll(dlg, (n) => String(n.props?.className || "").includes("is-disabled")).length, 0, "能力不应置灰");
+  assert.ok(textOf(dlg).includes("来源：手动填写"), "来源显示手动填写");
+});
+
+test("钉钉扫码：begin 失败 → 人话 + 重试；已连接显示 clientId 尾号与来源（扫码/手动）", async () => {
+  // begin 失败
+  const p1 = loadPlugin();
+  p1.setImBotsGet({ ok: true, wecom: {}, feishu: {}, dingtalk: {}, status: { dingtalk: {}, feishu: {}, deps: { feishu: { installed: false } } } });
+  p1.setDingAuthBegin({ ok: false, code: "network_error", message: "网络不通：无法连接钉钉接口" }, 502);
+  let tree = await p1.settle();
+  openEntry(tree, "channel");
+  tree = await p1.settle();
+  clickChannelRow(tree, "钉钉机器人");
+  tree = await p1.settle();
+  btnWith(tree, "用钉钉扫码，一键创建机器人").props.onClick();
+  await flush(); await flush();
+  tree = await p1.settle(3);
+  assert.ok(textOf(tree).includes("发起授权失败"), "失败要给人话");
+  assert.ok(textOf(tree).includes("网络不通"), "保留后端原因");
+  assert.ok(btnWith(tree, "用钉钉扫码，一键创建机器人"), "失败后按钮仍可重试");
+
+  // 已连接：尾号 + 来源
+  const p2 = loadPlugin();
+  p2.setImBotsGet({
+    ok: true, wecom: {}, feishu: {},
+    dingtalk: { enabled: true, clientId: "ding-client-8899", hasSecret: true, robotCode: "rc", credentialSource: "scan" },
+    status: { dingtalk: { connected: true }, feishu: {}, deps: { feishu: { installed: false } } },
+  });
+  tree = await p2.settle();
+  openEntry(tree, "channel");
+  tree = await p2.settle();
+  clickChannelRow(tree, "钉钉机器人");
+  tree = await p2.settle();
+  const t = textOf(tree);
+  assert.ok(t.includes("已连接"), "已连接状态要显示");
+  assert.ok(t.includes("8899"), "要显示 Client ID 尾号");
+  assert.ok(t.includes("来源：扫码创建"), "要显示凭据来源（扫码）");
+});
+
+test("飞书：依赖未装 → 41MB 下载入口；已装 → 只有 App ID/Secret 两个字段（不再让用户填接收人）", async () => {
   // 未装依赖
   const p1 = loadPlugin();
   p1.setImDeps({ installed: false, phase: "idle", version: "", lastError: "" });
@@ -758,13 +928,13 @@ test("飞书：依赖未装 → 41MB 下载入口 + 「不下载也能用其它�
   assert.ok(p1.requests.some((r) => r.path === "/dsh-remote/im-deps/feishu" && r.method === "POST"),
     "点下载必须 POST /dsh-remote/im-deps/feishu");
 
-  // 已装依赖
+  // 已装依赖：只有两个字段
   const p2 = loadPlugin();
   p2.setImDeps({ installed: true, phase: "done", version: "1.40.0", lastError: "" });
   p2.setImBotsGet({
     ok: true, wecom: {}, dingtalk: {},
-    feishu: { enabled: false, appId: "", hasSecret: false, receiveId: "", receiveIdType: "open_id" },
-    status: { deps: { feishu: { installed: true, phase: "done", version: "1.40.0", lastError: "" } } },
+    feishu: { enabled: false, appId: "", hasSecret: false },
+    status: { feishu: { connected: false, boundChatId: "" }, deps: { feishu: { installed: true, phase: "done", version: "1.40.0", lastError: "" } } },
   });
   tree = await p2.settle();
   openEntry(tree, "channel");
@@ -774,26 +944,81 @@ test("飞书：依赖未装 → 41MB 下载入口 + 「不下载也能用其它�
   let dlg = find(tree, (n) => String(n.props?.className || "").split(/\s+/).includes("dru-ia-dialog"));
   assert.ok(dlg, "已装依赖应打开飞书配置页");
   assert.ok(textOf(dlg).includes("1.40.0"), "应显示依赖版本");
-  for (const id of ["dru-fs-appid", "dru-fs-secret", "dru-fs-recv", "dru-fs-rtype"]) {
-    assert.ok(find(dlg, (n) => (n.type === "input" || n.type === "select") && n.props?.id === id), "缺字段: " + id);
-  }
+  assert.ok(find(dlg, (n) => n.props?.id === "dru-fs-appid"), "要有 App ID");
+  assert.ok(find(dlg, (n) => n.props?.id === "dru-fs-secret"), "要有 App Secret");
+  // ★ 业主重点：接收人/接收类型不再出现（用户不知道怎么获取，默认自动发现）
+  assert.equal(find(dlg, (n) => n.props?.id === "dru-fs-recv"), undefined, "不得再出现「接收人」输入框");
+  assert.equal(find(dlg, (n) => n.props?.id === "dru-fs-rtype"), undefined, "不得再出现「接收类型」选择");
+  const inputs = findAll(dlg, (n) => n.type === "input");
+  assert.equal(inputs.length, 2, "飞书配置页只能有两个输入框（App ID / App Secret），实际 " + inputs.length);
+  assert.ok(textOf(dlg).includes("不需要操作") || textOf(dlg).includes("自动绑定"),
+    "未绑定时要说明「连接后自动绑定，不需要操作」");
+
+  // 两个官方链接（业主给的地址），target=_blank rel=noopener
   const links = findAll(dlg, (n) => n.type === "a");
-  assert.equal(links.length, 2, "配置页顶部要有两个官方文档外链，实际 " + links.length);
+  assert.equal(links.length, 2, "配置页顶部要有两个官方外链，实际 " + links.length);
+  const hrefs = links.map((a) => a.props.href);
+  assert.ok(hrefs.includes("https://open.feishu.cn/app?lang=zh-CN"), "必须有「创建企业自建应用」链接");
+  assert.ok(hrefs.includes("https://open.feishu.cn/document/uAjLw4CM/ukzMukzMukzM/feishu-cards/quick-start/develop-a-card-interactive-bot"),
+    "必须有卡片交互机器人文档链接");
   for (const a of links) {
     assert.equal(a.props.target, "_blank");
     assert.equal(a.props.rel, "noopener");
-    assert.match(String(a.props.href), /^https:\/\/open\.feishu\.cn\//, "外链必须是飞书官方文档");
   }
-  const wizard = find(dlg, (n) => n.type === "button" && (n.children || []).some((c) => typeof c === "string" && c.includes("配置步骤（8 步）")));
-  assert.ok(wizard, "要有 8 步配置向导（可折叠）");
-  assert.equal(wizard.props["aria-expanded"], "false", "默认收起，避免文字堆砌");
-  wizard.props.onClick();
+
+  // 3 步主路径 + 细步骤折叠（不再一上来就 8 步）
+  const mainSteps = findAll(dlg, (n) => n.type === "li");
+  assert.equal(mainSteps.length, 3, "主路径只有 3 步，实际 " + mainSteps.length);
+  const toggle = find(dlg, (n) => n.type === "button" && (n.children || []).some((c) => typeof c === "string" && c.includes("细步骤")));
+  assert.ok(toggle, "要有「细步骤」折叠入口");
+  assert.equal(toggle.props["aria-expanded"], "false", "细步骤默认收起");
+  toggle.props.onClick();
   tree = await p2.settle();
   dlg = find(tree, (n) => String(n.props?.className || "").split(/\s+/).includes("dru-ia-dialog"));
-  const steps = findAll(dlg, (n) => n.type === "li");
-  assert.equal(steps.length, 8, "向导必须正好 8 步，实际 " + steps.length);
-  assert.ok(textOf(dlg).includes("长连接必须已在线"), "必须写明顺序坑：保存事件配置时长连接必须已在线");
-  assert.ok(textOf(dlg).includes("先在第 8 步填凭据"), "必须写明正确顺序：先填凭据连上，再去后台保存事件配置");
+  const allSteps = findAll(dlg, (n) => n.type === "li");
+  assert.equal(allSteps.length, 3 + 5, "展开后 3 条主路径 + 5 条细步骤，实际 " + allSteps.length);
+  assert.ok(textOf(dlg).includes("长连接必须已在线"), "顺序坑必须保留");
+  assert.ok(textOf(dlg).includes("先在上面填凭据"), "必须写明正确顺序：先填凭据连上，再去后台保存事件配置");
+});
+
+test("飞书：自动绑定状态行两态（未绑定提示自动发现 / 已绑定显示群名或私聊）", async () => {
+  // 已绑定私聊
+  const p1 = loadPlugin();
+  p1.setImDeps({ installed: true, phase: "done", version: "1.40.0", lastError: "" });
+  p1.setImBotsGet({
+    ok: true, wecom: {}, dingtalk: {},
+    feishu: { enabled: true, appId: "cli_1", hasSecret: true },
+    status: {
+      feishu: { connected: true, boundChatId: "ou_user_1", boundChatType: "p2p", receiveIdSource: "auto" },
+      deps: { feishu: { installed: true, phase: "done", version: "1.40.0", lastError: "" } },
+    },
+  });
+  let tree = await p1.settle();
+  openEntry(tree, "channel");
+  tree = await p1.settle();
+  clickChannelRow(tree, "飞书机器人");
+  tree = await p1.settle();
+  assert.ok(textOf(tree).includes("已自动绑定：私聊"), "已绑定私聊要显示「已自动绑定：私聊」");
+
+  // 已绑定群
+  const p2 = loadPlugin();
+  p2.setImDeps({ installed: true, phase: "done", version: "1.40.0", lastError: "" });
+  p2.setImBotsGet({
+    ok: true, wecom: {}, dingtalk: {},
+    feishu: { enabled: true, appId: "cli_1", hasSecret: true },
+    status: {
+      feishu: { connected: true, boundChatId: "oc_group_abcdef", boundChatType: "group", receiveIdSource: "auto" },
+      deps: { feishu: { installed: true, phase: "done", version: "1.40.0", lastError: "" } },
+    },
+  });
+  tree = await p2.settle();
+  openEntry(tree, "channel");
+  tree = await p2.settle();
+  clickChannelRow(tree, "飞书机器人");
+  tree = await p2.settle();
+  const t = textOf(tree);
+  assert.ok(t.includes("已自动绑定：群"), "已绑定群要显示「已自动绑定：群…」");
+  assert.ok(t.includes("无需配置"), "自动绑定要说明是自动发现、无需配置");
 });
 
 test("飞书依赖：失败状态可重试，失败原因人话展示", async () => {
@@ -815,13 +1040,13 @@ test("飞书依赖：失败状态可重试，失败原因人话展示", async ()
   assert.ok(plugin.requests.some((r) => r.path === "/dsh-remote/im-deps/feishu" && r.method === "POST"), "重试必须再次触发安装");
 });
 
-test("飞书表单提交体：appId/appSecret/receiveId/receiveIdType；secret 不回显", async () => {
+test("飞书表单提交体：只提交 appId/appSecret（不含接收人）；secret 不回显", async () => {
   const plugin = loadPlugin();
   plugin.setImDeps({ installed: true, phase: "done", version: "1.40.0", lastError: "" });
   plugin.setImBotsGet({
     ok: true, wecom: {}, dingtalk: {},
-    feishu: { enabled: true, appId: "cli_old", hasSecret: true, receiveId: "ou_old", receiveIdType: "open_id" },
-    status: { deps: { feishu: { installed: true, phase: "done", version: "1.40.0", lastError: "" } } },
+    feishu: { enabled: true, appId: "cli_old", hasSecret: true },
+    status: { feishu: { connected: true, boundChatId: "oc_g" }, deps: { feishu: { installed: true, phase: "done", version: "1.40.0", lastError: "" } } },
   });
   let tree = await plugin.settle();
   openEntry(tree, "channel");
@@ -834,110 +1059,14 @@ test("飞书表单提交体：appId/appSecret/receiveId/receiveIdType；secret �
   assert.equal(sec.props.value, "", "★ 已保存的 Secret 绝不能回显到输入框");
   assert.ok(String(sec.props.placeholder || "").includes("已保存"), "要提示「已保存（留空表示不修改）」");
   find(dlg, (n) => n.props?.id === "dru-fs-appid").props.onChange({ target: { value: "cli_new" } });
-  find(dlg, (n) => n.props?.id === "dru-fs-recv").props.onChange({ target: { value: "oc_chat_1" } });
-  find(dlg, (n) => n.props?.id === "dru-fs-rtype").props.onChange({ target: { value: "chat_id" } });
   tree = await plugin.settle();
   btnWith(tree, "仅保存").props.onClick();
   await flush(); await flush();
   const put = plugin.imBotsCalls().filter((c) => c.method === "PUT").pop();
   assert.ok(put, "应 PUT /dsh-remote/im-bots");
   assert.equal(put.body.platform, "feishu");
-  assert.deepEqual(put.body.config, { appId: "cli_new", appSecret: "", receiveId: "oc_chat_1", receiveIdType: "chat_id" },
-    "★ 飞书提交体字段锁死；空 secret = 不修改（不覆盖已保存的）");
-});
-
-// ───────────────────── ⑦ 配置页收口：说明折叠 + 统一字段结构 ─────────────────────
-
-test("配置页收口：说明默认折叠（「为什么要填这些」），四个字段统一 dru-ia-field 结构", async () => {
-  const plugin = loadPlugin();
-  const tree = await openWecom(plugin);
-  // 折叠：默认看不到服务地址字段
-  assert.equal(find(tree, (n) => n.props?.id === "dru-wecom-url"), undefined, "高级项默认折叠（不在主表单里）");
-  const disclose = find(tree, (n) => n.type === "button" && (n.children || []).some((c) => typeof c === "string" && c.includes("为什么要填这些")));
-  assert.ok(disclose, "必须有「为什么要填这些」折叠按钮");
-  assert.equal(disclose.props["aria-expanded"], "false");
-  disclose.props.onClick();
-  const tree2 = await plugin.settle();
-  assert.ok(find(tree2, (n) => n.props?.id === "dru-wecom-url"), "展开后才出现高级字段");
-  // 四个字段（会话 / Bot ID / Secret / 接收会话 ID）都在 .dru-ia-field 里，label 可见
-  const fields = byClass(tree2, "dru-ia-field");
-  assert.ok(fields.length >= 4, "字段必须用统一 dru-ia-field 结构（实际 " + fields.length + "）");
-  for (const id of ["dru-wecom-session", "dru-wecom-bot", "dru-wecom-secret", "dru-wecom-chat"]) {
-    const ctl = find(tree2, (n) => (n.type === "input" || n.type === "select") && n.props?.id === id);
-    assert.ok(ctl, "缺字段控件: " + id);
-    const label = find(tree2, (n) => n.type === "label" && n.props?.htmlFor === id);
-    assert.ok(label, "每个字段必须有可见 label: " + id);
-  }
-});
-
-// ───────────────────── ⑧ 发送预览卡片（task-25 尾，桥侧已就绪） ─────────────────────
-
-test("发送预览卡片：次要按钮在「测试」旁边；点击 PUT 带 previewCardAt 且不丢 botId/sessionId/targetChatId", async () => {
-  const plugin = loadPlugin();
-  plugin.setImBotsGet({
-    ok: true,
-    wecom: { enabled: true, botId: "aibdemo1234", hasSecret: true, url: "", targetChatId: "chat-9", sessionId: "", sessionTitle: "" },
-    status: {
-      connected: true, authenticated: true, lastError: "", boundChatId: "chat-9",
-      sessions: [{ id: "sess-1-abcdef123456", title: "修复登录问题", updatedAt: 1 }],
-      activeSessionId: "sess-1-abcdef123456", activeSessionTitle: "修复登录问题", boundSessionId: "",
-    },
-  });
-  let tree = await openWecom(plugin);
-  const previewBtn = btnWith(tree, "发送预览卡片");
-  assert.ok(previewBtn, "配置页必须有次要按钮「发送预览卡片」");
-  // 次要按钮：不是 primary（不抢主操作）、与「测试」同组摆在底部
-  assert.ok(!String(previewBtn.props.className || "").includes("is-primary"), "「发送预览卡片」不能是主按钮");
-  assert.ok(btnWith(tree, "测试"), "「测试」按钮仍在（两者并列）");
-
-  // 先选一个会话，验证预览请求会带上会话绑定
-  const sel = find(tree, (n) => n.type === "select" && n.props?.id === "dru-wecom-session");
-  sel.props.onChange({ target: { value: "sess-1-abcdef123456" } });
-  tree = await plugin.settle();
-
-  const before = Date.now();
-  btnWith(tree, "发送预览卡片").props.onClick();
-  await flush(); await flush();
-  tree = await plugin.settle();
-
-  const sent = plugin.imBotsCalls().filter((c) => c.method === "PUT").pop();
-  assert.ok(sent, "★ 点击必须 PUT /dsh-remote/im-bots（桥监听 previewCardAt）");
-  assert.equal(typeof sent.body.wecom.previewCardAt, "number", "previewCardAt 必须是数字（ms 时间戳）");
-  assert.ok(sent.body.wecom.previewCardAt >= before, "previewCardAt 应是本次点击的时间戳（值变大才会触发）");
-  assert.equal(sent.body.wecom.botId, "aibdemo1234", "★ 不丢 Bot ID（覆盖写不许冲掉）");
-  assert.equal(sent.body.wecom.targetChatId, "chat-9", "★ 不丢接收会话 ID");
-  assert.equal(sent.body.wecom.sessionId, "sess-1-abcdef123456", "★ 不丢会话绑定");
-  assert.equal(sent.body.wecom.sessionTitle, "修复登录问题");
-  assert.ok(!("secret" in sent.body.wecom), "空 Secret 不提交（= 保留已保存的）");
-  // 成功状态行
-  assert.ok(textOf(tree).includes("已发送预览卡片，去企业微信看看"), "发送成功要有状态行");
-});
-
-test("发送预览卡片：没有接收方（boundChatId 与 targetChatId 都空）→ 行内提示，但仍允许点击", async () => {
-  const plugin = loadPlugin();
-  plugin.setImBotsGet({
-    ok: true,
-    wecom: { enabled: true, botId: "aibdemo1234", hasSecret: true, url: "", targetChatId: "", sessionId: "", sessionTitle: "" },
-    status: { connected: true, authenticated: true, lastError: "", boundChatId: "", sessions: [], activeSessionId: "", boundSessionId: "" },
-  });
-  const tree = await openWecom(plugin);
-  assert.ok(textOf(tree).includes("先在企微里给机器人发一句话完成绑定"), "未绑定给机器人时要有行内提示");
-  const btn = btnWith(tree, "发送预览卡片");
-  assert.ok(btn, "按钮必须存在");
-  assert.notEqual(btn.props.disabled, true, "★ 仍允许点击（桥会记日志跳过，不拦用户）");
-});
-
-test("发送预览卡片：已绑定（boundChatId 非空）→ 不显示未绑定提示；有 lastPreviewCardAt → 显示「上次预览：HH:MM」", async () => {
-  const plugin = loadPlugin();
-  const ts = new Date(2026, 0, 2, 9, 7, 0).getTime();
-  plugin.setImBotsGet({
-    ok: true,
-    wecom: { enabled: true, botId: "aibdemo1234", hasSecret: true, url: "", targetChatId: "", sessionId: "", sessionTitle: "" },
-    status: { connected: true, authenticated: true, lastError: "", boundChatId: "chat-9", lastPreviewCardAt: ts, sessions: [], activeSessionId: "", boundSessionId: "" },
-  });
-  const tree = await openWecom(plugin);
-  assert.ok(!textOf(tree).includes("先在企微里给机器人发一句话完成绑定"), "已绑定就不该再提示未绑定");
-  assert.ok(textOf(tree).includes("上次预览：09:07"), "应显示上次预览时间（HH:MM）");
+  assert.deepEqual(put.body.config, { appId: "cli_new", appSecret: "" },
+    "★ 飞书提交体只有两个凭据字段（接收人由桥自动发现；空 secret = 不修改）");
 });
 
 // ───────────── ⑨ 未登录守卫 + 后台服务横排 + 卸载挽留（2026-11-07 业主逐条）─────────────

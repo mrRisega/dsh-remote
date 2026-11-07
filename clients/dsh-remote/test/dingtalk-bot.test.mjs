@@ -266,6 +266,10 @@ test("协议纯函数：open 请求体 / ACK（JSON 字符串 data）/ ping ACK 
   const cfg = normalizeDingtalkConfig({ enabled: true, clientId: " a ", clientSecret: "s", replyMode: "OPENAPI", allowFrom: ["u1", "u2"] });
   assert.equal(cfg.clientId, "a");
   assert.equal(cfg.replyMode, "openapi");
+  assert.equal(cfg.credentialSource, "manual", "默认凭据来源 = manual");
+  assert.equal(normalizeDingtalkConfig({ credentialSource: "scan" }).credentialSource, "scan", "扫码授权写入 scan");
+  assert.equal(normalizeDingtalkConfig({ credentialSource: "SCAN" }).credentialSource, "scan");
+  assert.equal(normalizeDingtalkConfig({ credentialSource: "weird" }).credentialSource, "manual", "非法值回 manual");
   assert.deepEqual(cfg.allowFrom, ["u1", "u2"]);
   // 缺省/非法值不抛
   assert.equal(normalizeDingtalkConfig(null).enabled, false);
@@ -519,10 +523,16 @@ test("controller：未启用不建连；启用后按配置起 bot（注入 subsc
     // 改成启用 + 本地网关（streamUrl 覆盖）→ 热更新后连上
     fs.writeFileSync(path.join(relayDir, IM_BOTS_FILE), JSON.stringify({
       version: 1,
-      dingtalk: { enabled: true, clientId: FAKE_CLIENT, clientSecret: FAKE_SECRET, robotCode: "rk", streamUrl: gateway.openUrl }
+      dingtalk: {
+        enabled: true, clientId: FAKE_CLIENT, clientSecret: FAKE_SECRET,
+        robotCode: "rk", cardTemplateId: "card-tpl-9", credentialSource: "scan", streamUrl: gateway.openUrl
+      }
     }), { mode: 0o600 });
     await waitFor(() => controller.status().enabled === true, { label: "控制器启用（热更新）", timeout: 4000 });
     await waitFor(() => gateway.state.opens.length >= 1, { label: "按配置建连", timeout: 4000 });
+    const botStatus = controller.status().bot;
+    assert.equal(botStatus.credentialSource, "scan", "controller 要把 credentialSource 透传给 bot");
+    assert.deepEqual(botStatus.capabilities, { openapi: true, card: true }, "controller 要把 cardTemplateId 透传给 bot");
     await controller.stop();
     assert.equal(controller.status().enabled, false);
     assert.equal(controller.status().reason, "stopped");
@@ -542,6 +552,76 @@ test("controller：DSH_IM_BOTS=0 全关（env 优先）", async () => {
 });
 
 // ─────────────────────────── 常量/默认值 ───────────────────────────
+
+// ─────────────────── robotCode 可选（扫码一键创建机器人，2026-11-08） ───────────────────
+
+test("★ robotCode 可选：只给 clientId/clientSecret 也能启动、收/回消息；状态 capabilities 如实降级", async () => {
+  const rt = await setupBot({ bot: { robotCode: "" } });
+  try {
+    await rt.start();
+    const st = rt.bot.status();
+    assert.equal(st.connected, true, "★ 没有 robotCode 也必须能连上");
+    assert.equal(st.robotCodeConfigured, false);
+    assert.deepEqual(st.capabilities, { openapi: false, card: false }, "★ robotCode 缺省 → openapi/card 降级");
+    // 收消息 + sessionWebhook 回复（主链路完全不依赖 robotCode）
+    await rt.inbound({ text: "扫码创建的机器人也能用", msgId: "norobot-1" });
+    await waitFor(() => rt.sub.calls.prompt.length === 1, { label: "入站转发" });
+    const call = await waitFor(() => rt.hook.state.calls[0], { label: "sessionWebhook 回复" });
+    assert.match(call.body.markdown.text, /已转给桌面端会话/);
+    // 状态文件也标记降级 + 凭据来源
+    const d = JSON.parse(fs.readFileSync(path.join(rt.relayDir, IM_BOT_STATUS_FILE), "utf8")).dingtalk;
+    assert.deepEqual(d.capabilities, { openapi: false, card: false });
+    assert.equal(d.robotCodeConfigured, false);
+    assert.equal(d.credentialSource, "manual");
+  } finally { await rt.close(); }
+});
+
+test("★ openapi 模式缺 robotCode：给明确错误、不崩、不白打 token 请求；接收消息照常", async () => {
+  const fetchUrls = [];
+  const trackedFetch = (url, init) => { fetchUrls.push(String(url)); return fetch(url, init); };
+  const rt = await setupBot({ bot: { robotCode: "", replyMode: "openapi", fetchImpl: trackedFetch } });
+  try {
+    await rt.start();
+    // 主动发送：明确拒绝，带 detail 与 capabilities（不是抛异常/静默失败）
+    const r = await rt.bot.sendMarkdown("主动推送试试");
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, "no_robot_code");
+    assert.match(String(r.detail || ""), /robotCode/);
+    assert.match(String(r.detail || ""), /接收消息|sessionWebhook/, "要说清主链路不受影响");
+    assert.deepEqual(r.capabilities, { openapi: false, card: false });
+    assert.ok(!fetchUrls.some((u) => u.includes("/oauth2/accessToken")), "★ 缺 robotCode 时不得白打一次 token 请求");
+    // 接收消息照常：openapi 回复失败但入站照常转给 DSH（不崩）
+    await rt.inbound({ text: "openapi 缺 robotCode 时的入站", msgId: "norobot-2" });
+    await waitFor(() => rt.sub.calls.prompt.length === 1, { label: "入站转发" });
+    assert.equal(rt.bot.status().capabilities.openapi, false);
+    assert.equal(rt.bot.status().connected, true, "连接不受能力降级影响");
+  } finally { await rt.close(); }
+});
+
+test("★ capabilities 组合：robotCode 决定 openapi；card 还需 cardTemplateId；credentialSource 透出", async () => {
+  // ① 有 robotCode、无卡片模板 → openapi 可用、card 不可用
+  {
+    const rt = await setupBot({ bot: { robotCode: "ding-robot", credentialSource: "scan" } });
+    try {
+      await rt.start();
+      assert.deepEqual(rt.bot.status().capabilities, { openapi: true, card: false });
+      assert.equal(rt.bot.status().credentialSource, "scan", "扫码授权的来源要透出");
+      const d = JSON.parse(fs.readFileSync(path.join(rt.relayDir, IM_BOT_STATUS_FILE), "utf8")).dingtalk;
+      assert.deepEqual(d.capabilities, { openapi: true, card: false });
+      assert.equal(d.credentialSource, "scan");
+    } finally { await rt.close(); }
+  }
+  // ② robotCode + cardTemplateId → 两项都可用
+  {
+    const rt = await setupBot({ bot: { robotCode: "ding-robot", cardTemplateId: "card-tpl-1" } });
+    try {
+      await rt.start();
+      assert.deepEqual(rt.bot.status().capabilities, { openapi: true, card: true });
+      const d = JSON.parse(fs.readFileSync(path.join(rt.relayDir, IM_BOT_STATUS_FILE), "utf8")).dingtalk;
+      assert.deepEqual(d.capabilities, { openapi: true, card: true });
+    } finally { await rt.close(); }
+  }
+});
 
 test("常量：默认 open 端点 / ticket 90s / 退避 1s→60s", () => {
   assert.equal(DINGTALK_OPEN_URL, "https://api.dingtalk.com/v1.0/gateway/connections/open");

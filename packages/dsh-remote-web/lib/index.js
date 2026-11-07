@@ -7787,6 +7787,7 @@ function imBotsView(relayDir) {
       allowFrom: dingtalkCfgOf(bots).allowFrom,
       cardTemplateId: dingtalkCfgOf(bots).cardTemplateId,
       streamUrl: dingtalkCfgOf(bots).streamUrl,
+      credentialSource: dingtalkCfgOf(bots).credentialSource,
     },
     feishu: {
       enabled: feishuCfgOf(bots).enabled,
@@ -7924,6 +7925,8 @@ function dingtalkCfgOf(bots) {
     allowFrom: strListOf(d.allowFrom),
     cardTemplateId: strOf(d.cardTemplateId),
     streamUrl: strOf(d.streamUrl),
+    // 凭据来源：scan=扫码一键创建；manual=用户手填（2026-11-08 面板显示用，非敏感）
+    credentialSource: strOf(d.credentialSource),
   };
 }
 
@@ -7961,6 +7964,18 @@ function imPlatformStatusOf(status, platform) {
     authenticated: !!p.authenticated,
     lastError: strOf(p.lastError).slice(0, 500),
     boundChatId: strOf(p.boundChatId),
+    // 飞书"接收群/私聊自动发现"（2026-11-08 业主：用户不需要填接收人）——
+    // boundChatType：p2p/group；receiveIdSource：auto/manual/config（桥侧口径，只透传字符串）
+    boundChatType: strOf(p.boundChatType).slice(0, 40),
+    receiveIdSource: strOf(p.receiveIdSource).slice(0, 40),
+    // 钉钉能力位（2026-11-08 桥侧新增）：凭据来源 / 是否已配置 Robot Code / 能力开关。
+    // 面板据 robotCodeConfigured 把「主动推送/卡片」置灰（缺 Robot Code 时能力不可用）。
+    credentialSource: strOf(p.credentialSource).slice(0, 20),
+    robotCodeConfigured: !!p.robotCodeConfigured,
+    capabilities: (() => {
+      const c = p.capabilities && typeof p.capabilities === "object" ? p.capabilities : null;
+      return c ? { openapi: !!c.openapi, card: !!c.card } : null;
+    })(),
     tier: (t === "free" || t === "pro" || t === "pro_max") ? t : "",
     caps: strListOf(p.caps).map((x) => x.slice(0, 80)),
     capsCount: numOf(p.capsCount),
@@ -8080,6 +8095,145 @@ function startFeishuInstall(relayDir, opts = {}) {
   return { ok: true, started: true, taskId, deps: { feishu: feishuDepsInfo(relayDir) } };
 }
 
+// ── 钉钉「扫码一键创建机器人」（2026-11-08，官方 connector 同款 device-flow）─────────────
+// 流程（服务端代跑，device_code 只存内存、不下发浏览器）：
+//   POST .../app/registration/init  {source:"DING_DWS_CLAW"} → {nonce}
+//   POST .../app/registration/begin {nonce}                 → {device_code, verification_uri_complete, interval, expires_in}
+//   POST .../app/registration/poll  {device_code}           → {status:"WAITING"|"SUCCESS", client_id, client_secret}
+// 安全：浏览器只拿 authId + 授权链接；clientSecret 只在 success 时直接写进 0600 的 im-bots.json，绝不回显。
+const DINGTALK_REG_BASE = "https://oapi.dingtalk.com/app/registration";
+const DINGTALK_AUTH_TTL_MS = 2 * 60 * 1000;        // 面板最长轮询 2 分钟
+const dingtalkAuthSessions = new Map();            // authId → {relayDir, deviceCode, url, interval, createdAt, expiresAt}
+const dingtalkAuthSuperseded = new Map();          // 被新授权作废的 authId → at（查询时回 cancelled）
+
+function jsonPostForAuth(fetchImpl, url, payload) {
+  return fetchImpl(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload || {}),
+    signal: AbortSignal.timeout(8000),
+  }).then(async (r) => {
+    let body = null;
+    try { body = await r.json(); } catch { body = null; }
+    return { ok: !!r.ok, status: r.status, body: body || {} };
+  });
+}
+
+/**
+ * 开始一次钉钉扫码授权（POST /dsh-remote/im-dingtalk-auth/begin）。
+ * 同一 relayDir 同时只保留一个会话：begin 时把旧的作废（旧 authId 后续 poll 只会得到 expired）。
+ */
+async function beginDingtalkAuth(relayDir, opts = {}) {
+  const fetchImpl = typeof opts.imAuthFetch === "function" ? opts.imAuthFetch : fetch;
+  // 作废旧会话（同一时间只允许一个进行中的授权；旧 authId 后续查询回 cancelled）
+  for (const [id, sess] of dingtalkAuthSessions) {
+    if (sess.relayDir === relayDir) {
+      dingtalkAuthSessions.delete(id);
+      dingtalkAuthSuperseded.set(id, Date.now());
+    }
+  }
+  // 有界：只留最近 20 个作废标记，避免长期运行内存增长
+  while (dingtalkAuthSuperseded.size > 20) {
+    const first = dingtalkAuthSuperseded.keys().next().value;
+    dingtalkAuthSuperseded.delete(first);
+  }
+  let init;
+  try {
+    init = await jsonPostForAuth(fetchImpl, `${DINGTALK_REG_BASE}/init`, { source: "DING_DWS_CLAW" });
+  } catch (e) {
+    return { ok: false, code: "network_error", message: `网络不通：无法连接钉钉接口（${e?.message || e}）` };
+  }
+  const nonce = init.ok && init.body && typeof init.body.nonce === "string" ? init.body.nonce : "";
+  if (!nonce) {
+    return { ok: false, code: "dingtalk_api_rejected", message: "钉钉接口拒绝了初始化请求（请稍后重试）" };
+  }
+  let begin;
+  try {
+    begin = await jsonPostForAuth(fetchImpl, `${DINGTALK_REG_BASE}/begin`, { nonce });
+  } catch (e) {
+    return { ok: false, code: "network_error", message: `网络不通：无法连接钉钉接口（${e?.message || e}）` };
+  }
+  const b = begin.body || {};
+  const deviceCode = typeof b.device_code === "string" ? b.device_code : "";
+  const url = typeof b.verification_uri_complete === "string" ? b.verification_uri_complete : "";
+  if (!begin.ok || !deviceCode || !url) {
+    return { ok: false, code: "dingtalk_api_rejected", message: "钉钉接口没有返回授权链接（请稍后重试）" };
+  }
+  const authId = `ding-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const interval = Math.max(1, Math.min(10, Number(b.interval) || 2));
+  const expiresIn = Math.max(10, Math.min(600, Number(b.expires_in) || 120));
+  const now = Date.now();
+  dingtalkAuthSessions.set(authId, {
+    relayDir, deviceCode, url, interval,
+    createdAt: now, expiresAt: Math.min(now + expiresIn * 1000, now + DINGTALK_AUTH_TTL_MS),
+  });
+  return { ok: true, authId, url, interval, expiresIn };
+}
+
+/** 把扫码拿到的凭据写进 im-bots.json 的 dingtalk 段（0600 原子写；保留其它字段）。 */
+function saveDingtalkScannedCredentials(relayDir, clientId, clientSecret) {
+  const bots = readImBots(relayDir);
+  const cur = dingtalkCfgOf(bots);
+  const next = {
+    ...cur,
+    enabled: true,
+    clientId: String(clientId || "").trim(),
+    clientSecret: String(clientSecret || "").trim(),
+    // 扫码流程只给 client_id/client_secret；robotCode 由桥连上后自动补齐/发现
+    credentialSource: "scan",
+  };
+  try {
+    writeImBots(relayDir, { ...bots, version: 1, dingtalk: next });
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, code: "write_failed", message: `保存扫码凭据失败：${e?.message || e}` };
+  }
+}
+
+/**
+ * 查询一次扫码授权状态（GET /dsh-remote/im-dingtalk-auth/status?id=...）。
+ * 返回 status: waiting | success | failed | expired；success 时**已**把凭据写盘，只回脱敏信息。
+ */
+async function dingtalkAuthStatus(authId, opts = {}) {
+  const key = String(authId || "");
+  const sess = dingtalkAuthSessions.get(key);
+  if (!sess) {
+    if (dingtalkAuthSuperseded.has(key)) {
+      dingtalkAuthSuperseded.delete(key);
+      return { ok: false, status: "failed", code: "cancelled", message: "已开始新的授权，这次已取消" };
+    }
+    return { ok: false, status: "expired", code: "expired", message: "授权会话不存在或已超时，请重新发起" };
+  }
+  const now = Date.now();
+  if (now > sess.expiresAt) {
+    dingtalkAuthSessions.delete(String(authId));
+    return { ok: false, status: "expired", code: "expired", message: "授权已超时（2 分钟内未确认），请重新发起" };
+  }
+  const fetchImpl = typeof opts.imAuthFetch === "function" ? opts.imAuthFetch : fetch;
+  let r;
+  try {
+    r = await jsonPostForAuth(fetchImpl, `${DINGTALK_REG_BASE}/poll`, { device_code: sess.deviceCode });
+  } catch (e) {
+    return { ok: false, status: "failed", code: "network_error", message: `网络不通：查询授权状态失败（${e?.message || e}）` };
+  }
+  const b = r.body || {};
+  const st = String(b.status || "").toUpperCase();
+  if (st === "WAITING" || st === "PENDING") return { ok: true, status: "waiting" };
+  if (st === "SUCCESS" || (b.client_id && b.client_secret)) {
+    const saved = saveDingtalkScannedCredentials(sess.relayDir, b.client_id, b.client_secret);
+    dingtalkAuthSessions.delete(String(authId));
+    if (!saved.ok) return { ok: false, status: "failed", code: saved.code, message: saved.message };
+    const cid = String(b.client_id || "");
+    return {
+      ok: true, status: "success", credentialSource: "scan",
+      clientIdTail: cid.length > 4 ? cid.slice(-4) : cid,
+      hasSecret: true
+    };
+  }
+  // 钉钉明确拒绝（创建被取消/参数过期等）
+  return { ok: false, status: "failed", code: "dingtalk_api_rejected", message: String(b.message || b.errmsg || "钉钉授权被拒绝，请重试") };
+}
+
 /** 保存 dingtalk 配置（空 secret = 不修改；凭据完整性在返回里说清）。 */
 function saveDingtalkConfig(relayDir, input) {
   const src = input && typeof input === "object" ? input : {};
@@ -8098,6 +8252,10 @@ function saveDingtalkConfig(relayDir, input) {
   if (Object.prototype.hasOwnProperty.call(src, "allowFrom")) next.allowFrom = strListOf(src.allowFrom);
   if (Object.prototype.hasOwnProperty.call(src, "enabled")) next.enabled = !!src.enabled;
   else if (!next.enabled && next.clientId && next.clientSecret && next.robotCode) next.enabled = true;
+  // 凭据来源标记（面板显示「扫码创建 / 手动填写」）：手填过凭据就记 manual；扫码流程会写 scan。
+  if (Object.prototype.hasOwnProperty.call(src, "clientId") || Object.prototype.hasOwnProperty.call(src, "clientSecret")) {
+    next.credentialSource = "manual";
+  }
   if (!next.clientId) return { ok: false, code: "missing_client_id", message: "请填写 Client ID（= 钉钉应用的 AppKey）" };
   if (!next.clientSecret) return { ok: false, code: "missing_client_secret", message: "请填写 Client Secret（= 钉钉应用的 AppSecret，只保存在本机）" };
   if (!next.robotCode) return { ok: false, code: "missing_robot_code", message: "请填写 Robot Code（机器人编码，在钉钉开放平台机器人页复制）" };
@@ -8136,7 +8294,8 @@ function saveFeishuConfig(relayDir, input) {
   else if (!next.enabled && next.appId && next.appSecret && next.receiveId) next.enabled = true;
   if (!next.appId) return { ok: false, code: "missing_app_id", message: "请填写 App ID（飞书开放平台应用的 App ID）" };
   if (!next.appSecret) return { ok: false, code: "missing_app_secret", message: "请填写 App Secret（只保存在本机，不会回显）" };
-  if (!next.receiveId) return { ok: false, code: "missing_receive_id", message: "请填写接收人 open_id（或 chat_id）" };
+  // 接收人**不是必填**（2026-11-08 业主实测：App ID+Secret 连上后桥会自己发现你的群/私聊）。
+  // 保留 receiveId/receiveIdType 字段是为了兼容桥侧手工配置/后续高级用法；面板不再要求填写。
   const out = { ...bots, version: 1, feishu: next };
   try {
     writeImBots(relayDir, out);
@@ -9069,6 +9228,25 @@ function registerRoutes(ctx, relayDir, opts = {}) {
       },
     },
     {
+      // 钉钉扫码一键创建机器人：开始授权（返回授权链接；device_code 只存服务端内存）
+      method: "POST",
+      path: "/dsh-remote/im-dingtalk-auth/begin",
+      handler: async (_req, res) => {
+        const r = await beginDingtalkAuth(relayDir, { imAuthFetch: opts.imAuthFetch });
+        sendJson(res, r.ok ? 200 : 502, r);
+      },
+    },
+    {
+      // 轮询授权状态：waiting / success（已写盘，只回脱敏结果）/ failed / expired
+      method: "GET",
+      path: "/dsh-remote/im-dingtalk-auth/status",
+      handler: async (req, res) => {
+        const url = new URL(req.url ?? "/", "http://x");
+        const r = await dingtalkAuthStatus(url.searchParams.get("id") || "", { imAuthFetch: opts.imAuthFetch });
+        sendJson(res, 200, r);
+      },
+    },
+    {
       // 飞书 SDK「按需下载」现状（面板据此显示未装/已装/下载中/失败）。
       method: "GET",
       path: "/dsh-remote/im-deps",
@@ -9456,6 +9634,8 @@ export function apply(ctx, config = {}) {
     imBotsWaitMs: Number(config.imBotsWaitMs) || undefined,
     // 测试钩子：飞书 SDK 安装的 npm spawn（用例注入假实现，**绝不真的联网装包**）。
     imDepsSpawn: typeof config.imDepsSpawn === "function" ? config.imDepsSpawn : undefined,
+    // 测试钩子：钉钉扫码授权的 fetch（用例注入假实现，**绝不真的打钉钉接口**）。
+    imAuthFetch: typeof config.imAuthFetch === "function" ? config.imAuthFetch : undefined,
   }), "dsh-remote-web: /dsh-remote routes");
   // 0.1.2-rc.1+ 浏览器会话代持：换取 Harness 会话 Cookie 供 bridge 上游携带（手机点设备不再 401 白页）
   ctx.effect(() => scheduleHarnessMint(ctx, relayDir), "dsh-remote-web: harness browser-session mint");

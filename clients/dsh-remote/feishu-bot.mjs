@@ -132,15 +132,32 @@ export const SDK_MISSING_HINT =
 /** 长连接不支持代理（官方文档）→ 连接失败时给这条。 */
 export const PROXY_HINT = "飞书长连接不支持代理：如果公司网络必须走代理，这条通道在当前网络下连不上（可改用手机远程）。";
 
-/** 飞书官方文档 / 注册入口（配置页 8 步向导直接引用；不在此模块画 UI）。 */
+/**
+ * 飞书官方文档 / 注册入口 + 配置向导（配置页直接渲染；本模块不画 UI）。
+ *
+ * 业主 2026-11-08 明确的产品口径：**接收人（open_id/chat_id）不让用户填** —— 用户本来也
+ * 不知道去哪拿，默认就是他/她本人。所以主路径只有两步（填 App ID/Secret + 发一句话自动绑定），
+ * 后台的 7 项配置折叠成「需要更细的步骤」。
+ */
 export const FEISHU_SETUP_GUIDE = Object.freeze({
   docs: Object.freeze({
+    createApp: "https://open.feishu.cn/app?lang=zh-CN",
+    cardInteractiveBot: "https://open.feishu.cn/document/uAjLw4CM/ukzMukzMukzM/feishu-cards/quick-start/develop-a-card-interactive-bot",
     longConnectionEvent: "https://open.feishu.cn/document/server-docs/event-subscription-guide/event-subscription-configure-/request-url-configuration-case",
     longConnectionCallback: "https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/event-subscription-guide/callback-subscription/configure-callback-request-address",
     sendMessage: "https://open.feishu.cn/document/server-docs/im-v1/message/create",
     receiveMessage: "https://open.feishu.cn/document/server-docs/im-v1/message/events/receive",
     registerApp: "https://open.feishu.cn/app"
   }),
+  /** 主路径（展示在第一层，只要两件事）。 */
+  quickPath: Object.freeze([
+    "在飞书开放平台创建一个企业自建应用，复制 **App ID / App Secret**（只填这两样，接收人不用填）",
+    "填进本面板 → 下载依赖 → 在飞书里给机器人**发一句话**：接收人自动绑定，之后通知/拍板都发给你"
+  ]),
+  quickPathHint: "应用能力/权限/事件与回调/发版这些后台设置仍需做一次（点开「需要更细的步骤」照着做）。",
+  detailsLabel: "需要更细的步骤",
+  /** 接收人自动绑定的口径（面板可展示成一句说明）。 */
+  bindingHint: "接收人不需要填：机器人收到你的第一条消息后自动记住这个会话；在群里 @ 它则记住那个群。",
   steps: Object.freeze([
     "打开飞书开放平台（open.feishu.cn/app）→ 创建**企业自建应用**（商店应用不支持长连接）",
     "「凭证与基础信息」→ 复制 **App ID / App Secret**（App ID 形如 cli_ 开头的一串字符）",
@@ -149,7 +166,7 @@ export const FEISHU_SETUP_GUIDE = Object.freeze({
     "「事件与回调 → 事件配置」→ 订阅方式选**使用长连接接收事件** → 添加「接收消息 v2.0」",
     "「事件与回调 → 回调配置」→ 订阅方式选**使用长连接接收回调** → 添加 card.action.trigger（拍板卡片用）",
     "「版本管理与发布」→ 创建版本并**发布**（不发布不生效）；「可用范围」包含你自己/目标成员",
-    "回到本面板：填 App ID / Secret → 「下载依赖」→「测试连接」→ 在飞书里给机器人**发一句话**完成绑定"
+    "回到本面板：填 App ID / Secret → 「下载依赖」→「测试连接」→ 在飞书里给机器人**发一句话**（接收人自动绑定，无需填写）"
   ]),
   // 最容易被忽略的顺序坑：保存事件配置时，必须已经有一个长连接在线。
   orderWarning: "顺序很重要：先在本机填好凭据让长连接在线，再去开发者后台保存「事件/回调」配置（否则保存会提示「应用未建立长连接」）。",
@@ -731,6 +748,10 @@ export function createFeishuBot({
   receiveIdType = "",
   allowFrom = [],
   cardApproval = true,
+  /** 配置里预填的绑定点（可选；兼容旧配置/手工排障）。正常流程由 chat.list 或首条消息自动绑定。 */
+  boundChatId = "",
+  /** 连接成功后用 chat.list 自动选群：每页条数。 */
+  chatListPageSize = 20,
   relayDir = "",
   env = process.env,
   logger,
@@ -755,6 +776,7 @@ export function createFeishuBot({
   const seenCards = new Map();
   let sender = null;
   let wsClient = null;
+  let sdkRef = null; // 懒加载后的 SDK（chat.list 自动选群用）
   let dispatcherHandlers = null;
   let pollTimer = null;
   let stopped = false;
@@ -768,6 +790,10 @@ export function createFeishuBot({
     lastConnectedAt: 0,
     lastMessageAt: 0,
     boundChatId: "",
+    boundChatType: "", // "chat_id"（群，来自 chat.list/群消息）| "open_id"（单聊，来自消息）
+    boundChatName: "", // 群名（面板展示"已自动绑定：<群名或私聊>"）
+    boundSource: "",   // "auto_group"（chat.list 自动选群）| "auto"（首条消息/预填）
+    chatCount: null,   // 机器人所在群数（chat.list 结果；null=没查到/没权限）
     sdkVersion: "",
     ackCount: 0,
     decisionCount: 0
@@ -800,6 +826,7 @@ export function createFeishuBot({
       state.lastConnectedAt = Number(clock()) || Date.now();
       log.info("长连接已就绪");
       try { emitter.emit("ready", status()); } catch { /* 忽略 */ }
+      void autoBindFromChatList();
     } else if (!connected) {
       state.connected = false;
       state.authenticated = false;
@@ -830,6 +857,7 @@ export function createFeishuBot({
       state.lastConnectedAt = Number(clock()) || Date.now();
       try { emitter.emit("ready", status()); } catch { /* 忽略 */ }
       emitStatus();
+      void autoBindFromChatList();
     }
   }
 
@@ -910,7 +938,17 @@ export function createFeishuBot({
       void sender?.sendText?.(inbound.chatId, "你不在这个通道的白名单里，无法指挥这台电脑。", { receiveIdType: "chat_id" });
       return;
     }
-    state.boundChatId = inbound.chatId;
+    /*
+     * 首次说话即绑定（与企微/钉钉一致）：接收人不让用户填。
+     *   · 群聊 → 记 chat_id（后续按 chat_id 推）
+     *   · 单聊 → 记 sender.open_id（后续按 open_id 推，用户换群也不会发错地方）
+     * 绑定信息只放内存 + 状态文件（桥写），配置里不需要 receiveId。
+     */
+    const isGroup = inbound.chatType === "group";
+    state.boundChatId = isGroup ? inbound.chatId : (inbound.openId || inbound.chatId);
+    state.boundChatType = isGroup ? "chat_id" : "open_id"; // 直接就是后续发送用的 receive_id_type
+    state.boundChatName = ""; // 消息里没有群名；面板显示「私聊/群」即可
+    state.boundSource = "auto"; // 用户发消息即改绑（覆盖 chat.list 的 auto_group）
     state.lastMessageAt = Number(clock()) || Date.now();
     emitStatus();
     try { emitter.emit("message", inbound); } catch (e) { log.warn(`message 处理异常：${truncateText(e?.message || e, 100)}`); }
@@ -934,6 +972,133 @@ export function createFeishuBot({
     return { dispatcher, handlers };
   }
 
+  /**
+   * 接收人来源：
+   *   · config      —— 用户在高级场景里手工填了 receiveId（优先）
+   *   · auto_group  —— 连接成功后 chat.list 自动选中了机器人所在的群
+   *   · auto        —— 首条消息自动绑定（私聊 open_id / 群 chat_id），或配置预填
+   *   · none        —— 还没绑定（通知会跳过并记日志，不报错）
+   */
+  function receiveIdSource() {
+    if (String(receiveId || "").trim()) return "config";
+    if (!state.boundChatId) return "none";
+    return state.boundSource === "auto_group" ? "auto_group" : "auto";
+  }
+
+  /** 自动绑定后的推送类型（直接就是 receive_id_type）。 */
+  function boundTargetType() {
+    if (state.boundChatType === "chat_id") return "chat_id";
+    if (state.boundChatType === "open_id") return "open_id";
+    return "";
+  }
+
+  /**
+   * **连接成功后自动选群**（业主/Lead 实测：`client.im.v1.chat.list()` 能列出机器人所在群）：
+   *   · 有群 → 记为接收人（多个群取第一个，用户发消息会改绑）→ receiveIdSource=auto_group
+   *   · 空   → 不绑定，等首条消息
+   *   · 无权限/失败 → 只记日志，**不影响连接与"发消息绑定"**
+   * 配置里填了 receiveId 时只记录群数，不覆盖（配置优先）。
+   */
+  async function autoBindFromChatList() {
+    if (autoBindTried) return;
+    autoBindTried = true;
+    const cfgTo = String(receiveId || "").trim();
+    let client = null;
+    try {
+      if (!sdkRef || typeof sdkRef.Client !== "function") {
+        log.info("SDK 未提供 Client（跳过自动选群，等首条消息绑定）");
+        return;
+      }
+      const opts = { appId, appSecret };
+      if (normalizeDomain(domain) === "lark" && sdkRef?.Domain?.Lark) opts.domain = sdkRef.Domain.Lark;
+      client = new sdkRef.Client(opts);
+    } catch (e) {
+      log.warn(`创建 Client 失败（跳过自动选群，不影响消息绑定）：${truncateText(e?.message || e, 120)}`);
+      return;
+    }
+    const listFn = client?.im?.v1?.chat?.list;
+    if (typeof listFn !== "function") {
+      log.info("SDK 没有 chat.list（跳过自动选群，等首条消息绑定）");
+      return;
+    }
+    let resp = null;
+    try {
+      // 官方 1.76 的调用形态是 { params: {…} }；兼容直接传参数 / 无参（Lead 实测无参也能列出群）
+      try {
+        resp = await listFn.call(client.im.v1.chat, { params: { page_size: chatListPageSize } });
+      } catch (e1) {
+        try {
+          resp = await listFn.call(client.im.v1.chat, { page_size: chatListPageSize });
+        } catch (e2) {
+          resp = await listFn.call(client.im.v1.chat);
+        }
+      }
+    } catch (e) {
+      // 常见：应用没申请 im:chat:readonly → 只记日志（不影响连接/发消息/消息绑定）
+      log.warn(`chat.list 失败（忽略，不影响消息绑定；如需自动选群请加 im:chat:readonly）：${truncateText(e?.message || e, 120)}`);
+      return;
+    }
+    const code = Number(resp?.code ?? resp?.data?.code);
+    if (Number.isFinite(code) && code !== 0) {
+      log.warn(`chat.list 返回错误码 ${code}（忽略；如需自动选群请加 im:chat:readonly）；${feishuErrorHint(code, resp?.msg || "")}`);
+      return;
+    }
+    const items = Array.isArray(resp?.data?.items) ? resp.data.items : (Array.isArray(resp?.items) ? resp.items : []);
+    state.chatCount = items.length;
+    // 显式指定（receiveId）或配置预填 boundChatId 都算"用户已经定了目标"→ 只记录群数，不覆盖
+    const prefilled = String(boundChatId || "").trim();
+    if (cfgTo || prefilled) {
+      // 不覆盖用户指定的目标，但尽量补上群名（面板显示「已自动绑定：<群名>」）
+      const wanted = cfgTo || prefilled;
+      const hit = items.find((it) => String(it?.chat_id || it?.chatId || "") === wanted);
+      if (hit && !state.boundChatName) state.boundChatName = String(hit.name || "");
+      log.info(`接收人已指定（${cfgTo ? "receiveId" : "配置预填 boundChatId"}，优先），chat.list 仅记录机器人所在群数=${items.length}`);
+      emitStatus();
+      return;
+    }
+    if (!items.length) {
+      log.info("机器人还没进任何群：等用户私聊或拉群后自动绑定");
+      emitStatus();
+      return;
+    }
+    const first = items[0] || {};
+    const chatId = String(first.chat_id || first.chatId || "");
+    if (!chatId) {
+      emitStatus();
+      return;
+    }
+    state.boundChatId = chatId;
+    state.boundChatType = "chat_id";
+    state.boundChatName = String(first.name || "");
+    state.boundSource = "auto_group";
+    log.info(`已自动绑定到群 chat=${chatIdHash(chatId)} 群数=${items.length}${items.length > 1 ? "（多个群取第一个；用户发消息会改绑）" : ""}`);
+    emitStatus();
+  }
+  let autoBindTried = false;
+
+  /**
+   * 解析一次发送的 target 与 receive_id_type（产品口径：接收人默认自动绑定）。
+   *
+   * 优先级（任务书第 3 条）：
+   *   ① 调用方显式传的 receiveIdType（内部回复用，最明确）
+   *   ② 配置里手工填的 receiveIdType（高级场景）
+   *   ③ 按 boundChatType 自动判断（群→chat_id / 单聊→open_id）
+   *   ④ 兜底 open_id（老行为）
+   * target 优先级：显式 to > 配置 receiveId > 自动绑定的 boundChatId
+   */
+  function resolveSendTarget(explicitTo, explicitType) {
+    const cfgTo = String(receiveId || "").trim();
+    const to = String(explicitTo || "").trim() || cfgTo || state.boundChatId || "";
+    let type = normalizeReceiveIdType(explicitType || "", "");
+    if (!type && cfgTo) {
+      // 只有"用户显式填了 receiveId"时，receiveIdType 才有意义（插件的默认 open_id 不能套到群上）
+      type = normalizeReceiveIdType(receiveIdType, "") || DEFAULT_RECEIVE_ID_TYPE;
+    }
+    // 显式 to（内部回复，未传 type）沿用老行为 open_id；自动绑定则按 boundChatType 判断
+    if (!type) type = explicitTo ? DEFAULT_RECEIVE_ID_TYPE : (boundTargetType() || DEFAULT_RECEIVE_ID_TYPE);
+    return { to, type };
+  }
+
   function status() {
     return {
       enabled: started && !stopped,
@@ -944,6 +1109,12 @@ export function createFeishuBot({
       lastConnectedAt: state.lastConnectedAt,
       lastMessageAt: state.lastMessageAt,
       boundChatId: state.boundChatId,
+      boundChatType: state.boundChatType,
+      boundChatName: state.boundChatName,
+      chatCount: state.chatCount,
+      // 接收人来源：config / auto_group（chat.list 自动选群）/ auto（首条消息）/ none
+      receiveIdSource: receiveIdSource(),
+      receiveIdConfigured: Boolean(String(receiveId || "").trim()),
       appId: maskAppId(appId),
       domain: normalizeDomain(domain),
       receiveIdType: normalizeReceiveIdType(receiveIdType, ""),
@@ -984,7 +1155,15 @@ export function createFeishuBot({
         return { ok: false, reason: "sdk_missing", status: status() };
       }
       const sdk = loaded.sdk || {};
+      sdkRef = sdk;
       state.sdkVersion = String(loaded.status?.version || "");
+      // 配置里预填的绑定点（可选）：oc_ 开头视为群 chat_id，其余视为 open_id
+      const seeded = String(boundChatId || "").trim();
+      if (seeded && !state.boundChatId) {
+        state.boundChatId = seeded;
+        state.boundChatType = /^oc_/i.test(seeded) ? "chat_id" : "open_id";
+        state.boundSource = "auto";
+      }
 
       // ③ 发送器（REST）
       sender = createFeishuSender({
@@ -1041,13 +1220,12 @@ export function createFeishuBot({
       return { ok: true };
     },
 
-    /** 发文本（自动按飞书通道格式化）。 */
+    /** 发文本（自动按飞书通道格式化；接收人默认自动绑定）。 */
     async sendText(to, text, opts = {}) {
-      const target = String(to || receiveId || state.boundChatId || "");
       if (!sender) return { ok: false, reason: "发送器未初始化（连接尚未建立）" };
-      const r = await sender.sendText(target, text, {
-        receiveIdType: opts.receiveIdType || normalizeReceiveIdType(receiveIdType, state.boundChatId ? "chat_id" : DEFAULT_RECEIVE_ID_TYPE)
-      });
+      const { to: target, type } = resolveSendTarget(to, opts.receiveIdType);
+      if (!target) return { ok: false, reason: "还没绑定接收人：先在飞书里给机器人发一句话" };
+      const r = await sender.sendText(target, text, { receiveIdType: type });
       if (r.ok) {
         state.lastMessageAt = Number(clock()) || Date.now();
         emitStatus();
@@ -1057,11 +1235,10 @@ export function createFeishuBot({
 
     /** 发审批卡片（返回值带 messageId，供回执后原地更新）。 */
     async sendCard(to, card, opts = {}) {
-      const target = String(to || receiveId || state.boundChatId || "");
       if (!sender) return { ok: false, reason: "发送器未初始化（连接尚未建立）" };
-      return sender.sendCard(target, card, {
-        receiveIdType: opts.receiveIdType || normalizeReceiveIdType(receiveIdType, state.boundChatId ? "chat_id" : DEFAULT_RECEIVE_ID_TYPE)
-      });
+      const { to: target, type } = resolveSendTarget(to, opts.receiveIdType);
+      if (!target) return { ok: false, reason: "还没绑定接收人：先在飞书里给机器人发一句话" };
+      return sender.sendCard(target, card, { receiveIdType: type });
     },
 
     /** 更新卡片（best-effort）。 */
@@ -1254,6 +1431,12 @@ export function createFeishuBotController(options = {}) {
       lastConnectedAt: bs?.lastConnectedAt || 0,
       lastMessageAt: bs?.lastMessageAt || 0,
       boundChatId: (bs && bs.boundChatId) || "",
+      boundChatType: (bs && bs.boundChatType) || "",
+      boundChatName: (bs && bs.boundChatName) || "",
+      chatCount: Number.isInteger(bs?.chatCount) ? bs.chatCount : null,
+      // 面板据此显示「接收人：自动绑定（已/未）/ 手动配置」；receiveId 用户不用填
+      receiveIdSource: (bs && bs.receiveIdSource) || (configNow?.receiveId ? "config" : "none"),
+      receiveIdConfigured: Boolean(configNow?.receiveId),
       appId: bs?.appId || maskAppId(""),
       domain: bs?.domain || "feishu",
       receiveIdType: bs?.receiveIdType || "",
@@ -1342,7 +1525,7 @@ export function createFeishuBotController(options = {}) {
     if (!notifyEnabled || !bot) return;
     const target = targetOf();
     if (!target) {
-      log.info("有事件要推，但还没绑定接收方：先在飞书里给机器人发一句话，或在配置里填 receiveId");
+      log.info("有事件要推，但还没绑定接收方：不用填接收人 —— 在飞书里给机器人发一句话，就会自动绑定到你这个会话");
       return;
     }
     if (!notifyRateOk()) {
@@ -1570,6 +1753,7 @@ export function createFeishuBotController(options = {}) {
           receiveId: cfg.receiveId,
           receiveIdType: cfg.receiveIdType,
           allowFrom: cfg.allowFrom,
+          boundChatId: cfg.boundChatId,
           cardApproval: cardApprovalAllowed && cfg.cardApproval,
           relayDir,
           env,

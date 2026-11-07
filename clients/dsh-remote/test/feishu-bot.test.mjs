@@ -84,8 +84,8 @@ function fakeSdkDir(relayDir, version = "1.76.0") {
 }
 
 // ── 假 SDK ────────────────────────────────────────────────────────────────
-function makeFakeSdk({ connectError = null, connectionState = "connected" } = {}) {
-  const calls = { ws: [], dispatchers: [], starts: [], closes: 0, ctors: 0 };
+function makeFakeSdk({ connectError = null, connectionState = "connected", chats = [], chatListError = null, chatListCode = 0 } = {}) {
+  const calls = { ws: [], dispatchers: [], starts: [], closes: 0, ctors: 0, clientCtors: 0, chatListArgs: [] };
   class EventDispatcher {
     constructor(opts) { this.opts = opts; this.handlers = {}; calls.dispatchers.push(this); }
     register(handlers) { this.handlers = handlers; return this; }
@@ -100,7 +100,24 @@ function makeFakeSdk({ connectError = null, connectionState = "connected" } = {}
     getConnectionStatus() { return { state: connectionState }; }
     close() { calls.closes += 1; return Promise.resolve(); }
   }
-  class Client { constructor(opts) { this.opts = opts; } }
+  class Client {
+    constructor(opts) {
+      calls.clientCtors += 1;
+      this.opts = opts;
+      // 对齐官方 1.76：client.im.v1.chat.list({ params })；无权限/失败用 chatListError 模拟
+      this.im = {
+        v1: {
+          chat: {
+            list: async (args) => {
+              calls.chatListArgs.push(args);
+              if (chatListError) throw chatListError;
+              return { code: chatListCode, msg: chatListCode ? "list failed" : "", data: { items: chats } };
+            }
+          }
+        }
+      };
+    }
+  }
   return { sdk: { WSClient, EventDispatcher, Client }, calls };
 }
 
@@ -146,6 +163,16 @@ function makeSubscriber() {
     async listSessions() { calls.listenSessions += 1; return [{ sessionId: "session-abc", title: "t" }]; },
     async promptSession(req) { calls.prompts.push(req); return { ok: true }; }
   };
+}
+
+/** 轮询等待（自动绑定等异步动作；不依赖真实 timers 精度）。 */
+async function waitFor(fn, ms = 1500) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    try { if (fn()) return true; } catch { /* 继续等 */ }
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  return false;
 }
 
 // ── 假消息/回调夹具（形状对齐官方事件） ──────────────────────────────────
@@ -477,7 +504,6 @@ async function startBot({ sdkOpts, fetchOpts, botOpts = {} } = {}) {
     sdkFactory: () => fake.sdk,
     fetchImpl: f.fn,
     clock: at,
-    receiveIdType: "open_id",
     logger: { info: (m) => logs.push(m), warn: (m) => logs.push(m), error: (m) => logs.push(m), debug: () => {} },
     ...botOpts
   });
@@ -538,17 +564,86 @@ test("bot 建连：SDK start 抛凭据错 → 人话（凭据校验失败），�
   assert.equal(bot.status().state, "failed");
 });
 
-test("bot 入站：文本消息 → 'message' 事件（归一化）+ 绑定 chatId；bot 自己消息被过滤", async () => {
+test("bot 入站：文本消息 → 'message' 事件；**首次说话自动绑定**（单聊记 open_id）", async () => {
   const { bot } = await startBot();
   const got = [];
   bot.on("message", (m) => got.push(m));
+  // 启动时还没有接收人，也不需要配置
+  assert.equal(bot.status().boundChatId, "");
+  assert.equal(bot.status().receiveIdSource, "none");
   bot._dispatch("im.message.receive_v1", inboundText("你好"));
   assert.equal(got.length, 1);
   assert.equal(got[0].text, "你好");
   assert.equal(got[0].chatId, "oc_chat_1");
-  assert.equal(bot.status().boundChatId, "oc_chat_1");
+  const st = bot.status();
+  assert.equal(st.boundChatId, "ou_user_1", "单聊绑定发送者 open_id（不用用户填）");
+  assert.equal(st.boundChatType, "open_id");
+  assert.equal(st.receiveIdSource, "auto");
   bot._dispatch("im.message.receive_v1", inboundText("自己", { senderType: "bot" }));
   assert.equal(got.length, 1, "bot 自己的消息不能触发");
+  await bot.stop();
+});
+
+/** 群聊入站夹具：chat_type=group。 */
+const inboundGroup = (text = "群里 @ 它") => ({
+  event: {
+    sender: { sender_id: { open_id: "ou_user_1" }, sender_type: "user" },
+    message: {
+      message_id: "om_in_g1",
+      chat_id: "oc_group_9",
+      chat_type: "group",
+      message_type: "text",
+      content: JSON.stringify({ text })
+    }
+  }
+});
+
+test("bot 入站：群聊自动绑定 chat_id；单聊/群聊的推送类型自动判断", async () => {
+  const { bot, fetchCalls } = await startBot();
+  bot._dispatch("im.message.receive_v1", inboundText("私聊"));
+  assert.equal(bot.status().boundChatId, "ou_user_1");
+  assert.equal(bot.status().boundChatType, "open_id");
+  await bot.sendText(undefined, "给单聊用户");
+  const p2pCall = fetchCalls.filter((c) => c.url.includes("/im/v1/messages")).pop();
+  assert.match(p2pCall.url, /receive_id_type=open_id/);
+  assert.equal(JSON.parse(p2pCall.body).receive_id, "ou_user_1");
+
+  bot._dispatch("im.message.receive_v1", inboundGroup("群里"));
+  assert.equal(bot.status().boundChatId, "oc_group_9");
+  assert.equal(bot.status().boundChatType, "chat_id");
+  await bot.sendText(undefined, "给群");
+  const groupCall = fetchCalls.filter((c) => c.url.includes("/im/v1/messages")).pop();
+  assert.match(groupCall.url, /receive_id_type=chat_id/);
+  assert.equal(JSON.parse(groupCall.body).receive_id, "oc_group_9");
+  await bot.stop();
+});
+
+test("bot 发送：配置 receiveId/receiveIdType 优先于自动绑定（高级场景）", async () => {
+  const { bot, fetchCalls } = await startBot({
+    botOpts: { receiveId: "oc_configured", receiveIdType: "chat_id" }
+  });
+  assert.equal(bot.status().receiveIdSource, "config");
+  assert.equal(bot.status().receiveIdConfigured, true);
+  bot._dispatch("im.message.receive_v1", inboundText("私聊")); // 自动绑定仍记，但不影响配置优先
+  assert.equal(bot.status().receiveIdSource, "config");
+  await bot.sendText(undefined, "配置优先");
+  const call = fetchCalls.filter((c) => c.url.includes("/im/v1/messages")).pop();
+  assert.equal(JSON.parse(call.body).receive_id, "oc_configured");
+  assert.match(call.url, /receive_id_type=chat_id/);
+  // 显式 opts.receiveIdType 覆盖配置
+  await bot.sendText(undefined, "覆盖", { receiveIdType: "open_id" });
+  const override = fetchCalls.filter((c) => c.url.includes("/im/v1/messages")).pop();
+  assert.match(override.url, /receive_id_type=open_id/);
+  await bot.stop();
+});
+
+test("bot 发送：未绑定也无配置 → 返回明确 reason，不发请求（不报错）", async () => {
+  const { bot, fetchCalls } = await startBot();
+  const before = fetchCalls.length;
+  const r = await bot.sendText(undefined, "还没人跟我说话");
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /还没绑定接收人/);
+  assert.equal(fetchCalls.length, before, "未绑定不该发任何 HTTP");
   await bot.stop();
 });
 
@@ -630,6 +725,112 @@ test("bot.stop：关闭 WSClient 且幂等；状态回到 idle", async () => {
   assert.equal(fake.calls.closes, 1, "幂等");
 });
 
+test("chat.list 自动选群：只有 1 个群 → 连上就绑定（不用用户先说话）", async () => {
+  const { bot } = await startBot({ sdkOpts: { chats: [{ chat_id: "oc_auto_1", name: "项目群" }] } });
+  assert.ok(await waitFor(() => bot.status().boundChatId === "oc_auto_1"), "应自动绑定唯一群");
+  const st = bot.status();
+  assert.equal(st.boundChatType, "chat_id");
+  assert.equal(st.boundChatName, "项目群");
+  assert.equal(st.receiveIdSource, "auto_group");
+  assert.equal(st.chatCount, 1);
+  assert.equal(st.receiveIdConfigured, false);
+  await bot.stop();
+});
+
+test("chat.list 多群 → 取第一个并记录群数；用户发消息即改绑", async () => {
+  const { bot, fetchCalls } = await startBot({
+    sdkOpts: { chats: [{ chat_id: "oc_g1", name: "群1" }, { chat_id: "oc_g2", name: "群2" }] }
+  });
+  assert.ok(await waitFor(() => bot.status().boundChatId === "oc_g1"));
+  assert.equal(bot.status().chatCount, 2);
+  assert.equal(bot.status().receiveIdSource, "auto_group");
+  await bot.sendText(undefined, "发到第一个群");
+  const call = fetchCalls.filter((c) => c.url.includes("/im/v1/messages")).pop();
+  assert.match(call.url, /receive_id_type=chat_id/);
+  assert.equal(JSON.parse(call.body).receive_id, "oc_g1");
+  // 用户私聊 → 改绑到该用户
+  bot._dispatch("im.message.receive_v1", inboundText("私聊改绑"));
+  assert.equal(bot.status().boundChatId, "ou_user_1");
+  assert.equal(bot.status().boundChatType, "open_id");
+  assert.equal(bot.status().receiveIdSource, "auto");
+  await bot.stop();
+});
+
+test("chat.list 无权限/失败 → 只记日志，不影响连接与「发消息绑定」", async () => {
+  const { bot, logs } = await startBot({
+    sdkOpts: { chatListError: Object.assign(new Error("permission denied: im:chat:readonly"), { code: 99991672 }) }
+  });
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(bot.status().connected, true, "连接不受影响");
+  assert.equal(bot.status().boundChatId, "");
+  assert.equal(bot.status().receiveIdSource, "none");
+  assert.ok(logs.some((l) => /chat\.list 失败/.test(l)), "应有可读日志");
+  bot._dispatch("im.message.receive_v1", inboundText("先说话"));
+  assert.equal(bot.status().boundChatId, "ou_user_1");
+  assert.equal(bot.status().receiveIdSource, "auto");
+  await bot.stop();
+});
+
+test("chat.list 空列表 → 不绑定，等首条私聊消息（open_id）", async () => {
+  const { bot } = await startBot({ sdkOpts: { chats: [] } });
+  assert.ok(await waitFor(() => bot.status().chatCount === 0));
+  assert.equal(bot.status().boundChatId, "");
+  assert.equal(bot.status().receiveIdSource, "none");
+  bot._dispatch("im.message.receive_v1", inboundText("你好"));
+  assert.equal(bot.status().boundChatId, "ou_user_1");
+  assert.equal(bot.status().boundChatType, "open_id");
+  await bot.stop();
+});
+
+test("配置优先：填了 receiveId 时不被 chat.list 覆盖，但群数仍记录，发送走配置", async () => {
+  const { bot, fetchCalls } = await startBot({
+    botOpts: { receiveId: "oc_cfg", receiveIdType: "chat_id" },
+    sdkOpts: { chats: [{ chat_id: "oc_auto", name: "群" }] }
+  });
+  assert.ok(await waitFor(() => bot.status().chatCount === 1));
+  assert.equal(bot.status().receiveIdSource, "config");
+  assert.equal(bot.status().boundChatId, "", "配置优先时不写自动绑定");
+  assert.equal(bot.status().receiveIdConfigured, true);
+  await bot.sendText(undefined, "发配置目标");
+  const call = fetchCalls.filter((c) => c.url.includes("/im/v1/messages")).pop();
+  assert.equal(JSON.parse(call.body).receive_id, "oc_cfg");
+  assert.match(call.url, /receive_id_type=chat_id/);
+  await bot.stop();
+});
+
+test("真实配置形态：receiveId 空但插件写了默认 receiveIdType=open_id → 群绑定仍按 chat_id 发送", async () => {
+  // 复刻 ~/.dsh-remote/im-bots.json 的实际形态：receiveId=""、receiveIdType="open_id"、boundChatId=oc_…
+  const { bot, fetchCalls } = await startBot({
+    botOpts: { receiveId: "", receiveIdType: "open_id", boundChatId: "oc_real" },
+    sdkOpts: { chats: [{ chat_id: "oc_real", name: "真实群" }] }
+  });
+  assert.ok(await waitFor(() => bot.status().chatCount === 1));
+  assert.equal(bot.status().receiveIdSource, "auto");
+  assert.equal(bot.status().boundChatType, "chat_id");
+  assert.equal(bot.status().boundChatName, "真实群", "预填目标也要能从 chat.list 补群名");
+  await bot.sendText(undefined, "发到群");
+  const call = fetchCalls.filter((c) => c.url.includes("/im/v1/messages")).pop();
+  assert.match(call.url, /receive_id_type=chat_id/, "receiveIdType=open_id 不能套到群 chat_id 上");
+  assert.equal(JSON.parse(call.body).receive_id, "oc_real");
+  await bot.stop();
+});
+
+test("配置预填 boundChatId 优先于 chat.list（不被第一个群覆盖）；仍记录群数", async () => {
+  const { bot, fetchCalls } = await startBot({
+    botOpts: { boundChatId: "oc_seeded" },
+    sdkOpts: { chats: [{ chat_id: "oc_other", name: "别的群" }, { chat_id: "oc_g2", name: "群2" }] }
+  });
+  assert.ok(await waitFor(() => bot.status().chatCount === 2));
+  assert.equal(bot.status().boundChatId, "oc_seeded", "预填目标不能被覆盖");
+  assert.equal(bot.status().boundChatType, "chat_id");
+  assert.equal(bot.status().receiveIdSource, "auto");
+  await bot.sendText(undefined, "发到预填群");
+  const call = fetchCalls.filter((c) => c.url.includes("/im/v1/messages")).pop();
+  assert.equal(JSON.parse(call.body).receive_id, "oc_seeded");
+  assert.match(call.url, /receive_id_type=chat_id/);
+  await bot.stop();
+});
+
 // ===========================================================================
 // E. Controller：配置 / 状态文件 / 会员闸 / 通知
 // ===========================================================================
@@ -646,7 +847,7 @@ function startController(relayDir, opts = {}) {
     sdkFactory: () => fake.sdk,
     fetchImpl: f.fn,
     subscriberFactory: () => sub,
-    log: (line) => logs.push(String(line)),
+    log: (level, line) => logs.push(String(line ?? level)),
     configPollMs: 10,
     ...opts,
     // 允许覆盖
@@ -780,6 +981,43 @@ test("controller：审批事件 → 发可点卡片（interactive）；turn_end 
   await controller.stop();
 });
 
+test("controller：接收人自动绑定 —— 未绑定时通知跳过（不报错），首次说话后发到自动绑定目标", async () => {
+  const relayDir = mkRelayDir("ctl-autobind");
+  // 关键：**不填 receiveId**（业主口径：用户不知道也不用填）
+  writeConfig(relayDir, { enabled: true, appId: APP_ID, appSecret: APP_SECRET });
+  const sub = makeSubscriber();
+  const { controller, fetchCalls, logs } = startController(relayDir, { subscriber: sub });
+  await controller.start();
+  assert.equal(controller._bot().status().receiveIdSource, "none");
+
+  // 未绑定：通知跳过（只记日志，不报错、不发 HTTP）
+  sub.emit("event", { kind: "approval-request", eventId: "apr_auto_1", toolName: "Bash", sessionId: "s1" });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(fetchCalls.filter((c) => c.url.includes("/im/v1/messages")).length, 0, "未绑定时不该发");
+  assert.ok(logs.some((l) => /还没绑定接收方/.test(l)), "应记一条可读日志");
+  const st0 = JSON.parse(fs.readFileSync(path.join(relayDir, "im-bot-status.json"), "utf8"));
+  assert.equal(st0.feishu.boundChatId, "");
+  assert.equal(st0.feishu.receiveIdSource, "none");
+
+  // 首次说话 → 自动绑定（单聊记 open_id）
+  controller._bot()._dispatch("im.message.receive_v1", inboundText("你好"));
+  await new Promise((r) => setTimeout(r, 20));
+  const st1 = JSON.parse(fs.readFileSync(path.join(relayDir, "im-bot-status.json"), "utf8"));
+  assert.equal(st1.feishu.boundChatId, "ou_user_1");
+  assert.equal(st1.feishu.boundChatType, "open_id");
+  assert.equal(st1.feishu.receiveIdSource, "auto");
+
+  // 绑定后：审批卡片发到自动绑定的 open_id
+  sub.emit("event", { kind: "approval-request", eventId: "apr_auto_2", toolName: "Bash", sessionId: "s1" });
+  await new Promise((r) => setTimeout(r, 20));
+  const card = fetchCalls.filter((c) => c.url.includes("/im/v1/messages")).pop();
+  assert.ok(card, "绑定后应发卡片");
+  assert.match(card.url, /receive_id_type=open_id/);
+  assert.equal(JSON.parse(card.body).receive_id, "ou_user_1");
+  assert.equal(JSON.parse(card.body).msg_type, "interactive");
+  await controller.stop();
+});
+
 test("controller：热更新（改 appId）→ 重建长连接", async () => {
   const relayDir = mkRelayDir("ctl-reload");
   writeConfig(relayDir, { enabled: true, appId: APP_ID, appSecret: APP_SECRET, receiveId: "ou_owner" });
@@ -828,12 +1066,24 @@ test("controller：日志里绝不出现 appSecret", async () => {
 // F. 配置页向导契约（供插件半渲染；不画 UI）
 // ===========================================================================
 
-test("8 步向导：官方链接齐全、步骤 8 条、含顺序坑与「一个应用一台电脑」", () => {
-  assert.match(FEISHU_SETUP_GUIDE.docs.registerApp, /open\.feishu\.cn\/app/);
-  assert.match(FEISHU_SETUP_GUIDE.docs.longConnectionEvent, /long-connection|event-subscription/);
+test("向导：主路径只有两件事（填 App ID/Secret + 发一句话自动绑定）+ 业主给的官方链接", () => {
+  // 业主 2026-11-08 给的链接（一字不改）
+  assert.equal(FEISHU_SETUP_GUIDE.docs.createApp, "https://open.feishu.cn/app?lang=zh-CN");
+  assert.equal(
+    FEISHU_SETUP_GUIDE.docs.cardInteractiveBot,
+    "https://open.feishu.cn/document/uAjLw4CM/ukzMukzMukzM/feishu-cards/quick-start/develop-a-card-interactive-bot"
+  );
+  assert.equal(FEISHU_SETUP_GUIDE.quickPath.length, 2, "主路径只留两件事");
+  assert.match(FEISHU_SETUP_GUIDE.quickPath[0], /App ID \/ App Secret/);
+  assert.match(FEISHU_SETUP_GUIDE.quickPath[0], /接收人不用填/);
+  assert.match(FEISHU_SETUP_GUIDE.quickPath[1], /发一句话/);
+  assert.match(FEISHU_SETUP_GUIDE.bindingHint, /自动记住这个会话/);
+  assert.equal(FEISHU_SETUP_GUIDE.detailsLabel, "需要更细的步骤", "其余步骤折叠");
+  // 折叠的详细步骤仍在（后台那 7 项不能省）
   assert.equal(FEISHU_SETUP_GUIDE.steps.length, 8);
   assert.match(FEISHU_SETUP_GUIDE.steps[4], /长连接接收事件/);
   assert.match(FEISHU_SETUP_GUIDE.steps[5], /card\.action\.trigger/);
   assert.match(FEISHU_SETUP_GUIDE.orderWarning, /长连接在线/);
   assert.match(FEISHU_SETUP_GUIDE.oneAppOnePc, /一台电脑/);
+  assert.match(FEISHU_SETUP_GUIDE.docs.registerApp, /open\.feishu\.cn\/app/);
 });
