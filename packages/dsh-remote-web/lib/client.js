@@ -667,6 +667,11 @@ window.__ModuleLoader__.load({
       ".dru-ia-iconbtn{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;flex:none;border-radius:8px;border:1px solid var(--dru-border-ctl);background:var(--dru-surface-2);color:var(--dsw-alias-label-secondary,var(--dru-fg-muted));cursor:pointer}",
       ".dru-ia-iconbtn:hover{color:var(--dru-accent);border-color:var(--dru-accent)}",
       ".dru-ia-iconbtn:focus-visible{outline:2px solid var(--dru-focus);outline-offset:2px}",
+      // 配置页的「为什么要填这些」折叠按钮 + 原生 select 统一外观（业主：别文字堆砌，多余信息收起来）
+      ".dru-ia-disclose{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:32px;padding:0;border:0;background:none;color:var(--dsw-alias-label-tertiary,var(--dru-fg-muted));font:inherit;font-size:12px;cursor:pointer;text-align:left}",
+      ".dru-ia-disclose:hover{color:var(--dru-accent)}",
+      ".dru-ia-disclose:focus-visible{outline:2px solid var(--dru-focus);outline-offset:2px}",
+      "select.dru-ia-input{appearance:none;-webkit-appearance:none;padding-right:28px;background-image:linear-gradient(45deg,transparent 50%,currentColor 50%),linear-gradient(135deg,currentColor 50%,transparent 50%);background-position:calc(100% - 15px) 50%,calc(100% - 10px) 50%;background-size:5px 5px,5px 5px;background-repeat:no-repeat}",
       "@media (prefers-reduced-motion: reduce){",
       "  .dru-ia-scrim,.dru-ia-card,.dru-ia-btn,.dru-ia-seg-btn,.dru-ia-row{animation:none !important;transition:none !important}",
       "}",
@@ -3430,6 +3435,14 @@ window.__ModuleLoader__.load({
       var imBotsChatArr = useState(""); var imBotsChat = imBotsChatArr[0]; var setImBotsChat = imBotsChatArr[1];
       var imBotsUrlArr = useState(""); var imBotsUrl = imBotsUrlArr[0]; var setImBotsUrl = imBotsUrlArr[1];
       var imBotsShowSecretArr = useState(false); var imBotsShowSecret = imBotsShowSecretArr[0]; var setImBotsShowSecret = imBotsShowSecretArr[1];
+      // 「转接到哪个会话」：空串 = 跟随当前活跃会话（桥侧默认）。title 一起存，用于回显与保存。
+      var imBotsSessionIdArr = useState(""); var imBotsSessionId = imBotsSessionIdArr[0]; var setImBotsSessionId = imBotsSessionIdArr[1];
+      var imBotsSessionTitleArr = useState(""); var imBotsSessionTitle = imBotsSessionTitleArr[0]; var setImBotsSessionTitle = imBotsSessionTitleArr[1];
+      // 「为什么要填这些」默认折叠（业主：配置页别文字堆砌）
+      var imBotsWhyArr = useState(false); var imBotsWhyOpen = imBotsWhyArr[0]; var setImBotsWhyOpen = imBotsWhyArr[1];
+      // 从「飞书/钉钉即将支持 → 告诉我，优先支持」跳到反馈视图时带过去的一句引导（独立状态：
+      // message 会被面板里各种动作清掉，跨视图的上下文不能押在它身上）。
+      var iaFbHintArr = useState(""); var iaFbHint = iaFbHintArr[0]; var setIaFbHint = iaFbHintArr[1];
 
       /** 读通道配置（GET 只回脱敏视图：botId/hasSecret/url/targetChatId + 桥写的状态）。 */
       function loadImBots() {
@@ -3505,6 +3518,9 @@ window.__ModuleLoader__.load({
         var sec = String(imBotsSecret || "").trim();
         if (sec) wecom.secret = sec;
         wecom.targetChatId = String(imBotsChat || "").trim();
+        // 会话可选绑定：空串 = 跟随当前活跃会话（服务端会同时清掉 sessionTitle）
+        wecom.sessionId = String(imBotsSessionId || "").trim();
+        wecom.sessionTitle = wecom.sessionId ? String(imBotsSessionTitle || "").trim() : "";
         var u = String(imBotsUrl || "").trim();
         if (u) wecom.url = u;
         return wecom;
@@ -3517,6 +3533,7 @@ window.__ModuleLoader__.load({
         else if (code === "missing_secret") e.secret = text || "请填写 Secret";
         else if (code === "invalid_url") e.url = text || "服务地址必须以 http:// 或 https:// 开头";
         else if (code === "invalid_target_chat_id") e.chat = text || "接收会话 ID 太长";
+        else if (code === "invalid_session_id") e.session = text || "会话 ID 太长";
         return e;
       }
       /** 保存（PUT）；testAfter=true 时走 POST /test（= 保存后等桥连接，最多 10s）。 */
@@ -5267,7 +5284,10 @@ window.__ModuleLoader__.load({
       // ---------- 反馈视图(独立页,带返回) ----------
       function renderFeedback() {
         return h("div", null,
-          h("button", { type: "button", className: "dru-btn dru-btn-ghost", style: { width: "100%" }, onClick: function () { setView("home"); } }, "← 返回"),
+          h("button", { type: "button", className: "dru-btn dru-btn-ghost", style: { width: "100%" }, onClick: function () { setIaFbHint(""); setView("home"); } }, "← 返回"),
+          // 带过来的上下文提示（例如从「飞书即将支持 → 告诉我，优先支持」过来时的那句引导）；
+          // 离开反馈视图时清空（它在 setView("home") 的返回按钮里一并清掉）。
+          iaFbHint ? h("div", { className: "dru-msg dru-msg-ok" }, iaFbHint) : null,
           h(FeedbackCard, null)
         );
       }
@@ -5757,6 +5777,9 @@ window.__ModuleLoader__.load({
             setImBotsBotId(String(w.botId || ""));
             setImBotsSecret("");
             setImBotsChat(String(w.targetChatId || ""));
+            setImBotsSessionId(String(w.sessionId || ""));
+            setImBotsSessionTitle(String(w.sessionTitle || ""));
+            setImBotsWhyOpen(false);
             setImBotsUrl(String(w.url || ""));
           });
         }
@@ -6046,11 +6069,47 @@ window.__ModuleLoader__.load({
         );
       }
 
-      /** 企业微信配置步骤：Bot ID / Secret（不回显）/ 接收会话 ID（可选）/ 保存并连接 / 测试。 */
+      /** 统一的表单字段结构（label + 控件 + 错误位；错误就近显示）。 */
+      function iaField(label, htmlFor, control, errText, hintText, extraHintId) {
+        // 同时带 dru-field 语义类名（任务里约定的字段结构名），样式仍由 .dru-ia-field 承担。
+        return h("div", { className: "dru-ia-field dru-field" },
+          h("label", { className: "dru-ia-label", htmlFor: htmlFor }, label),
+          control,
+          errText ? h("div", { id: extraHintId || undefined, className: "dru-ia-err", role: "alert" }, errText) : null,
+          hintText ? h("div", { className: "dru-ia-hint" }, hintText) : null
+        );
+      }
+      /** 会话 id 的短形态（下拉里标题可能重复，短 id 帮用户区分）。 */
+      function iaShortId(id) {
+        var s2 = String(id || "");
+        return s2.length > 8 ? (s2.slice(0, 8) + "…") : s2;
+      }
+      /** 会话标题截断（业主：下拉文案别撑爆一行）。 */
+      function iaTruncTitle(t) {
+        var s2 = String(t || "").trim();
+        if (!s2) return "未命名会话";
+        return s2.length > 24 ? (s2.slice(0, 24) + "…") : s2;
+      }
+      /** 当前实际转发目标的一句话（绑定会话：<title or 跟随活跃>）。 */
+      function iaBoundSessionText() {
+        var ws = (imBots && imBots.status) || {};
+        var list = Array.isArray(ws.sessions) ? ws.sessions : [];
+        var bound = String(ws.boundSessionId || "");
+        if (bound) {
+          var hit = null;
+          for (var i = 0; i < list.length; i++) { if (list[i] && list[i].id === bound) { hit = list[i]; break; } }
+          return iaTruncTitle((hit && hit.title) || bound);
+        }
+        var activeTitle = String(ws.activeSessionTitle || "");
+        return activeTitle ? ("跟随活跃（" + iaTruncTitle(activeTitle) + "）") : "跟随活跃会话";
+      }
+
+      /** 企业微信配置步骤：会话绑定 / Bot ID / Secret（不回显）/ 接收会话 ID / 保存并连接 / 测试。 */
       function renderWecomStep(close) {
         var w = (imBots && imBots.wecom) || {};
         var ws = (imBots && imBots.status) || {};
         var fieldErr = imBotsFieldErr || {};
+        var sessions = Array.isArray(ws.sessions) ? ws.sessions : [];
         var stateLine = null;
         if (imBotsBusy === "test") {
           stateLine = h("div", { className: "dru-ia-state", role: "status", "aria-live": "polite" }, h("span", { className: "dru-spin" }), "正在连接企业微信…（最多 10 秒）");
@@ -6064,9 +6123,33 @@ window.__ModuleLoader__.load({
         } else if (w.enabled || w.hasSecret) {
           stateLine = h("div", { className: "dru-ia-state", role: "status" }, "已保存，等待连接…" + (ws.lastError ? "：" + ws.lastError : ""));
         }
+
+        // 会话下拉：默认「跟随当前活跃会话」+ 状态文件里的会话（只读桥写的数据，不自己拉会话列表）
+        var sessionOptions = [h("option", { value: "" }, "跟随当前活跃会话（默认）")];
+        for (var i = 0; i < sessions.length; i++) {
+          var it = sessions[i] || {};
+          if (!it.id) continue;
+          sessionOptions.push(h("option", { value: String(it.id) },
+            iaTruncTitle(it.title) + " · " + iaShortId(it.id)));
+        }
+        var sessionSelect = h("select", {
+          id: "dru-wecom-session", className: "dru-ia-input", value: String(imBotsSessionId || ""),
+          "aria-invalid": fieldErr.session ? "true" : "false",
+          "aria-describedby": fieldErr.session ? "dru-wecom-session-err" : undefined,
+          onChange: function (e) {
+            var sid = String(e.target.value || "");
+            var title = "";
+            for (var k = 0; k < sessions.length; k++) {
+              if (sessions[k] && String(sessions[k].id) === sid) { title = String(sessions[k].title || ""); break; }
+            }
+            setImBotsSessionId(sid);
+            setImBotsSessionTitle(sid ? title : "");
+          }
+        }, sessionOptions);
+
         return iaDialog(Object.assign({}, {
           title: "企业微信智能机器人",
-          sub: "在企业微信「智能机器人」页面复制 Bot ID 与 Secret；Secret 只保存在本机，不会回显",
+          sub: "填 Bot ID 与 Secret 即可；Secret 只保存在本机，不会回显",
           onClose: close,
           foot: [
             h("button", {
@@ -6077,8 +6160,16 @@ window.__ModuleLoader__.load({
               imBotsBusy === "save" ? "保存中…" : "仅保存"),
             h("button", { type: "button", className: "dru-ia-btn is-ghost", disabled: imBotsBusy !== "", onClick: function () { testImBots(); } }, "测试")
           ]
-        }, { children: [h("div", { className: "dru-ia-field" },
-            h("label", { className: "dru-ia-label", htmlFor: "dru-wecom-bot" }, "Bot ID"),
+        }, { children: [
+          // 当前实际转发目标：一行说清楚（状态不只靠颜色/图标）
+          h("div", { className: "dru-ia-state" }, druIcon("chat"), "绑定会话：" + iaBoundSessionText()),
+          iaField("转接到哪个会话", "dru-wecom-session", sessionSelect,
+            fieldErr.session || "",
+            sessions.length
+              ? "给机器人发消息时，转发到这个会话；默认跟随当前活跃会话。"
+              : "还没有会话，去创建一个任务后这里会出现。",
+            "dru-wecom-session-err"),
+          iaField("Bot ID", "dru-wecom-bot",
             h("input", {
               id: "dru-wecom-bot", className: "dru-ia-input", type: "text", value: imBotsBotId,
               placeholder: "aibxxxxxxxx", autoComplete: "off", spellCheck: false,
@@ -6086,10 +6177,8 @@ window.__ModuleLoader__.load({
               "aria-describedby": fieldErr.botId ? "dru-wecom-bot-err" : undefined,
               onChange: function (e) { setImBotsBotId(e.target.value); }
             }),
-            fieldErr.botId ? h("div", { id: "dru-wecom-bot-err", className: "dru-ia-err", role: "alert" }, fieldErr.botId) : null
-          ),
-          h("div", { className: "dru-ia-field" },
-            h("label", { className: "dru-ia-label", htmlFor: "dru-wecom-secret" }, "Secret"),
+            fieldErr.botId || "", null, "dru-wecom-bot-err"),
+          iaField("Secret", "dru-wecom-secret",
             h("div", { className: "dru-ia-input-row" },
               h("input", {
                 id: "dru-wecom-secret", className: "dru-ia-input",
@@ -6106,31 +6195,37 @@ window.__ModuleLoader__.load({
                 onClick: function () { setImBotsShowSecret(!imBotsShowSecret); }
               }, druIcon(imBotsShowSecret ? "eyeoff" : "eye"))
             ),
-            fieldErr.secret ? h("div", { id: "dru-wecom-secret-err", className: "dru-ia-err", role: "alert" }, fieldErr.secret) : null,
-            h("div", { className: "dru-ia-hint" }, "只保存在本机配置目录；界面上永远不回显已保存的 Secret。")
-          ),
-          h("div", { className: "dru-ia-field" },
-            h("label", { className: "dru-ia-label", htmlFor: "dru-wecom-chat" }, "接收会话 ID（可选）"),
+            fieldErr.secret || "", "只保存在本机；已保存的 Secret 永远不回显。", "dru-wecom-secret-err"),
+          iaField("接收会话 ID（可选）", "dru-wecom-chat",
             h("input", {
               id: "dru-wecom-chat", className: "dru-ia-input", type: "text", value: imBotsChat,
               placeholder: "留空即可", autoComplete: "off", spellCheck: false,
               "aria-invalid": fieldErr.chat ? "true" : "false",
               onChange: function (e) { setImBotsChat(e.target.value); }
             }),
-            fieldErr.chat ? h("div", { className: "dru-ia-err", role: "alert" }, fieldErr.chat) : null,
-            h("div", { className: "dru-ia-hint" }, "不知道填什么就留空——你在企业微信里给机器人发一句话后会自动绑定。")
-          ),
+            fieldErr.chat || "", "不知道填什么就留空——你在企业微信里给机器人发一句话后会自动绑定。"),
+          // 高级项收进折叠：主表单只留 4 个字段（一屏一主操作）
           h("div", { className: "dru-ia-field" },
-            h("label", { className: "dru-ia-label", htmlFor: "dru-wecom-url" }, "服务地址（可选，高级）"),
-            h("input", {
-              id: "dru-wecom-url", className: "dru-ia-input", type: "url", value: imBotsUrl,
-              placeholder: "默认使用企业微信官方接口，一般无需填写", autoComplete: "off", spellCheck: false,
-              "aria-invalid": fieldErr.url ? "true" : "false",
-              onChange: function (e) { setImBotsUrl(e.target.value); }
-            }),
-            fieldErr.url ? h("div", { className: "dru-ia-err", role: "alert" }, fieldErr.url) : null
+            h("button", {
+              type: "button", className: "dru-ia-disclose", "aria-expanded": imBotsWhyOpen ? "true" : "false",
+              onClick: function () { setImBotsWhyOpen(!imBotsWhyOpen); }
+            }, "为什么要填这些", druIcon(imBotsWhyOpen ? "left" : "right")),
+            imBotsWhyOpen
+              ? h("div", { className: "dru-ia-hint", style: { padding: "8px 2px 0" } },
+                  "Bot ID/Secret 来自企业微信「智能机器人」页，机器人靠它连接；接收会话 ID 与转接会话决定消息发到哪个对话；服务地址仅私有化部署才需要改。",
+                  h("div", { style: { marginTop: 8 } },
+                    h("label", { className: "dru-ia-label", htmlFor: "dru-wecom-url" }, "服务地址（可选，高级）"),
+                    h("input", {
+                      id: "dru-wecom-url", className: "dru-ia-input", type: "url", value: imBotsUrl,
+                      placeholder: "默认使用企业微信官方接口，一般无需填写", autoComplete: "off", spellCheck: false,
+                      "aria-invalid": fieldErr.url ? "true" : "false",
+                      onChange: function (e) { setImBotsUrl(e.target.value); }
+                    }),
+                    fieldErr.url ? h("div", { className: "dru-ia-err", role: "alert" }, fieldErr.url) : null))
+              : null
           ),
-          stateLine] }));
+          stateLine
+        ] }));
       }
 
       /** 「微信机器人（扫码绑定）」步骤：复用既有 WeChatBotSection；未登录时给登录入口（不再隐藏功能）。 */
@@ -6152,18 +6247,45 @@ window.__ModuleLoader__.load({
                 }, "去登录"))] }));
       }
 
-      /** 飞书 / Webhook：先给诚实的空状态（不做假入口）。 */
+      /** 还没支持的平台：只给**诚实**的空状态（说明 + 反馈入口），绝不放假表单/假入口。 */
       function renderComingSoonStep(close, kind) {
-        var name = kind === "feishu" ? "飞书机器人" : "Webhook";
+        var meta = {
+          feishu: {
+            name: "飞书机器人",
+            why: "飞书官方长连接接入需要企业管理员配置应用（应用凭证 + 机器人能力），接入方式与企业微信类似。"
+          },
+          dingtalk: {
+            name: "钉钉机器人",
+            why: "钉钉应用机器人需要企业管理员创建应用并开通机器人权限，接入方式与企业微信类似。"
+          },
+          webhook: {
+            name: "高级 · Webhook",
+            why: "Webhook 需要你自行提供公网 HTTPS 端点并校验签名；我们会把它作为同一条通道的高级选项。"
+          }
+        }[kind] || { name: "这个平台", why: "接入方式还在评估中。" };
         return iaDialog(Object.assign({}, {
-          title: name,
-          sub: "这个平台还在开发中",
+          title: meta.name,
+          sub: "即将支持",
           onClose: close,
-          foot: h("button", { type: "button", className: "dru-ia-btn", onClick: function () { setIaChStep("list"); } }, "返回平台列表")
-        }, { children: [h("div", { className: "dru-ia-empty" },
+          foot: [
+            h("button", {
+              type: "button", className: "dru-ia-btn is-primary",
+              // 复用现有反馈通道：关掉弹层 → 打开反馈视图并带一句引导（不新增后端接口）
+              onClick: function () {
+                setIaModal(null); setIaChStep("list");
+                setIaFbHint("在下面写一句「想要 " + meta.name + "」，我们会按需求排期。");
+                setView("feedback");
+              }
+            }, "告诉我，优先支持"),
+            h("button", { type: "button", className: "dru-ia-btn", onClick: function () { setIaChStep("list"); } }, "返回平台列表")
+          ]
+        }, { children: [
+          h("div", { className: "dru-ia-empty" },
             druIcon("bell", 24),
-            h("div", { className: "dru-ia-empty-title" }, name + " 即将支持"),
-            h("div", null, "现在可以先用「企业微信智能机器人」；" + name + " 上线后会在同一位置出现，不需要重新配置。"))] }));
+            h("div", { className: "dru-ia-empty-title" }, meta.name + " 即将支持"),
+            h("div", null, meta.why),
+            h("div", { className: "dru-ia-hint", style: { marginTop: 4 } }, "现在可以先用「企业微信智能机器人」。"))
+        ] }));
       }
 
       /** 通道弹层：平台列表 → 配置步骤（一级一屏，不做长表单堆叠）。 */
@@ -6171,7 +6293,7 @@ window.__ModuleLoader__.load({
         if (iaModal !== "channel") return null;
         if (iaChStep === "wecom") return renderWecomStep(closeIAModal);
         if (iaChStep === "wechat") return renderWechatStep(closeIAModal);
-        if (iaChStep === "feishu" || iaChStep === "webhook") return renderComingSoonStep(closeIAModal, iaChStep);
+        if (iaChStep === "feishu" || iaChStep === "dingtalk" || iaChStep === "webhook") return renderComingSoonStep(closeIAModal, iaChStep);
         var w = (imBots && imBots.wecom) || {};
         var ws = (imBots && imBots.status) || {};
         var wecomSub = ws.connected
@@ -6185,8 +6307,9 @@ window.__ModuleLoader__.load({
         }, { children: [h("div", { className: "dru-ia-list" },
             iaChannelRow("chat", "企业微信智能机器人", wecomSub, function () { setIaChStep("wecom"); setImBotsMsg(null); setImBotsFieldErr({}); }, "配置"),
             iaChannelRow("chat", "微信机器人（扫码绑定）", "扫码绑定 · 在微信里收通知 / 回数字拍板", function () { setIaChStep("wechat"); }, "打开"),
-            iaChannelRow("send", "飞书机器人", "即将支持", function () { setIaChStep("feishu"); }, "查看"),
-            iaChannelRow("code", "高级 · Webhook", "即将支持", function () { setIaChStep("webhook"); }, "查看")
+            iaChannelRow("send", "飞书机器人", "即将支持 · 需要企业管理员配置应用", function () { setIaChStep("feishu"); }, "查看"),
+            iaChannelRow("send", "钉钉机器人", "即将支持 · 需要企业管理员创建应用", function () { setIaChStep("dingtalk"); }, "查看"),
+            iaChannelRow("code", "高级 · Webhook", "高级用法 · 自备公网端点", function () { setIaChStep("webhook"); }, "查看")
           )] }));
       }
 

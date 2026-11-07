@@ -89,6 +89,26 @@ export const ANSWER_TRUNCATED_NOTE = "…(已截断，完整内容看电脑)";
  * 拿到的是空/上一条。只在「ok 但没有正文」时补一次（400ms），拿到就发；这是唯一会多等的场景。
  */
 export const ANSWER_FETCH_RETRY_DELAYS_MS = Object.freeze([0, 400]);
+
+/* ── 审批卡片（task-24）────────────────────────────────────────────────────────
+ * 协议来自官方 @wecom/aibot-node-sdk 类型定义（Lead 已核实）：
+ *   发卡：{cmd:"aibot_send_msg", headers:{req_id}, body:{chatid, msgtype:"template_card", template_card:{...}}}
+ *   点按钮 → 入站 {cmd:"aibot_event_callback", body:{event:{eventtype:"template_card_event", event_key, task_id}}}
+ *   更新：{cmd:"aibot_respond_update_msg", headers:{req_id:事件帧的req_id},
+ *          body:{response_type:"update_template_card", template_card:{...改后的卡...}}}
+ */
+/** 审批卡 TTL（与系统一致 90s）：过期后再点按「拒绝」处理（fail-closed）。 */
+export const APPROVAL_CARD_TTL_MS = 90_000;
+/** 卡片摘要上限（官方 sub_title_text 限 112 字）。 */
+export const APPROVAL_CARD_SUMMARY_MAX = 112;
+/** task_id 上限（官方：字母数字-_@，≤128）。 */
+export const APPROVAL_CARD_TASK_ID_MAX = 128;
+/** 审批卡在内存里最多保留多少张（超出丢最旧；只影响「点旧卡」时的幂等/过期判定）。 */
+export const APPROVAL_CARD_MAX = 50;
+/** 状态文件 `sessions[]` 上限（task-24：≤10，只含 id/title/updatedAt）。 */
+export const SESSION_LIST_MAX = 10;
+/** 会话列表（含标题/updatedAt）的刷新节流；会话事件很密，避免每来一条就查一次 DSH。 */
+export const SESSION_LIST_REFRESH_MS = 30_000;
 /** 入站 msgid 去重表上限 / TTL（重连后官方可能补发同一条）。 */
 export const SEEN_MSG_MAX = 200;
 export const SEEN_MSG_TTL_MS = 10 * 60 * 1000;
@@ -269,14 +289,16 @@ export function fileMode(file) {
  *     "secret": "",
  *     "url": "",                // 可选：私有部署企业填自己的长连接地址
  *     "targetChatId": "",       // 可选：主动推送的兜底接收方（userid 或群 chatid）
- *     "allowFrom": []           // 可选：入站白名单（userid / chatid），空 = 首次发送者自动绑定
+ *     "allowFrom": [],          // 可选：入站白名单（userid / chatid），空 = 首次发送者自动绑定
+ *     "sessionId": "",          // 可选：**固定转发目标会话**（空 = 跟随当前活跃会话）
+ *     "sessionTitle": ""        // 可选：上面那个会话的显示名（只用于状态文件/面板展示）
  *   },
  *   "feishu": { "enabled": false, "appId": "", "appSecret": "" }
  * }
  * ```
  *
  * @param {any} raw
- * @returns {{version:number, wecom:{enabled:boolean,botId:string,secret:string,url:string,targetChatId:string,allowFrom:string[]}, feishu:{enabled:boolean,appId:string,appSecret:string}}}
+ * @returns {{version:number, wecom:{enabled:boolean,botId:string,secret:string,url:string,targetChatId:string,allowFrom:string[],sessionId:string,sessionTitle:string}, feishu:{enabled:boolean,appId:string,appSecret:string}}}
  */
 export function normalizeImBotsConfig(raw) {
   const src = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
@@ -291,7 +313,10 @@ export function normalizeImBotsConfig(raw) {
       secret: typeof w.secret === "string" ? w.secret : "",
       url: str(w.url),
       targetChatId: str(w.targetChatId),
-      allowFrom: normalizeAllowList(w.allowFrom)
+      allowFrom: normalizeAllowList(w.allowFrom),
+      // 会话可选绑定（task-24）：空 = 跟随「最近活跃会话」
+      sessionId: str(w.sessionId),
+      sessionTitle: str(w.sessionTitle)
     },
     feishu: {
       enabled: f.enabled === true,
@@ -462,6 +487,121 @@ function shortSession(sessionId) {
 }
 
 // ===========================================================================
+// 4b. 审批卡片（纯函数，便于单测钉住报文形状）
+// ===========================================================================
+
+/** 安全哈希（字母数字）：task_id 只允许 [A-Za-z0-9-_@]，且 ≤128。 */
+export function approvalTaskId(requestId) {
+  const raw = String(requestId || "");
+  let hash = "";
+  try {
+    hash = crypto.createHash("sha1").update(raw).digest("hex").slice(0, 32);
+  } catch {
+    hash = "x" + raw.replace(/[^A-Za-z0-9]/g, "").slice(0, 31);
+  }
+  const id = `apr_${hash}`;
+  return id.length > APPROVAL_CARD_TASK_ID_MAX ? id.slice(0, APPROVAL_CARD_TASK_ID_MAX) : id;
+}
+
+/**
+ * 解析按钮回调的 `event_key`（`allow:<requestId>` / `deny:<requestId>`）。
+ * requestId 本身可能含 `:`（DSH eventId 形态不定），所以**只按第一个冒号切**。
+ * @param {string} eventKey
+ * @returns {{decision:"allow"|"deny", requestId:string}|null}
+ */
+export function parseApprovalEventKey(eventKey) {
+  const raw = String(eventKey || "").trim();
+  const idx = raw.indexOf(":");
+  if (idx <= 0) return null;
+  const kind = raw.slice(0, idx).trim().toLowerCase();
+  const requestId = raw.slice(idx + 1).trim();
+  if (!requestId) return null;
+  if (kind === "allow" || kind === "allowed" || kind === "approve") return { decision: "allow", requestId };
+  if (kind === "deny" || kind === "denied" || kind === "reject") return { decision: "deny", requestId };
+  return null;
+}
+
+/**
+ * 审批卡（button_interaction）报文。
+ * @param {{requestId:string, title?:string, summary?:string, toolName?:string}} info
+ */
+export function buildApprovalCard(info = {}) {
+  const requestId = String(info.requestId || "");
+  const toolName = truncateText(info.toolName || "", 40);
+  const title = truncateText(info.title || "需要你在电脑上拍板", 30);
+  const summary = truncateText(info.summary || "", APPROVAL_CARD_SUMMARY_MAX);
+  return {
+    card_type: "button_interaction",
+    task_id: approvalTaskId(requestId),
+    main_title: {
+      title,
+      desc: toolName ? `工具：${toolName}` : "DeepSeek Harness 在等你允许一步操作"
+    },
+    // 官方限制 112 字；摘要只放"在等什么"，不放完整命令（隐私边界与 push-reporter 一致）
+    sub_title_text: summary,
+    button_list: [
+      { text: "允许一次", key: `allow:${requestId}`, style: 1 },
+      { text: "拒绝", key: `deny:${requestId}`, style: 2 }
+    ]
+  };
+}
+
+/** 卡片更新后的文案（决定/过期/失败）—— 用 text_notice（按钮消失，结果一目了然）。 */
+export function buildDecidedCard(info = {}) {
+  const state = String(info.state || "handled");
+  const requestId = String(info.requestId || "");
+  const who = truncateText(info.who || "", 40);
+  const whenText = typeof info.at === "number" && info.at > 0 ? fmtClockFromMs(info.at) : "";
+  const map = {
+    allowed: { title: "✅ 已允许一次", desc: who ? `操作人：${who}` : "已允许一次" },
+    denied: { title: "❌ 已拒绝", desc: who ? `操作人：${who}` : "已拒绝" },
+    expired: { title: "⌛ 已过期（按拒绝处理）", desc: "超过 90 秒未处理，已 fail-closed 按拒绝执行" },
+    failed: { title: "⚠️ 没能送达电脑端", desc: truncateText(info.reason || "请到电脑上确认", 60) },
+    handled: { title: "ℹ️ 这条审批已经处理过了", desc: who ? `操作人：${who}` : "" },
+  };
+  const hit = map[state] || map.handled;
+  return {
+    card_type: "text_notice",
+    task_id: approvalTaskId(requestId),
+    main_title: { title: hit.title, desc: hit.desc },
+    sub_title_text: whenText ? `处理时间：${whenText}` : ""
+  };
+}
+
+/** 毫秒时间戳 → HH:MM:SS（本地时区；只用于卡片确认文案）。 */
+function fmtClockFromMs(ms) {
+  try {
+    const d = new Date(Number(ms));
+    if (Number.isNaN(d.getTime())) return "";
+    const p = (n) => String(n).padStart(2, "0");
+    return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  } catch { return ""; }
+}
+
+/**
+ * 状态文件里的 `sessions[]`（≤10，只含 id/title/updatedAt；**绝不含消息正文**）。
+ * @param {Array<{id:string,title?:string,updatedAt?:number}>} list
+ */
+export function normalizeSessionStatusList(list) {
+  const out = [];
+  const seen = new Set();
+  const arr = Array.isArray(list) ? list : [];
+  for (const it of arr) {
+    if (!it || typeof it !== "object") continue;
+    const id = typeof it.id === "string" ? it.id.trim() : "";
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push({
+      id,
+      title: truncateText(it.title || "", 60),
+      updatedAt: Number.isFinite(Number(it.updatedAt)) ? Number(it.updatedAt) : 0
+    });
+    if (out.length >= SESSION_LIST_MAX) break;
+  }
+  return out;
+}
+
+// ===========================================================================
 // 5. WebSocket 长连接客户端
 // ===========================================================================
 
@@ -507,6 +647,13 @@ export function createWecomBot(options = {}) {
   const answerRelayEnabled = options.answerRelay !== false;
   const answerRelayTtlMs = positiveNumber(options.answerRelayTtlMs, ANSWER_RELAY_TTL_MS);
   const answerMaxChars = Math.max(20, Math.floor(positiveNumber(options.answerMaxChars, ANSWER_MAX_CHARS)));
+  // 审批卡片（task-24）：默认开；TTL 可注入（测试用）；决策回调由 bridge 注入
+  const approvalCardsEnabled = options.approvalCards !== false;
+  const approvalCardTtlMs = positiveNumber(options.approvalCardTtlMs, APPROVAL_CARD_TTL_MS);
+  const onApprovalDecision = typeof options.onApprovalDecision === "function" ? options.onApprovalDecision : null;
+  // 会话可选绑定（task-24）：配置固定的会话（空 = 跟随活跃会话）
+  const configuredSessionId = String(options.configuredSessionId || "").trim();
+  const configuredSessionTitle = truncateText(options.configuredSessionTitle || "", 60);
   const log = createScopedLogger({ sink: options.logger, secrets: [secret], prefix: "[wecom]" });
 
   const statusFile = relayDir ? path.join(relayDir, IM_BOT_STATUS_FILE) : "";
@@ -533,7 +680,9 @@ export function createWecomBot(options = {}) {
     notified: 0,
     sent: 0,
     sendFailed: 0,
-    answers: 0
+    answers: 0,
+    cards: 0,
+    approvalDecisions: 0
   };
 
   let ws = null;
@@ -549,7 +698,6 @@ export function createWecomBot(options = {}) {
   let subscriber = null;
   let ownsSubscriber = false;
   let wired = false;
-  let lastSeenSessionId = "";
   let lastNoTargetLogAt = 0;
   /**
    * 最近一次**入站转发成功**的会话：{ sessionId, at }。
@@ -557,6 +705,21 @@ export function createWecomBot(options = {}) {
    * （否则业主只能看到「已转给桌面端会话 ✓」，看不到回答）。消费一次即清空。
    */
   let lastInbound = { sessionId: "", at: 0 };
+  /**
+   * 会话可选绑定（task-24）：
+   *   · sessionList — 状态文件里的 `sessions[]`（≤10，只含 id/title/updatedAt）
+   *   · activeSession — 最近活跃会话（来自 session-state running / control-activity / 事件）
+   *   · boundSessionId — 当前**实际**转发目标（config.sessionId → active → sessions[0]）
+   */
+  let sessionList = [];
+  let activeSession = { id: "", title: "" };
+  let boundSessionId = "";
+  const sessionRegistry = new Map(); // id -> {id,title,updatedAt}
+  const sessionCache = { at: 0, items: [], inFlight: false };
+  let sessionRefreshTimer = null;
+  /** 审批卡片：内存登记（task_id → 记录 / requestId → 记录），用于幂等与 TTL 判定。 */
+  const cardsByTask = new Map();
+  const cardsByRequest = new Map();
   const pending = new Map();   // reqId -> {kind, timer, onAck}
   const seenMsgs = new Map();  // msgid -> at
   const notifiedKeys = new Map(); // dedupe key -> at
@@ -586,7 +749,12 @@ export function createWecomBot(options = {}) {
       lastConnectedAt: Number(state.lastConnectedAt) || 0,
       lastMessageAt: Number(state.lastMessageAt) || 0,
       boundChatId: state.boundChatId || "",
-      targetChatId: targetChatId || ""
+      targetChatId: targetChatId || "",
+      // 会话可选绑定（task-24）：只读元数据（id/标题/更新时间），绝不含消息正文
+      sessions: normalizeSessionStatusList(sessionList),
+      activeSessionId: activeSession.id || "",
+      activeSessionTitle: activeSession.title || "",
+      boundSessionId: boundSessionId || ""
     };
   }
 
@@ -930,12 +1098,18 @@ export function createWecomBot(options = {}) {
 
   async function handleInboundEvent(frame) {
     const body = frame.body && typeof frame.body === "object" ? frame.body : {};
-    const eventType = String(body.event_type || body.eventType || body.event || "").trim();
+    const ev = body.event && typeof body.event === "object" ? body.event : {};
+    // 卡片事件的事件类型在 `body.event.eventtype` 里（body.event 是对象，不能直接 String()）
+    const eventType = String(ev.eventtype || ev.event_type || body.event_type || body.eventType || "").trim();
     const { fromUser, chatid, isGroup } = pickInboundIdentity(body);
     log.info(`收到机器人事件 event=${truncateText(eventType || "?", 40)}${fromUser ? ` from=${chatIdHash(fromUser)}` : ""}`);
     state.lastMessageAt = now();
     writeStatus();
     emitter.emit("bot-event", { eventType, fromUser, chatid, isGroup, frame, at: now() });
+    // 审批卡片按钮点击 → 走真实审批回执（task-24）
+    if (eventType === "template_card_event" || (ev.event_key && ev.task_id)) {
+      await handleApprovalCardEvent(frame);
+    }
   }
 
   /** 把入站文本转给 DSH 会话（尽力，失败给用户一句人话）。 */
@@ -963,6 +1137,8 @@ export function createWecomBot(options = {}) {
     if (result && result.ok) {
       // 记下"这次入站交给了哪个会话"：该会话下一次 turn/end 要把回答正文回传给企微
       lastInbound = { sessionId, at: now() };
+      // 状态文件对外表达"当前实际转发目标"（面板据此显示绑定关系）
+      if (boundSessionId !== sessionId) { boundSessionId = sessionId; writeStatus(); }
       log.info(`入站文本已转给会话 session=${shortSession(sessionId)}`);
       replyText(frame, `已转给桌面端会话 ✓（${shortSession(sessionId)}）`);
       emitter.emit("inbound-routed", { ...info, sessionId });
@@ -974,15 +1150,128 @@ export function createWecomBot(options = {}) {
     emitter.emit("inbound-failed", { ...info, sessionId, reason: why });
   }
 
-  /** 入站转发目标会话：注入的取值器 > 最近见过的事件会话 > 会话列表里挑一个。 */
+  // ---------- 会话可选绑定（task-24） ----------
+
+  /** subscriber 当前 follow 着的会话 id 列表（只读；拿不到算空）。 */
+  function followedSessionIds() {
+    const sub = subscriber;
+    if (!sub || typeof sub.sessions !== "function") return [];
+    try {
+      const ids = sub.sessions();
+      return Array.isArray(ids) ? ids.filter((x) => typeof x === "string" && x).slice(0, 100) : [];
+    } catch { return []; }
+  }
+
+  /** 会话标题：注入的 sessionTitle() > DSH 列表里的标题 > 配置里给固定会话起的名字。 */
+  function titleOfSession(id, fallback) {
+    if (typeof options.sessionTitle === "function") {
+      try {
+        const t = String(options.sessionTitle(id) || "").trim();
+        if (t) return truncateText(t, 60);
+      } catch { /* 忽略 */ }
+    }
+    if (fallback) return truncateText(fallback, 60);
+    if (id === configuredSessionId && configuredSessionTitle) return configuredSessionTitle;
+    const cached = sessionRegistry.get(id);
+    return cached && cached.title ? cached.title : "";
+  }
+
+  /** 转发目标优先级（task-24）：配置固定 → 最近活跃 → 会话列表第一个。 */
+  function computeBoundSessionId() {
+    if (configuredSessionId) return configuredSessionId;
+    if (activeSession.id) return activeSession.id;
+    return sessionList.length ? sessionList[0].id : "";
+  }
+
+  /** 同步 active/bound 派生状态 + 把「配置固定的会话」补进列表首位（用户明确选过）。 */
+  function syncSessionState() {
+    if (activeSession.id) activeSession.title = titleOfSession(activeSession.id, activeSession.title);
+    boundSessionId = computeBoundSessionId();
+    if (configuredSessionId && !sessionList.some((s) => s.id === configuredSessionId)) {
+      sessionList = normalizeSessionStatusList([
+        { id: configuredSessionId, title: configuredSessionTitle, updatedAt: 0 },
+        ...sessionList
+      ]);
+    }
+  }
+
+  /**
+   * 刷新「会话列表 + 标题 + updatedAt」并写状态文件。
+   *
+   * 来源（task-24）：`subscriber.sessions()`（= 当前 follow 中的会话 id）∩ `listSessions()` 的元数据。
+   * 只写元数据（id/title/updatedAt），**绝不含消息正文**；`listSessions` 有 30s 缓存，
+   * 会话事件再密也不会把 DSH 打成筛子。
+   */
+  async function refreshSessions(opts = {}) {
+    const sub = subscriber;
+    if (!sub) return;
+    const at = now();
+    const ids = followedSessionIds();
+    const needDetail = opts.force === true || at - sessionCache.at > SESSION_LIST_REFRESH_MS;
+    let detail = sessionCache.items;
+    if (needDetail && !sessionCache.inFlight && typeof sub.listSessions === "function") {
+      sessionCache.inFlight = true;
+      try {
+        const r = await sub.listSessions();
+        if (r && r.ok && Array.isArray(r.sessions)) {
+          detail = r.sessions;
+          sessionCache.at = now();
+          sessionCache.items = detail;
+        }
+      } catch { /* 忽略：拿不到标题不影响转发 */ } finally {
+        sessionCache.inFlight = false;
+      }
+    }
+    const byId = new Map();
+    for (const it of Array.isArray(detail) ? detail : []) {
+      if (it && typeof it.sessionId === "string" && it.sessionId) byId.set(it.sessionId, it);
+    }
+    const rows = [];
+    for (const id of ids) {
+      const d = byId.get(id) || {};
+      const title = titleOfSession(id, d.title);
+      const updatedAt = Number(d.updatedAt) || (sessionRegistry.get(id) && sessionRegistry.get(id).updatedAt) || at;
+      sessionRegistry.set(id, { id, title, updatedAt });
+      rows.push({ id, title, updatedAt });
+    }
+    rows.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    sessionList = normalizeSessionStatusList(rows);
+    syncSessionState();
+    writeStatus();
+  }
+
+  /** 会话事件的刷新合并（80ms）；`force` 时立刻拉一次详情（如 ready / 配置变更后）。 */
+  function scheduleSessionRefresh(force = false) {
+    if (stopped) return;
+    if (sessionRefreshTimer) return;
+    sessionRefreshTimer = setTimeout(() => {
+      sessionRefreshTimer = null;
+      void refreshSessions({ force }).catch(() => {});
+    }, force ? 0 : 80);
+    if (typeof sessionRefreshTimer.unref === "function") sessionRefreshTimer.unref();
+  }
+
+  /**
+   * 入站转发目标会话（task-24 优先级）：
+   *   ① `im-bots.json` 的 `wecom.sessionId`（配置固定；用户明确选的）
+   *   ② `activeSessionId`（最近活跃/最近事件）
+   *   ③ `sessions[0]`（follow 中按 updatedAt 最新）
+   *   ④ 兜底维持旧行为：`listSessions()` 里 running / 第一个
+   */
   async function resolveSessionId(sub) {
+    // ⓪ bridge 注入的显式取值器（历史钩子，最高优先；bridge 当前未使用）
     try {
       if (typeof options.sessionIdProvider === "function") {
         const got = String(options.sessionIdProvider() || "");
         if (got) return got;
       }
     } catch { /* 忽略 */ }
-    if (lastSeenSessionId) return lastSeenSessionId;
+    if (configuredSessionId) return configuredSessionId;
+    if (activeSession.id) return activeSession.id;
+    if (sessionList.length === 0) {
+      try { await refreshSessions({ force: true }); } catch { /* 忽略 */ }
+    }
+    if (sessionList.length) return sessionList[0].id;
     if (!sub || typeof sub.listSessions !== "function") return "";
     try {
       const r = await sub.listSessions();
@@ -1050,6 +1339,225 @@ export function createWecomBot(options = {}) {
     return r;
   }
 
+  // ---------- 审批卡片（task-24） ----------
+
+  /** 卡片记录表清理（只影响「点旧卡」时的幂等/TTL 判定；上限 50 张）。 */
+  function pruneApprovalCards() {
+    const at = now();
+    const cutoff = at - 10 * 60 * 1000;
+    for (const [taskId, rec] of cardsByTask) {
+      if (rec.sentAt < cutoff || rec.decidedAt && rec.decidedAt < cutoff) cardsByTask.delete(taskId);
+    }
+    for (const [rid, rec] of cardsByRequest) {
+      if (!cardsByTask.has(rec.taskId)) cardsByRequest.delete(rid);
+    }
+    while (cardsByTask.size > APPROVAL_CARD_MAX) {
+      const first = cardsByTask.keys().next();
+      if (first.done) break;
+      const rec = cardsByTask.get(first.value);
+      cardsByTask.delete(first.value);
+      if (rec) cardsByRequest.delete(rec.requestId);
+    }
+  }
+
+  /**
+   * 主动发一张**审批卡片**（button_interaction：允许一次 / 拒绝）。
+   *
+   * 与 markdown 通知的区别：卡片点按钮会回一个 `template_card_event`，据此走真实审批回执；
+   * markdown 只能"通知你去电脑上点"。所以审批类事件优先发卡片（发不出去再退回 markdown）。
+   *
+   * @param {string} chatid 单聊 = userid；群聊 = 群 chatid
+   * @param {{requestId:string, title?:string, summary?:string, toolName?:string}} info
+   * @returns {{ok:boolean, taskId?:string, reqId?:string, reason?:string}}
+   */
+  function sendApprovalCard(chatid, info = {}) {
+    const to = String(chatid || "").trim();
+    const requestId = String(info.requestId || "").trim();
+    if (!to) return { ok: false, reason: "no_chatid" };
+    if (!requestId) return { ok: false, reason: "no_request_id" };
+    if (!state.authenticated) return { ok: false, reason: "not_authenticated" };
+    pruneApprovalCards();
+    const card = buildApprovalCard({ requestId, title: info.title, summary: info.summary, toolName: info.toolName });
+    const record = {
+      taskId: card.task_id,
+      requestId,
+      chatid: to,
+      sentAt: now(),
+      decided: false,
+      decidedAt: 0,
+      decidedBy: "",
+      decidedState: "pending",
+      title: card.main_title && card.main_title.title,
+      summary: card.sub_title_text,
+    };
+    cardsByTask.set(record.taskId, record);
+    cardsByRequest.set(requestId, record);
+    const r = sendWithAck("send", "aibot_send_msg", {
+      chatid: to,
+      msgtype: "template_card",
+      template_card: card
+    }, (ack) => {
+      if (ack && ack.ok !== true && ack.timeout !== true) {
+        state.sendFailed += 1;
+        log.warn(`审批卡片被拒绝（errcode=${ack.errcode}）`);
+      }
+    });
+    if (!r.ok) {
+      cardsByTask.delete(record.taskId);
+      cardsByRequest.delete(requestId);
+      return r;
+    }
+    state.sent += 1;
+    state.cards += 1;
+    // 只打长度/短 task_id：请求 id 与工具名都不进日志
+    log.info(`审批卡片已发出 chat=${chatIdHash(to)} task=${record.taskId} 摘要长度=${(record.summary || "").length}`);
+    return { ok: true, taskId: record.taskId, reqId: r.reqId };
+  }
+
+  /** 用事件帧的 req_id 更新卡片（按钮消失 → text_notice 结果卡）。 */
+  function updateApprovalCard(frame, record, stateOverride) {
+    const headers = frame && frame.headers && typeof frame.headers === "object" ? frame.headers : {};
+    const reqId = typeof headers.req_id === "string" ? headers.req_id : typeof headers.reqId === "string" ? headers.reqId : "";
+    if (!reqId) return { ok: false, reason: "no_req_id" };
+    const card = buildDecidedCard({
+      requestId: record.requestId,
+      state: stateOverride || record.decidedState,
+      who: record.decidedBy,
+      at: record.decidedAt,
+      reason: record.failReason
+    });
+    const ok = rawSend({
+      cmd: "aibot_respond_update_msg",
+      headers: { req_id: reqId },
+      body: { response_type: "update_template_card", template_card: card }
+    });
+    return ok ? { ok: true } : { ok: false, reason: "socket_closed" };
+  }
+
+  /**
+   * 处理「用户点了审批卡片按钮」（template_card_event）。
+   *
+   * 幂等：同一张卡只消费一次——重复点击不再调回调，只把结果卡重放一遍 + 回一句"已处理"。
+   * TTL：90s（与系统一致）之后点 = 过期 → **按拒绝处理**（fail-closed）并回调 deny。
+   * 安全：`allowFrom` 白名单同样约束按钮点击（陌生人不能替业主拍板）。
+   */
+  async function handleApprovalCardEvent(frame) {
+    const body = frame && frame.body && typeof frame.body === "object" ? frame.body : {};
+    const ev = body.event && typeof body.event === "object" ? body.event : (body.event_type || body.eventtype ? body : {});
+    const eventType = String(ev.eventtype || ev.event_type || body.eventtype || body.event_type || "");
+    if (eventType && eventType !== "template_card_event") {
+      log.debug(`未处理的卡片事件类型 event=${truncateText(eventType, 30)}`);
+      return;
+    }
+    const eventKey = String(ev.event_key || ev.eventKey || "");
+    const taskId = String(ev.task_id || ev.taskId || "");
+    const parsed = parseApprovalEventKey(eventKey);
+    const { fromUser, chatid, isGroup } = pickInboundIdentity(body);
+    const senderId = fromUser || chatid;
+    const replyChat = chatid || state.boundChatId || targetChatId;
+
+    state.lastMessageAt = now();
+    writeStatus();
+    // 只打 hash：企业微信 userid 是可识别信息
+    log.info(`审批卡片点击 task=${taskId || "?"} decision=${parsed ? parsed.decision : "?"} from=${chatIdHash(senderId) || "?"}`);
+
+    if (allowFrom.length && !allowFrom.includes(fromUser) && !allowFrom.includes(chatid)) {
+      state.rejected += 1;
+      log.warn(`拒绝非白名单的审批点击 from=${chatIdHash(senderId) || "?"}`);
+      if (replyChat) sendMarkdown(replyChat, "你没有这台电脑的审批权限。");
+      emitter.emit("approval-rejected", { taskId, eventKey, fromUser, chatid, at: now() });
+      return;
+    }
+    if (!parsed) {
+      log.warn("审批卡片按钮无法识别（event_key 不合法或卡片已失效）");
+      if (replyChat) sendMarkdown(replyChat, "⚠️ 这个按钮已经失效了（审批请求可能已结束）。请到电脑上确认。");
+      return;
+    }
+    const requestId = parsed.requestId;
+    const record = (taskId && cardsByTask.get(taskId)) || cardsByRequest.get(requestId) || null;
+    const who = fromUser || chatid || "企微用户";
+
+    // ① 幂等：同一张卡只处理一次
+    if (record && record.decided) {
+      updateApprovalCard(frame, record);
+      const label = record.decidedState === "allowed" ? "已允许" : record.decidedState === "denied" ? "已拒绝" : record.decidedState === "expired" ? "已过期" : "已处理";
+      if (replyChat) sendMarkdown(replyChat, `ℹ️ 这条审批已经处理过了（${label}），重复点击不会再执行一次。`);
+      emitter.emit("approval-duplicate", { requestId, taskId: record.taskId, fromUser, chatid, at: now() });
+      return;
+    }
+
+    // ② TTL：过期（或记录已丢失 = 无法证明未过期）→ 按拒绝处理（fail-closed）
+    const expired = !record || (now() - record.sentAt > approvalCardTtlMs);
+    const target = record || {
+      taskId: taskId || approvalTaskId(requestId),
+      requestId,
+      chatid: replyChat || "",
+      sentAt: 0,
+      decided: false,
+      decidedAt: 0,
+      decidedBy: "",
+      decidedState: "pending",
+      title: "",
+      summary: ""
+    };
+    const decision = expired ? "deny" : parsed.decision;
+    target.decided = true;
+    target.decidedAt = now();
+    target.decidedBy = who;
+    target.decidedState = expired ? "expired" : decision === "allow" ? "allowed" : "denied";
+    cardsByTask.set(target.taskId, target);
+    cardsByRequest.set(requestId, target);
+
+    // ③ 调注入的决策回调（bridge 内部路由到 approvalCoordinator / pushReporter，与手机拍板同一条路）
+    let result = { ok: false, reason: "审批通道未就绪" };
+    if (onApprovalDecision) {
+      try {
+        const r = await Promise.resolve(onApprovalDecision(requestId, decision, {
+          source: "wecom-card",
+          taskId: target.taskId,
+          chatid: target.chatid,
+          fromUser,
+          isGroup,
+          expired,
+          at: now()
+        }));
+        result = r && typeof r === "object" ? r : { ok: r !== false };
+      } catch (e) {
+        result = { ok: false, reason: truncateText(e && e.message ? e.message : e, 80) };
+      }
+    }
+
+    if (expired) {
+      // 过期也要求"回调 deny"（幂等：DSH 侧若已按未批准处理，回执会失败，但卡片必须显示真相）
+      updateApprovalCard(frame, target);
+      if (replyChat) sendMarkdown(replyChat, `⌛ 这条审批已过期（超过 ${Math.round(approvalCardTtlMs / 1000)} 秒），已按「拒绝」处理。请到电脑上重新发起。`);
+      emitter.emit("approval-expired", { requestId, taskId: target.taskId, fromUser, chatid, decision: "deny", result, at: now() });
+      return;
+    }
+
+    if (result && result.ok) {
+      state.approvalDecisions += 1;
+      updateApprovalCard(frame, target);
+      const timeText = fmtClockFromMs(target.decidedAt);
+      if (replyChat) {
+        sendMarkdown(replyChat, decision === "allow"
+          ? `✅ 已允许一次（${who} · ${timeText}）`
+          : `❌ 已拒绝（${who} · ${timeText}）`);
+      }
+      log.info(`审批卡片处理完成 decision=${decision} task=${target.taskId}`);
+      emitter.emit("approval-decided", { requestId, taskId: target.taskId, decision, fromUser, chatid, via: result.via, at: now() });
+      return;
+    }
+
+    // ④ 没送达电脑端（例如手机上已经拍过板 / DSH 侧已过期）：如实说，卡片显示失败
+    target.decidedState = "failed";
+    target.failReason = truncateText((result && result.reason) || "没有可用的审批通道", 60);
+    updateApprovalCard(frame, target);
+    if (replyChat) sendMarkdown(replyChat, `⚠️ 没能送达电脑端：${target.failReason}。请到电脑上确认。`);
+    log.warn(`审批卡片未能送达电脑端：${target.failReason}`);
+    emitter.emit("approval-failed", { requestId, taskId: target.taskId, decision, fromUser, chatid, reason: target.failReason, at: now() });
+  }
+
   // ---------- DSH 事件订阅（出站通知 + 入站转发共用） ----------
 
   function ensureSubscriber() {
@@ -1091,12 +1599,20 @@ export function createWecomBot(options = {}) {
     wired = true;
     try {
       sub.on("event", (node) => onEventNode(node));
+      // 会话可选绑定（task-24）：活跃会话 + 会话列表元数据随事件刷新（合并后写状态文件）
       sub.on("session-state", (info) => {
-        if (info && typeof info.sessionId === "string" && info.state === "running") lastSeenSessionId = info.sessionId;
+        if (!info || typeof info.sessionId !== "string" || !info.sessionId) return;
+        if (info.state === "running") activeSession.id = info.sessionId;
+        else if (info.state === "removed" && activeSession.id === info.sessionId) activeSession.id = "";
+        scheduleSessionRefresh();
       });
       sub.on("control-activity", (info) => {
-        if (info && typeof info.sessionId === "string" && info.sessionId) lastSeenSessionId = info.sessionId;
+        if (info && typeof info.sessionId === "string" && info.sessionId) activeSession.id = info.sessionId;
+        scheduleSessionRefresh();
       });
+      sub.on("control-sessions", () => scheduleSessionRefresh());
+      sub.on("sessions-discovered", () => scheduleSessionRefresh());
+      sub.on("ready", () => scheduleSessionRefresh(true));
       sub.on("gap", (info) => {
         const from = info && info.from ? new Date(info.from).toISOString() : "?";
         const to = info && info.to ? new Date(info.to).toISOString() : "?";
@@ -1214,7 +1730,10 @@ export function createWecomBot(options = {}) {
 
   function onEventNode(node) {
     if (!node || typeof node !== "object") return;
-    if (typeof node.sessionId === "string" && node.sessionId) lastSeenSessionId = node.sessionId;
+    if (typeof node.sessionId === "string" && node.sessionId) {
+      activeSession.id = node.sessionId;
+      scheduleSessionRefresh();
+    }
     if (stopped || !notifyAllowed || !state.authenticated) return;
     // ── 回答回传：入站后的同一会话 turn/end → 发回答正文（消费一次）──
     if (shouldRelayAnswer(node)) {
@@ -1223,6 +1742,39 @@ export function createWecomBot(options = {}) {
       const sid = node.sessionId;
       lastInbound = { sessionId: "", at: 0 }; // 同一次入站只回传一次
       void relayAnswer(node, sid);
+      return;
+    }
+    // ── 审批类事件：优先发**可点按钮的卡片**（允许一次/拒绝），发不出去再退回 markdown ──
+    if (node.kind === NODE_KINDS.APPROVAL_REQUEST) {
+      const markdown = toMarkdownNotification(node, { sessionTitle: options.sessionTitle });
+      const key = notifyKey(node);
+      if (key && !rememberNotifyKey(key)) return;
+      const requestId = String(node.eventId || "");
+      const target = state.boundChatId || targetChatId;
+      if (!target) {
+        const at = now();
+        if (at - lastNoTargetLogAt > 10 * 60 * 1000) {
+          lastNoTargetLogAt = at;
+          log.info("有审批要推，但还没绑定接收方：请先在企业微信里给机器人发一句话（或在配置里填 targetChatId）");
+        }
+        return;
+      }
+      if (!notifyRateOk()) {
+        log.warn("通知超过每分钟上限，已丢弃（防止事件风暴刷屏）");
+        return;
+      }
+      state.notified += 1;
+      if (approvalCardsEnabled && requestId) {
+        const r = sendApprovalCard(target, {
+          requestId,
+          title: "需要你在电脑上拍板",
+          summary: node.reason || node.toolName || "",
+          toolName: node.toolName || ""
+        });
+        if (r.ok) return;
+        log.warn(`审批卡片发送失败（${r.reason}），退回文本通知`);
+      }
+      if (markdown) sendMarkdown(target, markdown);
       return;
     }
     const markdown = toMarkdownNotification(node, { sessionTitle: options.sessionTitle });
@@ -1327,7 +1879,13 @@ export function createWecomBot(options = {}) {
       sent: state.sent,
       sendFailed: state.sendFailed,
       subscriber: subscriber && typeof subscriber.state === "string" ? subscriber.state : "none",
-      lastSeenSessionId
+      // 会话可选绑定（task-24）：只读元数据，不含消息正文
+      sessions: normalizeSessionStatusList(sessionList),
+      activeSessionId: activeSession.id || "",
+      activeSessionTitle: titleOfSession(activeSession.id, activeSession.title),
+      boundSessionId: boundSessionId || "",
+      cards: state.cards,
+      approvalDecisions: state.approvalDecisions
     };
   }
 
@@ -1378,6 +1936,7 @@ export function createWecomBot(options = {}) {
     },
 
     sendMarkdown,
+    sendApprovalCard,
     replyStream,
     status,
     /** 事件：message / bot-event / authenticated / auth-failed / status / inbound-*（EventEmitter 语义）。 */
@@ -1428,6 +1987,8 @@ function positiveNumber(value, fallback) {
  *   notify?: boolean,
  *   createBot?: (opts:object)=>any,           // 仅测试：替换 bot 工厂
  *   botOptions?: object,                      // 透传给 createWecomBot（upstream/cookie/sessionTitle…）
+ *   onApprovalDecision?: (requestId, decision, meta) => Promise<{ok, reason?, via?}|boolean>,
+ *                                             // 审批卡片点击回调（bridge 注入；与手机拍板同一条路）
  * }} options
  */
 export function createWecomBotController(options = {}) {
@@ -1472,7 +2033,9 @@ export function createWecomBotController(options = {}) {
     try { secretHash = w.secret ? crypto.createHash("sha1").update(String(w.secret)).digest("hex") : ""; } catch { secretHash = "?"; }
     return JSON.stringify([
       w.enabled === true, w.botId || "", secretHash, w.url || "",
-      w.targetChatId || "", w.allowFrom || [], notifyAllowed()
+      w.targetChatId || "", w.allowFrom || [], notifyAllowed(),
+      // 会话可选绑定（task-24）：改了固定会话就要重建 bot（转发目标立即生效，无需重启 bridge）
+      w.sessionId || "", w.sessionTitle || ""
     ]);
   }
 
@@ -1493,7 +2056,11 @@ export function createWecomBotController(options = {}) {
           authenticated: false,
           lastError: truncateText(reason, 160),
           boundChatId: "",
-          targetChatId: ""
+          targetChatId: "",
+          sessions: [],
+          activeSessionId: "",
+          activeSessionTitle: "",
+          boundSessionId: ""
         }
       }, { onWarn: (m) => log.warn(m) });
     } catch (e) {
@@ -1556,6 +2123,11 @@ export function createWecomBotController(options = {}) {
         relayDir,
         targetChatId: w.targetChatId,
         allowFrom: w.allowFrom,
+        // 会话可选绑定（task-24）：配置固定的会话（空 = 跟随活跃会话；状态文件里写 boundSessionId）
+        configuredSessionId: w.sessionId,
+        configuredSessionTitle: w.sessionTitle,
+        // 审批卡片点击 → 决策回调（bridge 注入：approvalCoordinator.resolve → pushReporter.answerApproval）
+        onApprovalDecision: typeof options.onApprovalDecision === "function" ? options.onApprovalDecision : undefined,
         notify: notifyAllowed(),
         logger: options.log,
         clock: options.clock,

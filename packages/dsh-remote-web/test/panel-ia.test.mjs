@@ -568,3 +568,161 @@ test("通道测试：连接失败 → 弹层内如实显示桥给的原因（con
   assert.ok(text.includes("40001"), "★ 失败原因必须原样显示（用户才能拿去搜/找客服）");
   assert.ok(find(tree, (n) => n.props?.role === "status" && (n.children || []).some((c) => typeof c === "string" && c.includes("40001"))), "状态行要 aria-live/status 播报");
 });
+
+// ───────────────────── ⑤ 会话可选绑定（task-25） ─────────────────────
+
+const openWecom = async (plugin) => {
+  let tree = await plugin.settle();
+  assert.ok(openEntry(tree, "channel"), "应能打开通道弹层");
+  tree = await plugin.settle();
+  assert.ok(clickChannelRow(tree, "企业微信智能机器人"), "应能进入企业微信配置页");
+  return plugin.settle();
+};
+
+test("会话下拉：有列表 → 默认项 + 会话项（标题截断 24 字 + 短 id）；展示当前实际转发目标", async () => {
+  const plugin = loadPlugin();
+  plugin.setImBotsGet({
+    ok: true,
+    wecom: { enabled: true, botId: "aibdemo1234", hasSecret: true, url: "", targetChatId: "", sessionId: "", sessionTitle: "" },
+    status: {
+      connected: true, authenticated: true, lastError: "",
+      sessions: [
+        { id: "sess-1-abcdef123456", title: "修复登录问题", updatedAt: 111 },
+        { id: "sess-2-xyz", title: "这是一个非常非常长的会话标题用于验证截断逻辑是否生效", updatedAt: 222 },
+      ],
+      activeSessionId: "sess-2-xyz", activeSessionTitle: "这是一个非常非常长的会话标题用于验证截断逻辑是否生效",
+      boundSessionId: "sess-1-abcdef123456",
+    },
+  });
+  const tree = await openWecom(plugin);
+  const sel = find(tree, (n) => n.type === "select" && n.props?.id === "dru-wecom-session");
+  assert.ok(sel, "配置页必须有「转接到哪个会话」下拉");
+  const opts = sel.children.find((c) => c && c.type === "option") ? null : null; // 占位，真实取法见下
+  const options = [];
+  walk(tree, (n) => { if (n.type === "option") options.push(n); });
+  assert.equal(options.length, 3, "选项 = 跟随默认 + 2 个会话，实际 " + options.length);
+  assert.ok((options[0].children || []).join("").includes("跟随当前活跃会话（默认）"), "第一项必须是「跟随当前活跃会话（默认）」");
+  const longOpt = (options[2].children || []).join("");
+  assert.ok(longOpt.includes("…"), "长标题必须截断（最多 24 字 + …）：" + longOpt);
+  assert.ok(longOpt.includes("sess-2-x"), "选项要带短 id（标题可能重复）");
+  // 当前实际转发目标要一行说清（绑定会话优先）
+  assert.ok(textOf(tree).includes("绑定会话：修复登录问题"), "应展示「绑定会话：<title>」");
+});
+
+test("会话下拉：列表为空 → 说明「还没有会话，去创建一个任务后这里会出现」", async () => {
+  const plugin = loadPlugin();
+  plugin.setImBotsGet({
+    ok: true,
+    wecom: { enabled: false, botId: "", hasSecret: false, url: "", targetChatId: "", sessionId: "", sessionTitle: "" },
+    status: { connected: false, authenticated: false, lastError: "", sessions: [], activeSessionId: "", boundSessionId: "" },
+  });
+  const tree = await openWecom(plugin);
+  assert.ok(textOf(tree).includes("还没有会话，去创建一个任务后这里会出现"), "空列表必须有引导文案（不是空白下拉）");
+});
+
+test("会保存：选中某会话 → PUT 带 sessionId + sessionTitle；选回默认 → 两者清空", async () => {
+  const plugin = loadPlugin();
+  plugin.setImBotsGet({
+    ok: true,
+    wecom: { enabled: true, botId: "aibdemo1234", hasSecret: true, url: "", targetChatId: "", sessionId: "", sessionTitle: "" },
+    status: {
+      connected: true, authenticated: true, lastError: "",
+      sessions: [{ id: "sess-1-abcdef123456", title: "修复登录问题", updatedAt: 111 }],
+      activeSessionId: "sess-1-abcdef123456", activeSessionTitle: "修复登录问题", boundSessionId: "",
+    },
+  });
+  let tree = await openWecom(plugin);
+  let sel = find(tree, (n) => n.type === "select" && n.props?.id === "dru-wecom-session");
+  sel.props.onChange({ target: { value: "sess-1-abcdef123456" } });
+  tree = await plugin.settle();
+  assert.ok(textOf(tree).includes("绑定会话：跟随活跃（修复登录问题）"), "未保存前展示的仍是当前实际转发目标（跟随活跃）");
+
+  const saveOnly = btnWith(tree, "仅保存");
+  assert.ok(saveOnly, "必须有「仅保存」按钮");
+  saveOnly.props.onClick();
+  await flush(); await flush();
+  tree = await plugin.settle();
+  let sent = plugin.imBotsCalls().filter((c) => c.method === "PUT").pop();
+  assert.ok(sent, "应发出 PUT /dsh-remote/im-bots");
+  assert.equal(sent.body.wecom.sessionId, "sess-1-abcdef123456", "★ 选中会话必须写 sessionId");
+  assert.equal(sent.body.wecom.sessionTitle, "修复登录问题", "★ 同时写 sessionTitle（面板回显用）");
+
+  // 选回默认 → 清空
+  sel = find(tree, (n) => n.type === "select" && n.props?.id === "dru-wecom-session");
+  sel.props.onChange({ target: { value: "" } });
+  tree = await plugin.settle();
+  btnWith(tree, "仅保存").props.onClick();
+  await flush(); await flush();
+  tree = await plugin.settle();
+  const calls = plugin.imBotsCalls().filter((c) => c.method === "PUT");
+  sent = calls[calls.length - 1];
+  assert.equal(sent.body.wecom.sessionId, "", "★ 选「跟随当前活跃会话」= 清空 sessionId");
+  assert.equal(sent.body.wecom.sessionTitle, "", "★ 清空时标题也必须清空（否则 UI 会显示错目标）");
+});
+
+// ───────────────────── ⑥ 飞书 / 钉钉：诚实的「即将支持」 ─────────────────────
+
+test("平台列表：飞书 / 钉钉都标注「即将支持」，不放进假表单", async () => {
+  const plugin = loadPlugin();
+  let tree = await plugin.settle();
+  openEntry(tree, "channel");
+  tree = await plugin.settle();
+  const rows = byClass(tree, "dru-ia-row");
+  const texts = rows.map((r) => textOf(r));
+  assert.ok(texts.some((t) => t.includes("飞书机器人") && t.includes("即将支持")), "飞书行必须标注即将支持");
+  assert.ok(texts.some((t) => t.includes("钉钉机器人") && t.includes("即将支持")), "钉钉行必须标注即将支持");
+  assert.ok(texts.some((t) => t.includes("企业微信智能机器人") && !t.includes("即将支持")), "企微行是已支持（主推）");
+});
+
+test("飞书/钉钉：点进去只有说明 + 「告诉我，优先支持」；**没有输入框、没有提交**，点优先支持走现有反馈", async () => {
+  const plugin = loadPlugin();
+  for (const [row, name] of [["飞书机器人", "飞书机器人"], ["钉钉机器人", "钉钉机器人"]]) {
+    const p = loadPlugin();
+    let tree = await p.settle();
+    openEntry(tree, "channel");
+    tree = await p.settle();
+    assert.ok(clickChannelRow(tree, row), "应能点开 " + row);
+    tree = await p.settle();
+    const dlg = dialogOf(tree);
+    assert.ok(dlg, row + " 必须打开弹层（不是假入口）");
+    const text = textOf(dlg);
+    assert.ok(text.includes("即将支持"), row + " 必须标注「即将支持」");
+    assert.ok(text.includes("企业管理员"), row + " 说明要写清为什么现在还接不了（企业管理员配置应用）");
+    assert.equal(find(dlg, (n) => n.type === "input" || n.type === "select"), undefined,
+      "★ 不许放任何输入框/下拉（假表单）");
+    const tell = btnWith(dlg, "告诉我，优先支持");
+    assert.ok(tell, "必须有「告诉我，优先支持」按钮（复用反馈通道）");
+    const before = p.imBotsCalls().length;
+    tell.props.onClick();
+    tree = await p.settle();
+    assert.equal(dialogOf(tree), undefined, "点「优先支持」后关闭弹层");
+    assert.equal(p.imBotsCalls().length, before, "★ 不得调用 im-bots 写接口（不新增后端）");
+    const dbgText = textOf(tree);
+    assert.ok(dbgText.includes("想要 " + name), "反馈视图应带一句引导（告知用户写什么）；实际视图文本片段=" + dbgText.slice(0, 200));
+    void plugin;
+  }
+});
+
+// ───────────────────── ⑦ 配置页收口：说明折叠 + 统一字段结构 ─────────────────────
+
+test("配置页收口：说明默认折叠（「为什么要填这些」），四个字段统一 dru-ia-field 结构", async () => {
+  const plugin = loadPlugin();
+  const tree = await openWecom(plugin);
+  // 折叠：默认看不到服务地址字段
+  assert.equal(find(tree, (n) => n.props?.id === "dru-wecom-url"), undefined, "高级项默认折叠（不在主表单里）");
+  const disclose = find(tree, (n) => n.type === "button" && (n.children || []).some((c) => typeof c === "string" && c.includes("为什么要填这些")));
+  assert.ok(disclose, "必须有「为什么要填这些」折叠按钮");
+  assert.equal(disclose.props["aria-expanded"], "false");
+  disclose.props.onClick();
+  const tree2 = await plugin.settle();
+  assert.ok(find(tree2, (n) => n.props?.id === "dru-wecom-url"), "展开后才出现高级字段");
+  // 四个字段（会话 / Bot ID / Secret / 接收会话 ID）都在 .dru-ia-field 里，label 可见
+  const fields = byClass(tree2, "dru-ia-field");
+  assert.ok(fields.length >= 4, "字段必须用统一 dru-ia-field 结构（实际 " + fields.length + "）");
+  for (const id of ["dru-wecom-session", "dru-wecom-bot", "dru-wecom-secret", "dru-wecom-chat"]) {
+    const ctl = find(tree2, (n) => (n.type === "input" || n.type === "select") && n.props?.id === id);
+    assert.ok(ctl, "缺字段控件: " + id);
+    const label = find(tree2, (n) => n.type === "label" && n.props?.htmlFor === id);
+    assert.ok(label, "每个字段必须有可见 label: " + id);
+  }
+});

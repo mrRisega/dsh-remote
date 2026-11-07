@@ -28,9 +28,13 @@ import { WebSocketServer } from "ws";
 import {
   ANSWER_MAX_CHARS,
   ANSWER_TRUNCATED_NOTE,
+  APPROVAL_CARD_SUMMARY_MAX,
   IM_BOTS_FILE,
   IM_BOT_STATUS_FILE,
+  approvalTaskId,
   atomicWriteJson,
+  buildApprovalCard,
+  buildDecidedCard,
   createScopedLogger,
   createWecomBot,
   createWecomBotController,
@@ -38,6 +42,8 @@ import {
   fileMode,
   maskSecrets,
   normalizeImBotsConfig,
+  normalizeSessionStatusList,
+  parseApprovalEventKey,
   pickInboundIdentity,
   readImBotsConfig,
   toMarkdownNotification
@@ -143,10 +149,16 @@ function fakeSubscriber(over = {}) {
   sub.started = false;
   sub.closed = false;
   sub.promptCalls = [];
-  sub.sessions = over.sessions || [];
+  sub.sessionDetails = Array.isArray(over.sessions) ? over.sessions.slice() : [];
   sub.start = () => { sub.started = true; };
   sub.close = () => { sub.closed = true; };
-  sub.listSessions = async () => ({ ok: true, sessions: sub.sessions });
+  sub.listSessions = async () => ({ ok: true, sessions: sub.sessionDetails });
+  // task-24：follow 中的会话 id（`subscriber.sessions()` 的真实形状是 string[]）。
+  // 默认从 sessions 详情里取 id（更贴近真实：细节列表里有的会话通常也在 follow 中）。
+  sub.sessionIds = Array.isArray(over.sessionIds)
+    ? over.sessionIds.slice()
+    : sub.sessionDetails.map((x) => x && x.sessionId).filter(Boolean);
+  sub.sessions = () => sub.sessionIds.slice();
   /** 回答回传用（dsh-events 的真实签名：{ok:true,text} / {ok:false,code,text:""}；可动态替换）。 */
   sub.lastAssistantCalls = [];
   sub.assistantReply = over.assistantText !== undefined ? over.assistantText : { ok: true, text: "" };
@@ -554,7 +566,7 @@ test("★ 入站转发：有会话 → promptSession({sessionId,text})；无会�
 
 // ─────────────────────────── ⑩ 出站通知（fake subscriber）───────────────────────────
 
-test("★ 出站通知：turn_done/turn_error/approval_request → Markdown 推送到绑定的 chatid；无接收方时跳过", async () => {
+test("★ 出站通知：turn_done/turn_error → Markdown、approval_request → 审批卡片，都发到绑定的 chatid；无接收方时跳过", async () => {
   const server = await startFakeServer({ onFrame: (f, ws) => { autoAckAuth(f, ws); autoAckPing(f, ws); } });
   const sub = fakeSubscriber();
 
@@ -589,13 +601,16 @@ test("★ 出站通知：turn_done/turn_error/approval_request → Markdown 推�
     await sleep(120);
     assert.equal(server.state.frames.filter((f) => f.cmd === "aibot_send_msg").length, before, "同一 turn/end 不得重复推送");
 
-    // 出错 + 拍板
+    // 出错 → 仍是 markdown
     sub.emit("event", { kind: NODE_KINDS.SESSION_ERROR, sessionId: "session-x", message: "build failed" });
-    const errSend = await waitFor(() => server.state.frames.filter((f) => f.cmd === "aibot_send_msg" && /出错了/.test(f.body.markdown.content)).pop(), { label: "出错通知" });
+    const errSend = await waitFor(() => server.state.frames.filter((f) => f.cmd === "aibot_send_msg" && f.body.markdown && /出错了/.test(f.body.markdown.content)).pop(), { label: "出错通知" });
     assert.equal(errSend.body.chatid, "user-a");
-    sub.emit("event", { kind: NODE_KINDS.APPROVAL_REQUEST, sessionId: "session-x", eventId: "ev-1", toolName: "Bash" });
-    const apprSend = await waitFor(() => server.state.frames.filter((f) => f.cmd === "aibot_send_msg" && /拍板/.test(f.body.markdown.content)).pop(), { label: "拍板通知" });
-    assert.match(apprSend.body.markdown.content, /^🛂 需要你在电脑上拍板｜Bash/);
+    // 审批类 → **卡片**（task-24），不再是 markdown
+    sub.emit("event", { kind: NODE_KINDS.APPROVAL_REQUEST, sessionId: "session-x", eventId: "ev-1", toolName: "Bash", reason: "要执行一条命令" });
+    const cardSend = await waitFor(() => server.state.frames.filter((f) => f.cmd === "aibot_send_msg" && f.body.msgtype === "template_card").pop(), { label: "审批卡片" });
+    assert.equal(cardSend.body.chatid, "user-a");
+    assert.equal(cardSend.body.template_card.card_type, "button_interaction");
+    assert.match(cardSend.body.template_card.main_title.desc, /Bash/);
   } finally {
     await bot.stop();
   }
@@ -798,6 +813,324 @@ test("★ 回答回传边界：超过 TTL 不回传、超长截断+注明、正�
   }
 });
 
+// ─────────────────────────── ⑩c 审批卡片（task-24）───────────────────────────
+
+/** 模拟「用户点了卡片按钮」：官方入站事件帧（body.event.eventtype=template_card_event）。 */
+function pushCardClick(server, { reqId, taskId, eventKey, chatid = "user-a", userid = "user-a" }) {
+  server.push({
+    cmd: "aibot_event_callback",
+    headers: { req_id: reqId },
+    body: {
+      msgid: `evt-${reqId}`,
+      create_time: 1700000000,
+      msgtype: "event",
+      chatid,
+      chattype: "single",
+      from: { userid },
+      event: { eventtype: "template_card_event", event_key: eventKey, task_id: taskId }
+    }
+  });
+}
+
+/** 建一个「已认证、可收卡片点击」的 bot。 */
+async function setupCardBot(over = {}) {
+  const server = await startFakeServer({ onFrame: (f, ws) => { autoAckAuth(f, ws); autoAckPing(f, ws); autoAckSend(f, ws); } });
+  const lines = [];
+  const decisions = [];
+  const bot = createWecomBot({
+    botId: BOT_ID, secret: SECRET, url: server.url,
+    logger: (level, line) => lines.push(line),
+    onApprovalDecision: async (requestId, decision, meta) => {
+      decisions.push({ requestId, decision, meta });
+      if (typeof over.decide === "function") return over.decide(requestId, decision, meta);
+      return { ok: true, via: "dsh" };
+    },
+    ...(over.bot || {})
+  });
+  const sends = () => server.state.frames.filter((f) => f.cmd === "aibot_send_msg");
+  const updates = () => server.state.frames.filter((f) => f.cmd === "aibot_respond_update_msg");
+  const cards = () => sends().filter((f) => f.body && f.body.msgtype === "template_card");
+  const texts = () => sends().filter((f) => f.body && f.body.markdown);
+  return {
+    server, bot, lines, decisions, sends, updates, cards, texts,
+    async start() { bot.start(); await waitFor(() => bot.status().authenticated, { label: "认证完成(card)" }); },
+    async close() { await bot.stop(); await server.close(); }
+  };
+}
+
+test("★ 审批卡片报文：button_interaction 结构 / task_id 安全哈希 / 按钮 key / 摘要 ≤112 / 未认证拒绝", async () => {
+  // 纯函数先钉死（不依赖网络）
+  assert.match(approvalTaskId("ev-abc"), /^apr_[A-Za-z0-9_-]+$/);
+  assert.ok(approvalTaskId("x".repeat(500)).length <= 128, "task_id 必须 ≤128");
+  assert.notEqual(approvalTaskId("a"), approvalTaskId("b"), "不同 requestId → 不同 task_id");
+  assert.deepEqual(parseApprovalEventKey("allow:abc:def"), { decision: "allow", requestId: "abc:def" }, "只按第一个冒号切");
+  assert.deepEqual(parseApprovalEventKey("deny:xyz"), { decision: "deny", requestId: "xyz" });
+  assert.equal(parseApprovalEventKey("bogus:x"), null);
+  assert.equal(parseApprovalEventKey("allow:"), null, "空 requestId 不算合法按钮");
+  const pureCard = buildApprovalCard({ requestId: "ev-1", summary: "长".repeat(300), toolName: "Bash" });
+  assert.equal(pureCard.card_type, "button_interaction");
+  assert.equal(pureCard.sub_title_text.length, APPROVAL_CARD_SUMMARY_MAX, "摘要必须截到 112 字");
+  assert.equal(pureCard.button_list[0].style, 1);
+  assert.equal(pureCard.button_list[1].style, 2);
+  assert.match(buildDecidedCard({ requestId: "ev-1", state: "allowed", who: "张三", at: Date.now() }).main_title.title, /已允许/);
+  assert.ok(normalizeSessionStatusList([{ id: "a" }, { id: "a" }, { id: "b", title: " t ", updatedAt: 5 }]).length === 2);
+
+  const rt = await setupCardBot();
+  try {
+    await rt.start();
+    const longSummary = "命令详情 ".repeat(60);
+    const r = rt.bot.sendApprovalCard("user-a", { requestId: "ev-abc:123", title: "需要你在电脑上拍板", summary: longSummary, toolName: "Bash" });
+    assert.equal(r.ok, true);
+    const frame = await waitFor(() => rt.cards()[0], { label: "审批卡片帧" });
+    assert.equal(frame.body.chatid, "user-a");
+    assert.equal(frame.body.msgtype, "template_card");
+    const card = frame.body.template_card;
+    assert.equal(card.card_type, "button_interaction");
+    assert.match(card.task_id, /^apr_[A-Za-z0-9_-]+$/);
+    assert.ok(card.task_id.length <= 128);
+    assert.equal(card.task_id, r.taskId);
+    assert.equal(card.main_title.title, "需要你在电脑上拍板");
+    assert.match(card.main_title.desc, /Bash/);
+    assert.ok(card.sub_title_text.length <= APPROVAL_CARD_SUMMARY_MAX);
+    assert.equal(card.button_list.length, 2);
+    assert.deepEqual(card.button_list.map((b) => ({ text: b.text, style: b.style })), [
+      { text: "允许一次", style: 1 }, { text: "拒绝", style: 2 }
+    ]);
+    assert.equal(card.button_list[0].key, "allow:ev-abc:123", "requestId 原样进 key（含冒号）");
+    assert.equal(card.button_list[1].key, "deny:ev-abc:123");
+    // 未认证时如实失败（不静默）
+    assert.equal(rt.bot.sendApprovalCard("user-a", { requestId: "" }).reason, "no_request_id");
+    assert.equal(rt.bot.sendApprovalCard("", { requestId: "x" }).reason, "no_chatid");
+  } finally {
+    await rt.close();
+  }
+});
+
+test("★ 审批卡片点击：allow/deny → onApprovalDecision → aibot_respond_update_msg（req_id=事件帧）→ 短文本确认", async () => {
+  const rt = await setupCardBot();
+  try {
+    await rt.start();
+    // 允许
+    const r1 = rt.bot.sendApprovalCard("user-a", { requestId: "ev-allow", toolName: "Bash" });
+    await waitFor(() => rt.cards().length === 1, { label: "卡片已发" });
+    pushCardClick(rt.server, { reqId: "evt-req-1", taskId: r1.taskId, eventKey: "allow:ev-allow" });
+    await waitFor(() => rt.decisions.length === 1, { label: "allow 回调" });
+    assert.deepEqual(
+      { requestId: rt.decisions[0].requestId, decision: rt.decisions[0].decision, source: rt.decisions[0].meta.source },
+      { requestId: "ev-allow", decision: "allow", source: "wecom-card" }
+    );
+    const upd1 = await waitFor(() => rt.updates()[0], { label: "卡片更新(allow)" });
+    assert.equal(upd1.headers.req_id, "evt-req-1", "★ 更新帧的 req_id 必须是**事件帧**的 req_id");
+    assert.equal(upd1.body.response_type, "update_template_card");
+    assert.equal(upd1.body.template_card.card_type, "text_notice");
+    assert.match(upd1.body.template_card.main_title.title, /已允许/);
+    const txt1 = await waitFor(() => rt.texts().find((f) => /已允许一次/.test(f.body.markdown.content)), { label: "允许确认文本" });
+    assert.equal(txt1.body.chatid, "user-a");
+
+    // 拒绝
+    const r2 = rt.bot.sendApprovalCard("user-a", { requestId: "ev-deny", toolName: "Write" });
+    await waitFor(() => rt.cards().length === 2, { label: "第二张卡片" });
+    pushCardClick(rt.server, { reqId: "evt-req-2", taskId: r2.taskId, eventKey: "deny:ev-deny", userid: "user-b" });
+    await waitFor(() => rt.decisions.length === 2, { label: "deny 回调" });
+    assert.equal(rt.decisions[1].decision, "deny");
+    const upd2 = await waitFor(() => rt.updates().find((f) => f.headers.req_id === "evt-req-2"), { label: "卡片更新(deny)" });
+    assert.match(upd2.body.template_card.main_title.title, /已拒绝/);
+    assert.match(upd2.body.template_card.main_title.desc, /user-b/, "卡片上写清操作人");
+    await waitFor(() => rt.texts().find((f) => /已拒绝/.test(f.body.markdown.content)), { label: "拒绝确认文本" });
+    // senderId 不进日志（只 hash）
+    assert.ok(!rt.lines.join("\n").includes("user-b"), "★ 操作人 userid 不得进日志（只 hash）");
+    assert.ok(rt.lines.some((l) => /审批卡片点击/.test(l)));
+    assert.equal(rt.bot.status().approvalDecisions, 2);
+  } finally {
+    await rt.close();
+  }
+});
+
+test("★ 审批卡片：重复点击幂等（不再回调，回「已处理」）；过期后点=按拒绝处理（fail-closed）", async () => {
+  // 幂等
+  {
+    const rt = await setupCardBot();
+    try {
+      await rt.start();
+      const r = rt.bot.sendApprovalCard("user-a", { requestId: "ev-dup" });
+      await waitFor(() => rt.cards().length === 1, { label: "卡片" });
+      pushCardClick(rt.server, { reqId: "dup-1", taskId: r.taskId, eventKey: "allow:ev-dup" });
+      await waitFor(() => rt.decisions.length === 1, { label: "首次点击" });
+      pushCardClick(rt.server, { reqId: "dup-2", taskId: r.taskId, eventKey: "allow:ev-dup" });
+      await sleep(120);
+      assert.equal(rt.decisions.length, 1, "★ 同一张卡重复点击不得再次调回调（幂等）");
+      const dupText = await waitFor(() => rt.texts().find((f) => /已经处理过/.test(f.body.markdown.content)), { label: "已处理提示" });
+      assert.match(dupText.body.markdown.content, /已允许/);
+      const upd2 = await waitFor(() => rt.updates().find((f) => f.headers.req_id === "dup-2"), { label: "重复点击也更新卡片" });
+      assert.match(upd2.body.template_card.main_title.title, /已允许/);
+    } finally {
+      await rt.close();
+    }
+  }
+  // TTL 过期（注入 40ms）
+  {
+    const rt = await setupCardBot({ bot: { approvalCardTtlMs: 40 } });
+    try {
+      await rt.start();
+      const r = rt.bot.sendApprovalCard("user-a", { requestId: "ev-old" });
+      await waitFor(() => rt.cards().length === 1, { label: "卡片2" });
+      await sleep(120); // 超过 40ms TTL
+      pushCardClick(rt.server, { reqId: "old-1", taskId: r.taskId, eventKey: "allow:ev-old" });
+      await waitFor(() => rt.decisions.length === 1, { label: "过期也回调" });
+      assert.equal(rt.decisions[0].decision, "deny", "★ 过期点击必须 fail-closed 按拒绝处理（即使点的是允许）");
+      assert.equal(rt.decisions[0].meta.expired, true);
+      const upd = await waitFor(() => rt.updates().find((f) => f.headers.req_id === "old-1"), { label: "过期卡片更新" });
+      assert.match(upd.body.template_card.main_title.title, /已过期/);
+      const txt = await waitFor(() => rt.texts().find((f) => /过期/.test(f.body.markdown.content)), { label: "过期提示" });
+      assert.match(txt.body.markdown.content, /按「拒绝」处理/);
+    } finally {
+      await rt.close();
+    }
+  }
+});
+
+test("★ 审批回调失败：卡片显示「没能送达电脑端」+ 提示到电脑上确认（不假装成功）", async () => {
+  const rt = await setupCardBot({ decide: () => ({ ok: false, reason: "事件已作废（可能已在手机上拍板）" }) });
+  try {
+    await rt.start();
+    const r = rt.bot.sendApprovalCard("user-a", { requestId: "ev-fail" });
+    await waitFor(() => rt.cards().length === 1, { label: "卡片" });
+    pushCardClick(rt.server, { reqId: "fail-1", taskId: r.taskId, eventKey: "allow:ev-fail" });
+    await waitFor(() => rt.decisions.length === 1, { label: "回调" });
+    const upd = await waitFor(() => rt.updates().find((f) => f.headers.req_id === "fail-1"), { label: "失败卡片更新" });
+    assert.match(upd.body.template_card.main_title.title, /没能送达/);
+    const txt = await waitFor(() => rt.texts().find((f) => /没能送达电脑端/.test(f.body.markdown.content)), { label: "失败提示" });
+    assert.equal(rt.bot.status().approvalDecisions, 0, "失败不计数为成功");
+  } finally {
+    await rt.close();
+  }
+});
+
+// ─────────────────────────── ⑩d 会话可选绑定（task-24）───────────────────────────
+
+test("★ 会话绑定优先级：配置固定 → 最近活跃 → sessions[0]；状态文件 sessions/activeSessionId/boundSessionId", async () => {
+  const relayDir1 = tmpRelayDir();
+  // ① 配置固定优先
+  {
+    const sub = fakeSubscriber({
+      sessionIds: ["s-live"],
+      sessions: [{ sessionId: "s-live", title: "活跃会话", running: true, updatedAt: 200 }]
+    });
+    const server = await startFakeServer({ onFrame: (f, ws) => { autoAckAuth(f, ws); autoAckPing(f, ws); } });
+    const bot = createWecomBot({
+      botId: BOT_ID, secret: SECRET, url: server.url, relayDir: relayDir1, logger: () => {},
+      subscriber: sub, configuredSessionId: "s-fixed", configuredSessionTitle: "固定会话"
+    });
+    try {
+      bot.start();
+      await waitFor(() => bot.status().authenticated, { label: "认证1" });
+      sub.emit("session-state", { sessionId: "s-live", state: "running", at: Date.now() });
+      server.push({ cmd: "aibot_msg_callback", headers: { req_id: "bind-a" }, body: { msgid: "mb1", msgtype: "text", text: { content: "hi" }, from: { userid: "user-a" } } });
+      await waitFor(() => sub.promptCalls.length === 1, { label: "入站转发1" });
+      assert.equal(sub.promptCalls[0].sessionId, "s-fixed", "★ 配置固定的会话优先级最高");
+      await waitFor(() => {
+        const st = readStatus(relayDir1);
+        return st && st.wecom && st.wecom.boundSessionId === "s-fixed" && Array.isArray(st.wecom.sessions) && st.wecom.sessions.length >= 1;
+      }, { label: "状态文件 boundSessionId + sessions" });
+      const st = readStatus(relayDir1);
+      assert.equal(st.wecom.activeSessionId, "s-live");
+      assert.ok(Array.isArray(st.wecom.sessions) && st.wecom.sessions.length >= 1);
+      assert.deepEqual(Object.keys(st.wecom.sessions[0]).sort(), ["id", "title", "updatedAt"], "sessions 元素只含 id/title/updatedAt");
+      assert.equal(st.wecom.sessions[0].id, "s-fixed", "配置固定的会话补进列表（用户明确选过）");
+      assert.equal(st.wecom.sessions[0].title, "固定会话");
+    } finally {
+      await bot.stop();
+      await server.close();
+      fs.rmSync(relayDir1, { recursive: true, force: true });
+    }
+  }
+
+  // ② 无配置：最近活跃会话优先
+  {
+    const relayDir = tmpRelayDir();
+    const sub = fakeSubscriber({ sessionIds: ["s-a", "s-b"], sessions: [
+      { sessionId: "s-a", title: "A", updatedAt: 100 },
+      { sessionId: "s-b", title: "B", updatedAt: 200 }
+    ] });
+    const server = await startFakeServer({ onFrame: (f, ws) => { autoAckAuth(f, ws); autoAckPing(f, ws); } });
+    const bot = createWecomBot({ botId: BOT_ID, secret: SECRET, url: server.url, relayDir, logger: () => {}, subscriber: sub });
+    try {
+      bot.start();
+      await waitFor(() => bot.status().authenticated, { label: "认证2" });
+      sub.emit("session-state", { sessionId: "s-b", state: "running", at: Date.now() });
+      await waitFor(() => bot.status().activeSessionId === "s-b", { label: "活跃会话" });
+      server.push({ cmd: "aibot_msg_callback", headers: { req_id: "bind-b" }, body: { msgid: "mb2", msgtype: "text", text: { content: "hi" }, from: { userid: "user-a" } } });
+      await waitFor(() => sub.promptCalls.length === 1, { label: "入站转发2" });
+      assert.equal(sub.promptCalls[0].sessionId, "s-b", "★ 无配置时用最近活跃会话");
+      await waitFor(() => {
+        const st = readStatus(relayDir);
+        return st && st.wecom && st.wecom.boundSessionId === "s-b" && Array.isArray(st.wecom.sessions) && st.wecom.sessions.length >= 2;
+      }, { label: "状态文件2（bound + sessions）" });
+      const st = readStatus(relayDir);
+      assert.ok(st.wecom.sessions.length <= 10);
+      assert.deepEqual(st.wecom.sessions.map((x) => x.id).sort(), ["s-a", "s-b"].sort());
+    } finally {
+      await bot.stop();
+      await server.close();
+      fs.rmSync(relayDir, { recursive: true, force: true });
+    }
+  }
+
+  // ③ 无配置、无活跃：sessions[0]（按 updatedAt 最新）
+  {
+    const sub = fakeSubscriber({ sessionIds: ["s-1", "s-2"], sessions: [
+      { sessionId: "s-1", title: "旧", updatedAt: 100 },
+      { sessionId: "s-2", title: "新", updatedAt: 200 }
+    ] });
+    const server = await startFakeServer({ onFrame: (f, ws) => { autoAckAuth(f, ws); autoAckPing(f, ws); } });
+    const bot = createWecomBot({ botId: BOT_ID, secret: SECRET, url: server.url, logger: () => {}, subscriber: sub });
+    try {
+      bot.start();
+      await waitFor(() => bot.status().authenticated, { label: "认证3" });
+      server.push({ cmd: "aibot_msg_callback", headers: { req_id: "bind-c" }, body: { msgid: "mb3", msgtype: "text", text: { content: "hi" }, from: { userid: "user-a" } } });
+      await waitFor(() => sub.promptCalls.length === 1, { label: "入站转发3" });
+      assert.equal(sub.promptCalls[0].sessionId, "s-2", "★ sessions[0] = updatedAt 最新的那个");
+      // 列表上限 10
+      assert.ok(normalizeSessionStatusList(Array.from({ length: 15 }, (_, i) => ({ id: `x${i}` }))).length === 10);
+    } finally {
+      await bot.stop();
+      await server.close();
+    }
+  }
+});
+
+test("控制器：只改 sessionId 也会重建 bot（配置热更新后转发目标立即生效）", async () => {
+  const relayDir = tmpRelayDir();
+  const server = await startFakeServer({ onFrame: (f, ws) => { autoAckAuth(f, ws); autoAckPing(f, ws); } });
+  const imports = [];
+  const controller = createWecomBotController({
+    relayDir, configPollMs: 30, log: () => {}, env: {},
+    createBot: (opts) => {
+      imports.push({ sessionId: opts.configuredSessionId, sessionTitle: opts.configuredSessionTitle, hasDecisionCb: typeof opts.onApprovalDecision === "function" });
+      return createWecomBot({ ...opts, url: server.url });
+    }
+  });
+  try {
+    await controller.start();
+    fs.writeFileSync(path.join(relayDir, IM_BOTS_FILE), JSON.stringify({
+      version: 1, wecom: { enabled: true, botId: BOT_ID, secret: SECRET, sessionId: "s-one", sessionTitle: "一号会话" }
+    }), { mode: 0o600 });
+    await waitFor(() => imports.length >= 1 && controller.status().bot && controller.status().bot.authenticated, { timeoutMs: 5000, label: "起bot" });
+    assert.deepEqual({ id: imports[0].sessionId, title: imports[0].sessionTitle }, { id: "s-one", title: "一号会话" });
+    assert.equal(imports[0].hasDecisionCb, false, "没注入回调时如实没有（卡片点击会回「未就绪」）");
+    // 只改固定会话 → 摘要变化 → 重建
+    fs.writeFileSync(path.join(relayDir, IM_BOTS_FILE), JSON.stringify({
+      version: 1, wecom: { enabled: true, botId: BOT_ID, secret: SECRET, sessionId: "s-two", sessionTitle: "二号会话" }
+    }), { mode: 0o600 });
+    await waitFor(() => imports.length >= 2, { timeoutMs: 5000, label: "改 sessionId 后重建" });
+    assert.deepEqual({ id: imports[1].sessionId, title: imports[1].sessionTitle }, { id: "s-two", title: "二号会话" });
+  } finally {
+    await controller.stop();
+    await server.close();
+    fs.rmSync(relayDir, { recursive: true, force: true });
+  }
+});
+
 // ─────────────────────────── ⑪ 配置契约 ───────────────────────────
 
 test("配置契约：normalizeImBotsConfig 缺字段补默认、非法值当未配置；readImBotsConfig 文件不存在返回 null", () => {
@@ -820,10 +1153,13 @@ test("配置契约：normalizeImBotsConfig 缺字段补默认、非法值当未�
     assert.equal(broken.wecom.botId, "");
     assert.deepEqual(normalizeImBotsConfig(null).wecom.allowFrom, []);
 
-    fs.writeFileSync(path.join(relayDir, IM_BOTS_FILE), JSON.stringify({ wecom: { enabled: true, botId: "b", secret: "s" } }));
+    fs.writeFileSync(path.join(relayDir, IM_BOTS_FILE), JSON.stringify({ wecom: { enabled: true, botId: "b", secret: "s", sessionId: "sid-1", sessionTitle: "我的会话" } }));
     const read = readImBotsConfig(relayDir);
     assert.equal(read.wecom.botId, "b");
     assert.equal(read.wecom.enabled, true);
+    assert.equal(read.wecom.sessionId, "sid-1", "task-24：配置支持固定会话");
+    assert.equal(read.wecom.sessionTitle, "我的会话");
+    assert.equal(normalizeImBotsConfig({ wecom: {} }).wecom.sessionId, "", "缺省 = 跟随活跃会话");
   } finally {
     fs.rmSync(relayDir, { recursive: true, force: true });
   }

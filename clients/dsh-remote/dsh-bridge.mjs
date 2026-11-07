@@ -2969,6 +2969,35 @@ function ensureApprovalCoordinator() {
 
 let decisionPoller = null;
 
+/**
+ * 把「人做的审批决定」落到电脑端（**手机拍板与企微卡片共用同一条路**）。
+ *
+ * 顺序与 decision-poller 原来的 apply 完全一致，抽出来只为让企微卡片复用：
+ *   ① 先看是不是"本地 Agent（Claude Code）"的审批 —— 协调器认得就消费掉；
+ *   ② 否则按 DSH 审批回执处理：allow 只映射成 `allowed-once`，**绝不升级成永久放行**。
+ *
+ * @param {string} requestId DSH 的审批事件 id
+ * @param {"allow"|"deny"} decision
+ * @returns {Promise<{ok:boolean, via?:string, reason?:string}>} 永不抛
+ */
+async function applyApprovalDecision(requestId, decision) {
+  const id = String(requestId || "");
+  if (!id) return { ok: false, reason: "缺少审批请求 id" };
+  const decided = decision === "allow" ? "allow" : "deny";
+  try {
+    if (approvalCoordinator && approvalCoordinator.resolve(id, decided)) return { ok: true, via: "coordinator" };
+  } catch { /* 继续走 DSH 那条路 */ }
+  try {
+    if (!pushReporter || typeof pushReporter.answerApproval !== "function") {
+      return { ok: false, reason: "审批回执通道未就绪（事件订阅还没连上）" };
+    }
+    await pushReporter.answerApproval(id, decided === "allow" ? "allowed-once" : "rejected");
+    return { ok: true, via: "dsh" };
+  } catch (e) {
+    return { ok: false, reason: redactText(e) };
+  }
+}
+
 function startDecisionPoller() {
   try {
     if (decisionPoller) return;
@@ -2977,12 +3006,11 @@ function startDecisionPoller() {
       deviceId: DEVICE_ID,
       tokenProvider: () => PUSH_TOKEN,
       apply: async (item) => {
-        // ① 先看是不是"本地 Agent（Claude Code）"的审批 —— 协调器认得就消费掉
-        try {
-          if (approvalCoordinator && approvalCoordinator.resolve(item.request_id, item.decision)) return;
-        } catch { /* 继续走 DSH 那条路 */ }
-        // ② 否则按 DSH 审批回执处理：手机上的"允许"只能映射成 allowed-once，绝不升级成永久放行
-        return pushReporter.answerApproval(item.request_id, item.outcome);
+        // 手机拍板与企微卡片走同一条路（见 applyApprovalDecision 的说明）。
+        // 失败必须 throw：decision-poller 据此计入 failed 并写日志（沿用改动前的语义）。
+        const r = await applyApprovalDecision(item.request_id, item.decision);
+        if (!r || r.ok !== true) throw new Error((r && r.reason) || "审批回执未能送达电脑端");
+        return r;
       },
       log: (level, message) => {
         try {
@@ -3081,6 +3109,8 @@ function startImBots() {
         upstream: () => currentUpstreamForChannel(),
         cookie: harnessCookieOf
       },
+      // 企微审批卡片点按钮 → 与手机拍板同一条路（协调器 → DSH 回执）；失败返回 {ok:false} 让卡片显示"没送达"
+      onApprovalDecision: (requestId, decision) => applyApprovalDecision(requestId, decision),
       log: (level, message) => {
         try {
           if (level === "warn" || level === "error") console.warn(message);

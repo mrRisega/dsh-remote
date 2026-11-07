@@ -68,8 +68,8 @@ test("GET /dsh-remote/im-bots：未配置时给完整空形态（面板据此显
     const r = await json(`${base}/dsh-remote/im-bots`);
     assert.equal(r.status, 200);
     assert.equal(r.body.ok, true);
-    assert.deepEqual(r.body.wecom, { enabled: false, botId: "", hasSecret: false, url: "", targetChatId: "" },
-      "未配置 = 全空 + hasSecret:false（绝不出现 secret 字段）");
+    assert.deepEqual(r.body.wecom, { enabled: false, botId: "", hasSecret: false, url: "", targetChatId: "", sessionId: "", sessionTitle: "" },
+      "未配置 = 全空 + hasSecret:false（绝不出现 secret 字段；会话绑定也默认空 = 跟随活跃）");
     assert.equal(r.body.status.connected, false);
     assert.equal(r.body.status.lastError, "");
   });
@@ -117,7 +117,7 @@ test("PUT：保存 Bot ID + Secret + targetChatId；文件 0600（仅本机可�
     const file = path.join(relayDir, "im-bots.json");
     const cfg = JSON.parse(await readFile(file, "utf8"));
     assert.equal(cfg.version, 1);
-    assert.deepEqual(cfg.wecom, { enabled: true, botId: "aibdemo1234", secret: "s3cret", url: "", targetChatId: "chat-9" });
+    assert.deepEqual(cfg.wecom, { enabled: true, botId: "aibdemo1234", secret: "s3cret", url: "", targetChatId: "chat-9", sessionId: "", sessionTitle: "" });
     if (process.platform !== "win32") {
       const st = await stat(file);
       assert.equal(st.mode & 0o777, 0o600, "★ 配置文件必须 0600（含明文 secret）");
@@ -243,5 +243,72 @@ test("POST /test：带凭据 body = 先保存再测（面板「保存并连接�
     assert.equal(cfg.wecom.botId, "aibdemo9999", "POST body 里的凭据必须先落盘（桥只读文件）");
     assert.equal(cfg.wecom.secret, "new-secret");
     assert.equal(cfg.wecom.targetChatId, "chat-7");
+  });
+});
+
+// ─────────────────── 会话可选绑定（2026-11-07，task-25） ───────────────────
+//
+// 契约（与桥约定死，字段名不要改）：
+//   状态文件 wecom.sessions[{id,title,updatedAt}] / activeSessionId / boundSessionId
+//   配置     wecom.sessionId + wecom.sessionTitle（空 sessionId = 跟随当前活跃会话）
+// 面板只读状态文件里的会话列表，不自己拉会话；GET 必须按**白名单**挑字段。
+
+test("GET：透出会话白名单字段（sessions/activeSessionId/boundSessionId），且只挑 id/title/updatedAt", async () => {
+  const relayDir = await tmpRelay();
+  await withHost(relayDir, {}, async (base) => {
+    await writeStatus(relayDir, {
+      enabled: true, connected: true, authenticated: true, lastError: "",
+      sessions: [
+        { id: "sess-1-abcdef123456", title: "修复登录问题", updatedAt: 111, internalToken: "LEAK-1" },
+        { id: "sess-2-xyz", title: "部署到 NAS", updatedAt: 222 },
+        { id: "", title: "坏数据", updatedAt: 333 },
+      ],
+      activeSessionId: "sess-2-xyz",
+      activeSessionTitle: "部署到 NAS",
+      boundSessionId: "sess-1-abcdef123456",
+      secret: "LEAK-SECRET",
+    });
+    const r = await json(`${base}/dsh-remote/im-bots`);
+    const st = r.body.status;
+    assert.equal(st.activeSessionId, "sess-2-xyz");
+    assert.equal(st.boundSessionId, "sess-1-abcdef123456");
+    assert.equal(st.sessions.length, 2, "没有 id 的坏数据要过滤掉");
+    assert.deepEqual(st.sessions[0], { id: "sess-1-abcdef123456", title: "修复登录问题", updatedAt: 111 },
+      "★ 会话只挑白名单字段（internalToken 不得外泄）");
+    assert.ok(!JSON.stringify(r.body).includes("LEAK"), "★ 状态文件里的敏感字段绝不能被透出");
+  });
+});
+
+test("PUT：保存会话绑定写 sessionId + sessionTitle；传空 sessionId = 跟随活跃（同时清掉标题）", async () => {
+  const relayDir = await tmpRelay();
+  await withHost(relayDir, {}, async (base) => {
+    await put(base, { botId: "aibdemo1234", secret: "x" });
+    const r1 = await put(base, { sessionId: "sess-1-abcdef123456", sessionTitle: "修复登录问题" });
+    assert.equal(r1.status, 200);
+    assert.equal(r1.body.wecom.sessionId, "sess-1-abcdef123456", "GET/PUT 回显已绑定会话");
+    assert.equal(r1.body.wecom.sessionTitle, "修复登录问题");
+    const cfg1 = await readCfg(relayDir);
+    assert.equal(cfg1.wecom.sessionId, "sess-1-abcdef123456");
+    assert.equal(cfg1.wecom.sessionTitle, "修复登录问题");
+
+    // 选「跟随当前活跃会话」→ 空 sessionId + 空 title
+    const r2 = await put(base, { sessionId: "", sessionTitle: "残留标题" });
+    assert.equal(r2.status, 200);
+    const cfg2 = await readCfg(relayDir);
+    assert.equal(cfg2.wecom.sessionId, "", "空 sessionId = 跟随当前活跃会话");
+    assert.equal(cfg2.wecom.sessionTitle, "", "★ 清空绑定时必须同时清掉标题（否则 UI 会显示错的目标）");
+    assert.equal(cfg2.wecom.botId, "aibdemo1234", "其它凭据不受影响");
+  });
+});
+
+test("PUT：会话 ID 过长 → 400 invalid_session_id（不写半成品）", async () => {
+  const relayDir = await tmpRelay();
+  await withHost(relayDir, {}, async (base) => {
+    await put(base, { botId: "aibdemo1234", secret: "x" });
+    const r = await put(base, { sessionId: "s".repeat(201) });
+    assert.equal(r.status, 400);
+    assert.equal(r.body.error, "invalid_session_id");
+    const cfg = await readCfg(relayDir);
+    assert.equal(cfg.wecom.sessionId, "", "校验失败不得落盘");
   });
 });

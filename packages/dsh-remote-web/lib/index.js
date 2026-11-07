@@ -7549,7 +7549,7 @@ export function localRequestBlocked(req) {
 // 凭据让桥主动推送消息」的第二种通道，配置面就两个文件（契约与桥半约定，字段名**不要改**）：
 //
 //   <relayDir>/im-bots.json        插件写、桥读
-//     { version:1, wecom:{ enabled, botId, secret, url, targetChatId } }
+//     { version:1, wecom:{ enabled, botId, secret, url, targetChatId, sessionId, sessionTitle } }
 //   <relayDir>/im-bot-status.json  桥写、插件**只读**
 //     { updatedAt, wecom:{ enabled, connected, authenticated, lastError,
 //                          lastConnectedAt, lastMessageAt, boundChatId } }
@@ -7560,7 +7560,7 @@ export function localRequestBlocked(req) {
 //   · 状态文件是桥写的，插件只挑白名单字段转发，绝不整份透传（防止未来桥塞进敏感字段被带出去）。
 //
 // 三条 API：
-//   GET  /dsh-remote/im-bots               → {ok, wecom:{enabled,botId,hasSecret,url,targetChatId}, status}
+//   GET  /dsh-remote/im-bots               → {ok, wecom:{enabled,botId,hasSecret,url,targetChatId,sessionId,sessionTitle}, status}
 //   PUT  /dsh-remote/im-bots (body {...})  → 同上（保存后立刻回读；空 secret = 不修改）
 //   POST /dsh-remote/im-bots/test          → 写配置后轮询状态 ≤10s，回 {ok, connected, authenticated, lastError}
 // 失败一律人话 + 稳定错误码：invalid_bot_id / missing_secret / connect_failed / timeout（外加 invalid_url / bad_request）。
@@ -7597,6 +7597,9 @@ function wecomCfgOf(bots) {
     secret: typeof w.secret === "string" ? w.secret : "",
     url: typeof w.url === "string" ? w.url : "",
     targetChatId: typeof w.targetChatId === "string" ? w.targetChatId : "",
+    // 「转接到哪个会话」：空串 = 跟随当前活跃会话（桥侧默认）。
+    sessionId: typeof w.sessionId === "string" ? w.sessionId : "",
+    sessionTitle: typeof w.sessionTitle === "string" ? w.sessionTitle : "",
   };
 }
 
@@ -7613,6 +7616,20 @@ function wecomStatusOf(status) {
     lastConnectedAt: num(w.lastConnectedAt),
     lastMessageAt: num(w.lastMessageAt),
     boundChatId: str(w.boundChatId),
+    // ── 会话可选绑定（2026-11-07，字段名与桥约定死，不要改）──
+    // 只挑 id/title/updatedAt 三个字段、最多 50 条、title 截到 200 字：
+    // 状态文件是桥写的，插件没权利把它整份原样吐给浏览器（可能越来越大/带内部字段）。
+    activeSessionId: str(w.activeSessionId),
+    activeSessionTitle: str(w.activeSessionTitle),
+    boundSessionId: str(w.boundSessionId),
+    sessions: (Array.isArray(w.sessions) ? w.sessions : []).slice(0, 50).map(function (it) {
+      const o = it && typeof it === "object" ? it : {};
+      return {
+        id: str(o.id),
+        title: str(o.title).slice(0, 200),
+        updatedAt: num(o.updatedAt),
+      };
+    }).filter(function (it) { return !!it.id; }),
   };
 }
 
@@ -7644,6 +7661,8 @@ function imBotsView(relayDir) {
       hasSecret: w.secret.length > 0,
       url: w.url,
       targetChatId: w.targetChatId,
+      sessionId: w.sessionId,
+      sessionTitle: w.sessionTitle,
     },
     status: wecomStatusOf(stFile),
     updatedAt: typeof stFile.updatedAt === "number" ? stFile.updatedAt : 0,
@@ -7666,6 +7685,8 @@ function saveWecomConfig(relayDir, input) {
     secret: cur.secret,
     url: cur.url,
     targetChatId: cur.targetChatId,
+    sessionId: cur.sessionId,
+    sessionTitle: cur.sessionTitle,
   };
 
   if (Object.prototype.hasOwnProperty.call(src, "botId")) {
@@ -7691,6 +7712,13 @@ function saveWecomConfig(relayDir, input) {
     const cid = String(src.targetChatId ?? "").trim();
     if (cid.length > 200) return { ok: false, code: "invalid_target_chat_id", message: "接收会话 ID 过长（最多 200 字）" };
     next.targetChatId = cid;
+  }
+  if (Object.prototype.hasOwnProperty.call(src, "sessionId")) {
+    const sid = String(src.sessionId ?? "").trim();
+    if (sid.length > 200) return { ok: false, code: "invalid_session_id", message: "会话 ID 过长（最多 200 字）" };
+    // 空串 = **跟随当前活跃会话** → 同时清掉标题（保留一个"孤零零的标题"只会让 UI 说错话）
+    next.sessionId = sid;
+    next.sessionTitle = sid ? String(src.sessionTitle ?? "").trim().slice(0, 200) : "";
   }
   if (Object.prototype.hasOwnProperty.call(src, "enabled")) next.enabled = !!src.enabled;
   else if (!next.enabled && next.botId && next.secret) next.enabled = true; // 首次保存凭据 = 想让它生效
