@@ -26,6 +26,8 @@ import test from "node:test";
 import { WebSocketServer } from "ws";
 
 import {
+  ANSWER_MAX_CHARS,
+  ANSWER_TRUNCATED_NOTE,
   IM_BOTS_FILE,
   IM_BOT_STATUS_FILE,
   atomicWriteJson,
@@ -145,6 +147,13 @@ function fakeSubscriber(over = {}) {
   sub.start = () => { sub.started = true; };
   sub.close = () => { sub.closed = true; };
   sub.listSessions = async () => ({ ok: true, sessions: sub.sessions });
+  /** 回答回传用（dsh-events 的真实签名：{ok:true,text} / {ok:false,code,text:""}；可动态替换）。 */
+  sub.lastAssistantCalls = [];
+  sub.assistantReply = over.assistantText !== undefined ? over.assistantText : { ok: true, text: "" };
+  sub.lastAssistantText = async ({ sessionId } = {}) => {
+    sub.lastAssistantCalls.push({ sessionId });
+    return typeof sub.assistantReply === "function" ? sub.assistantReply(sessionId) : sub.assistantReply;
+  };
   sub.promptSession = async (arg) => {
     sub.promptCalls.push(arg);
     if (over.promptImpl) return over.promptImpl(arg);
@@ -624,6 +633,167 @@ test("★ 出站通知：turn_done/turn_error/approval_request → Markdown 推�
     } finally {
       await bot3.stop();
       await server.close();
+    }
+  }
+});
+
+// ─────────────────────────── ⑩b 回答回传（入站 → agent 回答 → 原路发回）───────────────────────────
+
+/** 建一个「已认证 + 入站一次 + 可注入回答」的 bot，返回便捷断言面。 */
+async function setupRelayBot(over = {}) {
+  const server = await startFakeServer({ onFrame: (f, ws) => { autoAckAuth(f, ws); autoAckPing(f, ws); autoAckSend(f, ws); } });
+  const lines = [];
+  const sub = fakeSubscriber({
+    sessions: [{ sessionId: "session-abc", running: true }],
+    ...(over.sub || {})
+  });
+  if (over.assistantText !== undefined) sub.assistantReply = over.assistantText;
+  const bot = createWecomBot({
+    botId: BOT_ID, secret: SECRET, url: server.url,
+    logger: (level, line) => lines.push(line),
+    subscriber: sub,
+    ...(over.bot || {})
+  });
+  const sends = () => server.state.frames.filter((f) => f.cmd === "aibot_send_msg");
+  const inbound = async (msgid, content, userid = "user-a") => {
+    const before = sub.promptCalls.length;
+    server.push({
+      cmd: "aibot_msg_callback", headers: { req_id: `in-${msgid}` },
+      body: { msgid, msgtype: "text", text: { content }, from: { userid } }
+    });
+    await waitFor(() => sub.promptCalls.length > before, { label: `入站 ${msgid} 被转发` });
+  };
+  const turnEnd = (extra = {}) => sub.emit("event", {
+    kind: NODE_KINDS.TURN_END, sessionId: "session-abc", reason: "completed",
+    turn: 1, seq: 1, at: Date.now(), ...extra
+  });
+  return { server, sub, bot, lines, sends, inbound, turnEnd, close: async () => { await bot.stop(); await server.close(); } };
+}
+
+test("★ 回答回传：入站后同会话 turn_done 发**回答正文**（不再发 ✅标题）；其它会话/已消费保持标题通知；取不到正文降级标题", async () => {
+  const rt = await setupRelayBot({ assistantText: { ok: true, text: "这是 agent 的最终回答" } });
+  try {
+    rt.bot.start();
+    await waitFor(() => rt.bot.status().authenticated, { label: "认证完成" });
+    await rt.inbound("relay-1", "你好");
+
+    // ① 入站后同会话 turn/end → 只发正文，不发标题
+    rt.turnEnd({ turn: 1, seq: 11 });
+    const first = await waitFor(() => rt.sends()[0], { label: "回答回传" });
+    assert.equal(first.body.chatid, "user-a", "回答必须发回最近入站的会话（boundChatId）");
+    assert.equal(first.body.msgtype, "markdown");
+    assert.equal(first.body.markdown.content, "这是 agent 的最终回答", "回答回传 = 正文本身（不带 ✅ 标题）");
+    assert.equal(rt.bot.status().answers, 1);
+    assert.deepEqual(rt.sub.lastAssistantCalls, [{ sessionId: "session-abc" }], "应通过 lastAssistantText 取正文");
+    await sleep(120);
+    assert.equal(rt.sends().length, 1, "同一次对话不得再补一条「✅ 任务完成」");
+
+    // ② 其它会话的 turn/end → 仍是标题通知
+    rt.sub.emit("event", { kind: NODE_KINDS.TURN_END, sessionId: "session-other", reason: "completed", turn: 1, seq: 12, at: Date.now() });
+    const other = await waitFor(() => rt.sends().find((f) => /任务完成/.test(f.body.markdown.content)), { label: "其它会话标题通知" });
+    assert.match(other.body.markdown.content, /^✅ 任务完成/);
+
+    // ③ 同会话但已消费过一次 → 保持标题通知（不会重复回传正文）
+    rt.turnEnd({ turn: 2, seq: 13 });
+    const again = await waitFor(() => rt.sends().filter((f) => /任务完成/.test(f.body.markdown.content)).length >= 2, { label: "消费一次后的标题通知" });
+    assert.ok(again, "同一次入站只回传一次正文，之后回落到标题通知");
+
+    // ④ 取不到正文 → 降级标题通知（不丢消息、也不假装有正文）
+    await rt.inbound("relay-2", "再问一句");
+    rt.sub.assistantReply = { ok: false, code: "page-failed", text: "" };
+    rt.turnEnd({ turn: 3, seq: 14 });
+    await waitFor(() => rt.lines.some((l) => /降级为标题通知/.test(l)), { label: "降级日志" });
+    const fallback = rt.sends().filter((f) => /任务完成/.test(f.body.markdown.content)).pop();
+    assert.match(fallback.body.markdown.content, /^✅ 任务完成/, "取不到正文时退回标题通知");
+
+    // ⑤ 重连快照补报的旧 turn（fromSnapshot）不得回传正文
+    await rt.inbound("relay-3", "第三句");
+    rt.sub.assistantReply = { ok: true, text: "来自快照的旧回答" };
+    const beforeSnapshot = rt.sends().length;
+    rt.turnEnd({ turn: 4, seq: 15, fromSnapshot: true });
+    await sleep(150);
+    assert.equal(rt.sends().length, beforeSnapshot + 1, "fromSnapshot 只走标题通知（一条），不触发正文回传");
+    assert.ok(!rt.sends().some((f) => f.body.markdown.content === "来自快照的旧回答"));
+  } finally {
+    await rt.close();
+  }
+});
+
+test("★ 回答回传：turn/end 瞬间正文还没落库 → 短重试后仍能回传（不是直接降级）", async () => {
+  let call = 0;
+  const rt = await setupRelayBot({
+    assistantText: () => {
+      call += 1;
+      // 第一次「ok 但空」（真实竞态），第二次拿到正文
+      return call === 1 ? { ok: true, text: "" } : { ok: true, text: "重试后拿到的回答" };
+    }
+  });
+  try {
+    rt.bot.start();
+    await waitFor(() => rt.bot.status().authenticated, { label: "认证完成" });
+    await rt.inbound("retry-1", "你好");
+    rt.turnEnd({ turn: 1, seq: 31 });
+    const send = await waitFor(() => rt.sends()[0], { label: "重试后的回答回传" });
+    assert.equal(send.body.markdown.content, "重试后拿到的回答", "ok 但空 → 补一次再发，不应直接降级");
+    assert.equal(rt.sub.lastAssistantCalls.length, 2, "应恰好重试一次");
+    assert.equal(rt.bot.status().answers, 1);
+  } finally {
+    await rt.close();
+  }
+});
+
+test("★ 回答回传边界：超过 TTL 不回传、超长截断+注明、正文绝不进日志、非 completed 带状态行", async () => {
+  // ① TTL：注入 40ms，入站后等过期再 turn/end → 只发标题通知
+  {
+    const rt = await setupRelayBot({ assistantText: { ok: true, text: "过期不该发的回答" }, bot: { answerRelayTtlMs: 40 } });
+    try {
+      rt.bot.start();
+      await waitFor(() => rt.bot.status().authenticated, { label: "认证完成" });
+      await rt.inbound("ttl-1", "你好");
+      await sleep(120); // 超过 40ms TTL
+      rt.turnEnd({ turn: 1, seq: 21, at: Date.now() });
+      const send = await waitFor(() => rt.sends()[0], { label: "超时后的标题通知" });
+      assert.match(send.body.markdown.content, /^✅ 任务完成/, "超过 10 分钟语义（测试缩放为 40ms）应回到标题通知");
+      assert.ok(!send.body.markdown.content.includes("过期不该发的回答"));
+    } finally {
+      await rt.close();
+    }
+  }
+
+  // ② 截断 + 正文不进日志 + 非 completed 状态行
+  {
+    const longAnswer = "开头" + "长".repeat(300) + "SECRET-ANSWER-TAIL";
+    const rt = await setupRelayBot({
+      assistantText: { ok: true, text: longAnswer },
+      bot: { answerMaxChars: 50 }
+    });
+    try {
+      rt.bot.start();
+      await waitFor(() => rt.bot.status().authenticated, { label: "认证完成" });
+      await rt.inbound("trunc-1", "来点长的");
+      rt.turnEnd({ turn: 1, seq: 22 });
+      const send = await waitFor(() => rt.sends()[0], { label: "截断后的回答" });
+      const content = send.body.markdown.content;
+      assert.ok(content.endsWith(ANSWER_TRUNCATED_NOTE), `超长回答要以「${ANSWER_TRUNCATED_NOTE}」结尾`);
+      assert.equal(content.length, 50 + ANSWER_TRUNCATED_NOTE.length, "正文部分必须恰好截到 answerMaxChars");
+      assert.ok(!content.includes("SECRET-ANSWER-TAIL"));
+      assert.ok(content.startsWith("开头"));
+      // 日志只打长度，不打正文
+      const allLogs = rt.lines.join("\n");
+      assert.ok(!allLogs.includes("SECRET-ANSWER-TAIL"), "★ 回答正文绝不能进日志");
+      assert.ok(!allLogs.includes("长".repeat(40)), "★ 回答正文片段也不能进日志");
+      assert.ok(allLogs.split("\n").some((l) => /回答回传 .* len=\d+/.test(l)), "日志只记长度");
+      assert.ok(allLogs.split("\n").some((l) => /已截断/.test(l)), "日志要标出截断");
+
+      // ③ 非 completed：带一句状态行 + 正文（仍是一条消息）
+      rt.sub.assistantReply = { ok: true, text: "只跑了一半的结果" };
+      await rt.inbound("err-1", "再试");
+      rt.turnEnd({ turn: 2, seq: 23, reason: "error" });
+      const errSend = await waitFor(() => rt.sends().find((f) => f.body.markdown.content.includes("只跑了一半的结果")), { label: "出错时回传" });
+      assert.match(errSend.body.markdown.content, /^❌ 出错了/);
+      assert.ok(errSend.body.markdown.content.includes("只跑了一半的结果"), "同一条消息里既给状态也给正文");
+    } finally {
+      await rt.close();
     }
   }
 });
