@@ -808,10 +808,12 @@ test("面板可见性：关于卡片写明「匿名统计 + 关闭方式」，�
   //    0.6.18 面板重排（「加入交流群」搬进账号卡）之后更是会变成空串 → 断言全部平凡通过。
   //    这是"静默失守"：比变红更危险（它看起来一直是绿的）。
   //    现在取片边界是「关于卡片开头 → renderHome 结尾」，并**显式断言切片非空且像样**。
-  const aboutStart = client.indexOf('card("📖 关于 dsh-remote"');
+  // IA 重做（2026-11-07）：关于卡不再用 card() 助手（标题图标改成内联 SVG，禁止 emoji）→
+  // 取片锚点改成"关于卡标题 → 弹层段开头"，仍然要求切片非空且真的包含卡片本体。
+  const aboutStart = client.indexOf('h("h3", null, "关于 dsh-remote")');
   assert.ok(aboutStart > 0, "必须能定位到「关于」卡片的开头");
-  const aboutEnd = client.indexOf("\n      // 【自动化】待重启时自动倒计时", aboutStart);
-  assert.ok(aboutEnd > aboutStart, "必须能定位到「关于」卡片的结束边界（renderHome 末尾）");
+  const aboutEnd = client.indexOf("// ── 弹层内容", aboutStart);
+  assert.ok(aboutEnd > aboutStart, "必须能定位到「关于」卡片的结束边界（弹层段开始之前）");
   const about = client.slice(aboutStart, aboutEnd);
   assert.ok(about.length > 400, "「关于」卡片切片不能是空串/碎片（空串会让下面四条断言全部平凡通过）");
   assert.ok(about.includes("关于 dsh-remote"), "切片必须真的包含「关于」卡片本体");

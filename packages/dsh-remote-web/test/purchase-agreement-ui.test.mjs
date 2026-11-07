@@ -18,6 +18,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
+import { openEntry } from "./lib-panel-ia.mjs";
 
 const SOURCE = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
 // 复制自 community-invite-ui 的迷你 React harness 里，交流群/弹层接口仍有默认夹具，统一给一个假二维码地址。
@@ -74,6 +75,7 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
  * @param {object} opts - community：/dsh-remote/community 的返回值（默认已配置二维码）
  */
 function loadPlugin(opts = {}) {
+  let iaOpened = false;
   let moduleFactory;
   const registered = new Map();
   const injects = new Map();
@@ -249,7 +251,12 @@ function loadPlugin(opts = {}) {
     },
     render() {
       const root = { type: registered.get("dsh-remote"), props: { close() {} }, children: [] };
-      return renderNode(root, "root");
+      let tree = renderNode(root, "root");
+      if (!iaOpened) {
+        iaOpened = true;
+        if (openEntry(tree, opts.autoModal || "account")) tree = renderNode(root, "root");
+      }
+      return tree;
     },
   };
 }
@@ -276,7 +283,9 @@ test("② 会员账号卡（业主点名场景）：续费会员按钮下方不�
 });
 
 test("③ 连接偏慢双路块：升级（购买）路旁也没有协议链接，协议地址零请求", async () => {
+  // 双路块在「手机访问」弹层（访问卡）里 → 打开该弹层
   const plugin = loadPlugin({
+    autoModal: "mobile",
     status: {
       ok: true,
       config: { phone: "138****0000", hasPhone: true, mode: "saas", deviceId: "dev-x" },

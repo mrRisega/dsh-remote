@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
+import { openEntry } from "./lib-panel-ia.mjs";
 
 const SOURCE = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
 
@@ -51,6 +52,7 @@ function loadPlugin(opts = {}) {
   const requests = [];
   const states = [];
   let hook = 0;
+  let iaOpened = false;
   let effectCursor = 0;
   let effectSlots = [];
   let pending = [];
@@ -184,7 +186,12 @@ function loadPlugin(opts = {}) {
     /** 渲染一轮并执行本轮需要运行的 effects（含 cleanup）。 */
     render() {
       hook = 0; effectCursor = 0; pending = [];
-      const tree = registered.get("dsh-remote")({ close() {} });
+      let tree = registered.get("dsh-remote")({ close() {} });
+      // IA 重做（2026-11-07）：账号/登录在「账号」弹层里 —— 按真实用户路径点开入口卡。
+      if (!iaOpened) {
+        iaOpened = true;
+        if (openEntry(tree, opts.autoModal || "account")) { hook = 0; effectCursor = 0; pending = []; tree = registered.get("dsh-remote")({ close() {} }); }
+      }
       const todos = pending; pending = [];
       for (const t of todos) {
         const prev = effectSlots[t.index];
@@ -215,7 +222,7 @@ function loadPlugin(opts = {}) {
 }
 
 test("未登录：不请求企业端、不出误导性红字；登录后自动拉取二维码与设备列表", async () => {
-  const plugin = loadPlugin();
+  const plugin = loadPlugin({ autoModal: "mobile" });
   let tree = await plugin.settle(); // 挂载 → refresh() 读状态
 
   assert.ok(!plugin.requests.some((r) => r.path === "/dsh-remote/access-key"), "未登录不得请求二维码接口");
@@ -230,7 +237,7 @@ test("未登录：不请求企业端、不出误导性红字；登录后自动�
 });
 
 test("登录瞬间中继未就绪：首次失败自动重试，退避到点即恢复（无需刷新页面）", async () => {
-  const plugin = loadPlugin({ failAccessKey: 1, failSessions: 1 });
+  const plugin = loadPlugin({ failAccessKey: 1, failSessions: 1, autoModal: "mobile" });
   let tree = await plugin.settle();
   tree = await plugin.login();
 
@@ -255,7 +262,7 @@ test("登录瞬间中继未就绪：首次失败自动重试，退避到点即�
 });
 
 test("点「立即重试」：不等退避窗口，立刻重发并恢复", async () => {
-  const plugin = loadPlugin({ failAccessKey: 1, failSessions: 1 });
+  const plugin = loadPlugin({ failAccessKey: 1, failSessions: 1, autoModal: "mobile" });
   await plugin.settle();
   const tree0 = await plugin.login();
   assert.equal(plugin.counts().keyCalls, 1);
@@ -270,7 +277,7 @@ test("点「立即重试」：不等退避窗口，立刻重发并恢复", async
 });
 
 test("持续失败：退避重试上限后停在红字并保留「立即重试」，不无限刷请求", async () => {
-  const plugin = loadPlugin({ failAccessKey: 99, failSessions: 99 });
+  const plugin = loadPlugin({ failAccessKey: 99, failSessions: 99, autoModal: "mobile" });
   await plugin.settle();
   await plugin.login();
   await plugin.advance(2000);   // 第 1 次自动重试
@@ -285,6 +292,7 @@ test("持续失败：退避重试上限后停在红字并保留「立即重试�
 
 test("不可重试失败（401 密码失效 / 未登录）：直接红字提示，不做无意义重试", async () => {
   const plugin = loadPlugin({
+    autoModal: "mobile",
     failAccessKey: 99,
     failSessions: 99,
     failStatus: 401,

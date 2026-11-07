@@ -21,6 +21,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
+import { openEntry } from "./lib-panel-ia.mjs";
 
 const SOURCE = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
 
@@ -90,6 +91,7 @@ function loadPlugin(opts = {}) {
   const clipboard = [];
   const states = [];
   let hook = 0;
+  let iaOpened = false;
   let effectCursor = 0;
   let effectSlots = [];
   let pending = [];
@@ -228,7 +230,15 @@ function loadPlugin(opts = {}) {
     counts() { return { connCalls, keyCalls, sessCalls }; },
     render() {
       hook = 0; effectCursor = 0; pending = [];
-      const tree = registered.get("dsh-remote")({ close() {} });
+      let tree = registered.get("dsh-remote")({ close() {} });
+      // IA 重做（2026-11-07）：访问卡/激活引导在「手机访问」弹层里 —— 按真实用户路径点开入口卡。
+      if (!iaOpened) {
+        iaOpened = true;
+        if (openEntry(tree, opts.autoModal || "mobile")) {
+          hook = 0; effectCursor = 0; pending = [];
+          tree = registered.get("dsh-remote")({ close() {} });
+        }
+      }
       const todos = pending; pending = [];
       for (const t of todos) {
         const prev = effectSlots[t.index];

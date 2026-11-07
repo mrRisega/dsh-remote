@@ -17,6 +17,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
+import { openEntry, clickChannelRow } from "./lib-panel-ia.mjs";
 
 const SOURCE = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
 
@@ -494,9 +495,13 @@ test("微信机器人引导：两步走引导块在能力清单之上（DOM 顺�
   const plugin = loadPlugin();
   let tree = await plugin.settle();
   // 进入微信机器人 tab（未登录时不渲染这个 tab，所以先确认它在）
-  const tab = nodeWithText(tree, "微信机器人通道");
-  assert.ok(tab, "应有「微信机器人通道」tab");
-  tab.props.onClick();
+  // IA 重做（2026-11-07）：顶部 tab 已删除 —— 微信通道在「通知与消息通道」弹层里，
+  // 主面板只保留入口卡；这里断言入口仍在（不再要求 tab）。
+  assert.ok(textHas(tree, "通知与消息通道"), "主面板应有「通知与消息通道」入口卡（登录不再隐藏功能）");
+  // IA 重做：通道入口 → 平台列表 → 微信机器人一行 → 绑定面板（原来的第三 tab 已删）
+  assert.ok(openEntry(tree, "channel"), "应能点开通道弹层");
+  tree = await plugin.settle();
+  assert.ok(clickChannelRow(tree, "微信机器人"), "通道弹层里应能点进微信机器人");
   tree = await plugin.settle();
 
   const embed = find(tree, (n) => n.props?.className === "dru-wx-embed");

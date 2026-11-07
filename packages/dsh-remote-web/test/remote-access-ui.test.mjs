@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
+import { openEntry } from "./lib-panel-ia.mjs";
 
 const SOURCE = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
 
@@ -50,6 +51,7 @@ function loadPlugin(opts = {}) {
   const states = [];
   let hook = 0;
   let sessionsCalls = 0;
+  let iaOpened = false;
 
   const react = {
     createElement(type, props, ...children) { return { type, props: props || {}, children }; },
@@ -153,7 +155,17 @@ function loadPlugin(opts = {}) {
     requests,
     opened,
     states,
-    render() { hook = 0; return registered.get("dsh-remote")({ close() {} }); },
+    render() {
+      hook = 0;
+      let tree = registered.get("dsh-remote")({ close() {} });
+      // IA 重做（2026-11-07）：原「📱 远程访问卡」搬进「手机访问」弹层 —— 用例按真实用户路径点开入口卡。
+      if (!iaOpened) {
+        iaOpened = true;
+        const kind = opts.autoModal || "mobile";
+        if (openEntry(tree, kind)) { hook = 0; tree = registered.get("dsh-remote")({ close() {} }); }
+      }
+      return tree;
+    },
   };
 }
 
@@ -191,7 +203,7 @@ test("📱 远程访问卡：bridge 在线 → 绿点文案；登录态点「生
 });
 
 test("已授权设备：展开列表（label/os/browser/时间）→ 取消配对二次确认 → 成功提示并刷新", async () => {
-  const plugin = loadPlugin();
+  const plugin = loadPlugin({ autoModal: "devices" });
   plugin.states[0] = { config: { phone: "13800000000", deviceId: "dev-x" }, service: { running: true } };
   let tree = plugin.render();
 
@@ -232,7 +244,7 @@ test("已授权设备：展开列表（label/os/browser/时间）→ 取消配�
 });
 
 test("已授权设备行内操作：活跃行有 取消配对+删除记录，已取消行有 删除记录；删除记录二次确认 → DELETE delete {id}", async () => {
-  const plugin = loadPlugin({ sessions: SESSIONS_1 }); // 固定列表：操作后重拉仍保留，便于断言行内按钮
+  const plugin = loadPlugin({ sessions: SESSIONS_1, autoModal: "devices" }); // 固定列表 + 设备弹层（IA 重做：列表在弹层里）
   plugin.states[0] = { config: { phone: "13800000000", deviceId: "dev-x" }, service: { running: true } };
   let tree = plugin.render();
   const openBtn = find(tree, (n) => typeof n.props?.onClick === "function" && (n.children || []).some((c) => typeof c === "string" && c.includes("已授权设备")));
@@ -271,7 +283,7 @@ test("已授权设备行内操作：活跃行有 取消配对+删除记录，已
 });
 
 test("已授权设备：卡片底部「清理已解绑」→ 二次确认 → POST purge → 提示条数 + 刷新列表", async () => {
-  const plugin = loadPlugin({ sessions: SESSIONS_1 });
+  const plugin = loadPlugin({ sessions: SESSIONS_1, autoModal: "devices" });
   plugin.states[0] = { config: { phone: "13800000000", deviceId: "dev-x" }, service: { running: true } };
   let tree = plugin.render();
   const openBtn = find(tree, (n) => typeof n.props?.onClick === "function" && (n.children || []).some((c) => typeof c === "string" && c.includes("已授权设备")));
@@ -302,7 +314,7 @@ test("已授权设备：卡片底部「清理已解绑」→ 二次确认 → PO
 });
 
 test("升级/续费按钮：点击 → GET /dsh-remote/access-key → window.open(url)（带登录态打开）", async () => {
-  const plugin = loadPlugin();
+  const plugin = loadPlugin({ autoModal: "account" });
   plugin.states[0] = { config: { phone: "13800000000", deviceId: "dev-x" }, service: { running: true } };
   let tree = plugin.render();
 
@@ -412,7 +424,7 @@ test("E2EE 徽标：未登录 / host 未下发 e2ee → 不打扰（不渲染状
 
 test("「更多」只收纳营销入口：档位规格数字（Mbps / GB / 价格）不再出现在账号卡里", () => {
   // 收纳态（localStorage 里记着用户关掉过引导）＝「更多」里会出现那两条折叠入口的场景
-  const plugin = loadPlugin({ localStorageSeed: { "dsh-remote-marketing-more-v1": "1" } });
+  const plugin = loadPlugin({ autoModal: "account", localStorageSeed: { "dsh-remote-marketing-more-v1": "1" } });
   plugin.states[0] = { config: { phone: "13800000000", deviceId: "dev-x" }, service: { running: true } };
   let tree = plugin.render();
 
@@ -488,7 +500,7 @@ test("E2EE 徽标（源码级约束）：client 含徽标字段/文案与 reason
 // 动线：账号（我是谁 / 退出）→ 主行动（升级或续费）→ 次要（反馈）→ 更多（其它入口）。
 
 test("★ 正面按钮收敛为三个：升级/续费 + 用户反馈 + 更多（不再一排按钮疯狂换行）", () => {
-  const plugin = loadPlugin();
+  const plugin = loadPlugin({ autoModal: "account" });
   plugin.states[0] = { config: { phone: "13800000000", deviceId: "dev-x" }, service: { running: true } };
   const tree = plugin.render();
   // 面板里可能有多处 .dru-actions（访问密钥卡等）；账号卡那一处用「更多」按钮定位。
@@ -520,7 +532,7 @@ test("★ 正面按钮收敛为三个：升级/续费 + 用户反馈 + 更多（
 });
 
 test("★ 次要入口全部在「更多」里：带新用户 / 修改密码 / 加入交流群（展开后可见）", () => {
-  const plugin = loadPlugin();
+  const plugin = loadPlugin({ autoModal: "account" });
   plugin.states[0] = { config: { phone: "13800000000", deviceId: "dev-x" }, service: { running: true } };
   let tree = plugin.render();
   const toggle = find(tree, (n) => n.props?.id === "dru-account-more");

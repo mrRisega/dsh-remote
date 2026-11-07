@@ -14,15 +14,15 @@
 //             旧代码用「文本包含『设置』」去找锚点 → 按钮被塞进设置面板栏目列表最上面（用户反馈的
 //             「植入错了地方」）。现在找不到锚点就**不注入**，绝不将就一个错误的落点。
 //   - 栏目内联渲染配置面板（浅色高对比 UI，遵循主流登录体验）
-//     · 登录态：已登录显示账号 + 退出登录；未登录显示 登录/注册 tabs
+//     · 登录态：已登录显示账号 + 退出登录；未登录显示 登录/注册（在「账号」弹层的分段里）
 //     · 🔒 修改密码（账号卡）：已登录账号经 图形验证码+短信验证码 重置（/dsh-remote/password/reset 代理）；
 //       成功后全部已授权设备/会话失效 → 本地登出并提示用新密码重新登录（覆盖本机 config 密码）
 //     · 忘记密码（登录卡）：未登录时登录表单内「忘记密码？」→ 同一套
 //       图形验证码+短信验证码 表单（手机号预填当前输入、可改），成功后本地登出并提示「请用新密码登录」
 //     · 登录要求图形验证码；注册要求两次密码 + 图形验证码
 //     · 📱 远程访问卡：一次性访问密钥（扫码/直接打开/复制 + 到期倒计时自动刷新）与已授权设备管理
-//     · 🤖 微信机器人通道：与「☁️ 云端服务 / 🖥 自建服务」并列的**第三个 tab**（条形 tab 由 home 与
-//       wechat 两个视图共用，所以切过去还能切回来）；不再是独立的 settings.section 栏目 ——
+//     · 🤖 微信机器人通道：「通知与消息通道」弹层里的一个平台入口（2026-11-07 IA 重做；
+//       顶部 3 tab 已删除，云端/自建降级为「手机访问」弹层内的分段；不再是独立的 settings.section 栏目 ——
 //       用户约定：「不要给它单独弄一个菜单，直接放到面板里面」（0.6.11）
 //       🔒 登录门（用户约定）：微信通道要求**已注册并登录**，未登录不渲染这个 tab；若会话在
 //          tab 开着的时候过期，view 复位回 home（兜底 effect + 分派条件），绝不留空面板。
@@ -578,6 +578,97 @@ window.__ModuleLoader__.load({
       "  .dru-copy-btn{width:100%}",
       // 气泡独占一行，绝不把按钮挤到屏幕外（320px 下也不横向滚动）
       "  .dru-tip{flex:1 1 100%;padding:9px 40px 9px 10px;font-size:12px}",
+      "}",
+      // ══════════════════════════════════════════════════════════════════════
+      // 🧭 面板信息架构（2026-11-07 业主 UX 重做）：状态头 + 2 列入口网格 + 弹层
+      //
+      // 为什么重做（业主原话）：「整个交互都是卡片式平铺堆叠，很糟糕。别人产品很清爽，
+      // 是弹出式设计，或者是有结构的」「插件端全是文字堆砌，太密集，布局垂直往下垒」。
+      // 结构：主面板只留 ①状态头 ②入口网格（每卡 ≤3 行）③一行文字入口；
+      //      具体操作全部进弹层（role=dialog，宽 480–560，Esc 关闭，焦点陷阱，关闭回焦点）。
+      // 视觉纪律（UX 数据库检索后的落地）：字号 15/600 标题、13/600 卡片标题、13 正文、12 辅助；
+      // 行高 1.5；8 网格（卡片内 16）；圆角 12；边框 1px；hover 150ms；尊重 reduced-motion；
+      // 图标一律内联 SVG 16px currentColor（**不用 emoji 当图标**）；状态不只靠颜色（圆点+文案）。
+      // 颜色全部走宿主主题变量（--dsw-alias-*，缺失时回落本插件的 --dru-*），不硬编码深浅色。
+      ".dru-ia{display:flex;flex-direction:column;gap:12px;font-size:13px;line-height:1.5}",
+      ".dru-ia-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 16px;border-radius:12px;border:1px solid var(--dsw-alias-border-l2,var(--dru-border));background:var(--dsw-alias-bg-layer-2,var(--dru-surface-2))}",
+      ".dru-ia-pill{display:inline-flex;align-items:center;gap:6px;min-height:24px;padding:2px 10px;border-radius:999px;font-size:12px;font-weight:600;white-space:nowrap;color:var(--dsw-alias-label-secondary,var(--dru-fg-muted));background:var(--dru-surface-3);border:1px solid var(--dru-border-soft)}",
+      ".dru-ia-pill-dot{width:7px;height:7px;border-radius:50%;background:var(--dru-dot-off);flex:none}",
+      ".dru-ia-pill.is-on{color:var(--dru-success);border-color:var(--dru-success-border)}",
+      ".dru-ia-pill.is-on .dru-ia-pill-dot{background:var(--dru-success);box-shadow:0 0 6px var(--dru-success-glow)}",
+      ".dru-ia-pill.is-warn{color:var(--dru-warn-fg)}",
+      ".dru-ia-pill.is-warn .dru-ia-pill-dot{background:var(--dru-warn-border-2)}",
+      ".dru-ia-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}",
+      "@media (max-width:520px){.dru-ia-grid{grid-template-columns:minmax(0,1fr)}}",
+      ".dru-ia-card{display:flex;flex-direction:column;gap:8px;min-width:0;padding:16px;border-radius:12px;border:1px solid var(--dsw-alias-border-l2,var(--dru-border));background:var(--dsw-alias-bg-layer-2,var(--dru-surface-2));transition:border-color .15s ease,box-shadow .15s ease}",
+      ".dru-ia-card:hover{border-color:var(--dru-accent);box-shadow:0 2px 10px var(--dru-focus-halo-3)}",
+      ".dru-ia-card-top{display:flex;align-items:center;gap:8px;min-width:0}",
+      ".dru-ia-ico{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;flex:none;border-radius:8px;background:var(--dru-accent-tint);color:var(--dru-accent-fg)}",
+      ".dru-ia-card-title{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary,var(--dru-fg));min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+      ".dru-ia-card-meta{font-size:12px;line-height:1.5;color:var(--dsw-alias-label-tertiary,var(--dru-fg-muted));min-height:18px}",
+      ".dru-ia-card-actions{margin-top:auto;display:flex;align-items:center;gap:8px;flex-wrap:wrap}",
+      ".dru-ia-links{display:flex;flex-wrap:wrap;align-items:center;gap:4px 14px;padding:2px 4px}",
+      ".dru-ia-link{display:inline-flex;align-items:center;gap:4px;min-height:32px;padding:0;border:0;background:none;color:var(--dsw-alias-label-tertiary,var(--dru-fg-muted));font:inherit;font-size:12px;cursor:pointer;border-radius:6px}",
+      ".dru-ia-link:hover{color:var(--dru-accent)}",
+      ".dru-ia-link:focus-visible{outline:2px solid var(--dru-focus);outline-offset:2px}",
+      ".dru-ia-link .dru-reddot{position:static;width:6px;height:6px;box-shadow:none}",
+      // ── 弹层（dialog）：宽 480–560、表头/底部操作固定、正文超过 1.5 屏才滚动 ──────
+      ".dru-ia-scrim{position:fixed;inset:0;z-index:2147482000;display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box;background:var(--dru-overlay);animation:dru-ia-fade .15s ease-out}",
+      ".dru-ia-dialog{display:flex;flex-direction:column;width:min(520px,calc(100vw - 48px));max-height:min(78vh,640px);box-sizing:border-box;border-radius:12px;border:1px solid var(--dsw-alias-border-l2,var(--dru-border));background:var(--dsw-alias-bg-layer-2,var(--dru-surface-2));color:var(--dsw-alias-label-primary,var(--dru-fg));box-shadow:0 24px 64px var(--dru-shadow);overflow:hidden;font-size:13px;line-height:1.5}",
+      ".dru-ia-dialog-head{display:flex;align-items:flex-start;gap:10px;padding:16px;border-bottom:1px solid var(--dru-border-soft);flex:none}",
+      ".dru-ia-dialog-title{opacity:1;font-size:15px;font-weight:600;line-height:1.4;min-width:0;flex:1}",
+      ".dru-ia-dialog-sub{font-size:12px;line-height:1.5;color:var(--dsw-alias-label-tertiary,var(--dru-fg-muted));margin-top:2px;font-weight:400}",
+      ".dru-ia-dialog-x{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;flex:none;border-radius:8px;border:1px solid transparent;background:none;color:var(--dsw-alias-label-tertiary,var(--dru-fg-muted));cursor:pointer}",
+      ".dru-ia-dialog-x:hover{background:var(--dru-hover);color:var(--dsw-alias-label-primary,var(--dru-fg))}",
+      ".dru-ia-dialog-x:focus-visible{outline:2px solid var(--dru-focus);outline-offset:2px}",
+      ".dru-ia-dialog-body{padding:16px;overflow-y:auto;min-height:0;display:flex;flex-direction:column;gap:12px}",
+      ".dru-ia-dialog-foot{display:flex;align-items:center;justify-content:flex-end;gap:8px;padding:12px 16px;border-top:1px solid var(--dru-border-soft);flex:none;background:var(--dsw-alias-bg-layer-2,var(--dru-surface-2))}",
+      ".dru-ia-dialog-foot .dru-hint{margin-right:auto}",
+      "@keyframes dru-ia-fade{from{opacity:0}to{opacity:1}}",
+      // 分段控件（segmented）：把原来顶部的 3 个 tab 降级成弹层内的一段
+      ".dru-ia-seg{display:flex;gap:2px;padding:3px;border-radius:10px;background:var(--dru-surface-3);border:1px solid var(--dru-border-soft)}",
+      ".dru-ia-seg-btn{flex:1;min-height:32px;padding:0 10px;border:0;border-radius:8px;background:none;color:var(--dsw-alias-label-secondary,var(--dru-fg-muted));font:inherit;font-size:12.5px;font-weight:600;cursor:pointer;transition:background .15s ease,color .15s ease}",
+      ".dru-ia-seg-btn:hover{color:var(--dsw-alias-label-primary,var(--dru-fg))}",
+      ".dru-ia-seg-btn.is-active{background:var(--dsw-alias-bg-layer-3,var(--dru-surface-2));color:var(--dsw-alias-label-primary,var(--dru-fg));box-shadow:0 1px 2px var(--dru-shadow)}",
+      ".dru-ia-seg-btn:focus-visible{outline:2px solid var(--dru-focus);outline-offset:1px}",
+      // 平台列表（通道弹层第一步）
+      ".dru-ia-list{display:flex;flex-direction:column;gap:8px}",
+      ".dru-ia-row{display:flex;align-items:center;gap:12px;width:100%;min-height:52px;padding:10px 12px;box-sizing:border-box;border-radius:10px;border:1px solid var(--dsw-alias-border-l2,var(--dru-border));background:var(--dsw-alias-bg-layer-2,var(--dru-surface-2));color:inherit;font:inherit;text-align:left;cursor:pointer;transition:border-color .15s ease,background .15s ease}",
+      ".dru-ia-row:hover{border-color:var(--dru-accent);background:var(--dru-hover)}",
+      ".dru-ia-row:focus-visible{outline:2px solid var(--dru-focus);outline-offset:2px}",
+      ".dru-ia-row-main{flex:1;min-width:0}",
+      ".dru-ia-row-title{font-size:13px;font-weight:600;line-height:1.4}",
+      ".dru-ia-row-sub{font-size:12px;color:var(--dsw-alias-label-tertiary,var(--dru-fg-muted));line-height:1.5}",
+      ".dru-ia-row-go{display:inline-flex;align-items:center;gap:4px;flex:none;font-size:12px;color:var(--dru-accent)}",
+      // 表单（label 可见、错误就近、按钮 ≥32）
+      ".dru-ia-field{display:flex;flex-direction:column;gap:6px}",
+      ".dru-ia-label{font-size:12px;font-weight:600;color:var(--dsw-alias-label-secondary,var(--dru-fg-muted))}",
+      ".dru-ia-input{width:100%;min-height:34px;box-sizing:border-box;padding:6px 10px;border-radius:8px;border:1px solid var(--dru-border-ctl);background:var(--dsw-alias-bg-layer-1,var(--dru-surface));color:var(--dsw-alias-label-primary,var(--dru-fg));font:inherit;font-size:13px}",
+      ".dru-ia-input:focus{outline:2px solid var(--dru-focus);outline-offset:1px;border-color:var(--dru-accent)}",
+      ".dru-ia-input[aria-invalid=\"true\"]{border-color:var(--dru-danger)}",
+      ".dru-ia-input-row{display:flex;gap:8px}",
+      ".dru-ia-input-row .dru-ia-input{flex:1;min-width:0}",
+      ".dru-ia-err{font-size:12px;line-height:1.5;color:var(--dru-danger)}",
+      ".dru-ia-hint{font-size:12px;line-height:1.5;color:var(--dsw-alias-label-tertiary,var(--dru-fg-muted))}",
+      ".dru-ia-state{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;font-size:12px;line-height:1.5;background:var(--dru-surface-3)}",
+      ".dru-ia-state.is-ok{color:var(--dru-success);background:var(--dru-success-soft)}",
+      ".dru-ia-state.is-err{color:var(--dru-danger);background:var(--dru-danger-soft)}",
+      ".dru-ia-state.is-warn{color:var(--dru-warn-fg);background:var(--dru-warn-soft)}",
+      ".dru-ia-empty{display:flex;flex-direction:column;align-items:center;gap:8px;padding:28px 12px;text-align:center;color:var(--dsw-alias-label-tertiary,var(--dru-fg-muted))}",
+      ".dru-ia-empty-title{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary,var(--dru-fg))}",
+      ".dru-ia-btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;min-height:32px;padding:0 14px;border-radius:8px;border:1px solid var(--dru-border-ctl);background:var(--dru-surface-2);color:var(--dsw-alias-label-primary,var(--dru-fg));font:inherit;font-size:13px;font-weight:600;cursor:pointer;transition:background .15s ease,border-color .15s ease}",
+      ".dru-ia-btn:hover{border-color:var(--dru-accent);background:var(--dru-hover)}",
+      ".dru-ia-btn:focus-visible{outline:2px solid var(--dru-focus);outline-offset:2px}",
+      ".dru-ia-btn[disabled]{opacity:.55;cursor:not-allowed}",
+      ".dru-ia-btn.is-primary{border-color:var(--dru-accent-fill);background:var(--dru-accent-fill);color:var(--dru-on-accent)}",
+      ".dru-ia-btn.is-primary:hover{background:var(--dru-accent);border-color:var(--dru-accent)}",
+      ".dru-ia-btn.is-ghost{border-color:transparent;background:none;color:var(--dru-accent)}",
+      ".dru-ia-btn.is-danger{border-color:var(--dru-danger-border);color:var(--dru-danger);background:none}",
+      ".dru-ia-iconbtn{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;flex:none;border-radius:8px;border:1px solid var(--dru-border-ctl);background:var(--dru-surface-2);color:var(--dsw-alias-label-secondary,var(--dru-fg-muted));cursor:pointer}",
+      ".dru-ia-iconbtn:hover{color:var(--dru-accent);border-color:var(--dru-accent)}",
+      ".dru-ia-iconbtn:focus-visible{outline:2px solid var(--dru-focus);outline-offset:2px}",
+      "@media (prefers-reduced-motion: reduce){",
+      "  .dru-ia-scrim,.dru-ia-card,.dru-ia-btn,.dru-ia-seg-btn,.dru-ia-row{animation:none !important;transition:none !important}",
       "}",
     ].join("\n");
     document.head.appendChild(styleEl);
@@ -3133,6 +3224,91 @@ window.__ModuleLoader__.load({
     // ── 面板主体（渲染于设置页 settings.section 栏目内） ─────────────────────
     // 匿名装机统计的「面板打开」只上报一次/每页（node 半还会每进程去重）。
     var panelOpenedSent = false;
+    // ══════════════════════════════════════════════════════════════════════
+    // 🧭 面板 IA 基础件（2026-11-07 UX 重做）：内联 SVG 图标 + 弹层（dialog）
+    //
+    // 为什么图标必须内联 SVG（业主原话「插件端全是文字堆砌，太密集」+ UX 规范）：
+    //   ① emoji 是**彩色位图**，跟随不了宿主主题的 currentColor，深色/亮色下观感不稳定；
+    //   ② 不同系统 emoji 字形差异巨大（Windows/Mac/iOS），同一个面板会长得不一样；
+    //   ③ 16px 的 emoji 在密集列表里视觉重量过大，是"文字堆砌感"的来源之一。
+    // 这里只放**本面板新增结构**用到的图标（旧卡片的 emoji 随重做一起不再出现在主界面）。
+    // ══════════════════════════════════════════════════════════════════════
+    var DRU_ICONS = {
+      phone: '<rect x="5" y="2" width="14" height="20" rx="2.5"/><path d="M11 18h2"/>',
+      bell: '<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/>',
+      devices: '<rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/>',
+      user: '<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
+      x: '<path d="M18 6 6 18M6 6l12 12"/>',
+      right: '<path d="m9 18 6-6-6-6"/>',
+      left: '<path d="m15 18-6-6 6-6"/>',
+      copy: '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
+      check: '<path d="M20 6 9 17l-5-5"/>',
+      open: '<path d="M7 17 17 7M7 7h10v10"/>',
+      key: '<circle cx="7.5" cy="15.5" r="3.5"/><path d="m21 2-9.6 9.6M15 7l3 3"/>',
+      qr: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3zM20 14h1M20 20h1M17 20h1"/>',
+      chat: '<path d="M21 11.5a8.4 8.4 0 0 1-8.5 8.5 9 9 0 0 1-3.4-.7L3 21l1.7-5.1A8.4 8.4 0 0 1 4 11.5 8.5 8.5 0 0 1 12.5 3 8.4 8.4 0 0 1 21 11.5z"/>',
+      send: '<path d="m22 2-7 20-4-9-9-4 20-7z"/>',
+      code: '<path d="m16 18 6-6-6-6M8 6l-6 6 6 6"/>',
+      link: '<path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/>',
+      eye: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/>',
+      eyeoff: '<path d="M17.9 17.9A10.6 10.6 0 0 1 12 19c-6.5 0-10-7-10-7a18 18 0 0 1 4.2-4.9M9.9 4.2A10.6 10.6 0 0 1 12 4c6.5 0 10 7 10 7a18 18 0 0 1-2.2 3.2M2 2l20 20"/>',
+      alert: '<path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9 2.4 18a2 2 0 0 0 1.7 3h15.8a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>'
+    };
+    /** 内联 SVG 图标（16px，currentColor）。名字不认识时退化成一个小圆点，绝不抛错。 */
+    function druIcon(name, size) {
+      var inner = DRU_ICONS[name] || '<circle cx="12" cy="12" r="3"/>';
+      return h("svg", {
+        width: size || 16, height: size || 16, viewBox: "0 0 24 24", fill: "none",
+        stroke: "currentColor", strokeWidth: 2, strokeLinecap: "round", strokeLinejoin: "round",
+        "aria-hidden": "true", focusable: "false",
+        dangerouslySetInnerHTML: { __html: inner }
+      });
+    }
+
+    /**
+     * 通用弹层（dialog）的**纯渲染函数**（不是组件：本仓库的面板只在少数 harness 里递归展开
+     * 函数组件，把弹层做成"组件"会让大量既有用例看不到弹层内容 —— 而且那也不影响真实 React）。
+     * 键盘（Esc / Tab 焦点陷阱）与"关闭后焦点回触发按钮"由 RemoteControlSection 里那条
+     * `useEffect([iaModal])` 统一负责，见 openIAModal 上方注释。
+     *
+     * 交互契约（UX 检索：modal focus trap / Esc / focus return）：
+     *   · role="dialog" + aria-modal + aria-labelledby（标题始终可见）；
+     *   · Esc 关闭；点遮罩关闭；右上角 ✕ 关闭（三者同一动作）；
+     *   · 关闭后焦点回到打开前的元素；
+     *   · 视觉：宽 480–560、圆角 12、边框 1px、表头/底部操作固定，正文超过 1.5 屏才滚动；
+     *   · prefers-reduced-motion 在样式表里统一关掉动效。
+     */
+    function iaDialog(props) {
+      var p = props || {};
+      var title = p.title || "";
+      var sub = p.sub || "";
+      var onClose = p.onClose;
+      var labelledBy = "dru-ia-dialog-title";
+      var bodyKids = Array.isArray(p.children) ? p.children : [p.children];
+      var footKids = Array.isArray(p.foot) ? p.foot : [p.foot];
+      var body = [].concat.apply(["div", { className: "dru-ia-dialog-body" }], bodyKids.filter(function (x) { return x !== null && x !== undefined && x !== false; }));
+      var headKids = [
+        h("div", { className: "dru-ia-dialog-title", id: labelledBy }, title,
+          sub ? h("div", { className: "dru-ia-dialog-sub" }, sub) : null),
+        h("button", { type: "button", className: "dru-ia-dialog-x", "aria-label": "关闭", onClick: onClose }, druIcon("x"))
+      ];
+      var kids = [
+        h("div", { className: "dru-ia-dialog-head" }, headKids[0], headKids[1]),
+        h.apply(null, body)
+      ];
+      if (p.foot) {
+        kids.push(h.apply(null, [].concat.apply(["div", { className: "dru-ia-dialog-foot" }], footKids)));
+      }
+      return h("div", {
+        className: "dru-ia-scrim",
+        onMouseDown: function (e) { if (e && e.target === e.currentTarget && onClose) onClose(); }
+      },
+        h.apply(null, [].concat.apply(["div", {
+          className: "dru-ia-dialog", role: "dialog", "aria-modal": "true", "aria-labelledby": labelledBy
+        }], kids))
+      );
+    }
+
     function RemoteControlSection(props) {
       // 🎨 主题（宿主深色/亮色）：订阅外部存储 → 宿主切换时本组件自动重渲染，
       // 根节点上的 data-dru-theme 随之更新，整套 --dru-* 令牌实时切换。
@@ -3236,6 +3412,170 @@ window.__ModuleLoader__.load({
       var diagMsgArr = useState(null); var diagMsg = diagMsgArr[0]; var setDiagMsg = diagMsgArr[1];
       var fixPromptArr = useState(null); var fixPrompt = fixPromptArr[0]; var setFixPrompt = fixPromptArr[1];
       var fixReportArr = useState(""); var fixReport = fixReportArr[0]; var setFixReport = fixReportArr[1];
+
+      // ── 🧭 面板 IA 重做 + 通知通道（2026-11-07）────────────────────────────────
+      // hook 序号铁律：全部追加在**最后一个既有 hook 之后**（见本组件顶部说明）。
+      //   · iaModal    当前打开的弹层（null / "mobile" / "channel" / "devices" / "account"）；
+      //   · iaChStep   通道弹层里的步骤（list / wecom / wechat / feishu / webhook）；
+      //   · imBots*    GET /dsh-remote/im-bots 的**脱敏**视图 + 表单态（secret 永不回显，
+      //                所以输入框初值恒为空字符串 = "不修改"）。
+      var iaModalArr = useState(null); var iaModal = iaModalArr[0]; var setIaModal = iaModalArr[1];
+      var iaChStepArr = useState("list"); var iaChStep = iaChStepArr[0]; var setIaChStep = iaChStepArr[1];
+      var imBotsArr = useState(null); var imBots = imBotsArr[0]; var setImBots = imBotsArr[1];
+      var imBotsBusyArr = useState(""); var imBotsBusy = imBotsBusyArr[0]; var setImBotsBusy = imBotsBusyArr[1];
+      var imBotsMsgArr = useState(null); var imBotsMsg = imBotsMsgArr[0]; var setImBotsMsg = imBotsMsgArr[1];
+      var imBotsFieldErrArr = useState({}); var imBotsFieldErr = imBotsFieldErrArr[0]; var setImBotsFieldErr = imBotsFieldErrArr[1];
+      var imBotsBotIdArr = useState(""); var imBotsBotId = imBotsBotIdArr[0]; var setImBotsBotId = imBotsBotIdArr[1];
+      var imBotsSecretArr = useState(""); var imBotsSecret = imBotsSecretArr[0]; var setImBotsSecret = imBotsSecretArr[1];
+      var imBotsChatArr = useState(""); var imBotsChat = imBotsChatArr[0]; var setImBotsChat = imBotsChatArr[1];
+      var imBotsUrlArr = useState(""); var imBotsUrl = imBotsUrlArr[0]; var setImBotsUrl = imBotsUrlArr[1];
+      var imBotsShowSecretArr = useState(false); var imBotsShowSecret = imBotsShowSecretArr[0]; var setImBotsShowSecret = imBotsShowSecretArr[1];
+
+      /** 读通道配置（GET 只回脱敏视图：botId/hasSecret/url/targetChatId + 桥写的状态）。 */
+      function loadImBots() {
+        return api("/dsh-remote/im-bots").then(function (b) {
+          setImBots(b && typeof b === "object" ? b : null);
+          return b;
+        }).catch(function () {
+          setImBots(null);   // 读不到 = 未配置（入口卡显示「未配置」）；进弹层点保存会拿到真实错误
+          return null;
+        });
+      }
+      // 挂载即读一次：入口格「通道」卡要显示当前状态；失败静默（下次打开弹层会重读）。
+      useEffect(function () { loadImBots(); }, []);
+
+      // 弹层的键盘/焦点契约（UX 检索：modal focus trap / Esc / focus return）：
+      //   · Esc 关闭；Tab / Shift+Tab 在弹层内循环（焦点绝不跑到背后的页面上）；
+      //   · 关闭后焦点回到打开前的元素（document.activeElement 快照）；
+      //   · 任何一步失败都吞掉 —— 弹层本身是纯 DOM，不依赖这些逻辑也能用。
+      useEffect(function () {
+        if (!iaModal) return undefined;
+        var prev = null;
+        try { prev = document.activeElement || null; } catch (e0) { prev = null; }
+        var onKey = function (ev) {
+          try {
+            if (!ev) return;
+            if (ev.key === "Escape" || ev.keyCode === 27) {
+              if (ev.stopPropagation) ev.stopPropagation();
+              setIaModal(null);
+              return;
+            }
+            if (ev.key !== "Tab") return;
+            var dlg = null;
+            try { dlg = document.querySelector(".dru-ia-dialog"); } catch (e1) { dlg = null; }
+            if (!dlg || typeof dlg.querySelectorAll !== "function") return;
+            var list = dlg.querySelectorAll('button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])');
+            var items = [];
+            for (var i = 0; i < list.length; i++) {
+              try { if (list[i] && list[i].offsetParent !== null) items.push(list[i]); } catch (e2) { /* 忽略 */ }
+            }
+            if (!items.length) return;
+            var first = items[0], last = items[items.length - 1];
+            var act = document.activeElement;
+            if (ev.shiftKey) {
+              if (act === first || !dlg.contains || !dlg.contains(act)) { ev.preventDefault(); try { last.focus(); } catch (e3) { /* 忽略 */ } }
+            } else if (act === last) {
+              ev.preventDefault();
+              try { first.focus(); } catch (e4) { /* 忽略 */ }
+            }
+          } catch (e5) { /* 键盘逻辑失败不影响弹层使用 */ }
+        };
+        try { document.addEventListener("keydown", onKey, true); } catch (e6) { /* 忽略 */ }
+        var t = null;
+        try {
+          t = setTimeout(function () {
+            try {
+              var dlg = document.querySelector(".dru-ia-dialog");
+              if (!dlg || typeof dlg.querySelector !== "function") return;
+              var el = dlg.querySelector(".dru-ia-dialog-body input, .dru-ia-dialog-body button, .dru-ia-dialog-x");
+              if (el && el.focus) el.focus();
+            } catch (e7) { /* 忽略 */ }
+          }, 0);
+        } catch (e8) { t = null; }
+        return function () {
+          try { if (t !== null) clearTimeout(t); } catch (e9) { /* 忽略 */ }
+          try { document.removeEventListener("keydown", onKey, true); } catch (e10) { /* 忽略 */ }
+          try { if (prev && prev.focus) prev.focus(); } catch (e11) { /* 忽略 */ }
+        };
+      }, [iaModal]);
+
+      /** 表单 → 契约 payload（空 secret 不传 = 保留已保存的 secret；空 targetChatId = 不设置）。 */
+      function imBotsFormPayload() {
+        var wecom = { enabled: true, botId: String(imBotsBotId || "").trim() };
+        var sec = String(imBotsSecret || "").trim();
+        if (sec) wecom.secret = sec;
+        wecom.targetChatId = String(imBotsChat || "").trim();
+        var u = String(imBotsUrl || "").trim();
+        if (u) wecom.url = u;
+        return wecom;
+      }
+      /** 节点半的稳定错误码 → 就近字段错误（有码就用码，没码就整体提示；绝不猜）。 */
+      function imBotsFieldErrorsOf(code, message) {
+        var e = {};
+        var text = message || "";
+        if (code === "invalid_bot_id") e.botId = text || "Bot ID 格式不对：应形如 aibxxxxxxxx";
+        else if (code === "missing_secret") e.secret = text || "请填写 Secret";
+        else if (code === "invalid_url") e.url = text || "服务地址必须以 http:// 或 https:// 开头";
+        else if (code === "invalid_target_chat_id") e.chat = text || "接收会话 ID 太长";
+        return e;
+      }
+      /** 保存（PUT）；testAfter=true 时走 POST /test（= 保存后等桥连接，最多 10s）。 */
+      function saveImBots(testAfter) {
+        if (imBotsBusy !== "") return undefined;
+        setImBotsBusy(testAfter ? "test" : "save");
+        setImBotsMsg(null);
+        setImBotsFieldErr({});
+        var payload = { wecom: imBotsFormPayload() };
+        var path = testAfter ? "/dsh-remote/im-bots/test" : "/dsh-remote/im-bots";
+        var opts = {
+          method: testAfter ? "POST" : "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload)
+        };
+        return api(path, opts, testAfter ? 15000 : 10000).then(function (b) {
+          if (testAfter && b && b.connected) {
+            setImBotsMsg({ kind: "ok", text: "已连接：企业微信机器人可以接收消息了。" + (b.authenticated ? "" : "（通道已连通，鉴权稍后完成）") });
+          } else {
+            setImBotsMsg({ kind: "ok", text: testAfter ? "配置已保存。" : "已保存。" });
+          }
+          return loadImBots();
+        }).catch(function (e) {
+          var body = (e && e.body) || {};
+          var code = String(body.error || "");
+          var text = String(body.message || (e && e.message) || "操作失败");
+          if (code === "missing_secret" || code === "invalid_bot_id" || code === "invalid_url" || code === "invalid_target_chat_id") {
+            setImBotsFieldErr(imBotsFieldErrorsOf(code, text));
+            setImBotsMsg({ kind: "err", text: text });
+          } else if (code === "connect_failed") {
+            setImBotsMsg({ kind: "err", text: "连接失败：" + (body.lastError || text) });
+          } else if (code === "timeout") {
+            setImBotsMsg({ kind: "warn", text: text });
+          } else {
+            setImBotsMsg({ kind: "err", text: text });
+          }
+          return null;
+        }).finally(function () { setImBotsBusy(""); });
+      }
+      /** 「测试」= 用**已保存**配置重连并等结果（不重写配置；想改字段请先「保存」/「保存并连接」）。 */
+      function testImBots() {
+        if (imBotsBusy !== "") return undefined;
+        setImBotsBusy("test");
+        setImBotsMsg(null);
+        return api("/dsh-remote/im-bots/test", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({}) }, 15000)
+          .then(function (b) {
+            if (b && b.connected) setImBotsMsg({ kind: "ok", text: "已连接" + (b.authenticated ? "（鉴权通过）" : "") + "。" });
+            else setImBotsMsg({ kind: "ok", text: "通道已就绪。" });
+            return loadImBots();
+          })
+          .catch(function (e) {
+            var body = (e && e.body) || {};
+            var code = String(body.error || "");
+            var text = String(body.message || (e && e.message) || "测试失败");
+            setImBotsMsg({ kind: code === "timeout" ? "warn" : "err", text: code === "connect_failed" ? "连接失败：" + (body.lastError || text) : text });
+            return null;
+          })
+          .finally(function () { setImBotsBusy(""); });
+      }
 
       var refresh = useCallback(function () {
         setBusy("status");
@@ -3674,8 +4014,11 @@ window.__ModuleLoader__.load({
       // ⚠️ 必须是无条件调用的 hook（hook 序号稳定），所以判断写在回调里，不能围着它加 if。
       // 同一帧的兜底还有底部的 view 分派：signed-out 时它**直接渲染 home**，不会先闪一帧空白。
       useEffect(function () {
-        if (view === "wechat" && !loggedIn) setView("home");
-      }, [view, loggedIn]);
+        // IA 重做（2026-11-07）：不再有 "wechat" 视图（微信通道搬进「通知与消息通道」弹层）——
+        // 这里只做**视角兜底**：任何不在白名单里的 view（例如旧代码/外部残留）一律回 home，
+        // 绝不让面板停在空视图上。保留这条 effect 也保证 hook 序号不变。
+        if (view !== "home" && view !== "feedback" && view !== "invite") setView("home");
+      }, [view]);
 
       /**
        * 连接阶段轮询：GET /dsh-remote/bridge-status（node 半在返回前自动补装运行环境 / 拉起 bridge /
@@ -5385,224 +5728,533 @@ window.__ModuleLoader__.load({
         ]);
       }
 
-      // ---------- 主视图 ----------
-      /**
-       * 主 Tab 的公共属性：视觉态（.active）与语义态（aria-selected）**同源**，不会说一套做一套；
-       * tabIndex=0 + Enter/Space → 键盘可操作（主 Tab 是面板的导航，不能只能点鼠标）。
-       * ⚠️ 与既有 tab 条（登录/注册、反馈 tab）保持同一形态：可点的 <div>，不改成 <button>
-       *    （那些 tab 已经是这样；换形态会让同一种控件在面板里出现两种外观与焦点行为）。
-       * 无障碍：文字标签**始终在**（选中态另有 border + 底色），不靠颜色单独表意。
-       */
-      function mainTabProps(active, onPick) {
-        return {
-          className: "dru-tab" + (active ? " active" : ""),
-          role: "tab",
-          "aria-selected": active ? "true" : "false",
-          tabIndex: 0,
-          onClick: onPick,
-          onKeyDown: function (e) {
-            var k = e && e.key;
-            if (k === "Enter" || k === " " || k === "Spacebar") { e.preventDefault(); onPick(); }
-          }
-        };
+      // ═════════════════════════════════════════════════════════════════════
+      // 🧭 主面板 IA（2026-11-07 业主 UX 重做）
+      //
+      // 旧结构（被业主否掉）：「顶部 3 个 tab（云端/自建/微信）」+ 一屏垂直堆叠的卡片 + 大段说明文字，
+      //   且微信通道**登录后才出现** —— 用户原话：「顶部 3 个 tab 页，还要登录之后才有微信通道」
+      //   「卡片式平铺堆叠，很糟糕」「全是文字堆砌，太密集，垂直往下垒」。
+      // 新结构（本段实现）：
+      //   · 一行状态头（连接状态 pill + 「打开手机端」主按钮）；
+      //   · 2 列入口网格（≤3 行/卡）：手机访问 / 通知与消息通道 / 已授权设备 / 账号；
+      //   · 一行文字入口（反馈 / 邀请 / 交流群 / 更多设置），高级设置默认折叠；
+      //   · 所有"进入细节"的操作一律走弹层（IADialog：Esc、焦点陷阱、关闭回焦点）；
+      //   · 原来的「云端/自建」降级成**手机访问弹层里的分段控件**，不再占据顶部导航；
+      //   · 登录**不再隐藏任何功能**：未登录时网格与卡片照常显示，卡片文案写「登录后可同步」，
+      //     点开进账号弹层登录，成功后在原地刷新（状态更新即重渲染，无需刷新页面）。
+      // ═════════════════════════════════════════════════════════════════════
+
+      /** 弹层开关：同一时刻只开一个（真实产品里多弹层叠加只会让用户更迷路）。 */
+      function openIAModal(name) {
+        setMessage(null);
+        setIaModal(name);
+        if (name === "channel") {
+          setIaChStep("list");
+          setImBotsMsg(null);
+          setImBotsFieldErr({});
+          loadImBots().then(function (b) {
+            var w = (b && b.wecom) || {};
+            setImBotsBotId(String(w.botId || ""));
+            setImBotsSecret("");
+            setImBotsChat(String(w.targetChatId || ""));
+            setImBotsUrl(String(w.url || ""));
+          });
+        }
+        // 数据加载交给下面的 effect（按"弹层是否打开"触发）：
+        // 不在这里直接调 loadAccessKey/loadDevices —— 点击处理里同步改 busy 态会让弹层第一帧
+        // 停在「生成中…」而不是空态，读屏/用例与真实用户看到的都应该是"空态 + 一个按钮"。
       }
-      /**
-       * 主 Tab 条（☁️ 云端服务 / 🖥 自建服务 / 💬 微信机器人通道）。
-       *
-       * ⚠️ 必须抽成函数、由 **home 与 wechat 两个视图共用**：这条 strip 原来长在 renderHome() 里，
-       *    而切到微信 tab 后 renderHome() 不再渲染 —— 只长在 renderHome() 里就等于「进了微信页
-       *    就再也回不去」（面板只有一个 settings.section 栏目，没有别的返回入口）。
-       *
-       * 选中态：模式两个 tab 只在 view !== "wechat" 时选中；微信 tab 只在 view === "wechat" 时选中。
-       * 点模式 tab 时一并把 view **复位成 home**（否则从微信页点「自建服务」会切了 mode 却留在微信页）。
-       *
-       * 🔒 登录门（用户约定：微信通道**要求已注册并登录**）：未登录时**不渲染**这第三个 tab。
-       *    登录态来自 st.config（phone / hasLocalKey），登录成功后 st 更新即重新渲染 ——
-       *    tab 当场出现，**不需要刷新页面**；登出/会话过期则当场消失（view 的兜底见 RemoteControlSection
-       *    里那条复位 effect 与底部的 view 分派）。除登录态外，不为任何其它理由隐藏它。
-       */
-      function renderMainTabs() {
-        var isLocal = mode === "local";
-        var onWeChat = view === "wechat";
-        return h("div", { className: "dru-tabs", style: { marginTop: 4 }, role: "tablist", "aria-label": "远程访问功能切换" },
-          h("div", mainTabProps(!onWeChat && !isLocal, function () { setMode("saas"); setView("home"); setMessage(null); }), "☁️ 云端服务"),
-          h("div", mainTabProps(!onWeChat && isLocal, function () { setMode("local"); setView("home"); setMessage(null); }), "🖥 自建服务"),
-          // 微信绿泡泡：纯装饰（可读名字来自同 tab 的文字标签），所以 aria-hidden；
-          // U+FE0E（变体选择符-15）强迫 💬 走**文字字形**，否则系统彩色 emoji 会忽略 color（见 .dru-wx-ico）。
-          // 🔒 只有已登录才渲染这个 tab（见上面的登录门说明）。
-          loggedIn
-            ? h("div", mainTabProps(onWeChat, function () { setView("wechat"); setMessage(null); }),
-                h("span", { className: "dru-wx-ico", "aria-hidden": "true" }, "💬\uFE0E"),
-                "微信机器人通道")
+
+      // 打开弹层时按需拉数据（幂等；失败由既有重试/红字逻辑兜底）。
+      useEffect(function () {
+        if (iaModal !== "mobile" || !loggedIn || akey) return;
+        try { loadAccessKey(); } catch (e1) { /* 忽略 */ }
+      }, [iaModal, loggedIn, akey]);
+      useEffect(function () {
+        if (iaModal !== "devices" || !loggedIn || devSessions !== null) return;
+        try { loadDevices(); } catch (e2) { /* 忽略 */ }
+      }, [iaModal, loggedIn, devSessions]);
+      function closeIAModal() { setIaModal(null); }
+
+      /** 连接状态 → pill 语义（圆点 + 文案；不只靠颜色）。 */
+      function iaConnState() {
+        if (st === null) return { cls: "", text: "连接中…" };
+        if (connInfo && connInfo.locked) return { cls: "is-warn", text: "本机已锁定" };
+        if (!loggedIn) return { cls: "is-warn", text: "未登录" };
+        if (connOnline) return { cls: "is-on", text: "已连接" };
+        if (connPhase === "error") return { cls: "is-warn", text: "连接异常" };
+        if (connPhase && connPhase !== "online") return { cls: "", text: "连接中…" };
+        return { cls: "", text: serviceRunning ? "等待设备连接" : "未连接" };
+      }
+
+      /** 入口卡（每卡 ≤3 行：标题 / 一行状态 / 操作）。 */
+      function iaCard(icon, title, meta, actions) {
+        return h("div", { className: "dru-ia-card" },
+          h("div", { className: "dru-ia-card-top" },
+            h("span", { className: "dru-ia-ico" }, druIcon(icon)),
+            h("div", { className: "dru-ia-card-title" }, title)),
+          h("div", { className: "dru-ia-card-meta" }, meta),
+          h("div", { className: "dru-ia-card-actions" }, actions)
+        );
+      }
+
+      function renderIAHeader() {
+        var cs = iaConnState();
+        return h("div", { className: "dru-ia-head" },
+          h("div", { className: "dru-ia-pill " + cs.cls, role: "status", "aria-live": "polite" },
+            h("span", { className: "dru-ia-pill-dot", "aria-hidden": "true" }),
+            cs.text),
+          h("button", { type: "button", className: "dru-ia-btn is-primary", onClick: function () { openIAModal("mobile"); } },
+            druIcon("phone"), "打开手机端")
+        );
+      }
+
+      /** 入口网格：4 张卡（2×2），每卡只讲一件事。 */
+      function renderIAGrid() {
+        var w = (imBots && imBots.wecom) || {};
+        var ws = (imBots && imBots.status) || {};
+        var chMeta;
+        if (imBots === null) chMeta = "企业微信机器人 · 读取中…";
+        else if (ws.connected) chMeta = "企业微信机器人 · 已连接";
+        else if (w.enabled || w.hasSecret) chMeta = "企业微信机器人 · 已配置（未连接）";
+        else chMeta = "企业微信机器人 · 未配置";
+
+        var devCount = devSessions === null ? null : devSessions.length;
+        var devMeta = !loggedIn
+          ? "登录后可同步设备"
+          : (devCount === null ? "尚未加载" : (devCount + " 台已授权设备"));
+
+        var acctMeta = st === null ? "读取中…" : (loggedIn ? (st.config && st.config.phone ? st.config.phone : "已登录") : "未登录（登录后可同步）");
+
+        var remain = 0;
+        if (akey) { var expMs = toMs(akey.expires_at); if (expMs) remain = expMs - nowTick; }
+        var mobileMeta = !loggedIn
+          ? "登录后生成一次性访问码"
+          : (akey && akey.url && remain > 0 ? ("访问码有效 · " + fmtRemain(remain) + "后过期") : "尚未生成访问码");
+
+        return h("div", { className: "dru-ia-grid" },
+          iaCard("phone", "手机访问", mobileMeta,
+            h("button", { type: "button", className: "dru-ia-btn is-primary", onClick: function () { openIAModal("mobile"); } },
+              loggedIn ? (akey && akey.url ? "查看访问码" : "生成访问码") : "登录并生成")),
+          iaCard("bell", "通知与消息通道", chMeta,
+            h("button", { type: "button", className: "dru-ia-btn", onClick: function () { openIAModal("channel"); } }, "设置")),
+          iaCard("devices", "已授权设备", devMeta,
+            h("button", { type: "button", className: "dru-ia-btn", onClick: function () { openIAModal("devices"); } }, "管理")),
+          iaCard("user", "账号", acctMeta,
+            h("button", { type: "button", className: "dru-ia-btn", onClick: function () { openIAModal("account"); } },
+              loggedIn ? "我的信息" : "登录 / 注册"))
+        );
+      }
+
+      /** 一行文字入口：低频功能收在这里，主界面保持清爽。 */
+      function renderIALinks() {
+        var unread = annState.ok && annState.bubble && typeof annState.unread === "number" ? annState.unread : 0;
+        return h("div", { className: "dru-ia-links" },
+          h("button", { type: "button", className: "dru-ia-link", onClick: function () { setView("feedback"); } }, druIcon("chat"), "用户反馈"),
+          h("button", { type: "button", className: "dru-ia-link", onClick: function () { setView("invite"); loadInvite(); } }, "邀请有礼"),
+          community && community.qrcode
+            ? h("button", { type: "button", className: "dru-ia-link", onClick: function () { setCommOpen(true); } }, "加入交流群")
+            : null,
+          h("button", {
+            type: "button", className: "dru-ia-link", "aria-expanded": moreOpen ? "true" : "false",
+            onClick: function () { setMoreOpen(!moreOpen); }
+          }, moreOpen ? "收起高级设置" : "更多设置", druIcon(moreOpen ? "left" : "right")),
+          unread > 0 ? h("span", { className: "dru-hint", style: { marginLeft: "auto" } }, "有 " + unread + " 条未读公告") : null
+        );
+      }
+
+      /** 后台服务卡（从旧 renderHome 搬出来；文案压缩，不再解释内部实现细节）。 */
+      function renderBridgeCard() {
+        return h("div", { className: "dru-card" },
+          h("h3", null, "后台服务"),
+          h("div", { className: "dru-status-line" },
+            h("span", { className: "dru-dot " + (serviceRunning ? "dru-dot-on" : "dru-dot-off") }),
+            h("span", null, st ? serviceStateText : "查询中…"),
+            launchdPid ? h("span", { className: "dru-meta", style: { marginTop: 0 } }, "(pid=" + launchdPid + ")") : null
+          ),
+          connInfo && connPhase && connPhase !== "no_account"
+            ? h("div", { className: "dru-hint", style: { marginTop: 6 } },
+                "连接进度：" + (connInfo.locked ? "本机已被锁定（额度已满，升级或解绑后自动恢复）" : connText))
+            : null,
+          h("div", { className: "dru-actions", style: { marginTop: 10 } },
+            !serviceRunning
+              ? h("button", { type: "button", className: "dru-btn dru-btn-primary", disabled: busy !== "", onClick: function () { toggleBridge(true); } }, busy === "start" ? "启动中…" : "启动后台服务")
+              : h("button", { type: "button", className: "dru-btn dru-btn-danger", disabled: busy !== "", onClick: function () { toggleBridge(false); } }, busy === "stop" ? "停止中…" : "停止后台服务")
+          ),
+          // 自启动形态（平台差异要如实说：Windows 用任务计划程序、其它平台用 launchd/systemd 类服务）。
+          h("div", { className: "dru-meta" }, st ? (st.service && (st.service.plistExists || st.service.serviceManager === "detached")
+            ? (st.service.serviceManager === "detached"
+              ? (st.service.autostartTask
+                ? "自启动：已注册登录任务（Windows 任务计划程序 dsh-remote-bridge）"
+                : "自启动：未注册登录任务（由面板在 dsh web 启动时自动拉起后台服务）")
+              : "自启动服务已安装")
+            : "自启动服务未安装（启动时自动创建）") : ""),
+          // 设备 ID 属于"客服排查时要报的一行"，留在高级设置里（主界面不露）。
+          h("div", { className: "dru-meta" }, st && st.config && st.config.deviceId ? "设备 ID：" + st.config.deviceId : "设备 ID：生成中"),
+          st && !serviceRuntimeReady
+            ? h("div", { className: "dru-hint", style: { marginTop: 8 } }, "运行环境正在自动补装，装完会自动启动，不需要你操作。")
+            : serviceCrashing
+              ? h("div", { className: "dru-hint", style: { marginTop: 8 } }, "上次启动失败，已自动修复并重试；若持续失败请到「版本与更新」点一键更新。")
+              : null,
+          st && st.service && st.service.bindError
+            ? (function (be) {
+                var isLocked = be.code === "device_locked" || be.code === "device_limit_exceeded";
+                var beLimit = (be.limit === 0 || be.limit) ? be.limit : null;
+                const isBindCap = be.code === "device_bind_cap";
+                return h("div", { className: "dru-msg dru-msg-err", style: { marginTop: 8 } },
+                  (isLocked ? "本机已被锁定：" : "设备注册失败：") + (be.message || "未说明原因"),
+                  h("div", { className: "dru-hint", style: { marginTop: 4 } },
+                    isLocked
+                      ? lockedPanelDetail(beLimit)
+                      : isBindCap
+                        ? "已绑定设备数达到上限（device_bind_cap）：请在手机端「管理电脑」解绑不再使用的设备；解绑后本机会自动恢复（后台守护按指数退避重试，无需反复点按钮）。"
+                        : "请确认网络与账号状态后重试；仍未解决可点「彻底卸载」后重新安装。"));
+              })(st.service.bindError)
             : null
         );
       }
-      /** 微信机器人 tab 的内容：直接复用 WeChatBotSection（embedded=省掉外层 settings-section 壳）。 */
-      function renderWeChat() {
-        return h("div", null,
-          renderMainTabs(),
-          h(WeChatBotSection, { embedded: true })
+
+      /** 「更多设置」：后台服务 / 版本与更新 / 关于。低频但必须有出口，默认折叠。 */
+      function renderMoreSettings() {
+        return h("div", { className: "dru-ia" },
+          renderBridgeCard(),
+          h(SelfManageCard, null),
+          h("div", { className: "dru-card" },
+            h("h3", null, "关于 dsh-remote"),
+            h("div", { className: "dru-hint" }, "用手机或另一台电脑随时接管这台电脑上的 DeepSeek Harness：装上即得专属加密地址，免公网 IP、免内网穿透，全程加密。"),
+            h("div", { className: "dru-hint", style: { marginTop: 6 } },
+              "匿名装机统计：只上报「装机 / 连接是否成功」这类事件（安装开始与失败原因、后台服务是否注册成功、是否首次远程打通）——"
+              + "不含任何账号、手机号、会话或文件内容、主机名、路径、设备指纹与 IP；标识是本机随机 ID（重装即变）。"
+              + "用环境变量 DSH_REMOTE_TELEMETRY=0 可完全关闭（不生成 ID、不发任何请求）。"),
+            h("div", { className: "dru-hint", style: { marginTop: 6 } },
+              "端到端加密：手机与电脑之间的消息内容用账号密码派生的密钥加密，密钥与密码不落服务端（中继只可见路径 / 大小 / 时间）。")
+          )
         );
       }
-      function renderHome() {
-        var isLocal = mode === "local";
+
+      // ── 弹层内容 ──────────────────────────────────────────────────────────
+      /** 自建服务表单（从旧 home 的自建卡搬出来，放进「手机访问」弹层的分段里）。 */
+      function renderSelfHostBody() {
+        if (st && st.config && st.config.mode === "local") {
+          return h("div", null,
+            h("div", { className: "dru-ia-state is-ok" }, druIcon("check"), "已连接 " + (st.config.selfHostUrl || "自建服务")),
+            h("div", { className: "dru-hint", style: { marginTop: 8 } }, "当前使用自建服务（本地认证，无需手机号账号）。切回云端：切到「云端服务」分段用手机号登录即可。")
+          );
+        }
         return h("div", null,
-          // 连接模式主 Tab(云端服务 / 自建服务 / 微信机器人通道；最后一个是 0.6.11 从独立栏目搬进来的)
-          renderMainTabs(),
-          // 云端 tab：📱 远程访问（一次性扫码访问 + 已授权设备）+ 账号（手机号登录，官方托管）
-          !isLocal ? h("div", null,
-            renderAccessCard(),
-            // 已授权设备：仅登录后展示（登录前不显示，避免空列表/误导）
-            loggedIn && st.config.phone ? renderDevicesCard() : null,
-            // 📣 公告（0.6.18）：插在「🔑 账号」之前 —— 未读公告与"远程访问/账号"同属首屏要紧信息；
-            //   没有可显示的内容时整卡不存在（见 renderAnnouncementsCard 的 fail closed 说明）。
-            renderAnnouncementsCard(),
-            card("🔑 账号",
-              st === null
-                ? h("div", { className: "dru-hint" }, "正在读取远控状态…")
-                : loggedIn && st.config.phone
-                  ? renderAccount()
-                  : h("div", null,
-                      h("div", { className: "dru-tabs" },
-                        h("div", { className: "dru-tab" + (authTab === "login" ? " active" : ""), onClick: function () { setAuthTab("login"); setPwdOpen(false); setMessage(null); } }, "登录"),
-                        h("div", { className: "dru-tab" + (authTab === "register" ? " active" : ""), onClick: function () { setAuthTab("register"); setPwdOpen(false); setMessage(null); } }, "注册")
-                      ),
-                      authTab === "login"
-                        ? (pwdOpen
-                            // 「忘记密码」展开：与账号卡「修改密码」共用同一重置表单（手机号可编辑、预填登录输入）
-                            ? renderResetPwdForm(true)
-                            : h("div", null,
-                                field("手机号", input({ type: "tel", value: phone, placeholder: "11 位手机号", autoComplete: "tel", onChange: function (e) { setPhone(e.target.value); } })),
-                                field("密码", input({ type: "password", value: pass, placeholder: "密码", autoComplete: "current-password", onChange: function (e) { setPass(e.target.value); } })),
-                                field("验证码", h("div", { className: "dru-captcha" },
-                                  input({ value: lcapTxt, placeholder: "图中数字", autoComplete: "off", inputMode: "numeric", maxLength: 6, onChange: function (e) { setLcapTxt(e.target.value); } }),
-                                  h("div", { className: "dru-captcha-box", title: "看不清？点击刷新", onClick: function () { loadCaptcha("login"); }, dangerouslySetInnerHTML: lcap && lcap.svg && lcap.svg.indexOf("<svg") === 0 ? { __html: lcap.svg } : void 0 },
-                                    lcap && lcap.svg && lcap.svg.indexOf("<svg") !== 0 ? lcap.svg : null)
-                                )),
-                                h("button", { type: "button", className: "dru-btn dru-btn-primary", style: { width: "100%" }, disabled: busy !== "", onClick: doLogin }, busy === "login" ? "登录中…" : "登录"),
-                                // 忘记密码：小字入口，点击展开短信验证码重置表单（不抢占任何官方按钮）
-                                h("div", { style: { display: "flex", justifyContent: "flex-end", marginTop: 8 } },
-                                  h("button", { type: "button", className: "dru-linkbtn", disabled: busy !== "", onClick: togglePwdForm }, "忘记密码？"))
-                              )
-                          )
-                        : h("div", null,
-                            field("手机号", input({ type: "tel", value: rphone, placeholder: "11 位手机号", autoComplete: "tel", onChange: function (e) { setRphone(e.target.value); } })),
-                            field("密码", input({ type: "password", value: rpass, placeholder: "至少 8 位", autoComplete: "new-password", onChange: function (e) { setRpass(e.target.value); } })),
-                            field("确认密码", input({ type: "password", value: rpass2, placeholder: "再次输入密码", autoComplete: "new-password", onChange: function (e) { setRpass2(e.target.value); } })),
-                            field("邀请码（选填）", input({ value: rInvite, placeholder: "邀请你的人的邀请码，如 A8K2M4XQ", autoComplete: "off", onChange: function (e) { setRInvite(e.target.value); } })),
-                            rcap && field("图形验证码", h("div", { className: "dru-captcha" },
-                              input({ value: rcapTxt, placeholder: "图中数字", autoComplete: "off", inputMode: "numeric", maxLength: 6, onChange: function (e) { setRcapTxt(e.target.value); } }),
-                              h("div", { className: "dru-captcha-box", title: "看不清？点击刷新", onClick: function () { loadCaptcha("register"); }, dangerouslySetInnerHTML: rcap.svg && rcap.svg.indexOf("<svg") === 0 ? { __html: rcap.svg } : void 0 },
-                                rcap.svg && rcap.svg.indexOf("<svg") !== 0 ? rcap.svg : null)
-                            )),
-                            field("短信验证码", h("div", { className: "dru-captcha" },
-                              input({ value: rsms, placeholder: "6 位验证码", autoComplete: "off", inputMode: "numeric", maxLength: 6, onChange: function (e) { setRsms(e.target.value); } }),
-                              h("button", { type: "button", className: "dru-btn dru-btn-ghost", style: { flex: "none", padding: "0 14px" }, disabled: busy !== "", onClick: sendRegSms }, rsmsBtn)
-                            )),
-                            h("button", { type: "button", className: "dru-btn dru-btn-primary", style: { width: "100%" }, disabled: busy !== "", onClick: doRegister }, busy === "register" ? "注册中…" : "注册")
-                          ),
-                      message && h("div", { className: "dru-msg dru-msg-" + message.kind }, message.text)
-                    )
-            )
-          ) : card("🔌 自建服务",
-            st && st.config && st.config.mode === "local"
-              ? h("div", null,
-                  h("div", { className: "dru-status-line" },
-                    h("span", { className: "dru-dot dru-dot-on" }),
-                    h("span", null, "已连接 " + (st.config.selfHostUrl || "自建服务"))
-                  ),
-                  h("div", { className: "dru-hint", style: { marginTop: 6 } },
-                    "当前使用自建服务（本地认证，无需手机号账号）。切换到云端：在上方「云端服务」标签用手机号账号登录即可。")
-                )
-              : h("div", null,
-                  field("服务器地址", input({ value: selfHost, placeholder: "my.example.com:13443", onChange: function (e) { setSelfHost(e.target.value); } })),
-                  field("访问密钥", input({ type: "password", value: localKey, placeholder: "自建服务的访问密钥", autoComplete: "off", onChange: function (e) { setLocalKey(e.target.value); } })),
-                  h("button", { type: "button", className: "dru-btn dru-btn-primary", style: { width: "100%" }, disabled: busy !== "", onClick: saveLocal }, busy === "local" ? "保存中…" : "切换到自建服务"),
-                  h("div", { className: "dru-hint", style: { marginTop: 6 } },
-                    "服务器地址由你自行部署决定：填写你自建的 dsh-remote 服务地址与访问密钥即可（不是上面的云端地址）。部署方法见 README「自建部署」一节；切回云端随时可登录恢复。")
-                )
+          field("服务器地址", input({ value: selfHost, placeholder: "my.example.com:13443", onChange: function (e) { setSelfHost(e.target.value); } })),
+          field("访问密钥", input({ type: "password", value: localKey, placeholder: "自建服务的访问密钥", autoComplete: "off", onChange: function (e) { setLocalKey(e.target.value); } })),
+          h("button", { type: "button", className: "dru-btn dru-btn-primary", style: { width: "100%", marginTop: 8 }, disabled: busy !== "", onClick: saveLocal }, busy === "local" ? "保存中…" : "切换到自建服务"),
+          h("div", { className: "dru-hint", style: { marginTop: 8 } }, "服务器地址由你的自建部署决定（不是上面的云端地址），填地址与访问密钥即可。")
+        );
+      }
+
+      /** 账号弹层内容：已登录 → 复用既有 renderAccount()；未登录 → 登录/注册表单（原样搬过来）。 */
+      function renderAccountBody() {
+        if (st === null) return h("div", { className: "dru-hint" }, "正在读取远控状态…");
+        if (loggedIn && st.config && st.config.phone) return renderAccount();
+        return h("div", null,
+          h("div", { className: "dru-ia-seg", role: "tablist", "aria-label": "登录或注册" },
+            h("button", {
+              type: "button", role: "tab", "aria-selected": authTab === "login" ? "true" : "false",
+              className: "dru-ia-seg-btn" + (authTab === "login" ? " is-active" : ""),
+              onClick: function () { setAuthTab("login"); setPwdOpen(false); setMessage(null); }
+            }, "登录"),
+            h("button", {
+              type: "button", role: "tab", "aria-selected": authTab === "register" ? "true" : "false",
+              className: "dru-ia-seg-btn" + (authTab === "register" ? " is-active" : ""),
+              onClick: function () { setAuthTab("register"); setPwdOpen(false); setMessage(null); }
+            }, "注册")
           ),
-          // 后台服务（原「Bridge 服务」：面向非技术用户统一叫「后台服务」，卡内配一句人话解释）
-          card("🖥 后台服务",
-            h("div", { className: "dru-status-line" },
-              h("span", { className: "dru-dot " + (serviceRunning ? "dru-dot-on" : "dru-dot-off") }),
-              h("span", null, st ? serviceStateText : "查询中…"),
-              launchdPid ? h("span", { className: "dru-meta", style: { marginTop: 0 } }, "(pid=" + launchdPid + ")") : null
-            ),
-            h("div", { className: "dru-hint", style: { marginTop: 6 } },
-              "「后台服务」＝装在这台电脑上、负责把手机和电脑连起来的小程序（内部名 bridge）。面板会自动安装、自动启动，一般不需要你手动操作；只有状态一直停在「已停止」时才需要点下面的按钮。"),
-            // 自动连接进度（登录后由面板 2.5s 短轮询自动推进）：让用户在 bridge 卡也能一眼看到
-            // 「到底走到哪一步了」——进程在跑≠能用，注册到中继才算。
-            connInfo && connPhase && connPhase !== "no_account"
-              ? h("div", { className: "dru-hint", style: { marginTop: 6 } },
-                  "自动连接进度：" + (connInfo.locked ? "本机已被锁定（当前套餐额度已满，升级或解绑后自动恢复）" : connText))
-              : null,
-            h("div", { className: "dru-actions", style: { marginTop: 10 } },
-              !serviceRunning
-                ? h("button", { type: "button", className: "dru-btn dru-btn-primary", disabled: busy !== "", onClick: function () { toggleBridge(true); } }, busy === "start" ? "启动中…" : "启动后台服务")
-                : h("button", { type: "button", className: "dru-btn dru-btn-danger", disabled: busy !== "", onClick: function () { toggleBridge(false); } }, busy === "stop" ? "停止中…" : "停止后台服务")
-            ),
-            h("div", { className: "dru-meta" }, st && st.config && st.config.deviceId ? "设备 ID：" + st.config.deviceId : "设备 ID：生成中"),
-            h("div", { className: "dru-meta" }, st ? (st.service && (st.service.plistExists || st.service.serviceManager === "detached")
-              ? (st.service.serviceManager === "detached"
-                ? (st.service.autostartTask
-                    ? "自启动：已注册登录任务（任务计划程序 dsh-remote-bridge）"
-                    : "自启动：未注册登录任务（由面板在 dsh web 启动时自动拉起后台服务）")
-                : "自启动服务已安装")
-              : "自启动服务未安装（启动时自动创建）") : ""),
-            // 0.6.2：把「运行环境缺失 / launchd 崩溃循环」如实告诉用户，而不是显示「运行中」
-            st && !serviceRuntimeReady
-              ? h("div", { className: "dru-hint", style: { marginTop: 8 } },
-                  "🛠 在插件市场搜索「dsh-remote-web」装上的只是「面板插件」，这台电脑上的后台服务需要额外补装——已自动在后台安装，装完会自动启动，不用做任何操作。若超过几分钟仍未变成「运行中」，点上方版本卡的「一键更新」手动补全即可。")
-              : serviceCrashing
-                ? h("div", { className: "dru-hint", style: { marginTop: 8 } },
-                    "⚠️ 上一次启动失败（自启动入口失效），已自动清理失效自启动项并重新补装运行环境。稍候会自动恢复；仍失败请点「一键更新」。")
-                : null,
-            st && st.service && st.service.bindError
-              ? (function (be) {
-                  var isLocked = be.code === "device_locked" || be.code === "device_limit_exceeded";
-                  var isBindCap = be.code === "device_bind_cap";
-                  var beLimit = (be.limit === 0 || be.limit) ? be.limit : null;
-                  return h("div", { className: "dru-msg dru-msg-err", style: { marginTop: 8 } },
-                    (isLocked ? "🔒 本机已被锁定：" : "⚠️ 设备注册失败：") + (be.message || "未说明原因"),
-                    h("div", { className: "dru-hint", style: { marginTop: 4 } },
-                      isLocked
-                        // 契约 §8.1 的新语义：不是"解绑旧设备才能登录"，而是"超额锁定 → 升级或解绑，本机自动解锁"
-                        ? lockedPanelDetail(beLimit)
-                        : isBindCap
-                          // device_bind_cap = 防滥用硬上限（bridge 退出码 5）：守护按指数退避重试，不是无限重试
-                          ? "已绑定设备数达到上限：请在手机端「管理电脑」解绑不再使用的设备；解绑后本机会自动恢复（后台守护会按指数退避重试，无需反复点按钮）。"
-                          : "请确认网络与账号状态后重试；仍未解决可点下方「彻底卸载」后重新安装。")
-                  );
-                })(st.service.bindError)
-              : null
-          ),
-          // 版本与更新（自管理：检测新版 / 一键在线更新 / 彻底卸载）
-          h(SelfManageCard, null),
-          // 📖 关于 dsh-remote（**挪到最底**，0.6.18 面板重排）：
-          //   原来它夹在「🖥 后台服务」与「🔄 版本与更新」之间，六段技术说明把
-          //   "需要你动一下"（版本/重启）和"日常会用的入口"（账号/微信/公告）全挤到了它上面 ——
-          //   用户为了找版本卡要先滚过一整屏说明文字。关于是**背景阅读**，天然属于最后一屏。
-          //   ⚠️ 整块必须留在 renderHome 的返回树里，**不能**塞进 SelfManageCard 的返回树 ——
-          //   那会让它跟着那个组件的状态生命周期一起消失/重建。
-          card("📖 关于 dsh-remote", [
-            // 一句话定位（面向非技术用户先讲清楚"这是什么"），下面 4 条为既有技术说明（文案受源码契约锁定）
-            h("div", { className: "dru-hint", style: { marginBottom: 6 } }, "📱 一句话：用手机随时接管这台电脑上的 DeepSeek Harness——装上即得专属加密地址，人在外面也能全功能操作（免内网穿透、免公网 IP、全程加密）。"),
-            h("div", { className: "dru-hint", style: { marginBottom: 6 } }, "📱 远程访问：用手机或另一台电脑的浏览器，随时随地使用同一份 dsh web——人在哪都能用（免公网 IP、免内网穿透）；官方托管中继，4G/5G 即用，也可自建服务。"),
-            h("div", { className: "dru-hint", style: { marginBottom: 6 } }, "🛠 电脑端一键安装：bridge 与「远程访问」面板一次到位——云端/自建切换、账号登录、bridge 启停、一次性扫码访问、已授权设备管理、意见反馈都在这里。"),
-            h("div", { className: "dru-hint", style: { marginBottom: 6 } }, "🔒 安全与通道：HTTP / WebSocket 全量透传，一次性访问密钥认证，面板实时显示设备与已授权设备列表。"),
-            h("div", { className: "dru-hint" }, "🛡 端到端加密：手机↔电脑之间的消息内容用「你的账号密码派生密钥」端到端加密——密钥与密码不落服务端（仅存校验值），中继只可见路径/大小/时间（详见 README「安全与隐私」）。"),
-            // 匿名装机统计（隐私披露）：开源项目必须把「采什么 / 不采什么 / 怎么关」写在用户看得到的地方。
-            // 只保留结论式的说明句:不再单列「隐私说明: README… · docs/telemetry.md」那一行文档链接
-            // (面板里堆文档链接既占地方又不像产品文案;完整字段清单在仓库 docs/telemetry.md)。
-            h("div", { className: "dru-hint", style: { marginTop: 6 } },
-              "📊 匿名装机统计：只上报「装机/连接是否成功」这类事件（安装开始与失败原因、后台服务是否注册成功、是否首次远程打通）——"
-              + "不含任何账号、手机号、会话或文件内容、主机名、路径、设备指纹与 IP；标识是本机随机 ID（重装即变）。"
-              + "用环境变量 DSH_REMOTE_TELEMETRY=0 可完全关闭（不生成 ID、不发任何请求）。")
-            // ⚠️ 「💬 加入交流群」按钮已搬到「🔑 账号」卡的功能区（与「💬 用户反馈」并列）——
-            //    那里才是"有事想找人问"时会看的地方；这里只剩阅读性内容。
-          ]),
+          authTab === "login"
+            ? (pwdOpen
+                ? renderResetPwdForm(true)
+                : h("div", null,
+                    field("手机号", input({ type: "tel", value: phone, placeholder: "11 位手机号", autoComplete: "tel", onChange: function (e) { setPhone(e.target.value); } })),
+                    field("密码", input({ type: "password", value: pass, placeholder: "密码", autoComplete: "current-password", onChange: function (e) { setPass(e.target.value); } })),
+                    field("验证码", h("div", { className: "dru-captcha" },
+                      input({ value: lcapTxt, placeholder: "图中数字", autoComplete: "off", inputMode: "numeric", maxLength: 6, onChange: function (e) { setLcapTxt(e.target.value); } }),
+                      h("div", { className: "dru-captcha-box", title: "看不清？点击刷新", onClick: function () { loadCaptcha("login"); }, dangerouslySetInnerHTML: lcap && lcap.svg && lcap.svg.indexOf("<svg") === 0 ? { __html: lcap.svg } : void 0 },
+                        lcap && lcap.svg && lcap.svg.indexOf("<svg") !== 0 ? lcap.svg : null)
+                    )),
+                    h("button", { type: "button", className: "dru-btn dru-btn-primary", style: { width: "100%" }, disabled: busy !== "", onClick: doLogin }, busy === "login" ? "登录中…" : "登录"),
+                    h("div", { style: { display: "flex", justifyContent: "flex-end", marginTop: 8 } },
+                      h("button", { type: "button", className: "dru-linkbtn", disabled: busy !== "", onClick: togglePwdForm }, "忘记密码？"))
+                  ))
+            : h("div", null,
+                field("手机号", input({ type: "tel", value: rphone, placeholder: "11 位手机号", autoComplete: "tel", onChange: function (e) { setRphone(e.target.value); } })),
+                field("密码", input({ type: "password", value: rpass, placeholder: "至少 8 位", autoComplete: "new-password", onChange: function (e) { setRpass(e.target.value); } })),
+                field("确认密码", input({ type: "password", value: rpass2, placeholder: "再次输入密码", autoComplete: "new-password", onChange: function (e) { setRpass2(e.target.value); } })),
+                field("邀请码（选填）", input({ value: rInvite, placeholder: "邀请你的人的邀请码，如 A8K2M4XQ", autoComplete: "off", onChange: function (e) { setRInvite(e.target.value); } })),
+                rcap && field("图形验证码", h("div", { className: "dru-captcha" },
+                  input({ value: rcapTxt, placeholder: "图中数字", autoComplete: "off", inputMode: "numeric", maxLength: 6, onChange: function (e) { setRcapTxt(e.target.value); } }),
+                  h("div", { className: "dru-captcha-box", title: "看不清？点击刷新", onClick: function () { loadCaptcha("register"); }, dangerouslySetInnerHTML: rcap.svg && rcap.svg.indexOf("<svg") === 0 ? { __html: rcap.svg } : void 0 },
+                    rcap.svg && rcap.svg.indexOf("<svg") !== 0 ? rcap.svg : null)
+                )),
+                field("短信验证码", h("div", { className: "dru-captcha" },
+                  input({ value: rsms, placeholder: "6 位验证码", autoComplete: "off", inputMode: "numeric", maxLength: 6, onChange: function (e) { setRsms(e.target.value); } }),
+                  h("button", { type: "button", className: "dru-btn dru-btn-ghost", style: { flex: "none", padding: "0 14px" }, disabled: busy !== "", onClick: sendRegSms }, rsmsBtn)
+                )),
+                h("button", { type: "button", className: "dru-btn dru-btn-primary", style: { width: "100%" }, disabled: busy !== "", onClick: doRegister }, busy === "register" ? "注册中…" : "注册")
+              ),
           message && h("div", { className: "dru-msg dru-msg-" + message.kind }, message.text)
+        );
+      }
+
+      /** 手机访问弹层：二维码/链接/倒计时（复用既有 renderAccessCard）+ 云端/自建分段。 */
+      function renderMobileModal() {
+        if (iaModal !== "mobile") return null;
+        var isLocal = mode === "local";
+        return iaDialog(Object.assign({}, {
+          title: "手机访问",
+          sub: "手机扫码或在浏览器里打开链接，即可远程使用这台电脑上的 DSH",
+          onClose: closeIAModal,
+          foot: h("button", { type: "button", className: "dru-ia-btn", onClick: closeIAModal }, "完成")
+        }, { children: [h("div", { className: "dru-ia-seg", role: "tablist", "aria-label": "接入方式" },
+            h("button", {
+              type: "button", role: "tab", "aria-selected": !isLocal ? "true" : "false",
+              className: "dru-ia-seg-btn" + (!isLocal ? " is-active" : ""),
+              onClick: function () { setMode("saas"); setMessage(null); }
+            }, "云端服务"),
+            h("button", {
+              type: "button", role: "tab", "aria-selected": isLocal ? "true" : "false",
+              className: "dru-ia-seg-btn" + (isLocal ? " is-active" : ""),
+              onClick: function () { setMode("local"); setMessage(null); }
+            }, "自建服务")
+          ),
+          isLocal ? renderSelfHostBody() : renderAccessCard(),
+          // 已授权设备概览（与入口网格里的设备卡同源）：扫码/发链接之后「哪台手机已授权」是同一件事的下半段。
+          (!isLocal && loggedIn)
+            ? h("div", null,
+                h("div", { className: "dru-ia-card-actions", style: { marginTop: 4 } },
+                  h("button", {
+                    type: "button", className: "dru-ia-btn",
+                    onClick: function () { setIaModal("devices"); }
+                  }, "已授权设备 " + (devSessions === null ? "…" : devSessions.length) + "（管理）")),
+                devMsg ? h("div", { className: "dru-msg dru-msg-" + devMsg.kind, style: { marginTop: 8 } }, devMsg.text) : null)
+            : null] }));
+      }
+
+      /** 通道列表行（弹层第一步）。 */
+      function iaChannelRow(icon, title, sub, go, goText) {
+        return h("button", { type: "button", className: "dru-ia-row", onClick: go },
+          h("span", { className: "dru-ia-ico" }, druIcon(icon)),
+          h("span", { className: "dru-ia-row-main" },
+            h("span", { className: "dru-ia-row-title" }, title),
+            h("span", { className: "dru-ia-row-sub" }, sub)),
+          h("span", { className: "dru-ia-row-go" }, goText, druIcon("right"))
+        );
+      }
+
+      /** 企业微信配置步骤：Bot ID / Secret（不回显）/ 接收会话 ID（可选）/ 保存并连接 / 测试。 */
+      function renderWecomStep(close) {
+        var w = (imBots && imBots.wecom) || {};
+        var ws = (imBots && imBots.status) || {};
+        var fieldErr = imBotsFieldErr || {};
+        var stateLine = null;
+        if (imBotsBusy === "test") {
+          stateLine = h("div", { className: "dru-ia-state", role: "status", "aria-live": "polite" }, h("span", { className: "dru-spin" }), "正在连接企业微信…（最多 10 秒）");
+        } else if (imBotsMsg) {
+          stateLine = h("div", {
+            className: "dru-ia-state " + (imBotsMsg.kind === "ok" ? "is-ok" : imBotsMsg.kind === "warn" ? "is-warn" : "is-err"),
+            role: "status", "aria-live": "polite"
+          }, imBotsMsg.text);
+        } else if (ws.connected) {
+          stateLine = h("div", { className: "dru-ia-state is-ok", role: "status" }, druIcon("check"), "已连接" + (ws.authenticated ? "（鉴权通过）" : ""));
+        } else if (w.enabled || w.hasSecret) {
+          stateLine = h("div", { className: "dru-ia-state", role: "status" }, "已保存，等待连接…" + (ws.lastError ? "：" + ws.lastError : ""));
+        }
+        return iaDialog(Object.assign({}, {
+          title: "企业微信智能机器人",
+          sub: "在企业微信「智能机器人」页面复制 Bot ID 与 Secret；Secret 只保存在本机，不会回显",
+          onClose: close,
+          foot: [
+            h("button", {
+              type: "button", className: "dru-ia-btn is-primary", disabled: imBotsBusy !== "",
+              onClick: function () { saveImBots(true); }
+            }, imBotsBusy === "test" ? "连接中…" : "保存并连接"),
+            h("button", { type: "button", className: "dru-ia-btn", disabled: imBotsBusy !== "", onClick: function () { saveImBots(false); } },
+              imBotsBusy === "save" ? "保存中…" : "仅保存"),
+            h("button", { type: "button", className: "dru-ia-btn is-ghost", disabled: imBotsBusy !== "", onClick: function () { testImBots(); } }, "测试")
+          ]
+        }, { children: [h("div", { className: "dru-ia-field" },
+            h("label", { className: "dru-ia-label", htmlFor: "dru-wecom-bot" }, "Bot ID"),
+            h("input", {
+              id: "dru-wecom-bot", className: "dru-ia-input", type: "text", value: imBotsBotId,
+              placeholder: "aibxxxxxxxx", autoComplete: "off", spellCheck: false,
+              "aria-invalid": fieldErr.botId ? "true" : "false",
+              "aria-describedby": fieldErr.botId ? "dru-wecom-bot-err" : undefined,
+              onChange: function (e) { setImBotsBotId(e.target.value); }
+            }),
+            fieldErr.botId ? h("div", { id: "dru-wecom-bot-err", className: "dru-ia-err", role: "alert" }, fieldErr.botId) : null
+          ),
+          h("div", { className: "dru-ia-field" },
+            h("label", { className: "dru-ia-label", htmlFor: "dru-wecom-secret" }, "Secret"),
+            h("div", { className: "dru-ia-input-row" },
+              h("input", {
+                id: "dru-wecom-secret", className: "dru-ia-input",
+                type: imBotsShowSecret ? "text" : "password", value: imBotsSecret,
+                placeholder: w.hasSecret ? "已保存（留空表示不修改）" : "粘贴机器人 Secret",
+                autoComplete: "new-password", spellCheck: false,
+                "aria-invalid": fieldErr.secret ? "true" : "false",
+                "aria-describedby": fieldErr.secret ? "dru-wecom-secret-err" : undefined,
+                onChange: function (e) { setImBotsSecret(e.target.value); }
+              }),
+              h("button", {
+                type: "button", className: "dru-ia-iconbtn",
+                "aria-label": imBotsShowSecret ? "隐藏 Secret" : "显示 Secret",
+                onClick: function () { setImBotsShowSecret(!imBotsShowSecret); }
+              }, druIcon(imBotsShowSecret ? "eyeoff" : "eye"))
+            ),
+            fieldErr.secret ? h("div", { id: "dru-wecom-secret-err", className: "dru-ia-err", role: "alert" }, fieldErr.secret) : null,
+            h("div", { className: "dru-ia-hint" }, "只保存在本机配置目录；界面上永远不回显已保存的 Secret。")
+          ),
+          h("div", { className: "dru-ia-field" },
+            h("label", { className: "dru-ia-label", htmlFor: "dru-wecom-chat" }, "接收会话 ID（可选）"),
+            h("input", {
+              id: "dru-wecom-chat", className: "dru-ia-input", type: "text", value: imBotsChat,
+              placeholder: "留空即可", autoComplete: "off", spellCheck: false,
+              "aria-invalid": fieldErr.chat ? "true" : "false",
+              onChange: function (e) { setImBotsChat(e.target.value); }
+            }),
+            fieldErr.chat ? h("div", { className: "dru-ia-err", role: "alert" }, fieldErr.chat) : null,
+            h("div", { className: "dru-ia-hint" }, "不知道填什么就留空——你在企业微信里给机器人发一句话后会自动绑定。")
+          ),
+          h("div", { className: "dru-ia-field" },
+            h("label", { className: "dru-ia-label", htmlFor: "dru-wecom-url" }, "服务地址（可选，高级）"),
+            h("input", {
+              id: "dru-wecom-url", className: "dru-ia-input", type: "url", value: imBotsUrl,
+              placeholder: "默认使用企业微信官方接口，一般无需填写", autoComplete: "off", spellCheck: false,
+              "aria-invalid": fieldErr.url ? "true" : "false",
+              onChange: function (e) { setImBotsUrl(e.target.value); }
+            }),
+            fieldErr.url ? h("div", { className: "dru-ia-err", role: "alert" }, fieldErr.url) : null
+          ),
+          stateLine] }));
+      }
+
+      /** 「微信机器人（扫码绑定）」步骤：复用既有 WeChatBotSection；未登录时给登录入口（不再隐藏功能）。 */
+      function renderWechatStep(close) {
+        return iaDialog(Object.assign({}, {
+          title: "微信机器人（扫码绑定）",
+          sub: "扫码绑定后，任务完成/出错/需要拍板时会推到你的微信",
+          onClose: close,
+          foot: h("button", { type: "button", className: "dru-ia-btn", onClick: function () { setIaChStep("list"); } }, "返回平台列表")
+        }, { children: [loggedIn
+            ? h(WeChatBotSection, { embedded: true })
+            : h("div", { className: "dru-ia-empty" },
+                druIcon("user", 24),
+                h("div", { className: "dru-ia-empty-title" }, "登录后可绑定微信机器人"),
+                h("div", null, "微信通道需要账号身份（用来把你的电脑和微信对上）。登录后回到这里即可扫码绑定。"),
+                h("button", {
+                  type: "button", className: "dru-ia-btn is-primary",
+                  onClick: function () { setIaModal("account"); setIaChStep("list"); }
+                }, "去登录"))] }));
+      }
+
+      /** 飞书 / Webhook：先给诚实的空状态（不做假入口）。 */
+      function renderComingSoonStep(close, kind) {
+        var name = kind === "feishu" ? "飞书机器人" : "Webhook";
+        return iaDialog(Object.assign({}, {
+          title: name,
+          sub: "这个平台还在开发中",
+          onClose: close,
+          foot: h("button", { type: "button", className: "dru-ia-btn", onClick: function () { setIaChStep("list"); } }, "返回平台列表")
+        }, { children: [h("div", { className: "dru-ia-empty" },
+            druIcon("bell", 24),
+            h("div", { className: "dru-ia-empty-title" }, name + " 即将支持"),
+            h("div", null, "现在可以先用「企业微信智能机器人」；" + name + " 上线后会在同一位置出现，不需要重新配置。"))] }));
+      }
+
+      /** 通道弹层：平台列表 → 配置步骤（一级一屏，不做长表单堆叠）。 */
+      function renderChannelModal() {
+        if (iaModal !== "channel") return null;
+        if (iaChStep === "wecom") return renderWecomStep(closeIAModal);
+        if (iaChStep === "wechat") return renderWechatStep(closeIAModal);
+        if (iaChStep === "feishu" || iaChStep === "webhook") return renderComingSoonStep(closeIAModal, iaChStep);
+        var w = (imBots && imBots.wecom) || {};
+        var ws = (imBots && imBots.status) || {};
+        var wecomSub = ws.connected
+          ? "已连接 · 推送消息到企业微信"
+          : (w.enabled || w.hasSecret ? "已配置，等待连接" : "未配置 · 填 Bot ID 与 Secret 即可");
+        return iaDialog(Object.assign({}, {
+          title: "通知与消息通道",
+          sub: "选一个平台，让电脑端在任务完成、出错或需要拍板时主动通知你",
+          onClose: closeIAModal,
+          foot: h("button", { type: "button", className: "dru-ia-btn", onClick: closeIAModal }, "关闭")
+        }, { children: [h("div", { className: "dru-ia-list" },
+            iaChannelRow("chat", "企业微信智能机器人", wecomSub, function () { setIaChStep("wecom"); setImBotsMsg(null); setImBotsFieldErr({}); }, "配置"),
+            iaChannelRow("chat", "微信机器人（扫码绑定）", "扫码绑定 · 在微信里收通知 / 回数字拍板", function () { setIaChStep("wechat"); }, "打开"),
+            iaChannelRow("send", "飞书机器人", "即将支持", function () { setIaChStep("feishu"); }, "查看"),
+            iaChannelRow("code", "高级 · Webhook", "即将支持", function () { setIaChStep("webhook"); }, "查看")
+          )] }));
+      }
+
+      /** 已授权设备弹层：复用既有设备列表（渲染逻辑一行未改，只是从卡片挪进弹层）。 */
+      function renderDevicesModal() {
+        if (iaModal !== "devices") return null;
+        return iaDialog(Object.assign({}, {
+          title: "已授权设备",
+          sub: "这些手机/电脑已经可以远程访问本机；撤销后需要重新授权",
+          onClose: closeIAModal,
+          foot: h("button", { type: "button", className: "dru-ia-btn", onClick: closeIAModal }, "完成")
+        }, { children: [!loggedIn
+            ? h("div", { className: "dru-ia-empty" },
+                druIcon("devices", 24),
+                h("div", { className: "dru-ia-empty-title" }, "登录后可查看已授权设备"),
+                h("div", null, "设备列表跟账号走：登录后这里会显示每一台已授权的手机/电脑。"),
+                h("button", { type: "button", className: "dru-ia-btn is-primary", onClick: function () { setIaModal("account"); } }, "去登录"))
+            : h("div", null,
+                h("div", { className: "dru-ia-card-actions", style: { marginBottom: 8 } },
+                  h("button", {
+                    type: "button", className: "dru-ia-btn", disabled: devBusy !== "",
+                    onClick: function () { try { loadDevices(); } catch (e1) { /* 忽略 */ } }
+                  }, "已授权设备 " + (devSessions === null ? "…" : devSessions.length) + "（刷新）")),
+                devSessions === null ? h("div", { className: "dru-hint" }, "正在读取设备列表…") : renderDeviceList(),
+                devMsg
+                  ? h("div", { className: "dru-msg dru-msg-" + devMsg.kind, style: { marginTop: 6 } },
+                      devMsg.text,
+                      devMsg.retry
+                        ? h("button", { type: "button", className: "dru-linkbtn", style: { marginLeft: 8 }, disabled: devBusy !== "", onClick: devMsg.retry }, devBusy === "list" ? "重试中…" : "立即重试")
+                        : null)
+                  : null)] }));
+      }
+
+      /** 账号弹层：登录不再隐藏任何功能 —— 未登录只是卡片写「登录后可同步」，点进来登录即可。 */
+      function renderAccountModal() {
+        if (iaModal !== "account") return null;
+        return iaDialog(Object.assign({}, {
+          title: "账号",
+          sub: "登录后可同步设备、生成访问码；账号只用于你自己的设备之间同步",
+          onClose: closeIAModal,
+          foot: h("button", { type: "button", className: "dru-ia-btn", onClick: closeIAModal }, "完成")
+        }, { children: [renderAccountBody()] }));
+      }
+
+      function renderIAModals() {
+        return h("div", null,
+          renderMobileModal(),
+          renderChannelModal(),
+          renderDevicesModal(),
+          renderAccountModal()
+        );
+      }
+
+      /**
+       * 主面板：状态头 + 入口网格 + 一行文字入口（+ 折叠的高级设置）。
+       * 「不做整页滚动」：这里最多两屏；细节一律进弹层（弹层内部才允许滚动）。
+       */
+      function renderHome() {
+        return h("div", { className: "dru-ia" },
+          renderSetupAlert(),
+          message ? h("div", { className: "dru-msg dru-msg-" + message.kind }, message.text) : null,
+          renderIAHeader(),
+          renderAnnouncementsCard(),
+          renderIAGrid(),
+          renderIALinks(),
+          // 高级设置默认折叠：**节点始终在 DOM 里**（<details> 的等价语义），
+          // 但折叠时用 hidden 完全收起 —— 主面板保持清爽，键盘/读屏也不会读到隐藏内容。
+          h("div", { hidden: moreOpen ? undefined : "" , "aria-hidden": moreOpen ? undefined : "true" }, renderMoreSettings())
         );
       }
 
@@ -5668,6 +6320,7 @@ window.__ModuleLoader__.load({
       };
 
       /** 交流群弹窗（复用满意度弹窗的 dru-popup 视觉；点遮罩/关闭即收起）。 */
+
       function renderCommunityModal() {
         if (!commOpen || !(community && community.qrcode)) return null;
         var close = function () { setCommOpen(false); };
@@ -5864,7 +6517,7 @@ window.__ModuleLoader__.load({
 
       return h("div", { className: "dru-settings-section", role: "region", "aria-label": "远程访问", "data-dru-theme": theme },
         h("div", { className: "dru-settings-head" },
-          h("span", { className: "dru-settings-icon" }, "📱"),
+          h("span", { className: "dru-settings-icon" }, druIcon("phone", 20)),
           h("div", null,
             h("h2", { className: "dru-settings-title" }, "远程访问"),
             h("div", { className: "dru-settings-sub" }, "通过手机或另一台电脑远程使用同一份 dsh web，人在哪都能用（免公网 IP）"),
@@ -5947,16 +6600,13 @@ window.__ModuleLoader__.load({
                 )
               )
             : null,
-          // view 分派：wechat（第三个主 tab，内容自带 tab 条）| feedback | invite | home
-          // 🔒 微信通道要求已登录：若 view 还停在 "wechat" 而登录态已失效（会话中途过期），
-          //    这里**直接回落到 home**（渲染账号/登录卡）—— 绝不留一个空面板；上一条 effect
-          //    会把 view 正式复位成 home，两者一致。
-          view === "wechat" && loggedIn ? renderWeChat()
-            : view === "wechat" ? renderHome()
-            : view === "feedback" ? renderFeedback()
+          // view 分派：feedback | invite | home（"wechat" 视图已不存在 —— 微信通道在通道弹层里）
+          view === "feedback" ? renderFeedback()
             : view === "invite" ? renderInvite()
             : renderHome()
         ),
+        // 🧭 弹层统一挂在面板根上（fixed 定位，不占布局）：任何视图下都能开、都能 Esc 关闭。
+        renderIAModals(),
         // 2026-10-17（业主）：删除「重启 DeepSeek Harness」整段说明 ——
         // 桌面端运行环境由应用本身托管、插件安装/更新自动热加载，刷新页面即可；
         // 只有非桌面端（自建 dsh web）才保留重启入口，且文案只讲这一种场景。
@@ -5979,8 +6629,8 @@ window.__ModuleLoader__.load({
     // ══ 🤖 微信机器人（「📱 远程访问」面板里的第三个 tab：微信机器人通道） ═════════
     // 【0.6.11 用户约定】「不要给它单独弄一个菜单，直接放到面板里面。在面板里单开一个
     // table 页，命名为『微信机器人通道』，并增加上微信的绿泡泡小图标，点开后可以进行绑定设置。」
-    // → 不再注册第二个 settings.section 栏目（只有 📱 远程访问 一个），本组件由 renderWeChat()
-    //    以 embedded=true 作为**子组件**渲染（见 renderMainTabs / renderWeChat）。
+    // → 不再注册第二个 settings.section 栏目（只有「远程访问」一个），本组件由通道弹层的
+    //    「微信机器人（扫码绑定）」步骤以 embedded=true 作为**子组件**渲染（见 renderWechatStep）。
     // 数据全部来自同源 /dsh-remote/wechat/*（宿主半边代理 bridge 的控制面）。
     //
     // ⚠️ 令牌铁律：本组件**只**渲染 bridge 已脱敏的字段；不请求、不拼接、不缓存任何 token
@@ -6621,7 +7271,7 @@ window.__ModuleLoader__.load({
       // order 30 > Agent 预设(20)，栏目落在「Agent 预设」下方；label 即栏目名（📱 远程访问）。
       // 【0.6.11】本插件在这个槽里**只有一个栏目**（📱 远程访问）：🤖 微信机器人原先以 order 31
       // 注册成第二个栏目，用户约定「不要给它单独弄一个菜单，直接放到面板里面」→ 已改成面板里的
-      // 第三个 tab（renderMainTabs / renderWeChat）。不要再往这个槽里加第二个 register。
+      // 通道弹层里的微信步骤（renderWechatStep）。不要再往这个槽里加第二个 register。
       /* 📱 侧栏底部的快捷入口 —— 官方列表槽 `sidebar.footer.action`（2026-10-10 三修）。
          这个槽由 `@deepseek-ai/dsh-client-ui-sidebar` 声明，渲染在侧栏底部的 footerActions 里
          （在「设置」那一行的上方、与「意见反馈/登录/更多」同属底部区域）。0.1.x 与 0.2 都有该槽，

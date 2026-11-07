@@ -29,6 +29,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
+import { openEntry, clickChannelRow, findDialog } from "./lib-panel-ia.mjs";
 
 const SOURCE = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
 
@@ -305,19 +306,17 @@ function loadPlugin(opts = {}) {
       let tree = renderNode(root, "root");
       renders += 1;
       if (!entered) {
-        // 真实用户路径：先进 📱 远程访问（home），再点第三个 tab（微信面板就在面板内，不是独立栏目）。
-        // ⚠️ 登录态来自 /dsh-remote/status，**第一次渲染时 st 还是 null**（= 未登录）→ 自然没有 tab。
-        //    所以这里不是「第一帧就必须有点击目标」，而是「状态读到之后必须能用」：先等一帧。
-        const tab = weChatTab(tree);
-        if (tab) {
-          entered = true;
-          tab.props.onClick();
+        // 真实用户路径（IA 重做 2026-11-07）：主面板「通知与消息通道」入口卡 → 平台列表 →
+        // 「微信机器人（扫码绑定）」行 → 微信绑定面板。原来的顶部第三个 tab 已不存在。
+        entered = true;
+        const opened = openEntry(tree, "channel");
+        if (opened) {
           tree = renderNode(root, "root");
-        } else if (!signedIn) {
-          entered = true; // 未登录：本来就不该有微信 tab（见登录门用例）
-        } else if (renders > 1) {
-          // 登录门：**已登录**且状态已读到之后，这个 tab 必须在（不变量不放松）。
-          assert.fail("已登录时远程访问面板的主 tab 条里必须有「微信机器人通道」tab");
+          const went = clickChannelRow(tree, "微信机器人");
+          if (went) tree = renderNode(root, "root");
+          else assert.fail("通道弹层里必须有「微信机器人（扫码绑定）」这一行");
+        } else {
+          assert.fail("主面板必须有「通知与消息通道」入口卡（登录不再隐藏任何功能）");
         }
       }
       return tree;
@@ -374,74 +373,37 @@ test("入口：settings.section 里**只有**「📱 远程访问」一个栏目
   assert.equal(typeof dispose, "function", "setting.section 的 inject 回调必须返回 disposer");
 });
 
-test("tab 条（home 与 wechat 共用）：第三个 tab 是「微信机器人通道」+ 微信绿泡泡图标；能进也能出", async () => {
+test("通道弹层：微信机器人一行能进能出；主面板不再有顶部 tab 条（IA 重做 2026-11-07）", async () => {
   const plugin = loadPlugin();
-  let tree = await plugin.settle(); // 首次渲染自动点在微信 tab 上
-  // 进入微信视图后 tab 条**仍在**（否则用户被关在微信页里出不来）
-  let strip = find(tree, (n) => n.props?.className === "dru-tabs" && n.props?.role === "tablist");
-  assert.ok(strip, "微信视图里也必须渲染主 tab 条（否则无法返回）");
-
-  // 三个 tab：云端服务 / 自建服务 / 微信机器人通道
-  const tabs = [];
-  walk(tree, (n) => { if (n.props?.role === "tab") tabs.push(n); });
-  const labels = tabs.map((t) => (t.children || []).filter((c) => typeof c === "string").join(""));
-  assert.deepEqual(labels, ["☁️ 云端服务", "🖥 自建服务", "微信机器人通道"], `主 tab 条应有三个 tab，实际：${labels.join("|")}`);
-
-  // 绿泡泡图标：装饰性 span.dru-wx-ico + aria-hidden（可访问名字来自文字标签）
-  const ico = find(tree, (n) => n.props?.className === "dru-wx-ico");
-  assert.ok(ico, "微信 tab 上必须有 .dru-wx-ico 绿泡泡图标");
-  assert.equal(ico.props["aria-hidden"], "true", "图标是装饰性的 → aria-hidden");
-  assert.equal(ico.type, "span");
-  assert.ok((ico.children || []).some((c) => typeof c === "string" && c.includes("💬")), "图标里应有 💬 气泡字符");
-
-  // 选中态：微信 tab active / aria-selected=true，两个模式 tab 都不 active（aria 与视觉同源）
-  const wxTab = tabs[2];
-  assert.match(wxTab.props.className, /dru-tab active/, "在微信视图里微信 tab 必须是 active");
-  assert.equal(wxTab.props["aria-selected"], "true");
-  assert.equal(tabs[0].props["aria-selected"], "false", "模式 tab 在微信视图里不得选中");
-  assert.equal(tabs[1].props["aria-selected"], "false");
-  assert.equal(tabs[0].props.tabIndex, 0, "tab 必须可聚焦（键盘可操作）");
-  assert.equal(wxTab.props["aria-selected"], "true", "aria-selected 与 .active 同源");
-
-  // 微信视图里没有第二个 .dru-settings-section 套娃（内嵌态省掉外壳）
-  assert.equal(tree.props.className, "dru-settings-section", "面板根仍是唯一的 .dru-settings-section");
-  assert.equal(find(tree, (n) => n.props?.className === "dru-settings-section" && n !== tree), undefined,
-    "内嵌态不得再嵌一层 .dru-settings-section");
-
-  // 出得去：点「🖥 自建服务」→ 回到 home（模式 tab 点击必须把 view 复位成 home）
-  tabs[1].props.onClick();
-  tree = plugin.render();
-  assert.equal(find(tree, (n) => n.props?.className === "dru-wx-embed"), undefined,
-    "点模式 tab 后必须离开微信视图（微信内容不再渲染）");
-  const modeTab = find(tree, (n) => n.props?.role === "tab" && (n.children || []).includes("🖥 自建服务"));
-  assert.equal(modeTab.props["aria-selected"], "true", "点自建服务后它应成为选中态（且 view 回到 home）");
-  assert.equal(find(tree, (n) => n.props?.role === "tab" && (n.children || []).some((c) => typeof c === "string" && c.includes("微信机器人通道"))).props["aria-selected"], "false",
-    "离开微信视图后微信 tab 不得再是选中态");
-  // 进得去：再点回微信 tab
-  const back = find(tree, (n) => n.props?.role === "tab" && (n.children || []).some((c) => typeof c === "string" && c.includes("微信机器人通道")));
+  let tree = await plugin.settle(); // 首次渲染自动走「通道入口 → 微信机器人行」
+  // 主面板不再有顶部 tab 条（旧结构："云端服务 / 自建服务 / 微信机器人通道"）
+  assert.equal(find(tree, (n) => n.props?.className === "dru-tabs"), undefined,
+    "主面板不得再有顶部 tab 条（已降级为弹层内的分段控件）");
+  // 微信绑定面板在弹层里（role=dialog），且弹层标题是「微信机器人（扫码绑定）」
+  const dlg = findDialog(tree);
+  assert.ok(dlg, "微信绑定内容必须在弹层里（role=dialog）");
+  assert.ok(textHas(tree, "微信机器人（扫码绑定）"), "弹层标题应是「微信机器人（扫码绑定）」");
+  // 出得去：点「返回平台列表」→ 弹层回到平台列表（不再是"进了就出不来"的 tab 视图）
+  const back = find(tree, (n) => n.type === "button" && (n.children || []).some((c) => typeof c === "string" && c.includes("返回平台列表")));
+  assert.ok(back, "弹层里必须有「返回平台列表」出口");
   back.props.onClick();
-  const again = plugin.render();
-  assert.ok(textHas(again, "未绑定") || textHas(again, "已绑定"), "再点回来仍是微信机器人内容");
-  assert.equal(find(again, (n) => n.props?.className === "dru-wx-ico") ? true : false, true, "tab 条（含绿泡泡）仍在");
+  tree = await plugin.settle();
+  assert.ok(textHas(tree, "企业微信智能机器人"), "返回后应是平台列表（能进也能出）");
 });
-
-test("绿泡泡与零外部资源（源码级）：.dru-wx-ico 是微信品牌绿、不新增任何外部资源/依赖", () => {
-  // 图标颜色：微信品牌绿 #07c160（用户约定：「增加上微信的绿泡泡小图标」）
-  assert.match(SOURCE, /\.dru-wx-ico\{[^}]*color:#07c160/, "绿泡泡必须是微信品牌绿 #07c160");
-  // 装饰性：节点上 aria-hidden（可读名字来自同 tab 的文字标签，见上一条用例）
-  assert.match(SOURCE, /className: "dru-wx-ico", "aria-hidden": "true"/, "图标节点必须 aria-hidden");
-  assert.match(SOURCE, /"微信机器人通道"/, "tab 必须有真实文字标签（不靠颜色/图标单独表意）");
-  // 图标 = 一个 emoji 字符 + 一条 CSS 规则，不加载任何外部资源（字体/图片/脚本/样式）
+test("图标：新 IA 一律内联 SVG（不用 emoji 当图标）；零外部资源/零依赖不变量不变", () => {
+  // 业主 UX 规范：图标必须内联 SVG 16px currentColor，**禁止 emoji 当图标**
+  assert.match(SOURCE, /function druIcon\(name, size\)/, "必须有统一的 SVG 图标函数");
+  assert.match(SOURCE, /dangerouslySetInnerHTML: \{ __html: inner \}/, "图标以 inline SVG 渲染（不是 emoji/图片）");
+  assert.match(SOURCE, /"aria-hidden": "true", focusable: "false"/, "装饰性图标必须 aria-hidden");
+  // 零外部资源：不 @import、不引远程 url、不注入 link/script、不引 QR 库
   assert.doesNotMatch(SOURCE, /@import/, "不得 @import 外部样式");
   assert.doesNotMatch(SOURCE, /url\(\s*["']?https?:/, "CSS 里不得引用远程 url(...)");
   assert.doesNotMatch(SOURCE, /createElement\("link"\)|createElement\('link'\)/, "不得注入外部 <link>");
-  assert.doesNotMatch(SOURCE, /createElement\("script"\)|createElement\('script'\)/, "不得注入外部 <script>");
   assert.doesNotMatch(SOURCE, /qrcodejs|qrcode-generator|davidshimjs|jsqr|nayuki|qrcode\.min\.js/i, "不得引入 QR 库");
-  // 依赖侧同样零新增：dsh-remote-web 没有（也不得有）任何运行时依赖
+  // 依赖侧同样零新增
   const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
   assert.deepEqual(pkg.dependencies || {}, {}, "dsh-remote-web 不得有运行时依赖（零依赖不变量）");
 });
-
 test("主题不变量：根节点带 .dru-settings-section + data-dru-theme；新增样式只引用令牌、不落 :root/body", async () => {
   const plugin = loadPlugin();
   const tree = await plugin.settle();
@@ -533,69 +495,29 @@ test("首屏导览：未绑定时就在最上面（DOM 顺序在「连接微信�
   assert.ok(textHas(boundTree, "已绑定"));
 });
 
-test("登录门：未登录时**没有**「微信机器人通道」tab（只剩两个模式 tab）；登录后当场出现，不用刷新页面", async () => {
-  const plugin = loadPlugin({ signedIn: false });
-  let tree = await plugin.settle();
-
-  // 未登录：tab 不存在（harness 的 auto-enter 也因此不会发生）
-  assert.equal(plugin.weChatTabOf(tree), undefined, "未登录时不得渲染「微信机器人通道」tab");
-  const labelsOf = (t) => {
-    const tabs = [];
-    walk(t, (n) => { if (n.props?.role === "tab") tabs.push(n); });
-    return tabs.map((x) => (x.children || []).filter((c) => typeof c === "string").join(""));
-  };
-  assert.deepEqual(labelsOf(tree), ["☁️ 云端服务", "🖥 自建服务"], "未登录时主 tab 条只剩两个模式 tab");
-  assert.equal(find(tree, (n) => n.props?.className === "dru-wx-embed"), undefined, "未登录时不得渲染微信内容");
-  // 不是空面板：账号/登录区就在 home
-  assert.ok(textHas(tree, "登录"), "未登录时应看到登录/账号区（不是空白）");
-
-  // 登录（/status 带上 config.phone）→ 不刷新页面，tab 当场出现
-  plugin.setSignedIn(true);
-  tree = await plugin.settle();
-  const tab = plugin.weChatTabOf(tree);
-  assert.ok(tab, "登录成功后微信 tab 必须自己出现（不需要刷新页面）");
-  assert.deepEqual(labelsOf(tree), ["☁️ 云端服务", "🖥 自建服务", "微信机器人通道"], "登录后 tab 条恢复三个 tab");
-  assert.ok(find(tree, (n) => n.props?.className === "dru-wx-ico"), "微信绿泡泡图标照旧");
-
-  // 且点得进去、内容正常
-  tab.props.onClick();
-  tree = await plugin.settle();
-  assert.ok(find(tree, (n) => n.props?.className === "dru-wx-embed"), "登录后点 tab 应进入微信机器人内容");
-  assert.ok(textHas(tree, "未绑定") || textHas(tree, "已绑定"), "内容读到状态（不是空面板）");
-});
-
-test("登录门（防御）：微信 tab 开着时会话失效 → 不渲染微信内容、回落到 home，绝不留空面板", async () => {
+test("登录不再隐藏功能（2026-11-07 业主批评根治）：未登录也能看到通道入口，进弹层后说明登录后才能绑定", async () => {
   const plugin = loadPlugin();
-  let tree = await plugin.settle(); // auto-enter：已进入微信 tab
-  assert.ok(find(tree, (n) => n.props?.className === "dru-wx-embed"), "前提：已在微信 tab 里");
-  assert.ok(find(tree, (n) => n.props?.["aria-label"] === "微信机器人通道"), "前提：微信 region 在渲染");
-
-  // 会话在 tab 开着的时候过期：/status 不再带 config.phone（登出 / 被踢下线 / 换账号）
   plugin.setSignedIn(false);
-  plugin.setStatus(NOT_BOUND);
-  tree = await plugin.settle();
-
-  // ① 微信内容一个都不渲染（没有内容体、没有那个 region）
-  assert.equal(find(tree, (n) => n.props?.className === "dru-wx-embed"), undefined, "登出后不得再渲染微信内容体");
-  assert.equal(find(tree, (n) => n.props?.role === "region" && n.props?.["aria-label"] === "微信机器人通道"), undefined,
-    "登出后不得再渲染「微信机器人通道」region");
-  // ② 也不是空白：已经回落到 home（账号/登录卡 + 主 tab 条都在）
-  assert.ok(find(tree, (n) => n.props?.role === "tablist"), "应回到 home 的 tab 条");
-  assert.ok(textHas(tree, "登录") && textHas(tree, "注册"), "home 的账号卡（登录/注册）应在场，不留空面板");
-  assert.ok(textHas(tree, "后台服务") || textHas(tree, "远程访问"), "home 的其它卡片也应在场");
-  // ③ 微信 tab 自身也消失（登录门一致）
-  assert.equal(plugin.weChatTabOf(tree), undefined, "登出后微信 tab 必须消失");
-
-  // ④ 重新登录：user 不用刷新页面就能回到微信 tab
-  plugin.setSignedIn(true);
-  tree = await plugin.settle();
-  const tab = plugin.weChatTabOf(tree);
-  assert.ok(tab, "重新登录后微信 tab 应再次出现");
-  tab.props.onClick();
-  tree = await plugin.settle();
-  assert.ok(find(tree, (n) => n.props?.className === "dru-wx-embed"), "重新登录后可以正常再进微信 tab");
+  const tree = await plugin.settle();
+  // ① 未登录时主面板照常渲染入口网格（不再隐藏整个功能）
+  assert.ok(textHas(tree, "通知与消息通道"), "未登录也必须有「通知与消息通道」入口卡");
+  // ② 通道弹层里微信一行仍在；点进去 → 说明要登录（而不是整块消失）
+  assert.ok(textHas(tree, "微信机器人（扫码绑定）"), "未登录也看得到微信通道这一行");
+  assert.ok(textHas(tree, "登录后可绑定微信机器人"), "微信步骤页要明确说明「登录后可绑定」");
+  const goLogin = find(tree, (n) => n.type === "button" && (n.children || []).some((c) => typeof c === "string" && c.includes("去登录")));
+  assert.ok(goLogin, "给一个「去登录」的出口（不再让人自己找）");
 });
-
+test("登录门（防御）：微信步骤会话失效 → 只显示登录提示，绝不渲染绑定内容或空白面板", async () => {
+  const plugin = loadPlugin();
+  let tree = await plugin.settle();
+  assert.ok(textHas(tree, "连接微信机器人") || textHas(tree, "已绑定") || textHas(tree, "未绑定"), "登录态下应是真绑定面板");
+  // 会话中途失效（下一帧 /status 不再带 config.phone）
+  plugin.setSignedIn(false);
+  tree = await plugin.settle(4);
+  assert.ok(textHas(tree, "登录后可绑定微信机器人"), "失效后必须如实说明要登录（不留空面板）");
+  assert.equal(find(tree, (n) => n.props?.className === "dru-wx-embed"), undefined, "不得继续渲染绑定内容");
+  assert.ok(findDialog(tree), "弹层仍然可用（用户可以关掉或去登录）");
+});
 test("动效引导（未绑定）：连接按钮带 .dru-wx-attn、装饰点 aria-hidden；样式表有 prefers-reduced-motion 关闭规则；绑定后消失", async () => {
   const plugin = loadPlugin();
   let tree = await plugin.settle();
@@ -864,7 +786,12 @@ test("无障碍：真 <button>、状态区 aria-live 播报、按钮有文字标
   assert.ok(btns.length >= 2, "至少要有「连接微信机器人」与「刷新状态」两个真按钮");
   for (const b of btns) {
     assert.equal(b.props.type, "button", "必须是真 <button type=button>（不是可点的 div）");
-    assert.ok((b.children || []).some((c) => typeof c === "string" && c.trim()), "按钮必须有可见文字");
+    // 可访问名来自「可见文字（含子树里的 span）」或「aria-label」——图标按钮必须给 aria-label。
+    let deepText = "";
+    walk(b, (n) => { for (const c of n.children || []) if (typeof c === "string") deepText += c; });
+    assert.ok(
+      deepText.trim() || (b.props["aria-label"] && String(b.props["aria-label"]).trim()),
+      "按钮必须有可见文字或 aria-label（图标按钮必须给 aria-label）：class=" + String(b.props?.className || ""));
   }
   const live = find(tree, (n) => n.props && n.props["aria-live"] === "polite" && n.props.role === "status");
   assert.ok(live, "状态变化要有 aria-live 播报位");

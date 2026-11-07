@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
+import { openEntry } from "./lib-panel-ia.mjs";
 
 const SOURCE = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
 
@@ -59,6 +60,7 @@ function makeEl(tag) {
  *                        localStorageSeed（预置 key/value）。
  */
 function loadPlugin(opts = {}) {
+  let iaOpened = false;
   let moduleFactory;
   const registered = new Map();
   const metas = new Map();
@@ -158,7 +160,16 @@ function loadPlugin(opts = {}) {
     registered, metas, injects, requests, removed, states, localStorage,
     intervals,
     lastObserver: () => lastObserver,
-    renderSection() { hook = 0; return registered.get("dsh-remote")({ close() {} }); },
+    renderSection() {
+      hook = 0;
+      let tree = registered.get("dsh-remote")({ close() {} });
+      // IA 重做（2026-11-07）：账号/退出登录在「账号」弹层里 —— 按真实用户路径点开入口卡。
+      if (!iaOpened) {
+        iaOpened = true;
+        if (openEntry(tree, opts.autoModal || "account")) { hook = 0; tree = registered.get("dsh-remote")({ close() {} }); }
+      }
+      return tree;
+    },
   };
 }
 
@@ -212,9 +223,10 @@ test("入口迁移：settings.section 里**只有一个**栏目（id=dsh-remote�
   assert.equal(plugin.metas.has("dsh-remote-wechat"), false,
     "「🤖 微信机器人」不得再注册成独立栏目（0.6.11：搬进面板的第三个 tab「微信机器人通道」）");
   assert.doesNotMatch(SOURCE, /dsh-remote-wechat/, "源码里也不得残留第二个栏目的 id");
-  // 搬进去之后仍然存在：面板 tab 条里的第三个 tab + 微信绿泡泡图标（行为断言见 wechat-bot-ui.test.mjs）
-  assert.match(SOURCE, /"微信机器人通道"/, "微信机器人 tab 必须在面板里");
-  assert.match(SOURCE, /dru-wx-ico/, "微信 tab 必须带绿泡泡图标 class");
+  // IA 重做（2026-11-07）：顶部 tab 与绿泡泡 emoji 均已删除 —— 微信通道在「通知与消息通道」弹层里，
+  // 主面板保留「通知与消息通道」入口卡（行为断言见 wechat-bot-ui.test.mjs）。
+  assert.match(SOURCE, /"通知与消息通道"/, "必须有「通知与消息通道」入口（微信/企微两条通道都在里面）");
+  assert.match(SOURCE, /"微信机器人（扫码绑定）"/, "通道弹层里必须有微信机器人一行");
   // 槽注入次数：settings.section + shell.overlay + sidebar.footer.action（2026-10-10 加的侧栏入口）
   assert.equal(plugin.injects.size, 3,
     `inject 的槽名应是 settings.section + shell.overlay + sidebar.footer.action，实际：${[...plugin.injects.keys()].join(",")}`);
@@ -233,25 +245,22 @@ test("登录态账号区：无「切换账号」，有「退出登录」，头�
   assert.ok(find(tree, (n) => n.children?.includes("退出登录")), "应保留「退出登录」");
   assert.ok(!find(tree, (n) => n.children?.includes("切换账号")), "「切换账号」按钮应移除");
 
-  // 关于 dsh-remote 说明卡片（面板底部，v0.5+ 价值要点）
-  assert.ok(find(tree, (n) => n.children?.includes("📖 关于 dsh-remote")), "应渲染「关于 dsh-remote」卡片标题");
-  const points = [
-    "📱 远程访问：用手机或另一台电脑的浏览器，随时随地使用同一份 dsh web——人在哪都能用（免公网 IP、免内网穿透）；官方托管中继，4G/5G 即用，也可自建服务。",
-    "🛠 电脑端一键安装：bridge 与「远程访问」面板一次到位——云端/自建切换、账号登录、bridge 启停、一次性扫码访问、已授权设备管理、意见反馈都在这里。",
-    "🔒 安全与通道：HTTP / WebSocket 全量透传，一次性访问密钥认证，面板实时显示设备与已授权设备列表。",
-    "🛡 端到端加密：手机↔电脑之间的消息内容用「你的账号密码派生密钥」端到端加密——密钥与密码不落服务端（仅存校验值），中继只可见路径/大小/时间（详见 README「安全与隐私」）。",
-  ];
-  for (const p of points) {
-    assert.ok(find(tree, (n) => n.children?.includes(p)), `说明卡片应含要点: ${p.slice(0, 12)}…`);
+  // 关于 dsh-remote 卡片：在「更多设置」折叠区里 —— 标题不再带 emoji（图标一律内联 SVG）
+  assert.ok(find(tree, (n) => n.children?.includes("关于 dsh-remote")), "应渲染「关于 dsh-remote」卡片标题");
+  // 价值要点仍要在（不要求逐字长文案：IA 重做后关于卡精简成结论句，避免文字堆砌）
+  const aboutBits = ["免公网 IP", "端到端加密", "匿名装机统计"];
+  for (const bit of aboutBits) {
+    assert.ok(textHas(tree, bit), "关于卡片应含要点: " + bit);
   }
 
-  // 面板主体仍在（连接模式 tab 不受影响）
-  assert.ok(find(tree, (n) => n.children?.includes("☁️ 云端服务")), "云端服务 tab 应保留");
-  assert.ok(find(tree, (n) => n.children?.includes("🖥 自建服务")), "自建服务 tab 应保留");
-
-  // 📱 远程访问卡 / 📲 已授权设备卡在云端视图中渲染（bridge 未运行 → “等待设备连接”）
-  assert.ok(find(tree, (n) => n.children?.includes("等待设备连接")), "无 bridge 时应显示「等待设备连接」状态行");
-  assert.ok(textHas(tree, "已授权设备"), "应渲染「已授权设备」管理按钮");
+  // 新 IA（2026-11-07）：顶部 tab 已删除 → 主面板是「状态头 + 2 列入口网格 + 文字入口」
+  for (const title of ["手机访问", "通知与消息通道", "已授权设备", "账号"]) {
+    assert.ok(find(tree, (n) => (n.children || []).includes(title)), "入口网格应有卡片: " + title);
+  }
+  assert.equal(find(tree, (n) => n.props?.className === "dru-tabs"), undefined, "主面板不得再有顶部 tab 条");
+  // 状态头：连接状态 pill（圆点 + 文案，不只靠颜色）+ 主按钮「打开手机端」
+  assert.ok(find(tree, (n) => String(n.props?.className || "").split(/\s+/).includes("dru-ia-pill")), "状态头应有连接状态 pill");
+  assert.ok(textHas(tree, "打开手机端"), "状态头应有主按钮「打开手机端」");
 });
 
 test("退出登录清除用户反馈线程凭据（localStorage dsh-feedback-threads）", async () => {

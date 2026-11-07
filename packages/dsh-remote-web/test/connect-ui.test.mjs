@@ -13,6 +13,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
+import { openEntry } from "./lib-panel-ia.mjs";
 
 const SOURCE = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
 
@@ -90,6 +91,7 @@ function loadPlugin(opts = {}) {
   const clipboard = [];
   const states = [];
   let hook = 0;
+  let iaOpened = false;
   let effectCursor = 0;
   let effectSlots = [];
   let pending = [];
@@ -239,7 +241,15 @@ function loadPlugin(opts = {}) {
     /** 渲染一轮并执行本轮需要运行的 effects（含 cleanup）。 */
     render() {
       hook = 0; effectCursor = 0; pending = [];
-      const tree = registered.get("dsh-remote")({ close() {} });
+      let tree = registered.get("dsh-remote")({ close() {} });
+      // IA 重做（2026-11-07）：访问卡/激活引导在「手机访问」弹层里 —— 按真实用户路径点开入口卡。
+      if (!iaOpened) {
+        iaOpened = true;
+        if (openEntry(tree, opts.autoModal || "mobile")) {
+          hook = 0; effectCursor = 0; pending = [];
+          tree = registered.get("dsh-remote")({ close() {} });
+        }
+      }
       const todos = pending; pending = [];
       for (const t of todos) {
         const prev = effectSlots[t.index];
@@ -378,10 +388,12 @@ test("轮询策略：document.hidden 时暂停短轮询，回前台立即补一�
 });
 
 test("面板注册带注册来源 reg_source=panel_register（增长约定：电脑端 vs 手机端网页注册）", async () => {
-  const plugin = loadPlugin({ status: NOT_LOGGED });
+  const plugin = loadPlugin({ status: NOT_LOGGED, autoModal: "account" });
   let tree = await plugin.settle();
-  const regTab = nodeWithText(tree, "注册");
-  assert.ok(regTab, "应有「注册」标签");
+  // IA 重做（2026-11-07）：登录/注册从顶部 tab 变成弹层内的分段控件（.dru-ia-seg-btn）
+  const regTab = find(tree, (n) => String(n.props?.className || "").split(/\s+/).includes("dru-ia-seg-btn")
+    && (n.children || []).some((c) => typeof c === "string" && c.includes("注册")));
+  assert.ok(regTab, "应有「注册」分段按钮");
   regTab.props.onClick();
   tree = await plugin.settle();
 

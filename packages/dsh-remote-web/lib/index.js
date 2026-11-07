@@ -7542,7 +7542,214 @@ export function localRequestBlocked(req) {
   return null;
 }
 
-function registerRoutes(ctx, relayDir) {
+// ═══════════════════════ 🤖 IM 机器人通道（2026-11-07，企业微信智能机器人）═══════════════════════
+//
+// 面板「通知与消息通道」弹层背后的三条本地 API。它**不是**原来那条「微信机器人扫码绑定」通道
+// （那条跑在 bridge 的 wechat-runtime 里，见 /dsh-remote/wechat/*），而是「用企业微信/飞书机器人的
+// 凭据让桥主动推送消息」的第二种通道，配置面就两个文件（契约与桥半约定，字段名**不要改**）：
+//
+//   <relayDir>/im-bots.json        插件写、桥读
+//     { version:1, wecom:{ enabled, botId, secret, url, targetChatId } }
+//   <relayDir>/im-bot-status.json  桥写、插件**只读**
+//     { updatedAt, wecom:{ enabled, connected, authenticated, lastError,
+//                          lastConnectedAt, lastMessageAt, boundChatId } }
+//
+// 安全边界（本文件里凡是下发给浏览器的字段都要过这里）：
+//   · **secret 永不返回浏览器**（GET/PUT/测试结果里只给 hasSecret:boolean）；
+//   · 配置文件按 0600 写 + 临时文件原子替换（半写文件会让桥读到坏 JSON → 通道静默失效）；
+//   · 状态文件是桥写的，插件只挑白名单字段转发，绝不整份透传（防止未来桥塞进敏感字段被带出去）。
+//
+// 三条 API：
+//   GET  /dsh-remote/im-bots               → {ok, wecom:{enabled,botId,hasSecret,url,targetChatId}, status}
+//   PUT  /dsh-remote/im-bots (body {...})  → 同上（保存后立刻回读；空 secret = 不修改）
+//   POST /dsh-remote/im-bots/test          → 写配置后轮询状态 ≤10s，回 {ok, connected, authenticated, lastError}
+// 失败一律人话 + 稳定错误码：invalid_bot_id / missing_secret / connect_failed / timeout（外加 invalid_url / bad_request）。
+const IM_BOTS_FILE = "im-bots.json";
+const IM_BOT_STATUS_FILE = "im-bot-status.json";
+/** POST test 最多等多久（桥真正连上企业微信是异步的；10s 是 task 契约）。可用 config.imBotsWaitMs 覆盖（测试用）。 */
+const IM_BOT_STATUS_WAIT_MS = 10_000;
+const IM_BOT_STATUS_POLL_MS = 300;
+/** 企业微信智能机器人的 Bot ID 形如 `aib...`（用户抄错时当场给可理解的错误，而不是存下去然后一直连不上）。 */
+const WECOM_BOT_ID_RE = /^aib[A-Za-z0-9_-]{3,}$/;
+const IM_BOT_URL_RE = /^https?:\/\/[^\s]+$/i;
+
+function imBotsPathOf(relayDir) { return join(relayDir, IM_BOTS_FILE); }
+function imBotStatusPathOf(relayDir) { return join(relayDir, IM_BOT_STATUS_FILE); }
+
+/** 读一个 JSON 文件；不存在/半写/坏 JSON 一律当空对象（通道没配 ≠ 面板报错）。 */
+function readJsonFileSoft(file) {
+  try {
+    const raw = readFileSync(file, "utf8");
+    const v = JSON.parse(raw);
+    return v && typeof v === "object" && !Array.isArray(v) ? v : {};
+  } catch { return {}; }
+}
+
+function readImBots(relayDir) { return readJsonFileSoft(imBotsPathOf(relayDir)); }
+function readImBotStatus(relayDir) { return readJsonFileSoft(imBotStatusPathOf(relayDir)); }
+
+/** 归一化 wecom 配置（读的时候也归一，桥手工编辑过/旧版本文件都不会让面板崩）。 */
+function wecomCfgOf(bots) {
+  const w = bots && bots.wecom && typeof bots.wecom === "object" ? bots.wecom : {};
+  return {
+    enabled: !!w.enabled,
+    botId: typeof w.botId === "string" ? w.botId : "",
+    secret: typeof w.secret === "string" ? w.secret : "",
+    url: typeof w.url === "string" ? w.url : "",
+    targetChatId: typeof w.targetChatId === "string" ? w.targetChatId : "",
+  };
+}
+
+/** 状态文件只转发白名单字段（桥以后往里塞什么都带不出去）。 */
+function wecomStatusOf(status) {
+  const w = status && status.wecom && typeof status.wecom === "object" ? status.wecom : {};
+  const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+  const str = (v) => (typeof v === "string" ? v : "");
+  return {
+    enabled: !!w.enabled,
+    connected: !!w.connected,
+    authenticated: !!w.authenticated,
+    lastError: str(w.lastError),
+    lastConnectedAt: num(w.lastConnectedAt),
+    lastMessageAt: num(w.lastMessageAt),
+    boundChatId: str(w.boundChatId),
+  };
+}
+
+/**
+ * 原子写 im-bots.json（0600）。
+ * 为什么 tmp + rename：桥是**另一个进程**，写一半被读到就是坏 JSON；rename 在同一目录内是原子的。
+ */
+function writeImBots(relayDir, data) {
+  mkdirSync(relayDir, { recursive: true });
+  const file = imBotsPathOf(relayDir);
+  const tmp = `${file}.dsh-remote.tmp`;
+  writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n", { mode: 0o600 });
+  try { hardenFile(tmp); } catch { /* Windows ACL 失败不致命 */ }
+  try { chmodSync(tmp, 0o600); } catch { /* 非 POSIX 忽略 */ }
+  renameSync(tmp, file);
+  try { chmodSync(file, 0o600); } catch { /* 忽略 */ }
+}
+
+/** 面板可见的通道状态（GET/PUT 共用同一个形状；**绝不含 secret**）。 */
+function imBotsView(relayDir) {
+  const bots = readImBots(relayDir);
+  const w = wecomCfgOf(bots);
+  const stFile = readImBotStatus(relayDir);
+  return {
+    ok: true,
+    wecom: {
+      enabled: w.enabled,
+      botId: w.botId,
+      hasSecret: w.secret.length > 0,
+      url: w.url,
+      targetChatId: w.targetChatId,
+    },
+    status: wecomStatusOf(stFile),
+    updatedAt: typeof stFile.updatedAt === "number" ? stFile.updatedAt : 0,
+  };
+}
+
+/**
+ * 保存 wecom 配置（PUT 与 POST test 共用；纯校验 + 写盘，不碰网络）。
+ * @returns {{ok:true}|{ok:false, code:string, message:string}}
+ */
+function saveWecomConfig(relayDir, input) {
+  const src = input && typeof input === "object" ? input : {};
+  const bots = readImBots(relayDir);
+  const cur = wecomCfgOf(bots);
+
+  // 只认契约字段；其余平台（feishu 等）与未知字段原样保留 —— 插件不认识它们，但没有权利删掉。
+  const next = {
+    enabled: cur.enabled,
+    botId: cur.botId,
+    secret: cur.secret,
+    url: cur.url,
+    targetChatId: cur.targetChatId,
+  };
+
+  if (Object.prototype.hasOwnProperty.call(src, "botId")) {
+    const botId = String(src.botId ?? "").trim();
+    if (botId && !WECOM_BOT_ID_RE.test(botId)) {
+      return { ok: false, code: "invalid_bot_id", message: "Bot ID 格式不对：应形如 aibxxxxxxxx（在企业微信「智能机器人」页面复制）" };
+    }
+    next.botId = botId;
+  }
+  if (Object.prototype.hasOwnProperty.call(src, "secret")) {
+    const secret = typeof src.secret === "string" ? src.secret.trim() : "";
+    // 空字符串 = **不修改**（面板不回显 secret，用户只改 Bot ID 时不该被迫重填）
+    if (secret) next.secret = secret;
+  }
+  if (Object.prototype.hasOwnProperty.call(src, "url")) {
+    const url = String(src.url ?? "").trim();
+    if (url && !IM_BOT_URL_RE.test(url)) {
+      return { ok: false, code: "invalid_url", message: "服务地址必须以 http:// 或 https:// 开头" };
+    }
+    next.url = url;
+  }
+  if (Object.prototype.hasOwnProperty.call(src, "targetChatId")) {
+    const cid = String(src.targetChatId ?? "").trim();
+    if (cid.length > 200) return { ok: false, code: "invalid_target_chat_id", message: "接收会话 ID 过长（最多 200 字）" };
+    next.targetChatId = cid;
+  }
+  if (Object.prototype.hasOwnProperty.call(src, "enabled")) next.enabled = !!src.enabled;
+  else if (!next.enabled && next.botId && next.secret) next.enabled = true; // 首次保存凭据 = 想让它生效
+
+  // 凭据完整性：Bot ID 与 Secret 缺一不可（secret 允许"沿用已保存的"，但最终必须存在）。
+  // 不做"只存 Bot ID、enabled=false"的半截配置 —— 那种文件桥读起来只会静默失效，用户以为配好了。
+  if (!next.botId) {
+    return { ok: false, code: "invalid_bot_id", message: "请先填写 Bot ID（在企业微信「智能机器人」页面复制，形如 aibxxxxxxxx）" };
+  }
+  if (!next.secret) {
+    return { ok: false, code: "missing_secret", message: "请先填写 Secret（企业微信智能机器人页面生成的密钥，只保存在本机）" };
+  }
+
+  const out = { ...bots, version: 1, wecom: next };
+  try {
+    writeImBots(relayDir, out);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, code: "write_failed", message: `配置保存失败：${e?.message || e}` };
+  }
+}
+
+/**
+ * POST /dsh-remote/im-bots/test：保存（若带凭据）→ 轮询桥写的状态文件 ≤ waitMs。
+ * 返回面板直接可渲染的结论：连接中 / 已连接 / 失败原因（桥的 lastError 原文照登）。
+ */
+async function imBotsTest(relayDir, waitMs, input) {
+  const hasInput = input && typeof input === "object" && Object.keys(input).length > 0;
+  if (hasInput) {
+    const saved = saveWecomConfig(relayDir, input);
+    if (!saved.ok) return { httpCode: 400, body: { ok: false, error: saved.code, message: saved.message } };
+  }
+  const w = wecomCfgOf(readImBots(relayDir));
+  if (!w.secret) {
+    return { httpCode: 400, body: { ok: false, error: "missing_secret", message: "还没有保存 Secret：请先填写并保存（Secret 只保存在本机）" } };
+  }
+  const startedAt = Date.now();
+  const total = Math.max(200, Number(waitMs) || IM_BOT_STATUS_WAIT_MS);
+  let last = wecomStatusOf(readImBotStatus(relayDir));
+  while (Date.now() - startedAt < total) {
+    if (last.connected) {
+      return { httpCode: 200, body: { ok: true, connected: true, authenticated: !!last.authenticated, lastError: last.lastError || "" } };
+    }
+    await new Promise((r) => { const t = setTimeout(r, IM_BOT_STATUS_POLL_MS); try { t.unref?.(); } catch { /* 忽略 */ } });
+    last = wecomStatusOf(readImBotStatus(relayDir));
+    if (last.lastError && !last.connected) break; // 桥已经明确报错：不用傻等到超时
+  }
+  if (last.connected) {
+    return { httpCode: 200, body: { ok: true, connected: true, authenticated: !!last.authenticated, lastError: last.lastError || "" } };
+  }
+  if (last.lastError) {
+    return { httpCode: 502, body: { ok: false, error: "connect_failed", lastError: last.lastError, message: `连接失败：${last.lastError}` } };
+  }
+  return { httpCode: 504, body: { ok: false, error: "timeout", message: "等待桥连接超时（10 秒内没有收到连接结果）。请确认电脑端 Bridge 在运行，然后重试。" } };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+
+function registerRoutes(ctx, relayDir, opts = {}) {
   // 本插件所在 profile：与配对备份的持久数据目录共用同一份推导（pluginProfileDir），
   // 避免"卸载删的目录"和"备份写的目录"各算各的（2026-10-17 双份备份加固时抽出）。
   const profileDir = pluginProfileDir();
@@ -8337,6 +8544,50 @@ function registerRoutes(ctx, relayDir) {
         await proxyCommunityInvite(relayDir, req, res, url.pathname);
       },
     },
+    // 🤖 IM 机器人通道（2026-11-07）：面板「通知与消息通道」弹层的数据面。
+    //   与其它 /dsh-remote/* 一样只在本机 webserver 上注册（跨站请求已被 localRequestBlocked 挡掉）。
+    //   ⚠️ secret 永不返回浏览器 —— 三个响应里都只有 hasSecret / lastError 这类非敏感字段。
+    // ⚠️ 用**一条** ALL 路由在 handler 内按 req.method 分发：webserver 的注册是按 path 的，
+    //    同一个 path 注册两条（GET/PUT）只会有一条生效 —— 那是 2026-11-07 本地实测踩到的坑
+    //    （面板保存打到了 GET 上，看着"没报错但没保存"）。feedback/announcements 用 prefix 同理。
+    {
+      method: "ALL",
+      path: "/dsh-remote/im-bots",
+      handler: async (req, res) => {
+        const method = String(req.method || "GET").toUpperCase();
+        if (method === "GET") {
+          sendJson(res, 200, imBotsView(relayDir));
+          return;
+        }
+        if (method !== "PUT") {
+          sendJson(res, 405, { ok: false, error: "method_not_allowed", message: "只支持 GET / PUT" });
+          return;
+        }
+        const body = await readJsonBody(req);
+        if (body.__parseError) return sendJson(res, 400, { ok: false, error: "bad_request", message: "请求体不是合法 JSON" });
+        const wecom = body && typeof body.wecom === "object" && body.wecom ? body.wecom : null;
+        if (!wecom) return sendJson(res, 400, { ok: false, error: "bad_request", message: "缺少 wecom 配置" });
+        const saved = saveWecomConfig(relayDir, wecom);
+        if (!saved.ok) return sendJson(res, 400, { ok: false, error: saved.code, message: saved.message });
+        sendJson(res, 200, imBotsView(relayDir));
+      },
+    },
+    {
+      method: "ALL",
+      path: "/dsh-remote/im-bots/test",
+      handler: async (req, res) => {
+        const method = String(req.method || "GET").toUpperCase();
+        if (method !== "POST") {
+          sendJson(res, 405, { ok: false, error: "method_not_allowed", message: "只支持 POST" });
+          return;
+        }
+        const body = await readJsonBody(req);
+        // body 可选：不传 = 只测**已保存**的配置；传 = 先保存再测（与面板「保存并连接」一次点完一致）
+        const wecom = body && !body.__parseError && typeof body.wecom === "object" && body.wecom ? body.wecom : null;
+        const r = await imBotsTest(relayDir, opts.imBotsWaitMs, wecom);
+        sendJson(res, r.httpCode, r.body);
+      },
+    },
   ];
 
   const disposers = [];
@@ -8680,7 +8931,10 @@ export function apply(ctx, config = {}) {
     markRestartPending(relayDir, "refresh", "插件已更新，刷新页面即可生效");
     ctx.logger?.info?.("dsh-remote-web: 插件文件晚于本次进程启动 → 提示刷新页面");
   }
-  ctx.effect(() => registerRoutes(ctx, relayDir), "dsh-remote-web: /dsh-remote routes");
+  ctx.effect(() => registerRoutes(ctx, relayDir, {
+    // 测试钩子：POST /dsh-remote/im-bots/test 的等待上限（默认 10s，见 imBotsTest 注释）。
+    imBotsWaitMs: Number(config.imBotsWaitMs) || undefined,
+  }), "dsh-remote-web: /dsh-remote routes");
   // 0.1.2-rc.1+ 浏览器会话代持：换取 Harness 会话 Cookie 供 bridge 上游携带（手机点设备不再 401 白页）
   ctx.effect(() => scheduleHarnessMint(ctx, relayDir), "dsh-remote-web: harness browser-session mint");
   // 目录选择器:远程控制下必须用浏览器内实现(否则手机点「添加工作区」像没反应) —— 见上方长注释

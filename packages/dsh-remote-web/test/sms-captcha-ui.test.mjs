@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
+import { openEntry } from "./lib-panel-ia.mjs";
 
 function walk(node, visit) {
   if (!node || typeof node !== "object") return;
@@ -24,7 +25,9 @@ test("账号状态未返回前只显示加载态且不暴露配置路径", () =>
   assert.match(source, /正在读取远控状态/);
   assert.match(source, /st\.config\.deviceId/);
   assert.doesNotMatch(source, /configPath/);
-  assert.match(source, /st !== null && !loggedIn/);
+  // IA 重做（2026-11-07）：登录不再隐藏功能 —— 未登录时主面板照常显示，入口卡写「登录后可同步」。
+  // （旧的 `st !== null && !loggedIn` 内联三元结构已随账号卡迁入弹层而消失，改锁新契约。）
+  assert.match(source, /登录后可同步/);
 });
 
 test("短信防刷要求图形验证码时，注册面板展示验证码并随重试提交", async () => {
@@ -97,7 +100,17 @@ test("短信防刷要求图形验证码时，注册面板展示验证码并随�
   // 面板入口已迁入设置页 settings.section 栏目（id=dsh-remote），不再有侧边栏入口/浮动面板
   const section = registered.get("dsh-remote");
   assert.ok(section, "settings.section 栏目组件应已注册");
-  const render = () => { hook = 0; return section({ close() {} }); };
+  let iaOpened = false;
+  const render = () => {
+    hook = 0;
+    let tree = section({ close() {} });
+    // IA 重做（2026-11-07）：登录/注册在「账号」弹层里 —— 按真实用户路径点开入口卡。
+    if (!iaOpened) {
+      iaOpened = true;
+      if (openEntry(tree, "account")) { hook = 0; tree = section({ close() {} }); }
+    }
+    return tree;
+  };
 
   states[0] = { config: { phone: "", deviceId: "dev-test" }, service: { running: false, plistExists: true } };
   let tree = render();

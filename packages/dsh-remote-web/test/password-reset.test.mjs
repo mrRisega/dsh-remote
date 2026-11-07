@@ -11,6 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import vm from "node:vm";
+import { openEntry } from "./lib-panel-ia.mjs";
 import { apply } from "../lib/index.js";
 
 const SOURCE = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
@@ -135,6 +136,7 @@ function loadPlugin(opts = {}) {
   const removed = [];
   const states = [];
   let hook = 0;
+  let iaOpened = false;
 
   const react = {
     createElement(type, props, ...children) { return { type, props: props || {}, children }; },
@@ -218,7 +220,15 @@ function loadPlugin(opts = {}) {
     requests,
     removed,
     states,
-    render() { hook = 0; return registered.get("dsh-remote")({ close() {} }); },
+    render() {
+      hook = 0;
+      let tree = registered.get("dsh-remote")({ close() {} });
+      if (!iaOpened) {
+        iaOpened = true;
+        if (openEntry(tree, opts.autoModal || "account")) { hook = 0; tree = registered.get("dsh-remote")({ close() {} }); }
+      }
+      return tree;
+    },
   };
 }
 

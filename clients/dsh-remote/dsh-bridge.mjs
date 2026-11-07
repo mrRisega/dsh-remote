@@ -118,6 +118,10 @@ import { createPushReporter } from "./push-reporter.mjs";
 import { createDecisionPoller } from "./decision-poller.mjs";
 import { createApprovalCoordinator } from "./approval-coordinator.mjs";
 import { createAgentRuntime } from "./agent/index.mjs";
+// 企业微信「智能机器人」长连接通道（task-21，2026-11-07）：Bot ID + Secret 直连官方 WebSocket，
+// 电脑在线即可双向联动。**默认关闭**：没有 `im-bots.json` / 未启用 / 缺凭据时什么都不起。
+// 与微信机器人通道（iLink 长轮询）互相独立：两条通道可同时开，也可以都不开。
+import { createWecomBotController } from "./wecom-bot.mjs";
 
 // ---------- 强制直连:清除代理环境变量 ----------
 // 家庭网络常配 Clash 等代理(127.0.0.1:7890),node 的 ws/fetch 会继承
@@ -3051,6 +3055,61 @@ async function stopWeChat() {
   }
 }
 
+/* ── 企业微信「智能机器人」长连接（task-21）──────────────────────────────────────
+ *
+ * 为什么默认关闭：这是**可选增强**，多一条常驻 WebSocket + 明文 secret 文件；
+ * 没有配置的用户不应该为此付任何代价（零连接、零文件、零日志噪音）。
+ *
+ * 启动条件（全部满足才起）：<relayDir>/im-bots.json 存在 && wecom.enabled === true
+ * && botId 与 secret 都非空。开关：
+ *   · DSH_IM_BOTS=0        —— 整个功能强制关闭（连配置都不看）
+ *   · DSH_IM_BOT_NOTIFY=0  —— 只关出站通知（入站转发照常）
+ *   · DSH_PUSH_REPORT=0    —— 既有推送总闸，同样关掉本通知（口径一致）
+ *
+ * 配置热更新由 controller 自己 fs.watchFile(2s) 完成（改凭据/停用都不需要重启 bridge）；
+ * 任何异常都只记日志 —— 绝不影响远程访问主链路。
+ */
+let imBots = null;
+
+function startImBots() {
+  try {
+    if (imBots) return;
+    imBots = createWecomBotController({
+      relayDir: RELAY_DIR,
+      // 订阅器要连的本机 dsh web：传取值器，宿主换端口时下一次重连能跟上
+      botOptions: {
+        upstream: () => currentUpstreamForChannel(),
+        cookie: harnessCookieOf
+      },
+      log: (level, message) => {
+        try {
+          if (level === "warn" || level === "error") console.warn(message);
+          else console.log(message);
+        } catch { /* 忽略 */ }
+      }
+    });
+    // 不 await：配置读取/连接都是可选增强，失败绝不影响隧道
+    void imBots.start().catch((e) => {
+      console.warn(`[bridge] 企业微信机器人通道启动失败(不影响远程访问): ${redactText(e)}`);
+    });
+  } catch (e) {
+    console.warn(`[bridge] 企业微信机器人通道初始化失败(不影响远程访问): ${redactText(e)}`);
+    imBots = null;
+  }
+}
+
+/** 优雅退出企业微信机器人通道（关长连接 + 停配置监听）。失败只记日志。 */
+async function stopImBots() {
+  const c = imBots;
+  imBots = null;
+  if (!c) return;
+  try {
+    await c.stop();
+  } catch (e) {
+    console.warn(`[bridge] 企业微信机器人通道停止失败(忽略): ${redactText(e)}`);
+  }
+}
+
 function redactText(e) {
   return String(e && e.message ? e.message : e).slice(0, 200);
 }
@@ -3193,6 +3252,8 @@ async function runTunnel() {
   startWeChat();
   // 同理：推送上报也是可选增强，最后起、失败静默
   startPushReporter();
+  // 企业微信「智能机器人」长连接（默认关闭；没有 im-bots.json 就是 no-op）
+  startImBots();
   // 多 Agent 运行时：默认关，只有 DSH_AGENT_ENABLED=1 **且** 推送通道已就绪时才起
   //（没有手机通道 = 审批无处可问，起了只会卡住用户）
   setTimeout(() => {
@@ -3248,6 +3309,8 @@ async function main() {
     // 多 Agent 运行时：关端口、删临时 settings、未决审批一律 deny（runtime 内部保证幂等）
     try { if (agentRuntime) await agentRuntime.stop(); } catch { /* 已内部兜底 */ }
     await stopWeChat();
+    // 企业微信机器人长连接：关连接 + 停配置监听（在 process.exit 之前）
+    await stopImBots();
     process.exit(0);
   };
   process.on("SIGTERM", () => { shutdown("SIGTERM"); });
