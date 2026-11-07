@@ -345,6 +345,31 @@ test("端到端：挂载失败必须中止安装，且**不写** patch（宁可�
   }
 });
 
+test("端到端：node_modules/<id> 是旧版整目录拷贝时，重装必须把版本刷到当前包（桌面端 hoisted 现场）", async () => {
+  const root = tmpDir();
+  try {
+    const profile = makeProfile(root);
+    await runInstaller(["plugin"], { DSH_PROFILE_DIR: profile });
+
+    // 复现桌面端现场：pnpm hoisted 的 file: 依赖是**整目录拷贝**，源目录升级后这份还是上一版，
+    // 且相邻 beta 的 lib/index.js 常逐字节相同 —— 只有 package.json 的版本号能说明它旧了。
+    const nm = path.join(profile, "node_modules", PLUGIN_ID);
+    fs.rmSync(nm, { recursive: true, force: true });
+    fs.cpSync(PLUGIN_SRC, nm, { recursive: true });
+    const currentPkg = JSON.parse(fs.readFileSync(path.join(PLUGIN_SRC, "package.json"), "utf8"));
+    fs.writeFileSync(path.join(nm, "package.json"),
+      JSON.stringify({ ...currentPkg, version: "0.0.0-old" }, null, 2) + "\n");
+
+    const r = await runInstaller(["plugin"], { DSH_PROFILE_DIR: profile });
+    assert.equal(r.code, 0, `重装应成功：${r.stdout}\n${r.stderr}`);
+    const after = JSON.parse(fs.readFileSync(path.join(nm, "package.json"), "utf8")).version;
+    assert.equal(after, currentPkg.version,
+      "★旧版整目录拷贝必须被重建，否则宿主继续 import 旧 package.json（面板版本号永远是旧的）");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 // ─────────────── ④ 自救入口：repair ───────────────
 
 test("repair：空壳现场能被修好，并打印挂载诊断三行", async () => {
