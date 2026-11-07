@@ -211,6 +211,38 @@ async function discoverUpstreamSelf(relayDir, { force = false } = {}) {
 }
 
 /**
+ * 上游地址是否已经"够用"（不需要在**响应路径里现扫**）。
+ * 【B1 · 2026-11-07】登录/首屏慢的主因之一就是在响应路径里 await 端口发现。
+ * 只要下面任一成立就够用：显式 env / 已知监听端口 / TTL 内的发现结果 / 测试隔离 / 平台模拟。
+ */
+function upstreamDiscoverySettled() {
+  // 测试钩子**最优先**（true=强制"未 settled"，false=强制"已 settled"；null=不干预）：
+  // DSH 宿主里跑测试时环境常带 DSH_WEB_URL（会被 boundWebPort 认成"已知端口"），
+  // 不放在最前面就没法模拟"端口未知、需要发现"的现场。
+  if (upstreamForceUnsettled === true) return false;
+  if (upstreamForceUnsettled === false) return true;
+  if (String(process.env.DSH_BRIDGE_UPSTREAM || "").trim()) return true;
+  if (boundWebPort()) return true;
+  if (discoveredUpstream.url && Date.now() - discoveredUpstream.at < UPSTREAM_DISCOVERY_TTL_MS) return true;
+  if (skipsSystemOps()) return true;
+  if (osPlatform() !== process.platform) return true;
+  return false;
+}
+
+/** 测试钩子：替换发现实现 / 强制"未 settled"（只给用例用，生产永远走真实实现）。 */
+let discoverImpl = discoverUpstreamSelf;
+let upstreamForceUnsettled = null;
+function setUpstreamTestState(opts = {}) {
+  if (typeof opts.discover === "function") discoverImpl = opts.discover;
+  if (typeof opts.unsettled === "boolean") upstreamForceUnsettled = opts.unsettled;
+  return { discover: discoverImpl, unsettled: upstreamForceUnsettled };
+}
+function resetUpstreamTestState() {
+  discoverImpl = discoverUpstreamSelf;
+  upstreamForceUnsettled = null;
+}
+
+/**
  * 把上游地址落盘（`<relayDir>/.dsh-upstream`），供**没有环境变量**的那些守护读取：
  * 开机自启的 watcher（Windows 登录任务 / launchd）由系统拉起，拿不到本进程的 env，
  * 只有插件半知道 dsh web 真实监听在哪个端口。运行时（0.6.12+）读这个文件当第二优先来源。
@@ -1461,7 +1493,7 @@ function writeLinuxUnit(relayDir) {
   if (!unitPath) return null;
   const setup = join(relayDir, "dsh-setup.mjs");
   const unit = `[Unit]
-Description=dsh-remote bridge (auto-starts with dsh web)
+Description=dsh-remote-web bridge (auto-starts with dsh web)
 
 [Service]
 ExecStart=${NODE_BIN} ${setup} run
@@ -1647,6 +1679,31 @@ function launchTarget() {
  * 仅在 print 本身不可用时才回退 list，且回退路径要求 pid 真实存活。
  */
 const NO_LAUNCHD = { running: false, pid: null, state: "", runs: null, lastExitCode: null, crashing: false };
+
+// ── B1：shell 探测短 TTL 缓存（2026-11-07 登录慢优化）─────────────────────────────
+// launchctl / ps / systemctl 每次调用都是一次进程 spawn（实测 30~120ms，慢机器更久），
+// 而状态轮询 2.5s 一次会反复重跑同一份"没变"的事实。这里给 10s TTL：
+//   · 结论按 key 缓存；**变更动作（启动/停止/卸载/账号切换）会主动清缓存**，不会让面板显示过期状态。
+const STATUS_PROBE_TTL_MS = 10 * 1000;
+const statusProbeCache = new Map();
+function memoStatusProbe(key, fn) {
+  // 测试/诊断隔离下**不缓存**：这类环境里 shell 探测是假命令/假结果（skipsSystemOps 或 DSH_TEST_*
+  // 注入的 fake PATH），缓存只会让用例互相污染（一个用例伪造的 pid/服务状态被下一个用例读到 → 假红）。
+  // 生产路径（真实 launchctl/ps）才走 10s TTL。
+  if (skipsSystemOps()) return fn();
+  try {
+    if (Object.keys(process.env).some((k) => k.startsWith("DSH_TEST_"))) return fn();
+  } catch { /* 忽略 */ }
+  const now = Date.now();
+  const hit = statusProbeCache.get(key);
+  if (hit && now - hit.at < STATUS_PROBE_TTL_MS) return hit.value;
+  const value = fn();
+  statusProbeCache.set(key, { at: now, value });
+  return value;
+}
+function clearStatusProbeCache() {
+  try { statusProbeCache.clear(); } catch { /* 忽略 */ }
+}
 
 function launchdStatus() {
   // 非 macOS 没有 launchctl（Windows 上连 process.getuid 都没有）：直接返回「无此服务」，
@@ -2655,6 +2712,7 @@ function stopBridgeDetached(relayDir, opts = {}) {
 
 /** 启动 bridge：确保运行环境就绪 + plist 存在 → launchctl bootstrap（回退 load -w）。 */
 function startBridge(relayDir) {
+  clearStatusProbeCache(); // B1：状态变更 → 立刻作废 shell 探测缓存，避免显示过期状态
   if (UNINSTALLED_DIRS.has(relayDir)) {
     // 已彻底卸载：面板/自愈在重启前可能仍在内存中，禁止再把自启动与 plist 拉回来
     return { ok: false, status: "uninstalled", detail: "插件已彻底卸载，重启 dsh web 后生效" };
@@ -2872,6 +2930,7 @@ const lastSelfhealReadyLine = new Map();
 
 /** 停止 bridge：macOS 走 launchctl bootout；Linux 走 systemd/脱离进程；Windows 结束 watcher/bridge 进程。 */
 function stopBridge(relayDir) {
+  clearStatusProbeCache(); // B1：状态变更 → 立刻作废 shell 探测缓存，避免显示过期状态
   if (isWindows()) return stopBridgeDetached(relayDir);
   // 测试隔离：置位时绝不对真实 launchd/systemd 下手（切换账号也会走到这里，
   // 少了这一条，用例就会去 bootout 开发者本机上真实运行的 bridge —— 实测过的污染风险）。
@@ -4008,8 +4067,9 @@ function maskPhone(p) {
 
 async function composeStatus(relayDir) {
   const cfg = loadConfig(relayDir);
-  const launchd = launchdStatus();
-  const manual = manualStatus(relayDir);
+  // B1：同样的 10s 缓存（状态轮询时不重复 spawn launchctl/ps）。
+  const launchd = memoStatusProbe("launchd", launchdStatus);
+  const manual = memoStatusProbe("manual:" + relayDir, () => manualStatus(relayDir));
   // 注册/绑定失败提示(bridge 写 .bind-error.json;面板据此展示“已达上限/需解绑”引导)
   let bindError = null;
   try {
@@ -5704,12 +5764,18 @@ async function accountDeviceBound(relayDir, cfg) {
  */
 async function composeConnect(relayDir, opts = {}) {
   const cfg = opts.cfg || loadConfig(relayDir);
-  // 【0.6.15】上游端口问不出来时，先主动发现一次再算阶段：否则诊断里永远是"3080 不可达"，
-  // 而用户的 dsh web 其实好好地跑在 2298（飞牛/NAS 实测）—— 面板与用户都会往"改端口"这个
-  // 错误方向使劲。发现很快（本机回环，全失败也就几百毫秒），失败不影响任何既有行为。
-  await discoverUpstreamSelf(relayDir).catch(() => FALLBACK_UPSTREAM);
-  const launchd = opts.launchd || launchdStatus();
-  const manual = opts.manual || manualStatus(relayDir);
+  // 【B1 · 2026-11-07 登录慢优化】端口发现**绝不再阻塞状态/登录响应**：
+  //   · 已有可用结论（显式 env / 已知监听端口 / TTL 内的发现结果 / 测试隔离）→ 直接用；
+  //   · 否则**放后台**跑（void），本次先用 hint/回退地址把状态返回 —— 首屏不再等信息；
+  //     发现完成后的结果会在下一次状态轮询自然带上（面板每 2.5~30s 轮询，无需推送）。
+  //   旧实现的 await 会把 lsof/netstat + 数百端口探测整个塞进首屏路径（业主实测 7~8 秒）。
+  const discoverySettled = upstreamDiscoverySettled();
+  if (!discoverySettled) {
+    void discoverImpl(relayDir).catch(() => FALLBACK_UPSTREAM);
+  }
+  // B1：这两次 shell 探测走 10s TTL 缓存（见 memoStatusProbe）；变更动作会清缓存。
+  const launchd = opts.launchd || memoStatusProbe("launchd", launchdStatus);
+  const manual = opts.manual || memoStatusProbe("manual:" + relayDir, () => manualStatus(relayDir));
   const book = connectBook(relayDir);
   const now = Date.now();
   const hasAcct = hasAccountCreds(cfg);
@@ -5958,6 +6024,8 @@ async function composeConnect(relayDir, opts = {}) {
     selfhealExhausted: selfhealGuardOf(relayDir).count >= SELFHEAL_MAX_RESTARTS,
     upstreamUrl: upstreamUrl(),
     upstreamSource: upstreamSourceLabel(),
+    // B1：这次响应是否"端口发现还没完成、已放后台跑"（只作诊断/文案；下一次轮询会自然收敛）
+    discoveryPending: Boolean(!discoverySettled),
     // 宿主形态：桌面端（Electron）与 Web 版（node）在若干动作上语义不同 ——
     // 最典型的是「重启 DeepSeek harness」在桌面端做不到也不该做（Host 由 Electron 托管，
     // 强行退出会弹原生致命错误）。面板据此改文案/去掉无意义的按钮，而不是等用户点了才失败。
@@ -7627,6 +7695,24 @@ function wecomStatusOf(status) {
     boundSessionId: str(w.boundSessionId),
     // 「上次预览卡片」已处理到的时间戳（桥写；面板只用来显示「上次预览：HH:MM」）
     lastPreviewCardAt: num(w.lastPreviewCardAt),
+    // ── 会员档位 / 额度（2026-11-07 桥侧新增，字段名锁死；只白名单，不整包吐）──
+    // tier 只认三个枚举值；拿不到就是空串（面板据此**不渲染**档位条，绝不猜）。
+    tier: (() => {
+      const t = str(w.tier);
+      return (t === "free" || t === "pro" || t === "pro_max") ? t : "";
+    })(),
+    // caps 是字符串数组：逐个转字符串 + 截断 + 上限 50 条（桥以后往里塞对象也别透出去）
+    caps: (Array.isArray(w.caps) ? w.caps : []).slice(0, 50).map((c) => str(c).slice(0, 80)).filter(Boolean),
+    capsCount: num(w.capsCount),
+    bindingGated: !!w.bindingGated,
+    messagesPerMonth: num(w.messagesPerMonth),
+    // null = 不限或未知（**必须和 0 区分**：0 条剩余 ≠ 不限量）
+    remainingMessages: typeof w.remainingMessages === "number" && Number.isFinite(w.remainingMessages) ? w.remainingMessages : null,
+    usage: (() => {
+      const u = w.usage && typeof w.usage === "object" ? w.usage : null;
+      if (!u) return null;
+      return { month: str(u.month), messages: num(u.messages) };
+    })(),
     sessions: (Array.isArray(w.sessions) ? w.sessions : []).slice(0, 50).map(function (it) {
       const o = it && typeof it === "object" ? it : {};
       return {
@@ -8290,7 +8376,26 @@ function registerRoutes(ctx, relayDir, opts = {}) {
         const bridgeRestart = startBridge(relayDir);
         // 登录成功即上报本机安装信息（企业端用于「升级插件后刷新版本号」约定）；失败静默。
         maybeReportInstall(relayDir, { force: true });
-        sendJson(res, 200, { ok: true, bridgeRestart, ...(await composeStatus(relayDir)) });
+        // 【B2 · 2026-11-07】登录响应**立即返回**：旧实现 `...(await composeStatus())` 会把
+        // 端口发现 / launchctl+ps / 中继探测全塞进登录路径（业主实测 7~8 秒）。
+        // 这里只回"保存成功 + bridge 重启结果 + 最小配置回显"，衍生信息由面板登录后异步拉
+        // （GET /dsh-remote/status & /bridge-status），UI 已经先切到已登录态。
+        const cfgEcho = loadConfig(relayDir);
+        sendJson(res, 200, {
+          ok: true,
+          bridgeRestart,
+          statusPending: true,
+          config: {
+            phone: maskPhone(cfgEcho.phone || ""),
+            hasPhone: Boolean(cfgEcho.phone),
+            hasPassword: Boolean(cfgEcho.password),
+            deviceId: cfgEcho.device_id || "",
+            apiUrl: cfgEcho.api_url || DEFAULT_API,
+            mode: cfgEcho.local_key ? "local" : "saas",
+            selfHostUrl: cfgEcho.tunnel_url ? String(cfgEcho.tunnel_url).replace(/^wss?:\/\//, "").replace(/\/+$/, "") : "",
+            hasLocalKey: Boolean(cfgEcho.local_key)
+          }
+        });
       },
     },
     {
@@ -9025,6 +9130,11 @@ export { pinBrowseDirectoryPicker as __pinBrowseDirectoryPicker, schedulePickerP
   setupStateOf as __setupStateOf, ensureConnection as __ensureConnection,
   // 设备超额锁定（契约 §8）：面板文案 / 插件半设备绑定退避都要能被单测钉住
   composeConnect as __composeConnect, readBindError as __readBindError, bindFailGate as __bindFailGate,
+  // B1（2026-11-07 登录慢）：端口发现是否阻塞、shell 探测 TTL 缓存、状态组装都要能被单测钉住
+  composeStatus as __composeStatus, launchdStatus as __launchdStatus,
+  clearStatusProbeCache as __clearStatusProbeCache, upstreamDiscoverySettled as __upstreamDiscoverySettled,
+  setUpstreamTestState as __setUpstreamTestState, resetUpstreamTestState as __resetUpstreamTestState,
+  STATUS_PROBE_TTL_MS as __STATUS_PROBE_TTL_MS,
   bindFailSignatureOf as __bindFailSignatureOf, isPermanentBindFailure as __isPermanentBindFailure,
   bindCapBackoffMs as __bindCapBackoffMs, connectBook as __connectBook, noteBindFailAttempt as __noteBindFailAttempt,
   DEVICE_BIND_CAP_EXIT_CODE as __DEVICE_BIND_CAP_EXIT_CODE, BIND_CAP_BACKOFF_MAX_MS as __BIND_CAP_BACKOFF_MAX_MS,

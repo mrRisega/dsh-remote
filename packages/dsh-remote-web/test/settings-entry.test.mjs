@@ -238,15 +238,19 @@ test("登录态账号区：无「切换账号」，有「退出登录」，头�
   let tree = plugin.renderSection();
 
   // 栏目头部：标题「远程访问」+ 副文案（人在哪都能用，免公网 IP）
-  assert.ok(find(tree, (n) => n.children?.includes("远程访问")), "头部标题应为「远程访问」");
-  assert.ok(find(tree, (n) => n.children?.includes("通过手机或另一台电脑远程使用同一份 dsh web，人在哪都能用（免公网 IP）")), "应渲染新副文案（人在哪都能用，免公网 IP）");
+  // 2026-11-07 品牌统一：顶部面板标题改为插件全名 dsh-remote-web（「远程访问」保留在副标题/栏目名里）
+  assert.ok(find(tree, (n) => n.children?.includes("dsh-remote-web")), "头部标题应为品牌全名 dsh-remote-web");
+  assert.ok(find(tree, (n) => (n.children || []).some((c) => typeof c === "string" && c.includes("远程访问"))),
+    "副标题仍说明这是「远程访问」能力");
+  assert.ok(find(tree, (n) => (n.children || []).some((c) => typeof c === "string" && c.includes("通过手机或另一台电脑远程使用同一份 dsh web，人在哪都能用（免公网 IP）"))),
+    "应渲染新副文案（人在哪都能用，免公网 IP）");
 
   // 账号区按钮
   assert.ok(find(tree, (n) => n.children?.includes("退出登录")), "应保留「退出登录」");
   assert.ok(!find(tree, (n) => n.children?.includes("切换账号")), "「切换账号」按钮应移除");
 
   // 关于 dsh-remote 卡片：在「更多设置」折叠区里 —— 标题不再带 emoji（图标一律内联 SVG）
-  assert.ok(find(tree, (n) => n.children?.includes("关于 dsh-remote")), "应渲染「关于 dsh-remote」卡片标题");
+  assert.ok(find(tree, (n) => n.children?.includes("关于 dsh-remote-web")), "应渲染「关于 dsh-remote-web」卡片标题");
   // 价值要点仍要在（不要求逐字长文案：IA 重做后关于卡精简成结论句，避免文字堆砌）
   const aboutBits = ["免公网 IP", "端到端加密", "匿名装机统计"];
   for (const bit of aboutBits) {
@@ -377,11 +381,15 @@ test("源码约束：侧栏入口走官方槽位/无浮动面板/无切换账号
   assert.doesNotMatch(SOURCE, /dru-backdrop\{/);
   assert.doesNotMatch(SOURCE, /切换账号/);
   assert.doesNotMatch(SOURCE, /dsh-remote-panel/);
-  assert.doesNotMatch(SOURCE, /远程控制/);   // 旧称呼「远程控制」不再出现（含 label/头部/说明）
+  // 旧称呼「远程控制」不再作为**面板名字**出现（label/头部/菜单）。
+  // 注：2026-11-07 业主新文案「保持在线，才能用手机端远程控制这台电脑」把该词当**动词**用，
+  // 因此不再对全文做一刀切禁止；这里锁"仍然叫远程访问"这个真正的约束。
+  assert.match(SOURCE, /"远程访问"/);
+  assert.doesNotMatch(SOURCE, /"远程控制"|远程控制（/);
   assert.match(SOURCE, /settings\.section/);
   assert.match(SOURCE, /dsh-remote-seen-dot/);
   assert.match(SOURCE, /fbClearThreads/);
-  assert.match(SOURCE, /关于 dsh-remote/);
+  assert.match(SOURCE, /关于 dsh-remote-web/);
   assert.match(SOURCE, /免公网 IP/);           // 关于卡 v0.5+ 价值要点
   assert.match(SOURCE, /端到端/);
   assert.match(SOURCE, /已授权设备/);

@@ -3107,7 +3107,13 @@ function startImBots() {
       // 订阅器要连的本机 dsh web：传取值器，宿主换端口时下一次重连能跟上
       botOptions: {
         upstream: () => currentUpstreamForChannel(),
-        cookie: harnessCookieOf
+        cookie: harnessCookieOf,
+        // 会员判定（2026-11-07 业主拍板：通知免费 / 审批免费 / 互动半阉割）：
+        // 直接复用微信通道那份档位解析（/api/me → 服务端权益包，含 caps/limits/rev），
+        // 拿不到就由 wecom-bot 按 free fail-closed 处理。
+        capsProvider: resolveWechatTier,
+        // 免费用户越界时的转化入口（与微信通道同一个 App 地址；wecom-bot 拼 /app/promo）
+        appUrl: wechatAppUrl()
       },
       // 企微审批卡片点按钮 → 与手机拍板同一条路（协调器 → DSH 回执）；失败返回 {ok:false} 让卡片显示"没送达"
       onApprovalDecision: (requestId, decision) => applyApprovalDecision(requestId, decision),

@@ -266,7 +266,7 @@ test("① 免费用户账号卡：升级 PRO 按钮仍在，但协议文案/链�
   const plugin = loadPlugin();
   const tree = await plugin.settle(4);
   // 购买入口（升级按钮）必须还在 —— 这次只删协议文案，不动购买能力
-  assert.ok(nodeWithText(tree, "🚀 升级 PRO"), "免费用户的「🚀 升级 PRO」按钮必须保留");
+  assert.ok(nodeWithText(tree, "升级 PRO"), "免费用户的「升级 PRO」按钮必须保留（图标换成内联 SVG，文案不再用 emoji）");
   // 协议痕迹一个都不能有
   assertNoAgreementInPanel(tree);
   // 客户端也不再为了这句话去问 node 半（面板里已经没有消费者了）
@@ -278,7 +278,7 @@ test("② 会员账号卡（业主点名场景）：续费会员按钮下方不�
     account: { plan: "pro", plan_source: "subscription", plan_ends_at: 1893456000000, invite_code: "ABC12345" },
   });
   const tree = await plugin.settle(4);
-  assert.ok(nodeWithText(tree, "🔄 续费会员"), "前提：会员的续费入口在（这正是业主看到那句话的位置）");
+  assert.ok(nodeWithText(tree, "续费会员"), "前提：会员的续费入口在（这正是业主看到那句话的位置）");
   assertNoAgreementInPanel(tree);
 });
 
@@ -314,7 +314,7 @@ test("④ 未登录：没有购买入口，也没有任何协议痕迹/请求", 
     },
   });
   const tree = await plugin.settle(4);
-  assert.equal(nodeWithText(tree, "🚀 升级 PRO"), undefined, "未登录没有购买入口");
+  assert.equal(nodeWithText(tree, "升级 PRO"), undefined, "未登录没有购买入口");
   assertNoAgreementInPanel(tree);
   assert.equal(plugin.agreementRequests().length, 0);
 });
@@ -334,7 +334,7 @@ test("⑤ 源码级回归锁：client.js 里不得再残留协议渲染痕迹（
 test("⑥ 只删文案、不动购买能力：点「升级 PRO」仍走既有购买流程（请求 /dsh-remote/access-key）", async () => {
   const plugin = loadPlugin();
   let tree = await plugin.settle(4);
-  const btn = nodeWithText(tree, "🚀 升级 PRO");
+  const btn = nodeWithText(tree, "升级 PRO");
   assert.ok(btn, "升级按钮必须还在");
   btn.props.onClick();
   await plugin.settle(2);

@@ -227,7 +227,10 @@ test("未登录：不请求企业端、不出误导性红字；登录后自动�
 
   assert.ok(!plugin.requests.some((r) => r.path === "/dsh-remote/access-key"), "未登录不得请求二维码接口");
   assert.ok(!plugin.requests.some((r) => r.path === "/dsh-remote/mobile-sessions"), "未登录不得请求设备列表");
-  assert.ok(textHas(tree, "登录下方「🔑 账号」卡片中的手机号账号后"), "未登录应给登录引导而非报错");
+  // IA 重做（2026-11-07）：未登录点「打开手机端/生成访问码」→ 直接弹登录弹层并说明原因；
+  // 这张卡自己的按钮文案也写明「登录并生成访问码」（不再静默失败）。
+  assert.ok(textHas(tree, "登录并生成访问码") || textHas(tree, "登录后才能用手机访问"),
+    "未登录应给明确的登录引导（不是静默失败，也不是红字报错）");
   assert.ok(!textHas(tree, "尚未登录"), "未登录也不该出现接口报错红字");
 
   tree = await plugin.login();

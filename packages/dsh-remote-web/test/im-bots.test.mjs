@@ -357,3 +357,44 @@ test("PUT previewCardAt：非法值（非数字 / 0 / 负数）→ 400 invalid_p
     assert.equal(cfg.wecom.previewCardAt, 0, "非法触发值绝不能写进文件（桥会永久失效且难排查）");
   });
 });
+
+// ─────────────────── 会员档位 / 额度（2026-11-07 桥侧判定） ───────────────────
+
+test("GET：白名单透出 tier/caps/capsCount/bindingGated/messagesPerMonth/remainingMessages/usage", async () => {
+  const relayDir = await tmpRelay();
+  await withHost(relayDir, {}, async (base) => {
+    await writeStatus(relayDir, {
+      enabled: true, connected: true, tier: "free",
+      caps: ["wecom", "session_binding"], capsCount: 2, bindingGated: true,
+      messagesPerMonth: 20, remainingMessages: 7,
+      usage: { month: "2026-11", messages: 13 },
+      // 攻击面：状态文件里的内部字段/额外字段绝不能被整包吐出去
+      secret: "LEAK", capsRaw: { internal: "LEAK2" }, extra: "LEAK3",
+    });
+    const r = await json(`${base}/dsh-remote/im-bots`);
+    const st = r.body.status;
+    assert.equal(st.tier, "free");
+    assert.deepEqual(st.caps, ["wecom", "session_binding"], "caps 只取字符串数组（截断/过滤），不得透出对象");
+    assert.equal(st.capsCount, 2);
+    assert.equal(st.bindingGated, true);
+    assert.equal(st.messagesPerMonth, 20);
+    assert.equal(st.remainingMessages, 7);
+    assert.deepEqual(st.usage, { month: "2026-11", messages: 13 });
+    assert.ok(!JSON.stringify(r.body).includes("LEAK"), "★ 白名单之外的状态字段绝不能被透出");
+  });
+});
+
+test("GET：tier 只认三个枚举值；remainingMessages=null 表示不限/未知（不能被当成 0）", async () => {
+  const relayDir = await tmpRelay();
+  await withHost(relayDir, {}, async (base) => {
+    await writeStatus(relayDir, { tier: "gold", remainingMessages: null, messagesPerMonth: 0 });
+    let st = (await json(`${base}/dsh-remote/im-bots`)).body.status;
+    assert.equal(st.tier, "", "未知档位必须归一成空串（面板据此不渲染，绝不猜）");
+    assert.equal(st.remainingMessages, null, "null 必须保持 null（0 条剩余 ≠ 不限量）");
+    assert.equal(st.messagesPerMonth, 0);
+
+    await writeStatus(relayDir, { tier: "pro_max", remainingMessages: null });
+    st = (await json(`${base}/dsh-remote/im-bots`)).body.status;
+    assert.equal(st.tier, "pro_max");
+  });
+});

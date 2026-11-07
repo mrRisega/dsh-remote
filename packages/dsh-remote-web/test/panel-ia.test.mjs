@@ -75,6 +75,12 @@ function domIndex(tree, predicate) {
 }
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
+/** 收集所有匹配节点（用例里要数"有几个单选"这类）。 */
+function findAll(tree, predicate) {
+  const out = [];
+  walk(tree, (n) => { if (predicate(n)) out.push(n); });
+  return out;
+}
 /** 子树全部文本（拼接；用于"卡片文案/按钮文案"断言）。 */
 function textOf(node) {
   let out = "";
@@ -92,6 +98,7 @@ function loadPlugin(opts = {}) {
   const metas = [];
   const injects = new Map();
   const requests = [];
+  const clipboard = [];
   let unmounted = false;
 
   // ── 迷你 React：真实 useState/useEffect + 递归展开**函数子组件** ──
@@ -223,7 +230,7 @@ function loadPlugin(opts = {}) {
     document: doc,
     localStorage,
     MutationObserver: MutationObserverMock,
-    navigator: { clipboard: { writeText: async () => {} } },
+    navigator: { clipboard: { writeText: async (t) => { clipboard.push(String(t)); } } },
     setTimeout: fakeSetTimeout,
     clearTimeout: fakeClear,
     setInterval: fakeSetInterval,
@@ -299,7 +306,7 @@ function loadPlugin(opts = {}) {
   }
 
   return {
-    requests, metas, injects,
+    requests, metas, injects, clipboard,
     counts() { return { ...counts }; },
     /** 设置页栏目列表（模拟 shell 的 ctx.slots.entries("settings.section")，按 order 排序）。 */
     sectionList() { return metas.filter((m) => m.name === "settings.section").slice().sort((a, b) => a.order - b.order); },
@@ -795,4 +802,195 @@ test("发送预览卡片：已绑定（boundChatId 非空）→ 不显示未绑�
   const tree = await openWecom(plugin);
   assert.ok(!textOf(tree).includes("先在企微里给机器人发一句话完成绑定"), "已绑定就不该再提示未绑定");
   assert.ok(textOf(tree).includes("上次预览：09:07"), "应显示上次预览时间（HH:MM）");
+});
+
+// ───────────── ⑨ 未登录守卫 + 后台服务横排 + 卸载挽留（2026-11-07 业主逐条）─────────────
+
+test("未登录「手机访问」卡：文案写「登录并生成访问码」，点击弹登录弹层；登录成功后自动回到手机访问", async () => {
+  const plugin = loadPlugin();
+  plugin.setSignedIn(false);
+  let tree = await plugin.settle();
+  const card = find(tree, (n) => String(n.props?.className || "").includes("dru-ia-card")
+    && textOf(n).includes("手机访问"));
+  assert.ok(card, "入口网格里应有「手机访问」卡");
+  assert.ok(textOf(card).includes("登录并生成访问码"), "未登录时按钮文案必须是「登录并生成访问码」（不是静默失败）");
+  const btn = find(card, (n) => n.type === "button");
+  btn.props.onClick();
+  tree = await plugin.settle();
+  assert.ok(textOf(tree).includes("登录后才能用手机访问"), "点击后弹登录弹层并说明原因");
+
+  // 登录成功 → 自动回到「手机访问」流程（iaAfterLogin 回跳），不再让用户自己再找一遍
+  plugin.setSignedIn(true);
+  tree = await plugin.settle(4);
+  assert.ok(textOf(tree).includes("手机访问"), "登录后应回到手机访问流程");
+  const dlg = find(tree, (n) => String(n.props?.className || "").split(/\s+/).includes("dru-ia-dialog"));
+  assert.ok(dlg, "登录后应自动打开手机访问弹层");
+});
+
+test("后台服务区块（A6）：显眼提示 + 横向紧凑网格（状态/启停/自启动/设备ID 不再竖排占屏）", async () => {
+  const plugin = loadPlugin();
+  const tree = await plugin.settle();
+  assert.ok(textOf(tree).includes("保持在线，才能用手机端远程控制这台电脑"), "必须有「保持在线」提示（业主点名）");
+  const grid = find(tree, (n) => String(n.props?.className || "") === "dru-bridge-grid");
+  assert.ok(grid, "后台服务应为横向网格布局（.dru-bridge-grid）");
+  const cells = byClass(grid, "dru-bridge-cell");
+  assert.ok(cells.length >= 4, "网格应含 4 格：状态 / 启停 / 自启动 / 设备 ID，实际 " + cells.length);
+  assert.ok(cells.some((c) => textOf(c).includes("设备 ID")), "设备 ID 在网格里（横向）");
+});
+
+test("彻底卸载（A7）：先弹挽留反馈（原因单选 + 建议）→ 提交走现有反馈通道 → 才继续卸载", async () => {
+  const plugin = loadPlugin();
+  let tree = await plugin.settle();
+  const unBtn = btnWith(tree, "彻底卸载");
+  assert.ok(unBtn, "应有「彻底卸载」按钮");
+  unBtn.props.onClick();
+  tree = await plugin.settle();
+  const dlg = find(tree, (n) => String(n.props?.className || "").split(/\s+/).includes("dru-ia-dialog"));
+  assert.ok(dlg, "点彻底卸载应先弹挽留反馈弹层");
+  assert.ok(textOf(dlg).includes("为什么要卸载"), "弹层要问「为什么要卸载？」；实际=" + textOf(dlg).slice(0, 200));
+  const radios = findAll(dlg, (n) => n.type === "input" && n.props?.type === "radio");
+  assert.ok(radios.length >= 4, "应有多个原因单选，实际 " + radios.length);
+  assert.ok(find(dlg, (n) => n.type === "textarea"), "应有可填建议的输入框");
+  assert.ok(btnWith(dlg, "我再想想"), "必须有「我再想想」退出选项");
+  // 未选原因就点「仍要卸载」→ 就近报错，且不提交/不卸载
+  const before = plugin.requests.length;
+  btnWith(dlg, "仍要卸载").props.onClick();
+  tree = await plugin.settle();
+  assert.ok(textOf(tree).includes("请选择一个卸载原因"), "未选原因要给就近错误");
+  const after = plugin.requests.slice(before).map((r) => r.path);
+  assert.ok(!after.includes("/dsh-remote/feedback"), "未选原因不得提交反馈（" + after.join(",") + "）");
+  assert.ok(!after.includes("/dsh-remote/self/uninstall"), "未选原因更不得开始卸载");
+
+  // 选一个原因 + 写建议 → 仍要卸载：先 POST 反馈（kind=uninstall），再 POST 卸载
+  const r0 = findAll(tree, (n) => n.type === "input" && n.props?.type === "radio")[0];
+  r0.props.onChange({ target: { value: r0.props.value } });
+  tree = await plugin.settle();
+  const note = find(tree, (n) => n.type === "textarea");
+  note.props.onChange({ target: { value: "加载太慢，希望优化" } });
+  tree = await plugin.settle();
+  btnWith(tree, "仍要卸载").props.onClick();
+  await flush(); await flush(); await flush();
+  const fb = plugin.requests.find((r) => r.path === "/dsh-remote/feedback" && r.method === "POST");
+  assert.ok(fb, "★ 必须先提交挽留反馈（复用现有反馈通道，不新增后端）");
+  assert.equal(fb.body.kind, "uninstall", "反馈必须带 kind=uninstall 标记");
+  assert.ok(String(fb.body.content).includes("原因"), "反馈内容要含所选原因");
+  assert.ok(String(fb.body.content).includes("加载太慢"), "用户填的建议要带上");
+  assert.ok(plugin.requests.some((r) => r.path === "/dsh-remote/self/uninstall" && r.method === "POST"),
+    "★ 提交反馈后应继续执行卸载（反馈不能反过来卡住用户）");
+});
+
+// ───────────────────── ⑩ 会员档位条 + 会话固定门禁（2026-11-07 桥侧判定） ─────────────────────
+
+test("企微配置页档位条：免费档 → 「本月剩余 N 条指令（每月 20 条）」+ 「升级 Pro 不限量」链接", async () => {
+  const plugin = loadPlugin();
+  plugin.setImBotsGet({
+    ok: true,
+    wecom: { enabled: true, botId: "aibdemo1234", hasSecret: true, url: "", targetChatId: "", sessionId: "", sessionTitle: "" },
+    status: {
+      connected: true, authenticated: true, tier: "free",
+      messagesPerMonth: 20, remainingMessages: 7, usage: { month: "2026-11", messages: 13 },
+      bindingGated: false, caps: ["wecom"], capsCount: 1,
+      sessions: [], activeSessionId: "", boundSessionId: "",
+    },
+  });
+  const tree = await openWecom(plugin);
+  const tierBar = find(tree, (n) => String(n.props?.className || "").includes("dru-ia-tier"));
+  assert.ok(tierBar, "免费档应渲染档位条");
+  assert.ok(textOf(tierBar).includes("免费档"), "档位条要写明「免费档」");
+  assert.ok(textOf(tierBar).includes("本月剩余 7 条指令"), "要显示剩余指令数");
+  assert.ok(textOf(tierBar).includes("每月 20 条"), "要显示每月上限");
+  const link = find(tierBar, (n) => n.type === "a");
+  assert.ok(link, "免费档必须有升级入口");
+  assert.equal(link.props.href, "/app/promo", "升级链接指向 /app/promo");
+  assert.ok((link.children || []).join("").includes("升级 Pro 不限量"));
+});
+
+test("企微配置页档位条：pro / pro_max → 「会员档 · 指令不限」，不出现升级链接", async () => {
+  for (const tier of ["pro", "pro_max"]) {
+    const plugin = loadPlugin();
+    plugin.setImBotsGet({
+      ok: true,
+      wecom: { enabled: true, botId: "aibdemo1234", hasSecret: true, url: "", targetChatId: "", sessionId: "", sessionTitle: "" },
+      status: { connected: true, authenticated: true, tier, bindingGated: false, sessions: [], activeSessionId: "", boundSessionId: "" },
+    });
+    const tree = await openWecom(plugin);
+    const tierBar = find(tree, (n) => String(n.props?.className || "").includes("dru-ia-tier"));
+    assert.ok(tierBar, tier + " 应渲染档位条");
+    assert.ok(textOf(tierBar).includes("会员档 · 指令不限"), tier + " 文案应为「会员档 · 指令不限」");
+    assert.equal(find(tierBar, (n) => n.type === "a"), undefined, tier + " 会员档不该有升级链接");
+  }
+});
+
+test("企微配置页档位条：取不到 tier / 未知值 → 整行不渲染（绝不瞎猜）", async () => {
+  for (const status of [
+    { connected: true, sessions: [], activeSessionId: "", boundSessionId: "" },                 // 旧桥：没有 tier
+    { connected: true, tier: "gold", sessions: [], activeSessionId: "", boundSessionId: "" },    // 未知值
+  ]) {
+    const plugin = loadPlugin();
+    plugin.setImBotsGet({
+      ok: true,
+      wecom: { enabled: false, botId: "", hasSecret: false, url: "", targetChatId: "", sessionId: "", sessionTitle: "" },
+      status,
+    });
+    const tree = await openWecom(plugin);
+    assert.equal(find(tree, (n) => String(n.props?.className || "").includes("dru-ia-tier")), undefined,
+      "拿不到有效档位时不得渲染档位条（" + JSON.stringify(status.tier) + "）");
+  }
+});
+
+test("会话固定门禁：bindingGated=true → 下拉置灰 + 「会员功能」徽章 + 悬停说明；已选值被忽略时如实说明", async () => {
+  const plugin = loadPlugin();
+  plugin.setImBotsGet({
+    ok: true,
+    wecom: { enabled: true, botId: "aibdemo1234", hasSecret: true, url: "", targetChatId: "", sessionId: "sess-1-abcdef123456", sessionTitle: "修复登录问题" },
+    status: {
+      connected: true, authenticated: true, tier: "free", bindingGated: true,
+      sessions: [{ id: "sess-1-abcdef123456", title: "修复登录问题", updatedAt: 1 }],
+      activeSessionId: "sess-2-xyz", activeSessionTitle: "部署到 NAS", boundSessionId: "",
+    },
+  });
+  const tree = await openWecom(plugin);
+  const sel = find(tree, (n) => n.type === "select" && n.props?.id === "dru-wecom-session");
+  assert.ok(sel, "下拉仍应存在（只是置灰）");
+  assert.equal(sel.props.disabled, true, "★ 免费档必须置灰（不能假装能选）");
+  assert.equal(sel.props.title, "升级后可固定转接会话", "悬停必须说明为什么不能选");
+  assert.equal(sel.props.value, "", "被忽略的选择不能显示成生效值");
+  const badge = find(tree, (n) => String(n.props?.className || "").includes("dru-ia-badge"));
+  assert.ok(badge && textOf(badge).includes("会员功能"), "置灰处要有「会员功能」徽章");
+  assert.ok(textOf(tree).includes("当前跟随活跃会话"), "已选值被忽略时要显示「当前跟随活跃会话」");
+  assert.ok(textOf(tree).includes("免费档不能固定转接"), "小字要说明原因");
+});
+
+// ───────────────────── ⑪ 品牌全名 + 安装命令（2026-11-07 业主） ─────────────────────
+
+test("品牌：面板标题 / 关于卡片统一用全名 dsh-remote-web，旧的「关于 dsh-remote」不再出现", async () => {
+  const plugin = loadPlugin();
+  const tree = await plugin.settle();
+  // 顶部面板标题（业主：「我的插件名字叫 dsh-remote-web，这个是全名」）
+  const title = find(tree, (n) => String(n.props?.className || "").includes("dru-settings-title"));
+  assert.ok(title, "应有面板标题");
+  assert.equal((title.children || []).join(""), "dsh-remote-web", "顶部标题必须是品牌全名 dsh-remote-web");
+  // 关于卡片
+  assert.ok(textOf(tree).includes("关于 dsh-remote-web"), "关于段落标题应为「关于 dsh-remote-web」");
+  // 精确断言：不得再出现裸品牌「关于 dsh-remote」（但不能误伤包名 @mrrisega/dsh-remote）
+  assert.doesNotMatch(SOURCE, /关于 dsh-remote(?!-web)/, "旧品牌写法「关于 dsh-remote」不得再出现");
+  assert.match(SOURCE, /@mrrisega\/dsh-remote/, "包名 @mrrisega/dsh-remote 必须保留（不是品牌文案）");
+  assert.match(SOURCE, /~\/\.dsh-remote/, "配置目录 ~/.dsh-remote 必须保留（代码/数据路径，不是品牌文案）");
+});
+
+test("版本与更新：有一行可复制的安装/更新命令 npx @mrrisega/dsh-remote@latest + 「重跑这条命令即可」说明", async () => {
+  const plugin = loadPlugin();
+  let tree = await plugin.settle();
+  assert.ok(textOf(tree).includes("npx @mrrisega/dsh-remote@latest"), "版本卡必须给出安装/更新命令");
+  assert.ok(textOf(tree).includes("已安装的更新：重跑这条命令即可"), "要说明更新方式是重跑该命令");
+  const copyBtn = find(tree, (n) => n.type === "button" && n.props?.["aria-label"] === "复制安装命令");
+  assert.ok(copyBtn, "命令旁必须有复制按钮（复用现有复制反馈样式）");
+  const code = find(tree, (n) => String(n.props?.className || "").includes("dru-code-val"));
+  assert.ok(code && (code.children || []).join("").includes("@mrrisega/dsh-remote@latest"), "命令要以可复制的代码样式展示");
+
+  copyBtn.props.onClick();
+  await flush(); await flush();
+  assert.deepEqual(plugin.clipboard, ["npx @mrrisega/dsh-remote@latest"], "★ 点复制必须把安装命令写进剪贴板");
+  tree = await plugin.settle();
+  assert.ok(textOf(tree).includes("✅ 已复制"), "复制成功要有与其它复制按钮一致的反馈");
 });

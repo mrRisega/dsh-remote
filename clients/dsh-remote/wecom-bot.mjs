@@ -51,6 +51,17 @@ import { EventEmitter } from "node:events";
 import WebSocket from "ws";
 
 import { createEventSubscriber, NODE_KINDS } from "./dsh-events.mjs";
+// 通道感知格式化（2026-11-08：企微/钉钉 markdown 不支持表格，发前统一适配；飞书/微信各有分支）
+import { formatForChannel } from "./im-format.mjs";
+// 会员能力表 = **单一真相源**：直接复用微信通道那套（WECHAT_CAPABILITY_TABLE / limitsFor / grantsCap），
+// 不另造一套。企微/飞书/钉钉将来都套同一套判定（见 research/.../im-channel-membership-design.md）。
+import {
+  WECHAT_CAPABILITY_TABLE,
+  WECHAT_TIER_LIMITS,
+  capabilitiesFor,
+  grantsCap,
+  limitsFor
+} from "./wechat-runtime.mjs";
 
 // ===========================================================================
 // 1. 常量 / 契约文件名
@@ -707,6 +718,21 @@ export function createWecomBot(options = {}) {
   // 会话可选绑定（task-24）：配置固定的会话（空 = 跟随活跃会话）
   const configuredSessionId = String(options.configuredSessionId || "").trim();
   const configuredSessionTitle = truncateText(options.configuredSessionTitle || "", 60);
+  // ── 会员判定（2026-11-07 业主拍板：通知免费、审批免费、互动半阉割）──
+  // capsProvider 由 bridge 注入（复用微信通道的 resolveWechatTier：字符串档位或 {plan,caps,limits,rev}）；
+  // 拿不到 / 未注入 → **按 free fail-closed**。
+  const capsProvider = typeof options.capsProvider === "function" ? options.capsProvider : null;
+  const tierOverride = typeof options.tier === "string" && options.tier.trim() ? options.tier.trim() : ""; // 仅测试
+  const capabilityTable = options.capabilityTable && typeof options.capabilityTable === "object" ? options.capabilityTable : WECHAT_CAPABILITY_TABLE;
+  const limitTable = options.limitTable && typeof options.limitTable === "object" ? options.limitTable : WECHAT_TIER_LIMITS;
+  const appUrl = String(options.appUrl || "").trim();
+  // 通道格式适配（wecom 当前唯一实现；钉钉/飞书接入时传对应 channel 即可）
+  const formatChannel = String(options.formatChannel || "wecom").trim() || "wecom";
+  const upgradeUrl = String(options.upgradeUrl || "").trim()
+    || (appUrl ? `${appUrl.replace(/\/+$/, "")}/promo` : "");
+  const tierRefreshMs = positiveNumber(options.tierRefreshMs, 10 * 60 * 1000);
+  const tierDenyThrottleMs = Number.isFinite(Number(options.tierDenyThrottleMs))
+    ? Math.max(0, Number(options.tierDenyThrottleMs)) : 5000;
   const log = createScopedLogger({ sink: options.logger, secrets: [secret], prefix: "[wecom]" });
 
   const statusFile = relayDir ? path.join(relayDir, IM_BOT_STATUS_FILE) : "";
@@ -740,6 +766,14 @@ export function createWecomBot(options = {}) {
     previewClicks: 0
   };
 
+  /** 会员状态：档位 + 服务端权益包 + 本月用量（跨重启从状态文件恢复）。 */
+  const membership = {
+    tier: "",               // 最近一次成功取到的档位（空 = 还没取到 → 对外按 free）
+    entitlements: null,     // {rev, plan, caps[], limits{}}（服务端权威）
+    checkedAt: 0,
+    usage: { month: "", count: 0 }
+  };
+
   let ws = null;
   let stopped = true;
   let reqSeq = 0;
@@ -749,6 +783,7 @@ export function createWecomBot(options = {}) {
   let authTimer = null;
   let heartbeatTimer = null;
   let reconnectTimer = null;
+  let tierTimer = null;
   let pingOutstanding = 0;
   let subscriber = null;
   let ownsSubscriber = false;
@@ -785,13 +820,163 @@ export function createWecomBot(options = {}) {
   const notifiedKeys = new Map(); // dedupe key -> at
   const notifyTimes = [];      // 限速窗口
 
-  // 重启后沿用上次绑定的会话（status 文件里那一份；不是密钥，泄露风险低）
+  // 重启后沿用上次绑定的会话 + 本月用量/档位快照（都不含密钥/正文）
   if (relayDir) {
     try {
       const prev = readJsonFile(statusFile);
-      const bid = prev && prev.wecom && typeof prev.wecom.boundChatId === "string" ? prev.wecom.boundChatId : "";
-      if (bid) state.boundChatId = bid;
+      const w = prev && prev.wecom && typeof prev.wecom === "object" ? prev.wecom : {};
+      if (typeof w.boundChatId === "string" && w.boundChatId) state.boundChatId = w.boundChatId;
+      // 用量必须恢复（否则重启 = 免费用户额度清零）；档位/权益包只在有 provider 时恢复，
+      // 且下次刷新会用服务端权威值覆盖 —— 没有 provider 时一律按 free fail-closed。
+      if (w.usage && typeof w.usage === "object" && typeof w.usage.month === "string") {
+        membership.usage = { month: w.usage.month, count: Math.max(0, Number(w.usage.messages ?? w.usage.count) || 0) };
+      }
+      if (capsProvider && typeof w.tier === "string" && w.tier) {
+        membership.tier = w.tier;
+        membership.entitlements = {
+          rev: typeof w.entitlementsRev === "string" ? w.entitlementsRev : "",
+          plan: w.tier,
+          caps: Array.isArray(w.caps) ? w.caps.slice() : null,
+          limits: w.limits && typeof w.limits === "object" ? w.limits : null
+        };
+      }
     } catch { /* 忽略 */ }
+  }
+
+  // ---------- 会员判定（通知免费 / 审批免费 / 互动半阉割） ----------
+
+  /** 月份键（用量按月归零；与微信通道同口径）。 */
+  function monthKey(at = now()) {
+    const d = new Date(at);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+  }
+  /** 当前档位（测试可注入 tier 覆盖；从没取到过 → free）。 */
+  function tierNow() {
+    if (tierOverride) return tierOverride;
+    return membership.tier || "free";
+  }
+  /**
+   * 当前生效能力：服务端权益包 caps 优先（**是数组就算数，空数组=什么都不给**），
+   * 否则按档位查内置表。判据是"是不是数组"而不是"非空"——空数组是服务端权威的"清空"，
+   * 当成"没给"会 fail-open（与微信通道 2026-09-23 的修法一致）。
+   */
+  function capsNow() {
+    const server = membership.entitlements && Array.isArray(membership.entitlements.caps)
+      ? membership.entitlements.caps : null;
+    if (server) return server;
+    return capabilitiesFor(tierNow(), capabilityTable) || [];
+  }
+  /** 当前生效限制（messages_per_month：0/缺省=不限）。 */
+  function limitsNow() {
+    const server = membership.entitlements && membership.entitlements.limits;
+    if (server && typeof server === "object") return server;
+    return limitsFor(tierNow(), limitTable) || {};
+  }
+  function canCap(cap) { return grantsCap(capsNow(), cap); }
+  /** 本月已用指令数（跨月自动归零）。 */
+  function usageThisMonth() {
+    const m = monthKey();
+    return membership.usage.month === m ? Number(membership.usage.count || 0) : 0;
+  }
+  /** 每月指令上限（0 = 不限）。 */
+  function messageLimitNow() {
+    const n = Number((limitsNow() || {}).messages_per_month || 0);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  }
+  /** 配置里的固定会话是否因免费档被忽略（`sessions` 是会员能力）。 */
+  function bindingGatedNow() {
+    return Boolean(configuredSessionId) && !canCap("sessions");
+  }
+
+  /**
+   * 刷新档位（带节流）。拿不到时**沿用上次已知档位**（首启即 free，fail-closed）。
+   * 契约与微信通道一致：字符串档位（旧）或 {plan,caps,limits,rev}（权益包）。
+   */
+  async function refreshTier({ force = false, minIntervalMs = 30_000 } = {}) {
+    if (!capsProvider) return tierNow();
+    const at = now();
+    if (!force && at - membership.checkedAt < minIntervalMs) return tierNow();
+    membership.checkedAt = at;
+    let got = null;
+    try {
+      got = await capsProvider();
+    } catch (e) {
+      log.warn(`读取账号档位失败（沿用上次）：${truncateText(e && e.message ? e.message : e, 100)}`);
+      return tierNow();
+    }
+    const isObj = Boolean(got) && typeof got === "object";
+    const plan = String((isObj ? got.plan : got) || "").trim();
+    if (!plan) return tierNow(); // 空 = 这次没取到 → 沿用（绝不因为网络抖动把付费用户降级）
+    const caps = isObj && Array.isArray(got.caps) ? got.caps : null;
+    const limits = isObj && got.limits && typeof got.limits === "object" ? got.limits : null;
+    const rev = isObj ? String(got.rev || "") : "";
+    const changed = plan !== membership.tier;
+    membership.tier = plan;
+    if (caps || limits) {
+      membership.entitlements = {
+        rev,
+        plan,
+        caps: caps || (membership.entitlements && membership.entitlements.caps) || null,
+        limits: limits || (membership.entitlements && membership.entitlements.limits) || null
+      };
+    }
+    if (changed) log.info(`账号档位：${plan}${caps ? "（含权益包）" : ""}`);
+    writeStatus();
+    return tierNow();
+  }
+  /** 判能力前先确保档位新鲜（被拒时用更短节流；买完马上重试能进）。 */
+  async function canCapNow(cap) {
+    if (canCap(cap)) return true;
+    await refreshTier({ minIntervalMs: tierDenyThrottleMs });
+    return canCap(cap);
+  }
+  /** 记一条指令用量（**只在真的派出去之后**调用；失败不扣额度）。 */
+  function bumpUsage() {
+    const m = monthKey();
+    const used = membership.usage.month === m ? Number(membership.usage.count || 0) : 0;
+    membership.usage = { month: m, count: used + 1 };
+    writeStatus();
+  }
+
+  /** 升级文案（**一次说完**：能做什么 / 还剩几条 / 去哪升级）。 */
+  function upgradeText(reason) {
+    const freeLimit = Number((limitsFor("free", limitTable) || {}).messages_per_month || 20);
+    const used = usageThisMonth();
+    const rows = [
+      reason === "quota"
+        ? `📵 本月免费指令已用完（${used}/${freeLimit}，下月 1 号自动恢复）。`
+        : "🔒 继续在企微里派活/追问是会员功能。",
+      "",
+      "免费可以用：接收任务通知、点审批卡（**不占额度**）"
+        + (reason === "quota" ? "" : `；每月 ${freeLimit} 条指令（本月已用 ${used}/${freeLimit}）`),
+      "升级 Pro：指令不限量、可开新任务、可切换会话"
+    ];
+    if (upgradeUrl) rows.push(`👉 ${upgradeUrl}`);
+    return rows.join("\n");
+  }
+
+  /** 入站会员闸：返回 null = 放行；返回对象 = 已被拦下（已回复用户）。 */
+  async function membershipGate(frame, info) {
+    // ① 能力闸：没有 assign.continue → 不能派活（先尝试刷新档位：可能刚升级）
+    if (!canCap("assign.continue")) {
+      if (await canCapNow("assign.continue")) return null;
+      replyText(frame, upgradeText("capability"));
+      emitter.emit("inbound-gated", { ...info, reason: "capability", tier: tierNow() });
+      log.info(`入站被会员闸拦下（无 assign.continue，tier=${tierNow()}）`);
+      return { reason: "capability" };
+    }
+    // ② 额度闸：免费档每月 N 条（0 = 不限）。超额前先刷新档位（可能刚买）
+    const limit = messageLimitNow();
+    if (limit > 0 && usageThisMonth() >= limit) {
+      await refreshTier({ minIntervalMs: tierDenyThrottleMs });
+      const limit2 = messageLimitNow();
+      if (!(limit2 > 0 && usageThisMonth() >= limit2)) return null;
+      replyText(frame, upgradeText("quota"));
+      emitter.emit("inbound-gated", { ...info, reason: "quota", tier: tierNow(), limit: limit2 });
+      log.info(`入站被额度闸拦下（${usageThisMonth()}/${limit2}，tier=${tierNow()}）`);
+      return { reason: "quota" };
+    }
+    return null;
   }
 
   // ---------- 状态文件（契约） ----------
@@ -814,7 +999,16 @@ export function createWecomBot(options = {}) {
       sessions: normalizeSessionStatusList(sessionList),
       activeSessionId: activeSession.id || "",
       activeSessionTitle: activeSession.title || "",
-      boundSessionId: boundSessionId || ""
+      boundSessionId: boundSessionId || "",
+      // ── 会员判定（2026-11-07）：档位 / 能力 / 本月用量 / 绑定是否被门槛忽略 ──
+      // caps 只放**能力名**（非敏感）；插件面板可只用 capsCount/remainingMessages。
+      tier: tierNow(),
+      caps: capsNow().slice(),
+      capsCount: capsNow().length,
+      bindingGated: bindingGatedNow(),
+      messagesPerMonth: messageLimitNow(),
+      remainingMessages: messageLimitNow() ? Math.max(0, messageLimitNow() - usageThisMonth()) : null,
+      usage: { month: membership.usage.month || monthKey(), messages: usageThisMonth() }
     };
   }
 
@@ -1175,6 +1369,9 @@ export function createWecomBot(options = {}) {
   /** 把入站文本转给 DSH 会话（尽力，失败给用户一句人话）。 */
   async function dispatchInbound(frame, info) {
     const sub = subscriber;
+    // ① 会员闸（通知/审批免费；派活受能力与月度额度约束，fail-closed）
+    const gated = await membershipGate(frame, info);
+    if (gated) return;
     const sessionId = await resolveSessionId(sub);
     if (!sub || typeof sub.promptSession !== "function") {
       log.warn("入站消息无法转发：事件订阅器未就绪（详见启动日志）");
@@ -1197,6 +1394,8 @@ export function createWecomBot(options = {}) {
     if (result && result.ok) {
       // 记下"这次入站交给了哪个会话"：该会话下一次 turn/end 要把回答正文回传给企微
       lastInbound = { sessionId, at: now() };
+      // 额度只统计**真的派出去的**指令（审批回执/预览按钮不经过这里，也就不计数）
+      bumpUsage();
       // 状态文件对外表达"当前实际转发目标"（面板据此显示绑定关系）
       if (boundSessionId !== sessionId) { boundSessionId = sessionId; writeStatus(); }
       log.info(`入站文本已转给会话 session=${shortSession(sessionId)}`);
@@ -1236,9 +1435,12 @@ export function createWecomBot(options = {}) {
     return cached && cached.title ? cached.title : "";
   }
 
-  /** 转发目标优先级（task-24）：配置固定 → 最近活跃 → 会话列表第一个。 */
+  /**
+   * 转发目标优先级（task-24）：配置固定 → 最近活跃 → 会话列表第一个。
+   * ⚠️ 配置固定会话是**会员能力**（sessions）：免费档忽略（见 bindingGatedNow）。
+   */
   function computeBoundSessionId() {
-    if (configuredSessionId) return configuredSessionId;
+    if (configuredSessionId && canCap("sessions")) return configuredSessionId;
     if (activeSession.id) return activeSession.id;
     return sessionList.length ? sessionList[0].id : "";
   }
@@ -1247,7 +1449,8 @@ export function createWecomBot(options = {}) {
   function syncSessionState() {
     if (activeSession.id) activeSession.title = titleOfSession(activeSession.id, activeSession.title);
     boundSessionId = computeBoundSessionId();
-    if (configuredSessionId && !sessionList.some((s) => s.id === configuredSessionId)) {
+    // 免费档不把"配置固定会话"补进列表（否则它会变成 sessions[0] 被拿去转发）
+    if (configuredSessionId && canCap("sessions") && !sessionList.some((s) => s.id === configuredSessionId)) {
       sessionList = normalizeSessionStatusList([
         { id: configuredSessionId, title: configuredSessionTitle, updatedAt: 0 },
         ...sessionList
@@ -1326,7 +1529,9 @@ export function createWecomBot(options = {}) {
         if (got) return got;
       }
     } catch { /* 忽略 */ }
-    if (configuredSessionId) return configuredSessionId;
+    // 配置固定的会话是**会员能力**（sessions）：免费档忽略它，回退"跟随活跃会话"，
+    // 状态文件里 bindingGated=true（面板据此把会话下拉置灰 + 标会员徽章）。
+    if (configuredSessionId && canCap("sessions")) return configuredSessionId;
     if (activeSession.id) return activeSession.id;
     if (sessionList.length === 0) {
       try { await refreshSessions({ force: true }); } catch { /* 忽略 */ }
@@ -1360,7 +1565,8 @@ export function createWecomBot(options = {}) {
 
   /** 回复一句人话：优先被动回复（不需要绑定），拿不到入站 req_id 时退回主动推送。 */
   function replyText(frame, text) {
-    const content = truncateText(text, 500);
+    // 被动回复同样按通道格式化（确认文案里可能有列表/表格；也防止超长撑爆客户端）
+    const content = formatForChannel(formatChannel, { text: text == null ? "" : String(text), maxChars: 500 });
     const r = replyStream(frame, "", content, true);
     if (r.ok) return r;
     const target = state.boundChatId || targetChatId;
@@ -1374,9 +1580,15 @@ export function createWecomBot(options = {}) {
    * @param {string} text
    * @returns {{ok:boolean, reqId?:string, reason?:string}}
    */
-  function sendMarkdown(chatid, text) {
+  function sendMarkdown(chatid, text, opts = {}) {
     const to = String(chatid || "").trim();
-    const content = truncateText(text == null ? "" : text, NOTIFY_MAX_CHARS);
+    // 2026-11-08：所有主动 markdown（通知/回答回传/确认文案）统一按通道能力格式化：
+    // 表格→可读列表、标题→加粗、分隔线→空行、wecom 4096 字节截断（优先段落边界）。
+    const content = formatForChannel(formatChannel, {
+      text: text == null ? "" : String(text),
+      maxBytes: opts.maxBytes,
+      maxChars: opts.maxChars
+    });
     if (!to) return { ok: false, reason: "no_chatid" };
     if (!content) return { ok: false, reason: "empty_text" };
     if (!state.authenticated) return { ok: false, reason: "not_authenticated" };
@@ -2015,7 +2227,13 @@ export function createWecomBot(options = {}) {
       cards: state.cards,
       approvalDecisions: state.approvalDecisions,
       previews: state.previews,
-      previewClicks: state.previewClicks
+      previewClicks: state.previewClicks,
+      // 会员判定（2026-11-07）：档位/能力/本月用量/绑定是否被门槛忽略
+      tier: tierNow(),
+      caps: capsNow().slice(),
+      bindingGated: bindingGatedNow(),
+      messagesPerMonth: messageLimitNow(),
+      usage: { month: membership.usage.month || monthKey(), messages: usageThisMonth() }
     };
   }
 
@@ -2036,6 +2254,12 @@ export function createWecomBot(options = {}) {
       writeStatus();
       ensureSubscriber();
       connect();
+      // 会员档位：启动时刷一次（不 await，不阻塞连接），之后每 10 分钟校准一次
+      void refreshTier({ force: true }).catch(() => {});
+      if (!tierTimer && capsProvider) {
+        tierTimer = setInterval(() => { void refreshTier().catch(() => {}); }, tierRefreshMs);
+        if (typeof tierTimer.unref === "function") tierTimer.unref();
+      }
       return status();
     },
 
@@ -2049,6 +2273,8 @@ export function createWecomBot(options = {}) {
       state.nextRetryInMs = 0;
       try { if (reconnectTimer) clearTimeout(reconnectTimer); } catch { /* 忽略 */ }
       reconnectTimer = null;
+      try { if (tierTimer) clearInterval(tierTimer); } catch { /* 忽略 */ }
+      tierTimer = null;
       stopHeartbeat();
       clearAuthTimer();
       for (const [, p] of pending) { try { clearTimeout(p.timer); } catch { /* 忽略 */ } }

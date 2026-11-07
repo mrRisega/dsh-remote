@@ -27,6 +27,24 @@
  *
  * ⚠️ 探测全部**并行**且有总预算：本地端口连接被拒是瞬时的，只有"端口在听但不回包"才会等到超时，
  *    串行探 12 个候选最坏要十几秒，会让 watcher 的轮询卡住。
+ *
+ * ## 2026-11-07 修复：别再乱敲本机所有端口（微信 CPU 高 + 登录慢）
+ *
+ * 旧实现把「本机所有回环 LISTEN 端口」（用户机实测 209 个）全部当候选逐个探测，
+ * 其中包含**微信 PC 客户端**监听的端口 —— 发现一次就把微信敲一遍，用户侧表现为 CPU 升高；
+ * 冷启动时几百个端口 × 900ms 超时也让登录卡 7–8 秒。
+ *
+ * 现在的纪律（"能发现非默认端口"的能力保留，只是不再乱敲）：
+ *   1. **只探可能是 dsh 的端口**：hint → dsh/node 进程自己的监听端口 → **按归属进程名过滤**后的
+ *      本机监听端口（白名单 node/dsh/deepseek/electron，且 IM 客户端进程名黑名单双保险）
+ *      → 静态候选（3080、43120..）。拿不到进程名时**不再退化成全量探测**（宁可漏，不乱敲）。
+ *   2. **更便宜**：探测超时 300ms、并发上限 16、**负缓存** 10 分钟（被判定"不是 dsh"的端口
+ *      期间不再探测）、监听表枚举缓存 10s。
+ *   3. **不阻塞请求路径**：`discoverUpstreamFast()` 只走 hint/缓存/进程端口（无全量探测）；
+ *      `discoverUpstream()` 默认先返回 fast 结果，没命中时最多再等 `maxWaitMs`（默认 600ms）
+ *      完成一次完整发现，否则把完整发现放后台、结果写缓存供下次用。
+ *   4. **可观测**：日志只打 `source / probed / rejected / skipped` 计数，**不打端口清单**
+ *      （skipped = 因"不是 node/dsh 进程"被跳过的端口数，含微信等 IM 客户端）。
  */
 
 import fs from "node:fs";
@@ -41,8 +59,45 @@ export const FALLBACK_UPSTREAM = "http://127.0.0.1:3080";
 export const DESKTOP_DEFAULT_PORT = 43120;
 /** Desktop 端口区间扫多少个（43120..43120+11）。 */
 export const DESKTOP_PORT_SCAN = 12;
-/** 单个候选的探测超时（本地回环，超过它基本就是"在听但不回包"）。 */
-const PROBE_TIMEOUT_MS = 900;
+/** 单个候选的探测超时（本地回环；旧值 900ms 会让冷启动明显变慢，2026-11-07 收到 300ms）。 */
+export const PROBE_TIMEOUT_MS = 300;
+/** 「不是 dsh」的负缓存时长（期间不再探测同一个端口）。 */
+export const NEGATIVE_CACHE_TTL_MS = 10 * 60 * 1000;
+/** 已确认上游的缓存时长（端口漂移时最多这么久后重新发现）。 */
+export const VERIFIED_CACHE_TTL_MS = 5 * 60 * 1000;
+/** 候选探测并发上限（本地回环，16 足够；防止一次打出上百个连接）。 */
+export const MAX_PROBE_CONCURRENCY = 16;
+/** 「按进程名过滤后的本机监听端口」最多取多少个进候选（开发机 node 进程可能很多）。 */
+export const LISTEN_PROBE_LIMIT = 24;
+/** 候选总数超过这个数时**整层放弃 listen 扫描**（只探 hint/进程/静态）——防止一次发现打上百个请求。 */
+export const MAX_PROBE_CANDIDATES = 20;
+/** 监听表枚举缓存（lsof/ss 调用不算贵但也没必要每次发现都跑）。 */
+const LISTEN_ENUM_TTL_MS = 10 * 1000;
+/** 监听表"拿不到"的缓存（lsof 不存在时不必每次重试；稍后仍会再试）。 */
+const LISTEN_ENUM_MISS_TTL_MS = 30 * 1000;
+
+/** 已知 IM / 会议客户端的进程名黑名单：**即使名字像 node 也绝不探**（双保险）。 */
+const IM_PROCESS_BLACKLIST = /wechat|weixin|wecom|wxwork|企业微信|微信|\bqq\b|dingtalk|dingding|feishu|lark|telegram|slack|discord|skype|whatsapp|\bteams\b|wemeet|tencent/i;
+/** 可能是 dsh web 宿主的进程名（macOS lsof 的 COMMAND 会被截断到 9 字符；Windows 去掉 .exe）。 */
+const DSH_LIKE_PROCESS = /^(?:node|nodejs|dsh|deepseek|electron)/i;
+
+/**
+ * 这个进程名是不是「可能是 dsh 的宿主」？
+ * IM 客户端黑名单优先（`wechat-node` 这类名字也一律拒绝）。
+ */
+export function isDshLikeProcessName(name) {
+  const n = String(name || "").trim();
+  if (!n) return false;
+  if (IM_PROCESS_BLACKLIST.test(n)) return false;
+  return DSH_LIKE_PROCESS.test(n);
+}
+
+/** 是否是已知 IM/会议客户端（用于统计 skipped 与双保险排除）。 */
+export function isIgnoredListenProcess(name) {
+  const n = String(name || "").trim();
+  if (!n) return false;
+  return IM_PROCESS_BLACKLIST.test(n);
+}
 
 /** 规范化：去尾斜杠；非 http(s) 一律丢弃（返回空串）。 */
 export function normalizeUpstream(value) {
@@ -286,19 +341,134 @@ export function allLoopbackListeningPorts(platform = process.platform) {
   return [...ports];
 }
 
+/** 本地地址是否可能通过 127.0.0.1 访问（回环或通配绑定）。 */
+function isLoopbackListenName(name) {
+  const v = String(name || "");
+  if (v.includes("->")) return false; // 已建立连接的那一端，不是监听项
+  return /^(?:127\.0\.0\.1|\[::1\]|\*|0\.0\.0\.0|\[::\]):\d+$/.test(v);
+}
+
+/** 解析 `lsof -nP -F pcn -iTCP -sTCP:LISTEN` 的字段化输出。 */
+function parseLsofFieldListeners(out) {
+  const rows = [];
+  let pid = 0;
+  let name = "";
+  for (const line of String(out || "").split("\n")) {
+    if (!line) continue;
+    const tag = line[0];
+    const val = line.slice(1);
+    if (tag === "p") { pid = Number(val) || 0; name = ""; continue; }
+    if (tag === "c") { name = val; continue; }
+    if (tag !== "n") continue;
+    if (!isLoopbackListenName(val)) continue;
+    const m = /:(\d+)$/.exec(val);
+    if (!m) continue;
+    const port = Number(m[1]);
+    if (!Number.isInteger(port) || port <= 0 || port >= 65536) continue;
+    rows.push({ port, name: String(name).replace(/\.exe$/i, ""), pid });
+  }
+  return rows;
+}
+
+/** 解析 `lsof -nP -iTCP -sTCP:LISTEN` 的整行输出（老 lsof 兜底）。 */
+function parseLsofPlainListeners(out) {
+  const rows = [];
+  for (const line of String(out || "").split("\n")) {
+    if (!/LISTEN/.test(line)) continue;
+    const head = /^(\S+)\s+(\d+)\s+/.exec(line);
+    const addr = /(?:TCP\s+)?(127\.0\.0\.1|\[::1\]|\*|0\.0\.0\.0):(\d+)\s*\(LISTEN\)/.exec(line);
+    if (!head || !addr) continue;
+    const port = Number(addr[2]);
+    if (!Number.isInteger(port) || port <= 0 || port >= 65536) continue;
+    rows.push({ port, name: head[1].replace(/\.exe$/i, ""), pid: Number(head[2]) });
+  }
+  return rows;
+}
+
 /**
- * 候选列表（已去重，按"可能性"排序），每项带**来源标注**（用于日志与测试断言）。
- * 顺序 = 提示里的端口 → 显式额外端口 → DSH_WEB_URL 的端口 → 祖先/dsh 进程实测监听端口
- *        → **本机所有回环监听端口** → 3080 → Desktop 默认端口区间。
+ * 本机 LISTEN 端口 **连同归属进程名**（macOS/Linux 用 lsof；Linux 再兜底 `ss -ltnp`）。
  *
- * 「所有回环监听端口」排在静态候选之前：NAS 上 dsh web 的端口（实测 2298）**只可能**从这一层找到，
- * 排在 3080 之后就等于白加（3080 探测失败之前不会去试它，而静态候选有 12 个 Desktop 端口）。
- * 最后仍留静态候选兜底（宿主把端口藏得很深、/proc 也没有的极端情况）。
- * @returns {Array<{port:number, source:string}>}
+ * 为什么需要进程名（2026-11-07 微信 CPU 事故）：旧实现把本机所有 LISTEN 端口都当候选去敲，
+ * 里面就有微信 PC 客户端的监听端口 —— 每发现一次就把微信敲一遍。现在只保留
+ * 「进程名像 node/dsh/deepseek/electron」的端口；IM 客户端黑名单双保险。
+ *
+ * ⚠️ 拿不到进程名时返回 **null**（调用方绝不退化成"全量探测"—— 宁可漏一个端口，也不再乱敲）。
+ * @returns {Array<{port:number,name:string,pid:number}>|null}
  */
-export function candidatePorts({ relayDir = "", env = process.env, extraPorts = [], platform = process.platform, listenPorts = null } = {}) {
+export function listeningPortsWithProcess(platform = process.platform) {
+  if (platform === "win32") {
+    // Windows 拿"端口 + 进程名"要 netstat + tasklist 两次调用（几百 ms），且有 Desktop 静态候选兜底：
+    // 本层只在 mac/Linux 提供；Windows 不猜、也不退化成全量探测。
+    return null;
+  }
+  // ① lsof：macOS 自带，Linux 常见。
+  //    优先 `-F pcn`（字段化输出）：本机实测比整行输出快 ~15ms，且解析不会被"COMMAND 带空格/截断"坑到。
+  const rows = parseLsofFieldListeners(tryExec("lsof", ["-nP", "-F", "pcn", "-iTCP", "-sTCP:LISTEN"], 6000));
+  if (rows.length) return rows;
+  // 兼容极老 lsof（不认 -F 组合）→ 退回整行解析
+  const plain = parseLsofPlainListeners(tryExec("lsof", ["-nP", "-iTCP", "-sTCP:LISTEN"], 6000));
+  if (plain.length) return plain;
+  // ② Linux：ss -ltnp（有 -p 时能拿到 users:(("node",pid=...))）
+  const ss = tryExec("ss", ["-ltnpH"], 5000) || tryExec("ss", ["-ltnp"], 5000);
+  const ssRows = [];
+  for (const line of ss.split("\n")) {
+    if (!/LISTEN/.test(line)) continue;
+    const cols = line.trim().split(/\s+/);
+    const local = cols[3] || "";
+    const m = /(?:127\.0\.0\.1|\[::1\]|\*|0\.0\.0\.0|\[::\]):(\d+)$/.exec(local);
+    const user = /users:\(\(\("([^"]+)",pid=(\d+)/.exec(line);
+    if (!m) continue;
+    const port = Number(m[1]);
+    if (!Number.isInteger(port) || port <= 0 || port >= 65536) continue;
+    ssRows.push({ port, name: user ? user[1] : "", pid: user ? Number(user[2]) : 0 });
+  }
+  if (ssRows.length) return ssRows;
+  return null; // 拿不到进程名：调用方不得退化成全量探测
+}
+
+/** 监听表枚举缓存（含"拿不到"的负结果；避免插件每次轮询都跑 lsof）。 */
+let listenEnumCache = { at: 0, rows: null };
+function cachedListenersWithProcess(platform) {
+  const nowAt = Date.now();
+  const ttl = listenEnumCache.rows ? LISTEN_ENUM_TTL_MS : LISTEN_ENUM_MISS_TTL_MS;
+  if (nowAt - listenEnumCache.at < ttl) return listenEnumCache.rows;
+  let rows = null;
+  try { rows = listeningPortsWithProcess(platform); } catch { rows = null; }
+  listenEnumCache = { at: nowAt, rows };
+  return rows;
+}
+
+/**
+ * 候选计划：返回候选列表 + 被跳过的端口数（skipped = 因"不是 node/dsh 进程"或 IM 黑名单跳过）。
+ *
+ * 顺序 = 提示里的端口 → 显式额外端口 → DSH_WEB_URL → 祖先/dsh 进程监听端口
+ *        → **按进程名过滤后的本机监听端口** → 3080 → Desktop 默认端口区间。
+ *
+ * 「本机监听端口」这一层**必须**有进程名才收（见 listeningPortsWithProcess）；
+ * 拿不到进程名就整层跳过（skipped 只统计被过滤掉的，不统计"拿不到进程名"）。
+ *
+ * @returns {{entries:Array<{port:number, source:string}>, skipped:number, truncated:number}}
+ */
+export function candidatePlan({
+  relayDir = "",
+  env = process.env,
+  extraPorts = [],
+  platform = process.platform,
+  listenPorts = null,   // 仅测试/特殊部署：直接注入端口列表（绕过进程名过滤）
+  listeners = null,     // 仅测试：注入 [{port,name,pid}] 以验证过滤/黑名单；false = 模拟"拿不到进程名"
+  includeStatic = true,
+  includeListen = true,
+  /**
+   * 是否枚举「祖先进程 / dsh 进程 / 逐 pid 的监听端口」。
+   * fast 路径传 false：那一段每次要跑 ps 链 + pgrep + 每个 pid 一次 lsof（本机实测 ~180ms），
+   * 而"进程端口"信息已经包含在 `includeListen` 的监听表里（带 pid/进程名），不必重复枚举。
+   */
+  includeProcess = true
+} = {}) {
   const out = [];
   const seen = new Set();
+  let skipped = 0;
+  let truncated = 0;
   const push = (p, source) => {
     const n = Number(p);
     if (!Number.isInteger(n) || n <= 0 || n >= 65536 || seen.has(n)) return;
@@ -309,15 +479,63 @@ export function candidatePorts({ relayDir = "", env = process.env, extraPorts = 
   push(portOf(hint.url), hint.source || "hint");
   for (const p of extraPorts) push(p, "extra");
   push(portOf(upstreamFromDshWebUrl(env)), "dsh_web_url");
-  const pids = [...new Set([process.pid, ...ancestorPids(process.pid, 6, platform), ...dshProcessPids(platform)])];
-  for (const pid of pids) for (const p of listeningPortsOfPid(pid, platform)) push(p, "process");
-  // ★ 本机所有回环 LISTEN 端口（0.6.15）：NAS 上 dsh web 在 2298 这类非默认端口时唯一的发现路径。
-  //   调用方可以注入 listenPorts（测试用），避免用例依赖开发机真实监听表。
-  const listen = Array.isArray(listenPorts) ? listenPorts : allLoopbackListeningPorts(platform);
-  for (const p of listen) push(p, "listen");
-  push(3080, "static");
-  for (let i = 0; i < DESKTOP_PORT_SCAN; i++) push(DESKTOP_DEFAULT_PORT + i, "static");
-  return out;
+  if (includeProcess) {
+    const pids = [...new Set([process.pid, ...ancestorPids(process.pid, 6, platform), ...dshProcessPids(platform)])];
+    for (const pid of pids) for (const p of listeningPortsOfPid(pid, platform)) push(p, "process");
+  }
+  if (includeListen) {
+    if (Array.isArray(listenPorts)) {
+      // 显式注入（测试/特殊部署）：不做进程名过滤，保持既有语义
+      for (const p of listenPorts) push(p, "listen");
+    } else {
+      const rows = listeners === false ? null : (Array.isArray(listeners) ? listeners : cachedListenersWithProcess(platform));
+      if (Array.isArray(rows)) {
+        let accepted = 0;
+        for (const row of rows) {
+          if (!row || typeof row !== "object") continue;
+          const name = String(row.name || "");
+          if (isIgnoredListenProcess(name) || !isDshLikeProcessName(name)) { skipped += 1; continue; }
+          if (accepted >= LISTEN_PROBE_LIMIT) { truncated += 1; continue; }
+          const before = out.length;
+          push(row.port, "listen");
+          if (out.length > before) accepted += 1;
+        }
+      }
+      // rows === null（拿不到进程名）→ 整层跳过：**绝不退化成全量探测**
+    }
+  }
+  if (includeStatic) {
+    push(3080, "static");
+    for (let i = 0; i < DESKTOP_PORT_SCAN; i++) push(DESKTOP_DEFAULT_PORT + i, "static");
+  }
+  return { entries: out, skipped, truncated };
+}
+
+/**
+ * 候选列表（兼容旧签名；只返回 entries）。需要 skipped/truncated 用 `candidatePlan()`。
+ * @returns {Array<{port:number, source:string}>}
+ */
+export function candidatePorts(opts = {}) {
+  return candidatePlan(opts).entries;
+}
+
+/**
+ * 给"要真的去探测"的候选计划加**总量上限**：超过 `MAX_PROBE_CANDIDATES` 时整层放弃 listen 扫描，
+ * 只保留 hint/进程/静态（这些是强信号，量级可控）。
+ *
+ * 为什么需要：开发机可能同时跑十几个 node 进程（各自 1–3 个监听端口），全探一遍就是几十个请求；
+ * 但"漏掉一个端口"的代价远小于"每次发现都打几十个请求"（正是本次微信 CPU 事故的教训）。
+ */
+function planCandidatesForProbe(opts = {}) {
+  const full = candidatePlan(opts);
+  if (full.entries.length <= MAX_PROBE_CANDIDATES) return full;
+  const minimal = candidatePlan({ ...opts, includeListen: false });
+  return {
+    entries: minimal.entries,
+    skipped: minimal.skipped,
+    truncated: minimal.truncated + Math.max(0, full.entries.length - minimal.entries.length),
+    capApplied: true
+  };
 }
 
 // ---------- 身份校验 ----------
@@ -373,6 +591,15 @@ export async function probeDshWeb(url, { timeoutMs = PROBE_TIMEOUT_MS, fetchImpl
   if (!target) return false;
   const doFetch = fetchImpl || globalThis.fetch;
   if (typeof doFetch !== "function") return false;
+  /**
+   * 探测一次。返回 `{http, matched}`：
+   *   · `http=false` = 连 HTTP 响应都没拿到（拒绝/超时/DNS/读失败）—— 这个端口基本不是活的
+   *   · `http=true`  = 拿到了 HTTP 响应（哪怕是 4xx/5xx/陌生页面）
+   *
+   * 为什么要区分（2026-11-07）：旧实现首探失败后还会再打 `/dsh-remote/self`，
+   * 于是**每个死端口都要发 2 个请求**（大多数候选都是死的）→ 扫描请求量翻倍。
+   * 现在：首探连 HTTP 都不是就直接判否，不再打第二个（省一半连接）。
+   */
   const once = async (path, check) => {
     try {
       const ac = new AbortController();
@@ -385,7 +612,8 @@ export async function probeDshWeb(url, { timeoutMs = PROBE_TIMEOUT_MS, fetchImpl
         clearTimeout(timer);
       }
       const status = Number(res && res.status) || 0;
-      if (status >= 500) return false;
+      if (!status) return { http: false, matched: false };
+      if (status >= 500) return { http: true, matched: false };
       // 只读前 8KB 足够命中特征；读流失败按"不是"处理（宁可少一个候选，不可误接）
       let text = "";
       try {
@@ -398,23 +626,181 @@ export async function probeDshWeb(url, { timeoutMs = PROBE_TIMEOUT_MS, fetchImpl
           text = await res.text();
         }
       } catch { /* 读失败 → text 为空 → 判否 */ }
-      return check(status, text.slice(0, 8192));
+      return { http: true, matched: check(status, text.slice(0, 8192)) };
     } catch {
-      return false;
+      return { http: false, matched: false };
     }
   };
-  if (await once("/", looksLikeDshWeb)) return true;
-  return once(DSH_REMOTE_SELF_PATH, looksLikeDshRemoteSelf);
+  const first = await once("/", looksLikeDshWeb);
+  if (first.matched) return true;
+  // 只有"确实拿到了 HTTP 响应但首页特征不中"才值得再问一次插件自己的 /dsh-remote/self
+  // （首页可能是登录页/自定义门户；连 HTTP 都不通的端口没有任何理由再打一次）
+  if (!first.http) return false;
+  return (await once(DSH_REMOTE_SELF_PATH, looksLikeDshRemoteSelf)).matched;
+}
+
+// ---------- 探测缓存（负缓存防反复敲、已确认缓存给 fast 路径） ----------
+
+/** port -> 判定"不是 dsh"的时间戳（10 分钟内不再探测）。 */
+const negativeCache = new Map();
+/** 最近一次**已验证**的上游（fast 路径直接采信/秒回）。 */
+const verifiedCache = { url: "", source: "", at: 0 };
+/** 正在后台跑的完整发现（超时返回时继续跑完，结果写缓存供下次用）。 */
+let bgDiscoveryInflight = null;
+
+function negativeKey(port) { return String(Number(port) || 0); }
+function isNegativelyCached(port) {
+  const key = negativeKey(port);
+  const at = negativeCache.get(key);
+  if (!at) return false;
+  if (Date.now() - at > NEGATIVE_CACHE_TTL_MS) { negativeCache.delete(key); return false; }
+  return true;
+}
+function rememberNegative(port) {
+  const key = negativeKey(port);
+  if (!key || key === "0") return;
+  negativeCache.set(key, Date.now());
+  if (negativeCache.size <= 512) return;
+  // 有界：Map 保插入序，超限删最旧
+  const first = negativeCache.keys().next();
+  if (!first.done) negativeCache.delete(first.value);
+}
+function rememberVerified(url, source) {
+  verifiedCache.url = String(url || "");
+  verifiedCache.source = String(source || "");
+  verifiedCache.at = Date.now();
+}
+function clearVerified() { verifiedCache.url = ""; verifiedCache.source = ""; verifiedCache.at = 0; }
+
+/** 仅测试：清空所有进程内缓存（负缓存/已验证/监听表），避免用例互相污染。 */
+export function __resetUpstreamCachesForTest() {
+  negativeCache.clear();
+  clearVerified();
+  listenEnumCache = { at: 0, rows: null };
+  bgDiscoveryInflight = null;
+}
+
+/** 仅测试：等后台完整发现跑完（没有在跑的则立即 resolve）。 */
+export async function __waitUpstreamDiscoveryForTest() {
+  if (bgDiscoveryInflight) { try { await bgDiscoveryInflight; } catch { /* 忽略 */ } }
 }
 
 /**
- * 发现上游地址（带身份校验）。
+ * 已验证缓存是否仍然可用：**每次都用一次本地回环探测确认**（1–2ms，端口死了最多 300ms）。
  *
- * @param {number[]} [extraPorts] 调用方已知的额外候选(排在静态候选之前;测试与特化部署用)。
- * @returns {Promise<{url: string, source: string, probed: number[], rejected: string[]}>}
- *          source: env | file | dsh_web_url | process | static | extra | fallback
+ * 为什么不"缓存内直接采信"（试过 30s 盲信）：dsh web 换端口后，盲信会把旧地址继续喂给
+ * bridge 最多 30–45s，端口漂移自愈被拖慢。本地探测成本极低，换来的是"缓存绝不会把请求
+ * 引到死端口"，更符合这个模块存在的意义。
  */
-export async function discoverUpstream({
+async function useVerifiedCache({ timeoutMs = PROBE_TIMEOUT_MS, fetchImpl } = {}) {
+  if (!verifiedCache.url) return null;
+  if (Date.now() - verifiedCache.at > VERIFIED_CACHE_TTL_MS) { clearVerified(); return null; }
+  if (await probeDshWeb(verifiedCache.url, { timeoutMs, fetchImpl })) {
+    verifiedCache.at = Date.now();
+    return { url: verifiedCache.url, source: verifiedCache.source };
+  }
+  clearVerified();
+  return null;
+}
+
+/** 限量并发 map（保持结果顺序；异常折成 undefined）。 */
+async function mapLimit(items, limit, fn) {
+  const list = Array.isArray(items) ? items : [];
+  const max = Math.max(1, Math.min(Number(limit) || 1, list.length || 1));
+  const out = new Array(list.length);
+  let cursor = 0;
+  const workers = Array.from({ length: max }, async () => {
+    for (;;) {
+      const i = cursor;
+      cursor += 1;
+      if (i >= list.length) return;
+      try { out[i] = await fn(list[i], i); } catch { out[i] = undefined; }
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
+/** 日志：只打计数，**不打端口清单**（隐私/噪音；排障要清单时用 `dsh-remote doctor` 的探测结果）。 */
+function logDiscovery(log, info) {
+  if (typeof log !== "function") return;
+  try {
+    const { found, source, probed, rejected, skipped, note } = info || {};
+    log(`[upstream] ${found ? "命中" : "未命中"} source=${source || "-"} probed=${probed || 0} rejected=${rejected || 0} skipped=${skipped || 0}${note ? `（${note}）` : ""}`);
+  } catch { /* 日志失败不影响发现 */ }
+}
+
+/**
+ * **快速发现**（供请求路径/热路径使用）：只用 hint / 已验证缓存 / 进程端口，
+ * **不做全量端口枚举**，正常情况 <50ms。
+ *
+ * 顺序：`DSH_BRIDGE_UPSTREAM`（直接采信）→ 已验证缓存 → hint 单次校验 → 显式 extraPorts
+ *       → 「祖先/dsh 进程 + 按进程名过滤后的本机监听端口」逐个校验（并发上限 16、300ms 超时、负缓存）。
+ *
+ * @returns {Promise<{url:string, source:string, probed:number[], rejected:string[], skipped:number, fast?:boolean}>}
+ *          没找到时 `url=""`（调用方决定用 hint/回退值，或再调完整发现）。
+ */
+export async function discoverUpstreamFast({
+  relayDir = "",
+  env = process.env,
+  timeoutMs = PROBE_TIMEOUT_MS,
+  fetchImpl,
+  platform = process.platform,
+  extraPorts = [],
+  listeners = null,
+  log
+} = {}) {
+  const hint = resolveUpstreamHint({ relayDir, env });
+  // ① 显式 env：部署方说是什么就是什么（保持既有语义，不探测）
+  if (hint.source === "env") {
+    return { url: hint.url, source: "env", probed: [], rejected: [], skipped: 0, fast: true };
+  }
+  // ② 已验证缓存（秒回；过期会重新校验一次）
+  const cached = await useVerifiedCache({ timeoutMs, fetchImpl });
+  if (cached) {
+    return { url: cached.url, source: cached.source, probed: [], rejected: [], skipped: 0, fast: true, cached: true };
+  }
+  const rejected = [];
+  // ③ hint 单次校验（端口文件可能过期，所以不盲信）
+  if (hint.url) {
+    if (await probeDshWeb(hint.url, { timeoutMs, fetchImpl })) {
+      rememberVerified(hint.url, hint.source);
+      return { url: hint.url, source: hint.source, probed: [portOf(hint.url)], rejected, skipped: 0, fast: true };
+    }
+    rejected.push(hint.url);
+  }
+  // ④ 进程端口 + 显式额外端口（**不含** static 兜底：13 个请求不该出现在请求路径上）
+  const plan = planCandidatesForProbe({
+    relayDir, env, platform, extraPorts, listeners,
+    includeStatic: false, includeListen: true, includeProcess: false
+  });
+  const hintPort = portOf(hint.url);
+  const entries = plan.entries.filter((e) => e.port !== hintPort && !isNegativelyCached(e.port));
+  const outcomes = await mapLimit(entries, MAX_PROBE_CONCURRENCY, async (e) => {
+    const ok = await probeDshWeb(`http://127.0.0.1:${e.port}`, { timeoutMs, fetchImpl });
+    if (!ok) rememberNegative(e.port);
+    return { ...e, ok };
+  });
+  const hit = outcomes.find((r) => r && r.ok);
+  if (hit) {
+    const url = `http://127.0.0.1:${hit.port}`;
+    rememberVerified(url, hit.source);
+    logDiscovery(log, { found: true, source: hit.source, probed: entries.length, rejected: rejected.length, skipped: plan.skipped, note: "fast" });
+    return { url, source: hit.source, probed: entries.map((e) => e.port), rejected, skipped: plan.skipped, fast: true };
+  }
+  return { url: "", source: "", probed: entries.map((e) => e.port), rejected, skipped: plan.skipped, fast: true };
+}
+
+/**
+ * **完整发现**（后台/诊断用）：fast 的全部来源 + 静态候选（3080、Desktop 区间）。
+ *
+ * 所有候选探测并发上限 16、单端口 300ms；被判定"不是 dsh"的端口进 10 分钟负缓存。
+ * 命中后写已验证缓存（`discoverUpstreamFast` 下一次直接秒回）。
+ *
+ * @returns {Promise<{url:string, source:string, probed:number[], rejected:string[], skipped:number, truncated?:number}>}
+ *          source: env | file | dsh_web_url | process | listen | extra | static | fallback
+ */
+export async function discoverUpstreamFull({
   relayDir = "",
   env = process.env,
   timeoutMs = PROBE_TIMEOUT_MS,
@@ -422,32 +808,98 @@ export async function discoverUpstream({
   platform = process.platform,
   extraPorts = [],
   listenPorts = null,
+  listeners = null,
   log
 } = {}) {
   const hint = resolveUpstreamHint({ relayDir, env });
-  // ① 显式环境变量:部署方说是什么就是什么(不探测,保持既有语义)
-  if (hint.source === "env") return { url: hint.url, source: "env", probed: [], rejected: [] };
-  // ② 提示地址先验证:文件/DSh_WEB_URL 都可能过期(宿主换端口/换了程序占用)
-  if (hint.url && (await probeDshWeb(hint.url, { timeoutMs, fetchImpl }))) {
-    return { url: hint.url, source: hint.source, probed: [portOf(hint.url)], rejected: [] };
+  if (hint.source === "env") {
+    rememberVerified(hint.url, "env");
+    return { url: hint.url, source: "env", probed: [], rejected: [], skipped: 0 };
   }
+  const rejected = [];
+  if (hint.url && (await probeDshWeb(hint.url, { timeoutMs, fetchImpl }))) {
+    rememberVerified(hint.url, hint.source);
+    return { url: hint.url, source: hint.source, probed: [portOf(hint.url)], rejected, skipped: 0 };
+  }
+  if (hint.url) rejected.push(hint.url);
 
-  // ③ 候选并行探测(本地端口,拒绝是瞬时的;并行是为了不让 watcher 卡住)
+  const plan = planCandidatesForProbe({ relayDir, env, platform, extraPorts, listenPorts, listeners });
   const hintPort = portOf(hint.url);
-  const entries = candidatePorts({ relayDir, env, platform, extraPorts, listenPorts }).filter((e) => e.port !== hintPort);
-  const results = await Promise.all(entries.map(async (e) => ({ ...e, ok: await probeDshWeb(`http://127.0.0.1:${e.port}`, { timeoutMs, fetchImpl }) })));
-  const hit = results.find((r) => r.ok);
+  const entries = plan.entries.filter((e) => e.port !== hintPort && !isNegativelyCached(e.port));
+  const probedPorts = [];
+  const outcomes = await mapLimit(entries, MAX_PROBE_CONCURRENCY, async (e) => {
+    probedPorts.push(e.port);
+    const ok = await probeDshWeb(`http://127.0.0.1:${e.port}`, { timeoutMs, fetchImpl });
+    if (!ok) rememberNegative(e.port);
+    return { ...e, ok };
+  });
+  const hit = outcomes.find((r) => r && r.ok);
   if (hit) {
     const url = `http://127.0.0.1:${hit.port}`;
-    if (typeof log === "function") log(`[upstream] 动态发现上游 ${url}（来源 ${hit.source}；提示 ${hint.url || "无"} 不可用）`);
-    return { url, source: hit.source, probed: entries.map((e) => e.port), rejected: hint.url ? [hint.url] : [] };
+    rememberVerified(url, hit.source);
+    logDiscovery(log, { found: true, source: hit.source, probed: entries.length, rejected: rejected.length, skipped: plan.skipped });
+    return { url, source: hit.source, probed: probedPorts, rejected, skipped: plan.skipped, truncated: plan.truncated };
   }
-
-  // ④ 都没找到:保持历史行为(3080),让上层按"上游没起来"正常重试
+  logDiscovery(log, { found: false, source: hint.url ? hint.source : "fallback", probed: entries.length, rejected: rejected.length, skipped: plan.skipped });
   return {
     url: hint.url || FALLBACK_UPSTREAM,
     source: hint.url ? hint.source : "fallback",
-    probed: entries.map((e) => e.port),
-    rejected: hint.url ? [hint.url] : []
+    probed: probedPorts,
+    rejected,
+    skipped: plan.skipped,
+    truncated: plan.truncated
+  };
+}
+
+/**
+ * 发现上游地址（**顶层 API，默认不阻塞**）。
+ *
+ * 语义（2026-11-07 提速）：
+ *   1. 先跑 `discoverUpstreamFast()` —— 正常情况 <50ms 返回；
+ *   2. fast 没命中时才做一次完整发现，但最多等 `maxWaitMs`（默认 600ms）：
+ *      完成就返回完整结果；超时则返回 fast/hint 的结果（`pending:true`），完整发现转到后台，
+ *      结果写缓存，供**下一次**调用秒回（并避免每个请求都重新全量探测）。
+ *
+ * 需要"一次调用就等到完整结果"（诊断/测试）时传 `{ wait: true }` 或直接用 `discoverUpstreamFull()`。
+ *
+ * @param {{wait?:boolean, maxWaitMs?:number}} [options]
+ * @returns {Promise<{url: string, source: string, probed: number[], rejected: string[], skipped: number, pending?:boolean}>}
+ *          source: env | file | dsh_web_url | process | listen | static | extra | fallback
+ */
+export async function discoverUpstream(options = {}) {
+  if (options.wait === true || options.full === true) return discoverUpstreamFull(options);
+  const maxWaitMs = Number.isFinite(Number(options.maxWaitMs)) ? Math.max(0, Number(options.maxWaitMs)) : 600;
+  let fast = null;
+  try {
+    fast = await discoverUpstreamFast(options);
+  } catch { fast = null; }
+  if (fast && fast.url) return { ...fast, pending: false };
+
+  // fast 没命中：给完整发现一个**有界**窗口（静态候选也就 13 个，正常远小于预算）
+  let timer = null;
+  let timedOut = false;
+  const full = discoverUpstreamFull(options).catch(() => null);
+  bgDiscoveryInflight = full.finally(() => { bgDiscoveryInflight = null; });
+  const bounded = await Promise.race([
+    full,
+    new Promise((resolve) => {
+      timer = setTimeout(() => { timedOut = true; resolve(null); }, maxWaitMs);
+      if (timer && typeof timer.unref === "function") timer.unref();
+    })
+  ]);
+  if (timer) { try { clearTimeout(timer); } catch { /* 忽略 */ } }
+  if (bounded && bounded.url) return { ...bounded, pending: false };
+  if (timedOut) {
+    // 超时：完整发现继续在后台跑（结果进缓存）；本次先返回 fast/hint 结果
+    void full;
+  }
+  const hint = resolveUpstreamHint({ relayDir: options.relayDir, env: options.env });
+  return {
+    url: (fast && fast.url) || hint.url || FALLBACK_UPSTREAM,
+    source: (fast && fast.source) || hint.source || "fallback",
+    probed: (fast && fast.probed) || [],
+    rejected: (fast && fast.rejected) || [],
+    skipped: (fast && fast.skipped) || 0,
+    pending: true
   };
 }

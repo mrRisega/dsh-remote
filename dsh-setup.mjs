@@ -1315,21 +1315,47 @@ function upstreamPort() {
 let upstreamDiscoveryAt = 0;
 let upstreamDiscoveryInflight = null;
 const UPSTREAM_DISCOVERY_COOLDOWN_MS = 15_000;
+/**
+ * 连续未命中后的**指数退避**：watcher 每 10s 轮询一次，上游长期不可达（dsh web 关着）时
+ * 每轮都全量扫本机端口 = 每 10s 敲一遍微信等客户端端口（2026-11-07 微信 CPU 高的放大器之一）。
+ * 现在：15s → 30s → 60s → 300s 封顶；端口文件一变（事件驱动）立即清零重试。
+ */
+const UPSTREAM_DISCOVERY_BACKOFF_MS = [15_000, 30_000, 60_000, 300_000];
+let upstreamDiscoveryFails = 0;
+let upstreamDiscoveryNextAt = 0;
+let warnedUpstreamDiscoveryBackoff = false;
 
 /**
  * 动态发现上游（带身份校验），成功后写入 `discoveredUpstream` 供全局复用。
- * @param {boolean} force 忽略冷却（探测失败后的重试用）
+ * @param {boolean} force 忽略冷却/退避（仅限安装瞬间等一次性场景；**轮询路径不要传 true**）
  */
 async function refreshUpstreamDiscovery(force = false) {
   if (upstreamDiscoveryInflight) return upstreamDiscoveryInflight;
   const now = Date.now();
+  // ⚠️ force 只绕过「普通冷却」，**绝不绕过失败退避**：watcher 每 10s 会 force 一次，
+  //    若 force 能打穿退避，就退化成"上游一直不可达 = 每 10s 全量扫一遍本机端口"
+  //    （2026-11-07 微信 CPU 事故的放大器）。端口文件一变，watchUpstreamFile 会清零退避。
+  if (now < upstreamDiscoveryNextAt) return upstreamUrl();
   if (!force && now - upstreamDiscoveryAt < UPSTREAM_DISCOVERY_COOLDOWN_MS) return upstreamUrl();
   upstreamDiscoveryAt = now;
   upstreamDiscoveryInflight = (async () => {
     try {
       const found = await discoverUpstream({ relayDir: CONFIG_DIR, log: (m) => console.log(`[dsh-remote] ${m}`) });
       // 「提示地址验证通过」与「候选命中」都值得记下来；fallback（什么都没找到）不污染现有判断
-      if (found.url && found.source !== "fallback") discoveredUpstream = found.url;
+      if (found.url && found.source !== "fallback") {
+        discoveredUpstream = found.url;
+        upstreamDiscoveryFails = 0;
+        upstreamDiscoveryNextAt = 0;
+        warnedUpstreamDiscoveryBackoff = false;
+      } else {
+        upstreamDiscoveryFails += 1;
+        const wait = UPSTREAM_DISCOVERY_BACKOFF_MS[Math.min(upstreamDiscoveryFails - 1, UPSTREAM_DISCOVERY_BACKOFF_MS.length - 1)];
+        upstreamDiscoveryNextAt = Date.now() + wait;
+        if (!warnedUpstreamDiscoveryBackoff) {
+          warnedUpstreamDiscoveryBackoff = true;
+          console.log(`[dsh-remote] 上游发现暂未命中 → ${Math.round(wait / 1000)}s 后再试（连续 ${upstreamDiscoveryFails} 次，退避最长 5 分钟；避免反复扫描本机端口）`);
+        }
+      }
       return upstreamUrl();
     } catch {
       return upstreamUrl();
@@ -1338,6 +1364,45 @@ async function refreshUpstreamDiscovery(force = false) {
     }
   })();
   return upstreamDiscoveryInflight;
+}
+
+/**
+ * 事件驱动上游端口（2026-11-07）：插件半每次启动/换端口都会重写 `<CONFIG_DIR>/.dsh-upstream`
+ * （**确认过：实际文件名就是 `.dsh-upstream`，`.dsh-config` 里没有 upstream 字段**）。
+ *
+ * 用 `fs.watchFile`（1s 一次 stat，**不扫端口**）监听它：
+ *   · 内容变了 → 直接采用新地址 + 清掉冷却/退避 → 立刻 `ensureBridge()`；
+ *   · 于是"上游端口变了"不再依赖每 10s 的全量端口扫描（那正是微信 CPU 高的放大器）。
+ * 监听不可用时静默退回原来的 10s 轮询（行为不回归）。
+ *
+ * @param {() => Promise<any>} [onChange]
+ */
+let upstreamFileWatch = null;
+function watchUpstreamFile(onChange) {
+  if (upstreamFileWatch) return;
+  const file = path.join(CONFIG_DIR, UPSTREAM_FILE);
+  let last = "";
+  try { last = String(fs.readFileSync(file, "utf8")).trim(); } catch { last = ""; }
+  try {
+    upstreamFileWatch = { file, last };
+    fs.watchFile(file, { interval: 1000, persistent: false }, () => {
+      let next = "";
+      try { next = String(fs.readFileSync(file, "utf8")).trim(); } catch { next = ""; }
+      if (!next || next === upstreamFileWatch.last) return;
+      upstreamFileWatch.last = next;
+      if (!/^https?:\/\/[^\s]+$/i.test(next)) return;
+      discoveredUpstream = next.replace(/\/+$/, "");
+      // 新端口 = 新的发现时机：清冷却/退避，下一次 ensureBridge 立刻采用
+      upstreamDiscoveryAt = 0;
+      upstreamDiscoveryFails = 0;
+      upstreamDiscoveryNextAt = 0;
+      warnedUpstreamDiscoveryBackoff = false;
+      reconcileUpstreamEnvFromFile();
+      if (typeof onChange === "function") {
+        Promise.resolve().then(() => onChange()).catch(() => {});
+      }
+    });
+  } catch { /* watch 不可用：保持 10s 轮询 */ }
 }
 
 /** 上游是否**有响应**（判据刻意宽松：4xx/5xx 也算"端口在听"，那种情况问题在别处）。 */
@@ -1374,6 +1439,8 @@ async function isDshWebUp(timeoutMs = 1200) {
     }
   } catch { /* 没有端口文件：继续走动态发现 */ }
   const before = upstreamUrl();
+  // 探测失败时主动发现一次（force = 绕过 15s 普通冷却；**失败退避仍在**，见 refreshUpstreamDiscovery），
+  // 所以 watcher 每 10s 调用也不会演变成"每 10s 全量扫描本机端口"。
   const after = await refreshUpstreamDiscovery(true);
   if (after === before) return false;
   return upstreamReachable(after, timeoutMs);
@@ -1947,6 +2014,7 @@ async function runBridge() {
 
   // 先做一次动态发现再打印/派生：否则日志会长期写着错误的端口（用户实测就卡在
   // 「等待 dsh web（127.0.0.1:3080）启动...」而真实上游在 43120）。
+  // 只在这一处 force 一次（进程启动必然需要一次真实发现）；轮询路径一律走冷却/退避。
   await refreshUpstreamDiscovery(true);
   console.log(`[dsh-remote] 等待 dsh web（${upstreamUrl()}）启动...`);
   let bridgeProc = null;
@@ -2055,9 +2123,10 @@ async function runBridge() {
     const alive = await checkUpstream();
     if (alive && childStopped(bridgeProc)) {
       starting = true;
-      // dsh 重启可能换端口（Electron 每次启动端口可能变）：拉起前**强制重新发现**，
-      // 否则 discoveredUpstream 缓存旧端口 → bridge 连不上上游 → 设备掉线（2026-10-25 实测）。
-      await refreshUpstreamDiscovery(true);
+      // dsh 重启可能换端口（Electron 每次启动端口可能变）：拉起前再确认一次最新地址。
+      // 走冷却/退避（不 force）：新端口通常已由 `.dsh-upstream` 的 watch 或 isDshWebUp 的文件优先读到；
+      // 真没有时退避会在几秒内放开，且不会演变成"每轮全量扫描"。
+      await refreshUpstreamDiscovery();
       console.log("[dsh-remote] dsh web 在线，启动 bridge...");
       // 清除代理环境变量（bridge 需直连 relay，不受本机代理影响）
       const childEnv = {
@@ -2204,7 +2273,9 @@ async function runBridge() {
   }
 
   await ensureBridge();
-  setInterval(ensureBridge, 10000); // 每 10s 检查
+  // 事件驱动：插件写 `.dsh-upstream` 的瞬间就采用新端口（替代"每 10s 全量扫描"）
+  watchUpstreamFile(ensureBridge);
+  setInterval(ensureBridge, 10000); // 每 10s 检查（只为 keep-bridge-alive；发现本身已按冷却/退避）
   console.log("[dsh-remote] 守护运行中（Ctrl-C 退出）");
 }
 

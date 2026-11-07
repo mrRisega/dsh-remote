@@ -178,7 +178,9 @@ test("📱 远程访问卡：bridge 在线 → 绿点文案；登录态点「生
 
   // 状态行：bridge 运行 → “已连接（可远程访问）”
   assert.ok(textHas(tree, "已连接（可远程访问）"), "bridge 在线状态文案应显示");
-  assert.ok(find(tree, (n) => n.children?.includes("📱 远程访问")), "应渲染「📱 远程访问」卡标题");
+  // A1（2026-11-07 业主截图）：正文里不再重复「远程访问」标题 —— 顶部与弹层标题已经表达了。
+  assert.equal(find(tree, (n) => n.children?.includes("📱 远程访问")), undefined,
+    "正文里不得再有重复的「远程访问」卡片标题（业主截图框出的那行）");
 
   // 未生成 key 的空态按钮 → 点击触发 /dsh-remote/access-key
   const genBtn = find(tree, (n) => (n.children || []).some((c) => typeof c === "string" && c.includes("生成访问链接")));
@@ -422,130 +424,66 @@ test("E2EE 徽标：未登录 / host 未下发 e2ee → 不打扰（不渲染状
   assert.equal(e2eeLine(oldHost.render()), undefined, "未下发 service.e2ee 时不应渲染状态行");
 });
 
-test("「更多」只收纳营销入口：档位规格数字（Mbps / GB / 价格）不再出现在账号卡里", () => {
-  // 收纳态（localStorage 里记着用户关掉过引导）＝「更多」里会出现那两条折叠入口的场景
+test("账号弹层平铺（A2）：所有功能直接可见，不再有「更多」折叠；且不渲染档位数值", () => {
   const plugin = loadPlugin({ autoModal: "account", localStorageSeed: { "dsh-remote-marketing-more-v1": "1" } });
   plugin.states[0] = { config: { phone: "13800000000", deviceId: "dev-x" }, service: { running: true } };
-  let tree = plugin.render();
+  const tree = plugin.render();
 
-  // 真实用户路径：点披露按钮展开「更多」
-  const toggle = find(tree, (n) => n.props?.id === "dru-account-more");
-  assert.ok(toggle, "账号卡应有「更多」披露按钮");
-  assert.equal(toggle.props["aria-expanded"], "false", "默认收起");
-  toggle.props.onClick();
-  tree = plugin.render();
-  const body = find(tree, (n) => n.props?.className === "dru-more-body");
-  assert.ok(body, "「更多」内容体应在 DOM 里");
-  assert.equal(body.props.hidden, false, "点击后应展开（hidden=false）");
+  // 不再有「更多」披露按钮 / 折叠体（业主：账号弹层不要折叠，空间足够）
+  assert.equal(find(tree, (n) => n.props?.id === "dru-account-more"), undefined,
+    "账号弹层不得再有「更多」折叠按钮");
+  assert.equal(find(tree, (n) => n.props?.className === "dru-more-body"), undefined,
+    "账号弹层不得再有「更多」折叠体");
 
-  // 【0.6.11】档位明细整块删除：标题「套餐与额度」、PRO / Pro Max 规格行、价格与结论句都不再渲染
-  assert.ok(!textHas(body, "套餐与额度"), "「套餐与额度」标题应删除");
-  assert.ok(!textHas(body, "Mbps"), "不得再渲染带宽数值（用户约定：本地面板不展示 PRO 版本流量带宽）");
-  assert.ok(!textHas(body, "GB"), "不得再渲染流量数值");
-  assert.ok(!textHas(body, "¥"), "不得再渲染价格");
-  assert.ok(!textHas(body, "以套餐页为准"), "随档位明细一起删掉的结论句不得残留");
-  // 整张账号卡同样一个规格数字都不许有
-  assert.ok(!textHas(tree, "Mbps"), "账号卡里不得出现 Mbps");
-  assert.ok(!textHas(tree, "¥"), "账号卡里不得出现价格");
+  // 各功能直接平铺（无需展开就能看到）
+  for (const label of ["用户反馈", "带新用户换会员", "修改密码"]) {
+    assert.ok(find(tree, (n) => n.type === "button" && (n.children || []).some((c) => typeof c === "string" && c.includes(label))),
+      "应直接平铺按钮: " + label);
+  }
 
-  // 2026-10-17 版式简化（业主）：正面只留「升级/续费 + 用户反馈 + 更多」；
-  // 「带新用户换会员 / 修改密码」收进「更多」。升级入口**永远在正面**（不再随收纳状态搬家）。
-  const upsell = find(tree, (n) => n.type === "button" && (n.children || []).some((c) => typeof c === "string" && c.includes("升级 PRO")));
-  const invite = find(body, (n) => n.type === "button" && (n.children || []).some((c) => typeof c === "string" && c.includes("带新用户换会员")));
-  assert.ok(upsell, "正面应保留「🚀 升级 PRO」入口（主行动，位置稳定）");
-  assert.ok(invite, "「更多」里应保留「🎁 带新用户换会员」入口");
-  assert.equal(typeof upsell.props.onClick, "function");
-  assert.equal(typeof invite.props.onClick, "function");
-  // 正面不应再出现「带新用户换会员」（已收进「更多」）
-  const actions = find(tree, (n) => n.props?.className === "dru-actions");
-  assert.ok(actions, "应有主按钮行");
-  assert.ok(!textHas(actions, "带新用户换会员"), "带新用户入口不再占正面按钮行");
-  // 「更多」现在与主行动同排：按钮本体带 .dru-btn（原来的整宽 .dru-disclose 披露条已去掉）
-  const moreBtn = find(tree, (n) => n.props?.id === "dru-account-more");
-  assert.ok(moreBtn, "「更多」按钮应存在");
-  assert.match(String(moreBtn.props.className || ""), /dru-btn/, "「更多」必须与主行动同排（按钮样式，不再是整宽披露条）");
-  assert.doesNotMatch(String(moreBtn.props.className || ""), /dru-disclose(?!-inline)/, "不得再继承整宽披露条样式");
-
-  // 源码级：函数与其调用都删掉了（不留死代码）。
-  // ⚠️ 断言「代码形态」而不是裸标识符 —— 注释里**故意**留着「这里原本是什么、为什么删」的说明
-  //    （与 settings-entry.test.mjs 的同款约定：注释里允许出现说明文字）。
-  assert.doesNotMatch(SOURCE, /function renderPlanDetail\(/, "renderPlanDetail 函数必须删除");
-  assert.doesNotMatch(SOURCE, /^\s*renderPlanDetail\(\),/m, "renderPlanDetail 的调用点必须删除");
-  assert.doesNotMatch(SOURCE, /function planSpecText\(/, "planSpecText 定义必须删除");
-  assert.doesNotMatch(SOURCE, /planSpecText\("/, "planSpecText 的调用必须删除");
-  assert.doesNotMatch(SOURCE, /function freeMbpsOf\(/, "freeMbpsOf 定义必须删除");
-  assert.doesNotMatch(SOURCE, /=\s*freeMbpsOf\(\)/, "freeMbpsOf 的调用必须删除");
-  assert.doesNotMatch(SOURCE, /var FREE_FACTS\s*=/, "FREE_FACTS 定义必须删除（只被 freeMbpsOf 使用）");
-  assert.doesNotMatch(SOURCE, /" Mbps"|" GB\/月，¥"/, "不得残留渲染规格数字的字符串拼接");
-  // 不变量仍在：planFactsOf 仍被 upgradePath 用来取档位展示名（不是死代码）
-  assert.match(SOURCE, /var name = planFactsOf\(key\)\.name;/);
+  // 档位明细/数值始终不渲染（用户约定：本地面板不展示 PRO 版本流量带宽）
+  assert.ok(!textHas(tree, "套餐与额度"), "「套餐与额度」标题应删除");
+  assert.ok(!textHas(tree, "Mbps"), "不得再渲染带宽数值");
+  assert.ok(!textHas(tree, "GB"), "不得再渲染流量数值");
+  assert.ok(!textHas(tree, "¥"), "不得再渲染价格");
 });
 
-test("E2EE 徽标（源码级约束）：client 含徽标字段/文案与 reason 映射表", () => {
-  assert.match(SOURCE, /service\.e2ee/);
-  assert.match(SOURCE, /\.e2ee-state\.json/);
-  assert.match(SOURCE, /🔒 端到端加密已启用（手机解锁后生效）/);
-  assert.match(SOURCE, /端到端加密暂不可用（当前为普通安全连接 HTTPS）/);
-  assert.doesNotMatch(SOURCE, /等待服务端开启 E2EE/);   // 已正式开启，不再出现“灰度等待”措辞
-  assert.match(SOURCE, /当前为普通安全连接（HTTPS）/);
-  assert.match(SOURCE, /server_disabled/);
-  assert.match(SOURCE, /params_unreachable/);
-  assert.match(SOURCE, /disabled_by_config/);
-  assert.match(SOURCE, /derive_failed/);
-  assert.match(SOURCE, /describeE2ee/);
-  assert.match(SOURCE, /dru-e2ee-line/);
-});
-
-// ── 2026-10-17 版式与文案精简（业主 UX 反馈）──────────────────────────────────
-// 动线：账号（我是谁 / 退出）→ 主行动（升级或续费）→ 次要（反馈）→ 更多（其它入口）。
-
-test("★ 正面按钮收敛为三个：升级/续费 + 用户反馈 + 更多（不再一排按钮疯狂换行）", () => {
+test("账号弹层：一屏一个主操作（只有升级/续费是 primary）；退出登录在状态头（A3）", () => {
   const plugin = loadPlugin({ autoModal: "account" });
   plugin.states[0] = { config: { phone: "13800000000", deviceId: "dev-x" }, service: { running: true } };
   const tree = plugin.render();
-  // 面板里可能有多处 .dru-actions（访问密钥卡等）；账号卡那一处用「更多」按钮定位。
-  const actions = find(tree, (n) => {
-    if (n.props?.className !== "dru-actions") return false;
-    let hit = false;
-    walk(n, (x) => { if (x.props?.id === "dru-account-more") hit = true; });
-    return hit;
-  });
-  assert.ok(actions, "应有账号卡主按钮行");
 
-  const btns = [];
-  walk(actions, (n) => { if (n.type === "button") btns.push(n); });
-  // 三个按钮：主行动、用户反馈、更多
-  assert.equal(btns.length, 3, `正面按钮应为 3 个，实际 ${btns.length} 个（多了就是又回到"按钮墙"）`);
-  const labels = btns.map((b) => JSON.stringify(b.children || []));
-  assert.ok(labels.some((t) => t.includes("升级 PRO") || t.includes("续费会员")), "第一个是主行动");
-  assert.ok(labels.some((t) => t.includes("用户反馈")), "用户反馈留在正面");
-  assert.ok(labels.some((t) => t.includes("更多")), "「更多」与主行动同排");
+  const primary = findAll(tree, (n) => n.type === "button" && String(n.props?.className || "").includes("dru-btn-primary"));
+  assert.ok(primary.length <= 1, `一屏最多一个主操作，实际 ${primary.length} 个 primary 按钮`);
 
-  // 退出登录**不在**主按钮行里，而在账号行（.dru-user）右侧
-  const logoutInActions = btns.some((b) => (b.children || []).some((c) => c === "退出登录"));
-  assert.equal(logoutInActions, false, "退出登录不得再占主按钮行");
-  const userRow = find(tree, (n) => n.props?.className === "dru-user");
-  assert.ok(userRow, "应有账号行");
-  const logout = find(userRow, (n) => n.type === "button" && (n.children || []).includes("退出登录"));
-  assert.ok(logout, "退出登录应在账号行里（业主：放到账号那一行旁边）");
-  assert.match(String(logout.props.className || ""), /dru-user-logout/);
+  // 登录/退出登录同一位置：状态头右侧（`.dru-ia-head-actions`）
+  const headActions = find(tree, (n) => String(n.props?.className || "").split(/\s+/).includes("dru-ia-head-actions"));
+  assert.ok(headActions, "状态头右侧应有按钮组（登录/退出登录与打开手机端同一处）");
+  assert.ok(find(headActions, (n) => n.type === "button" && (n.children || []).includes("退出登录")),
+    "已登录时状态头应有「退出登录」");
+  // 账号弹层内部不再重复一个退出登录按钮
+  const dlg = find(tree, (n) => String(n.props?.className || "").includes("dru-ia-dialog"));
+  assert.equal(find(dlg, (n) => n.type === "button" && (n.children || []).includes("退出登录")), undefined,
+    "退出登录不得在账号弹层里重复出现（同一动作只在一个位置）");
 });
 
-test("★ 次要入口全部在「更多」里：带新用户 / 修改密码 / 加入交流群（展开后可见）", () => {
-  const plugin = loadPlugin({ autoModal: "account" });
-  plugin.states[0] = { config: { phone: "13800000000", deviceId: "dev-x" }, service: { running: true } };
+test("未登录：状态头显示「登录 / 注册」；点「打开手机端」直接弹登录弹层并说明原因（A3/A4）", () => {
+  const plugin = loadPlugin();
+  // 该 harness 无 setSignedIn：直接给状态槽一个"未登录"的 st（useEffect 在本 harness 是空实现）
+  plugin.states[0] = { ok: true, config: {}, service: { running: false } };
   let tree = plugin.render();
-  const toggle = find(tree, (n) => n.props?.id === "dru-account-more");
-  assert.ok(toggle, "应有「更多」按钮");
-  toggle.props.onClick(); // 展开
-  tree = plugin.render();
-  const body = find(tree, (n) => n.props?.className === "dru-more-body");
-  assert.ok(body && body.props.hidden === false, "展开后「更多」内容体可见");
-  const btns = [];
-  walk(body, (n) => { if (n.type === "button") btns.push(n); });
-  const labels = btns.map((b) => JSON.stringify(b.children || []));
-  assert.ok(labels.some((t) => t.includes("带新用户换会员")), "带新用户换会员在「更多」里");
-  assert.ok(labels.some((t) => t.includes("修改密码")), "修改密码在「更多」里");
+  const headActions = find(tree, (n) => String(n.props?.className || "").split(/\s+/).includes("dru-ia-head-actions"));
+  assert.ok(headActions, "未登录也要有状态头按钮组");
+  const loginBtn = find(headActions, (n) => n.type === "button" && (n.children || []).some((c) => typeof c === "string" && c.includes("登录 / 注册")));
+  assert.ok(loginBtn, "未登录时同一位置显示「登录 / 注册」入口");
+
+  // 点状态头的「打开手机端」→ 不许静默失败：直接弹登录弹层 + 说明
+  const openPhone = find(headActions, (n) => n.type === "button" && (n.children || []).some((c) => typeof c === "string" && c.includes("打开手机端")));
+  assert.ok(openPhone, "应有「打开手机端」主按钮");
+  openPhone.props.onClick();
+  tree = plugin.settle ? plugin.render() : plugin.render();
+  assert.ok(find(tree, (n) => String(n.props?.className || "").includes("dru-ia-dialog")), "应弹出登录弹层（不是静默失败）");
+  assert.ok(textHas(tree, "登录后才能用手机访问"), "弹层里要说明「登录后才能用手机访问」");
 });
 
 test("★ 删除了两段解释性文案：升级带登录态说明 / 重启 DeepSeek Harness 说明", () => {

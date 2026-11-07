@@ -1165,7 +1165,8 @@ test("★ 会话绑定优先级：配置固定 → 最近活跃 → sessions[0]�
     const server = await startFakeServer({ onFrame: (f, ws) => { autoAckAuth(f, ws); autoAckPing(f, ws); } });
     const bot = createWecomBot({
       botId: BOT_ID, secret: SECRET, url: server.url, relayDir: relayDir1, logger: () => {},
-      subscriber: sub, configuredSessionId: "s-fixed", configuredSessionTitle: "固定会话"
+      subscriber: sub, configuredSessionId: "s-fixed", configuredSessionTitle: "固定会话",
+      tier: "pro" // 固定会话是会员能力（sessions）；免费档会被忽略（另有用例覆盖）
     });
     try {
       bot.start();
@@ -1274,6 +1275,285 @@ test("控制器：只改 sessionId 也会重建 bot（配置热更新后转发�
     await controller.stop();
     await server.close();
     fs.rmSync(relayDir, { recursive: true, force: true });
+  }
+});
+
+// ─────────────────────── ⑩f IM 通道会员判定（2026-11-07）───────────────────────
+
+// 复用微信通道那套能力表（单一真相源）：免费 = 通知/审批/状态/急停 + assign.continue(20 条/月)
+const FREE_CAPS = ["notify", "approve", "status", "stop", "assign.continue"];
+const PAID_CAPS = ["notify", "approve", "status", "stop", "assign", "sessions", "summary", "steer", "attach", "multi"];
+const tierFreeObj = () => ({ plan: "free", caps: FREE_CAPS, limits: { messages_per_month: 20 }, rev: "rev-free" });
+const tierProObj = () => ({ plan: "pro", caps: PAID_CAPS, limits: { messages_per_month: 0 }, rev: "rev-pro" });
+
+/** 会员用例的 bot：接入一个可控 capsProvider，返回常用断言面。 */
+async function setupMemberBot(over = {}) {
+  const server = await startFakeServer({ onFrame: (f, ws) => { autoAckAuth(f, ws); autoAckPing(f, ws); autoAckSend(f, ws); } });
+  const sub = fakeSubscriber(over.sub || {
+    sessionIds: ["s-live", "s-other"],
+    sessions: [
+      { sessionId: "s-live", title: "活跃会话", running: true, updatedAt: 200 },
+      { sessionId: "s-other", title: "另一个", updatedAt: 100 }
+    ]
+  });
+  const lines = [];
+  const decisions = [];
+  const bot = createWecomBot({
+    botId: BOT_ID, secret: SECRET, url: server.url,
+    logger: (level, line) => lines.push(line),
+    subscriber: sub,
+    capsProvider: over.capsProvider,
+    appUrl: "https://app.test/",
+    onApprovalDecision: async (requestId, decision) => { decisions.push({ requestId, decision }); return { ok: true }; },
+    tierDenyThrottleMs: 0,
+    ...(over.bot || {})
+  });
+  const replies = () => server.state.frames.filter((f) => f.cmd === "aibot_respond_msg");
+  const markdowns = () => server.state.frames.filter((f) => f.cmd === "aibot_send_msg" && f.body && f.body.markdown);
+  const cards = () => server.state.frames.filter((f) => f.cmd === "aibot_send_msg" && f.body && f.body.msgtype === "template_card");
+  let seq = 0;
+  return {
+    server, sub, bot, lines, decisions, replies, markdowns, cards,
+    async start() { bot.start(); await waitFor(() => bot.status().authenticated, { label: "认证(member)" }); },
+    /** 发一条入站文本；返回是否真的被转发（promptSession）。 */
+    async inbound(text = "hi", userid = "user-a") {
+      seq += 1;
+      const beforeP = sub.promptCalls.length;
+      const beforeR = replies().length;
+      server.push({
+        cmd: "aibot_msg_callback", headers: { req_id: `min-${seq}` },
+        body: { msgid: `mm-${seq}`, msgtype: "text", text: { content: text }, from: { userid } }
+      });
+      await waitFor(() => sub.promptCalls.length > beforeP || replies().length > beforeR, { label: `入站 ${seq} 处理完` });
+      await sleep(10);
+      return sub.promptCalls.length > beforeP;
+    },
+    lastReplyText() {
+      const r = replies()[replies().length - 1];
+      return r && r.body && r.body.stream ? String(r.body.stream.content || "") : "";
+    },
+    async close() { await bot.stop(); await server.close(); }
+  };
+}
+
+test("★ 会员·免费档：通知照常、审批卡可点且**不计数**、额度不变", async () => {
+  const relayDir = tmpRelayDir();
+  const rt = await setupMemberBot({ capsProvider: async () => tierFreeObj(), bot: { relayDir } });
+  try {
+    await rt.start();
+    await waitFor(() => rt.bot.status().tier === "free", { label: "档位 free" });
+    // 入站绑定（同时消耗 1 条免费额度）
+    assert.equal(await rt.inbound("你好"), true);
+    await waitFor(() => rt.bot.status().usage.messages === 1, { label: "用量 1" });
+    // 通知照常（免费）
+    rt.sub.emit("event", { kind: NODE_KINDS.TURN_END, sessionId: "session-x", reason: "completed", turn: 1, seq: 1, at: Date.now() });
+    await waitFor(() => rt.markdowns().find((f) => /任务完成/.test(f.body.markdown.content)), { label: "免费通知" });
+    // 审批卡：可点、不计数
+    const card = rt.bot.sendApprovalCard("user-a", { requestId: "ev-free-1", toolName: "Bash" });
+    await waitFor(() => rt.cards().length === 1, { label: "免费审批卡" });
+    pushCardClick(rt.server, { reqId: "free-click-1", taskId: card.taskId, eventKey: "allow:ev-free-1" });
+    await waitFor(() => rt.decisions.length === 1, { label: "免费审批回执" });
+    assert.equal(rt.bot.status().usage.messages, 1, "★ 审批回执不得计数（安全阀优先）");
+    const st = readStatus(relayDir);
+    assert.deepEqual(st.wecom.usage, { month: st.wecom.usage.month, messages: 1 }, "状态文件 usage 只记 1（入站那条）");
+    assert.equal(st.wecom.tier, "free");
+    assert.ok(Array.isArray(st.wecom.caps) && st.wecom.caps.includes("assign.continue"));
+    assert.equal(st.wecom.messagesPerMonth, 20);
+    assert.equal(st.wecom.remainingMessages, 19);
+  } finally {
+    await rt.close();
+    fs.rmSync(relayDir, { recursive: true, force: true });
+  }
+});
+
+test("★ 会员·免费档额度：前 20 条正常派活，第 21 条回「本月免费指令已用完」+ 升级链接且不调 promptSession", async () => {
+  const relayDir = tmpRelayDir();
+  const rt = await setupMemberBot({ capsProvider: async () => tierFreeObj(), bot: { relayDir } });
+  try {
+    await rt.start();
+    for (let i = 1; i <= 20; i++) {
+      assert.equal(await rt.inbound(`第 ${i} 条`), true, `第 ${i} 条应允许`);
+    }
+    await waitFor(() => rt.bot.status().usage.messages === 20, { label: "用满 20" });
+    const promptsBefore = rt.sub.promptCalls.length;
+    assert.equal(await rt.inbound("第 21 条"), false, "★ 第 21 条不得派活");
+    assert.equal(rt.sub.promptCalls.length, promptsBefore, "第 21 条不得调用 promptSession");
+    const reply = rt.lastReplyText();
+    assert.match(reply, /本月免费指令已用完/);
+    assert.match(reply, /20/);
+    assert.match(reply, /升级 Pro/);
+    assert.match(reply, /https:\/\/app\.test\/promo/, "要带升级链接 /app/promo");
+    assert.equal(rt.bot.status().usage.messages, 20, "被拦的消息不计数");
+    // 超额后通知仍然正常（不能把已有通道静默停掉）
+    rt.sub.emit("event", { kind: NODE_KINDS.TURN_END, sessionId: "session-x", reason: "completed", turn: 9, seq: 9, at: Date.now() });
+    await waitFor(() => rt.markdowns().find((f) => /任务完成/.test(f.body.markdown.content)), { label: "超额后通知仍在" });
+  } finally {
+    await rt.close();
+    fs.rmSync(relayDir, { recursive: true, force: true });
+  }
+});
+
+test("★ 会员·跨月清零：上月用满 20 条 → 本月第一条仍可派活", async () => {
+  const relayDir = tmpRelayDir();
+  // 预置"上个月已经用满"的状态
+  fs.writeFileSync(path.join(relayDir, IM_BOT_STATUS_FILE), JSON.stringify({
+    version: 1, wecom: { usage: { month: "2000-01", messages: 25 } }
+  }), { mode: 0o600 });
+  const rt = await setupMemberBot({ capsProvider: async () => tierFreeObj(), bot: { relayDir } });
+  try {
+    await rt.start();
+    await waitFor(() => rt.bot.status().tier === "free", { label: "档位" });
+    assert.equal(await rt.inbound("新月份第一条"), true, "★ 跨月必须清零");
+    const st = readStatus(relayDir);
+    const d = new Date();
+    const month = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+    assert.equal(st.wecom.usage.month, month);
+    assert.equal(st.wecom.usage.messages, 1);
+  } finally {
+    await rt.close();
+    fs.rmSync(relayDir, { recursive: true, force: true });
+  }
+});
+
+test("★ 会员·fail-closed：没有 capsProvider 按 free 处理（额度用满即拦）；档位刷新后放行", async () => {
+  const relayDir = tmpRelayDir();
+  const d = new Date();
+  const month = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+  fs.writeFileSync(path.join(relayDir, IM_BOT_STATUS_FILE), JSON.stringify({
+    version: 1, wecom: { usage: { month, messages: 20 } }
+  }), { mode: 0o600 });
+  // ① 完全没有 provider
+  {
+    const rt = await setupMemberBot({ bot: { relayDir } });
+    try {
+      await rt.start();
+      await sleep(30);
+      assert.equal(rt.bot.status().tier, "free", "★ 没有 capsProvider → free（fail-closed）");
+      assert.equal(await rt.inbound("没有 provider"), false);
+      assert.match(rt.lastReplyText(), /本月免费指令已用完/);
+    } finally {
+      await rt.close();
+    }
+  }
+  // ② provider 先取不到（空），随后返回 pro → 下一次放行
+  {
+    let plan = "";
+    const rt = await setupMemberBot({ capsProvider: async () => (plan ? tierProObj() : ""), bot: { relayDir } });
+    try {
+      await rt.start();
+      await sleep(30);
+      assert.equal(await rt.inbound("空档位时"), false, "取不到档位 → 按 free 拦");
+      plan = "pro";
+      assert.equal(await rt.inbound("刚升级后"), true, "★ 档位刷新后必须放行（不用重启）");
+      assert.equal(rt.bot.status().tier, "pro");
+    } finally {
+      await rt.close();
+    }
+  }
+  fs.rmSync(relayDir, { recursive: true, force: true });
+});
+
+test("★ 会员·免费档忽略配置固定会话（bindingGated）；paid 档全放开（不限量/固定会话生效）", async () => {
+  // ① 免费：配置了 sessionId 也不生效，回退活跃会话；状态标注 bindingGated
+  {
+    const relayDir = tmpRelayDir();
+    const rt = await setupMemberBot({
+      capsProvider: async () => tierFreeObj(),
+      bot: { relayDir, configuredSessionId: "s-fixed", configuredSessionTitle: "固定会话" }
+    });
+    try {
+      await rt.start();
+      await waitFor(() => rt.bot.status().tier === "free", { label: "free" });
+      const st0 = rt.bot.status();
+      assert.equal(st0.bindingGated, true, "★ 免费档固定会话被门槛忽略");
+      assert.equal(await rt.inbound("免费档"), true);
+      assert.equal(rt.sub.promptCalls[0].sessionId, "s-live", "免费档回退到活跃会话，而不是 s-fixed");
+      await waitFor(() => { const st = readStatus(relayDir); return st && st.wecom && st.wecom.bindingGated === true; }, { label: "状态文件 bindingGated" });
+      const st = readStatus(relayDir);
+      assert.equal(st.wecom.boundSessionId, "s-live");
+      assert.equal(st.wecom.bindingGated, true);
+    } finally {
+      await rt.close();
+      fs.rmSync(relayDir, { recursive: true, force: true });
+    }
+  }
+  // ② paid：不限量 + 固定会话生效 + bindingGated=false
+  {
+    const relayDir = tmpRelayDir();
+    const rt = await setupMemberBot({
+      capsProvider: async () => tierProObj(),
+      bot: { relayDir, configuredSessionId: "s-fixed", configuredSessionTitle: "固定会话" }
+    });
+    try {
+      await rt.start();
+      await waitFor(() => rt.bot.status().tier === "pro", { label: "pro" });
+      assert.equal(rt.bot.status().bindingGated, false);
+      for (let i = 1; i <= 25; i++) assert.equal(await rt.inbound(`付费 ${i}`), true, `付费第 ${i} 条`);
+      assert.equal(rt.bot.status().usage.messages, 25, "付费也统计用量（但不限量）");
+      assert.equal(rt.bot.status().messagesPerMonth, 0, "0 = 不限");
+      assert.equal(rt.sub.promptCalls.every((c) => c.sessionId === "s-fixed"), true, "★ 付费档固定会话生效");
+      const st = readStatus(relayDir);
+      assert.equal(st.wecom.tier, "pro");
+      assert.equal(st.wecom.remainingMessages, null, "不限量时 remaining=null");
+    } finally {
+      await rt.close();
+      fs.rmSync(relayDir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("★ 会员·服务端 caps 清空（空数组=权威）→ 互动全关但通知照常；审批卡仍可点", async () => {
+  const rt = await setupMemberBot({
+    capsProvider: async () => ({ plan: "free", caps: [], limits: { messages_per_month: 20 }, rev: "rev-empty" })
+  });
+  try {
+    await rt.start();
+    await waitFor(() => rt.bot.status().caps.length === 0, { label: "caps 清空" });
+    assert.equal(rt.bot.status().caps.length, 0, "空数组 = 服务端明确清空，不得回退内置表");
+    assert.equal(await rt.inbound("被清空的档位"), false, "没有 assign.continue → 不得派活");
+    assert.match(rt.lastReplyText(), /会员功能|升级 Pro/);
+    // 通知不受能力表影响（通知是免费能力，不能静默停掉）
+    rt.sub.emit("event", { kind: NODE_KINDS.TURN_END, sessionId: "session-x", reason: "completed", turn: 3, seq: 3, at: Date.now() });
+    await waitFor(() => rt.markdowns().find((f) => /任务完成/.test(f.body.markdown.content)), { label: "通知仍在" });
+    // 审批卡也不受互动闸影响（点得动、不计数）
+    const card = rt.bot.sendApprovalCard("user-a", { requestId: "ev-empty-1", toolName: "Bash" });
+    await waitFor(() => rt.cards().length === 1, { label: "卡" });
+    pushCardClick(rt.server, { reqId: "empty-click", taskId: card.taskId, eventKey: "allow:ev-empty-1" });
+    await waitFor(() => rt.decisions.length === 1, { label: "审批回执" });
+    assert.equal(rt.bot.status().usage.messages, 0);
+  } finally {
+    await rt.close();
+  }
+});
+
+// ─────────────────────── ⑩g 通道格式化接入（2026-11-08）───────────────────────
+
+test("★ 通道格式化接入：回答回传含 Markdown 表格时，发出的报文里没有裸表格（转成「• 列：值」）", async () => {
+  const answerWithTable = [
+    "修复完成，改动如下：",
+    "",
+    "| 文件 | 改动 | 行数 |",
+    "|---|---|---|",
+    "| clients/dsh-remote/a.mjs | 修端口探测 | 10 |",
+    "| clients/dsh-remote/b.mjs | 加负缓存 | 20 |",
+    "",
+    "以上。"
+  ].join("\n");
+  const rt = await setupRelayBot({ assistantText: { ok: true, text: answerWithTable } });
+  try {
+    rt.bot.start();
+    await waitFor(() => rt.bot.status().authenticated, { label: "认证完成" });
+    await rt.inbound("relay-table-1", "给我看下改动");
+    rt.turnEnd({ turn: 1, seq: 41 });
+    const send = await waitFor(() => rt.sends()[0], { label: "回答回传" });
+    const content = send.body.markdown.content;
+    assert.ok(!/\|\s*-{2,}/.test(content), "★ 报文里不得出现 |--- 分隔行");
+    assert.ok(!/^\s*\|.*\|\s*$/m.test(content), "★ 报文里不得出现裸表格行");
+    assert.match(content, /^• 文件：clients\/dsh-remote\/a\.mjs · 改动：修端口探测 · 行数：10$/m);
+    assert.match(content, /修复完成/);
+    assert.match(content, /以上。/);
+  } finally {
+    await rt.close();
   }
 });
 

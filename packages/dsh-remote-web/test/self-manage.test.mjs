@@ -231,7 +231,11 @@ test("源码约束：浏览器半提供版本与更新卡片（含彻底卸载�
   assert.match(source, /一键更新/);
   assert.match(source, /彻底卸载/);
   assert.match(source, /dsh-remote\/self\/uninstall/);
-  assert.match(source, /再点一次确认彻底卸载/);
+  // A7（2026-11-07 业主）：彻底卸载前先弹**挽留反馈**（原因单选 + 建议），提交后继续卸载。
+  assert.match(source, /为什么要卸载/, "必须询问卸载原因（挽留反馈）");
+  assert.match(source, /我再想想/, "必须给「我再想想」的退出选项");
+  assert.match(source, /仍要卸载/, "确认按钮必须是「仍要卸载」");
+  assert.match(source, /kind: "uninstall"/, "反馈必须复用现有反馈通道（kind=uninstall）");
 });
 
 test("★ 用户反馈锁：已是最新版时，修复入口必须**看得出是修复入口**（不能只叫「重新检查」）", () => {
