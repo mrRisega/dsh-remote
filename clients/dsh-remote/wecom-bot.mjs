@@ -53,6 +53,9 @@ import WebSocket from "ws";
 import { createEventSubscriber, NODE_KINDS } from "./dsh-events.mjs";
 // 通道感知格式化（2026-11-08：企微/钉钉 markdown 不支持表格，发前统一适配；飞书/微信各有分支）
 import { formatForChannel } from "./im-format.mjs";
+// 命令层（2026-11-08）：/help /status /stop /ls /use /unbind 在**进模型前**拦下执行；
+// 解析/文案/能力门禁三家共用（与会员升级文案同口径）。
+import { executeImCommand, writeImBotsSession } from "./im-commands.mjs";
 // 会员能力表 = **单一真相源**：直接复用微信通道那套（WECHAT_CAPABILITY_TABLE / limitsFor / grantsCap），
 // 不另造一套。企微/飞书/钉钉将来都套同一套判定（见 research/.../im-channel-membership-design.md）。
 import {
@@ -716,8 +719,8 @@ export function createWecomBot(options = {}) {
   const approvalCardTtlMs = positiveNumber(options.approvalCardTtlMs, APPROVAL_CARD_TTL_MS);
   const onApprovalDecision = typeof options.onApprovalDecision === "function" ? options.onApprovalDecision : null;
   // 会话可选绑定（task-24）：配置固定的会话（空 = 跟随活跃会话）
-  const configuredSessionId = String(options.configuredSessionId || "").trim();
-  const configuredSessionTitle = truncateText(options.configuredSessionTitle || "", 60);
+  let configuredSessionId = String(options.configuredSessionId || "").trim();
+  let configuredSessionTitle = truncateText(options.configuredSessionTitle || "", 60);
   // ── 会员判定（2026-11-07 业主拍板：通知免费、审批免费、互动半阉割）──
   // capsProvider 由 bridge 注入（复用微信通道的 resolveWechatTier：字符串档位或 {plan,caps,limits,rev}）；
   // 拿不到 / 未注入 → **按 free fail-closed**。
@@ -1367,8 +1370,87 @@ export function createWecomBot(options = {}) {
   }
 
   /** 把入站文本转给 DSH 会话（尽力，失败给用户一句人话）。 */
+  /**
+   * 命令层（三家共用 `im-commands.mjs`）：命中返回 true（已回复，调用方直接 return）。
+   * 回复走被动回复/主动推送（replyText），不经过模型、不计额度。
+   */
+  async function handleCommand(frame, info) {
+    const text = String((info && info.text) || "");
+    if (!/^\s*\//.test(text)) return false; // 快路径：非命令不构造 ctx
+    const cmd = await executeImCommand({
+      text,
+      ctx: {
+        caps: capsNow(),
+        tier: tierNow(),
+        appUrl,
+        channelLabel: "企业微信",
+        sessions: async () => {
+          try { await refreshSessions({ force: true }); } catch { /* 忽略 */ }
+          return sessionList.map((x) => ({ sessionId: x.id, title: x.title, updatedAt: x.updatedAt, running: false }));
+        },
+        currentSessionId: () => {
+          const known = boundSessionId || activeSession.id || "";
+          if (known) return known;
+          if (configuredSessionId && canCap("sessions")) return configuredSessionId;
+          if (sessionList.length) return sessionList[0].id;
+          const sub = subscriber;
+          try {
+            if (sub && typeof sub.sessions === "function") {
+              const ids = sub.sessions();
+              if (Array.isArray(ids) && ids.length) return String(ids[0]);
+            }
+          } catch { /* 忽略 */ }
+          return "";
+        },
+        currentSessionTitle: () => titleOfSession(boundSessionId || activeSession.id, activeSession.title || ""),
+        cancelSession: async ({ sessionId }) => {
+          const sub = subscriber;
+          if (!sub || typeof sub.cancelSession !== "function") return { ok: false, message: "订阅器未就绪" };
+          try {
+            const r = await sub.cancelSession({ sessionId });
+            return r && typeof r === "object" ? r : { ok: Boolean(r) };
+          } catch (e) { return { ok: false, message: e && e.message ? e.message : String(e) }; }
+        },
+        switchSession: async ({ sessionId, title }) => {
+          const r = writeImBotsSession(relayDir, "wecom", { sessionId, sessionTitle: title });
+          if (r.ok) {
+            configuredSessionId = sessionId;
+            configuredSessionTitle = truncateText(title || "", 60);
+            writeStatus();
+          }
+          return r;
+        },
+        unbind: async () => {
+          state.boundChatId = "";
+          writeStatus();
+          return { ok: true };
+        },
+        statusSnapshot: async () => ({
+          connected: state.connected === true,
+          authenticated: state.authenticated === true,
+          state: state.connected ? "connected" : "idle",
+          lastError: state.lastError || "",
+          tier: tierNow(),
+          usage: { month: monthKey(), messages: usageThisMonth() },
+          messagesPerMonth: messageLimitNow(),
+          remainingMessages: messageLimitNow() ? Math.max(0, messageLimitNow() - usageThisMonth()) : null,
+          currentSessionId: boundSessionId || activeSession.id || "",
+          currentSessionTitle: titleOfSession(boundSessionId || activeSession.id, activeSession.title || "")
+        })
+      }
+    });
+    if (!cmd || !cmd.handled) return false;
+    replyText(frame, cmd.text);
+    emitter.emit("command", { ...info, command: cmd.command, ok: cmd.ok === true, gated: cmd.gated === true });
+    log.info(`命令 ${cmd.command}${cmd.gated ? "（会员闸拦截）" : ""} 已回复（不转模型）`);
+    return true;
+  }
+
   async function dispatchInbound(frame, info) {
     const sub = subscriber;
+    // ⓪ 命令层：命中即执行并回复，**绝不进模型**，也不计入额度（/stop、/unbind 永远免费）
+    const cmd = await handleCommand(frame, info);
+    if (cmd) return;
     // ① 会员闸（通知/审批免费；派活受能力与月度额度约束，fail-closed）
     const gated = await membershipGate(frame, info);
     if (gated) return;

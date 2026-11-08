@@ -152,6 +152,8 @@ function fakeSubscriber(over = {}) {
   sub.started = false;
   sub.closed = false;
   sub.promptCalls = [];
+  sub.cancelCalls = [];
+  sub.cancelSession = async ({ sessionId } = {}) => { sub.cancelCalls.push({ sessionId }); return { ok: true }; };
   sub.sessionDetails = Array.isArray(over.sessions) ? over.sessions.slice() : [];
   sub.start = () => { sub.started = true; };
   sub.close = () => { sub.closed = true; };
@@ -1715,4 +1717,39 @@ test("atomicWriteJson：覆盖写、目录自动创建、0600、失败不留临�
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ─────────────────────── 命令层（2026-11-08：/ls 不再转给模型）───────────────────────
+
+test("★ 命令层：/help /status 直接回复、/ls 免费档被拦、/stop 免费急停；命中命令**不进 promptSession**", async () => {
+  const rt = await setupRelayBot();
+  try {
+    rt.bot.start();
+    await waitFor(() => rt.bot.status().authenticated, { label: "认证" });
+    const replies = () => rt.server.state.frames.filter((f) => f.cmd === "aibot_respond_msg");
+    const sendCmd = async (msgid, content) => {
+      const before = replies().length;
+      rt.server.push({ cmd: "aibot_msg_callback", headers: { req_id: `cmd-${msgid}` }, body: { msgid: `m-${msgid}`, msgtype: "text", text: { content }, from: { userid: "user-a" } } });
+      await waitFor(() => replies().length > before, { label: `命令 ${msgid} 回复` });
+      return String(replies()[before].body.stream.content || "");
+    };
+    const help = await sendCmd("help", "/help");
+    assert.match(help, /可用命令/);
+    assert.match(help, /\/ls/);
+    assert.match(help, /\/unbind/);
+    assert.equal(rt.sub.promptCalls.length, 0, "★ 命令不得进模型");
+    const status = await sendCmd("status", "/status");
+    assert.match(status, /连接状态/);
+    assert.match(status, /当前会话/);
+    const ls = await sendCmd("ls", "/ls");
+    assert.match(ls, /会员功能/, "免费档 /ls 必须被拦");
+    assert.equal(rt.sub.promptCalls.length, 0);
+    const stop = await sendCmd("stop", "/stop");
+    assert.match(stop, /已急停|没有正在运行/);
+    assert.deepEqual(rt.sub.cancelCalls, [{ sessionId: "session-abc" }], "★ /stop 调 cancelSession");
+    assert.equal(rt.sub.promptCalls.length, 0, "★ 全部命令都不进模型");
+    // 普通文本照旧进模型
+    await rt.inbound("normal-1", "帮我改一下代码");
+    assert.equal(rt.sub.promptCalls.length, 1);
+  } finally { await rt.close(); }
 });

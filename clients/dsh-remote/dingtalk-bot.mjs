@@ -51,6 +51,8 @@ import WebSocket from "ws";
 
 import { createEventSubscriber, NODE_KINDS } from "./dsh-events.mjs";
 import { formatForChannel } from "./im-format.mjs";
+// 命令层（2026-11-08）：/help /status /stop /ls /use /unbind 在进模型前拦下执行（三家共用）
+import { executeImCommand, writeImBotsSession } from "./im-commands.mjs";
 import {
   WECHAT_CAPABILITY_TABLE,
   WECHAT_TIER_LIMITS,
@@ -91,6 +93,15 @@ export const TOPIC_CARD_CALLBACK = "/v1.0/card/instances/callback";
 export const DEFAULT_SUBSCRIPTIONS = Object.freeze([{ type: "CALLBACK", topic: TOPIC_ROBOT }]);
 /** ticket 有效期（官方：90s / 一次性）。状态文件只记过期时间，不存 ticket。 */
 export const TICKET_TTL_MS = 90_000;
+/**
+ * 回复通道持久化文件（相对 relayDir；0600）：缓存最近一次入站带来的
+ * `{sessionWebhook, sessionWebhookExpiredTime, senderStaffId, conversationId, conversationType, boundChatId, at}`。
+ * 为什么不写状态文件：sessionWebhook 里带会话令牌，状态文件是给面板/浏览器看的（只放元数据）。
+ * 为什么要落盘：进程重启后「回答回传」仍要能发出去（Lead 实测 bug：只存内存会丢，回传直接发不出）。
+ */
+export const REPLY_FILE = "im-dingtalk-reply.json";
+/** webhook 过期后降级 openapi 时给用户/日志的明确原因（面板据此提示"再发一条消息激活"）。 */
+const NO_REPLY_CHANNEL_HINT = "回复通道不可用：请在钉钉里再发一条消息激活（或配置 robotCode 走 OpenAPI）";
 /** 重连退避：1s 起、翻倍、60s 封顶（+0~1s 抖动，照官方 SDK 行为）。 */
 export const RECONNECT_BASE_MS = 1_000;
 export const RECONNECT_MAX_MS = 60_000;
@@ -189,8 +200,8 @@ export function normalizeBotMessage(data) {
     sessionWebhookExpiredTime: Number(d.sessionWebhookExpiredTime) || 0,
     robotCode: String(d.robotCode || ""),
     createAt: Number(d.createAt) || 0,
-    /** 主动发消息/去重用的目标：群=conversationId，单聊=senderStaffId。 */
-    chatId: conversationId || senderStaffId,
+    /** 主动发消息/去重用的目标：群=conversationId，单聊=senderStaffId（单聊 conversationId 不能当 chatId，否则会被误判成群聊）。 */
+    chatId: (conversationType === "2" ? conversationId : senderStaffId) || conversationId || senderStaffId,
     raw: d
   };
 }
@@ -277,8 +288,8 @@ export function createDingtalkBot(options = {}) {
   const relayDir = options.relayDir ? String(options.relayDir) : "";
   const allowFrom = normalizeAllowList(options.allowFrom);
   const targetChatId = String(options.targetChatId || "").trim();
-  const configuredSessionId = String(options.configuredSessionId || "").trim();
-  const configuredSessionTitle = truncateText(options.configuredSessionTitle || "", 60);
+  let configuredSessionId = String(options.configuredSessionId || "").trim();
+  let configuredSessionTitle = truncateText(options.configuredSessionTitle || "", 60);
   const now = typeof options.clock === "function" ? options.clock : () => Date.now();
   const doFetch = typeof options.fetchImpl === "function" ? options.fetchImpl : globalThis.fetch;
   const wsFactory = typeof options.wsFactory === "function" ? options.wsFactory : (url) => new WebSocket(url);
@@ -322,7 +333,9 @@ export function createDingtalkBot(options = {}) {
     boundSessionWebhook: "",
     boundSessionWebhookExpiredAt: 0,
     messages: 0,
-    gated: 0
+    gated: 0,
+    /** 最近一次回复失败原因（人话；写状态 replyChannel.lastError，不覆盖连接错误）。 */
+    replyChannelError: ""
   };
   const membership = { tier: "", entitlements: null, checkedAt: 0, usage: { month: "", count: 0 } };
 
@@ -355,6 +368,19 @@ export function createDingtalkBot(options = {}) {
   // 配置里持久化的 sessionWebhook（插件/上次运行留下的）：首次入站前也能主动发；
   // ⚠️ webhook 里带会话令牌，**绝不写状态文件**，只在内存里用。
   if (options.sessionWebhook) state.boundSessionWebhook = String(options.sessionWebhook || "");
+  // 上次入站缓存的回复通道（跨重启可用）：im-dingtalk-reply.json（0600）
+  if (relayDir) {
+    try {
+      const saved = readJsonFile(path.join(relayDir, REPLY_FILE));
+      if (saved && typeof saved === "object") {
+        if (typeof saved.sessionWebhook === "string" && saved.sessionWebhook) state.boundSessionWebhook = saved.sessionWebhook;
+        if (Number.isFinite(Number(saved.sessionWebhookExpiredTime))) state.boundSessionWebhookExpiredAt = Number(saved.sessionWebhookExpiredTime);
+        if (typeof saved.senderStaffId === "string" && saved.senderStaffId) state.boundUserId = saved.senderStaffId;
+        if (typeof saved.conversationId === "string" && saved.conversationId) state.boundConversationId = saved.conversationId;
+        if (typeof saved.boundChatId === "string" && saved.boundChatId) state.boundChatId = saved.boundChatId;
+      }
+    } catch { /* 忽略坏文件 */ }
+  }
   if (targetChatId && !state.boundChatId) state.boundChatId = targetChatId;
 
   // 重启恢复：用量 / 绑定目标 / 档位快照（均不含凭据）
@@ -502,6 +528,8 @@ export function createDingtalkBot(options = {}) {
       credentialSource,
       robotCodeConfigured: Boolean(robotCode),
       capabilities: capabilitiesNow(),
+      // 回复通道三层降级（面板显示「可用/需重新发一条消息激活」；不含 webhook 原值）
+      replyChannel: replyChannelStatus(),
       // 会员 + 用量（与企微对齐）
       tier: tierNow(),
       caps: capsNow().slice(),
@@ -760,7 +788,30 @@ export function createDingtalkBot(options = {}) {
     }
   }
 
-  /** 更新「回复目标」：sessionWebhook 优先（即时回复），同时记住 openapi 需要的 conversation/user。 */
+  /** 写回复通道缓存到磁盘（0600；含会话令牌，绝不进状态/日志）。 */
+  function persistReplyChannel() {
+    if (!relayDir) return;
+    try {
+      atomicWriteJson(path.join(relayDir, REPLY_FILE), {
+        version: 1,
+        sessionWebhook: state.boundSessionWebhook || "",
+        sessionWebhookExpiredTime: Number(state.boundSessionWebhookExpiredAt) || 0,
+        senderStaffId: state.boundUserId || "",
+        conversationId: state.boundConversationId || "",
+        boundChatId: state.boundChatId || "",
+        at: now()
+      }, { onWarn: (m) => log.warn(m) });
+    } catch (e) {
+      log.warn(`回复通道缓存写入失败（忽略）：${truncateText(e && e.message ? e.message : e, 100)}`);
+    }
+  }
+
+  /** 日志/状态里只用 webhook 的 host（整条 URL 含会话令牌，绝不外泄）。 */
+  function webhookHost(url) {
+    try { return new URL(String(url)).host; } catch { return chatIdHash(String(url)) || "?"; }
+  }
+
+  /** 更新「回复目标」：缓存 sessionWebhook（被动回复）+ senderStaffId/conversationId（openapi 降级用）。 */
   function bindTarget(info) {
     if (info.conversationId) state.boundConversationId = info.conversationId;
     if (info.senderStaffId) state.boundUserId = info.senderStaffId;
@@ -769,9 +820,13 @@ export function createDingtalkBot(options = {}) {
       log.info(`已绑定推送会话 chat=${chatIdHash(info.chatId)}${info.isGroup ? "（群）" : "（单聊）"}`);
     }
     if (info.sessionWebhook) {
+      const changed = info.sessionWebhook !== state.boundSessionWebhook;
       state.boundSessionWebhook = info.sessionWebhook;
       state.boundSessionWebhookExpiredAt = info.sessionWebhookExpiredTime || 0;
+      state.replyChannelError = "";
+      if (changed) log.info(`已缓存回复通道 sessionWebhook（host=${webhookHost(info.sessionWebhook)}，过期=${state.boundSessionWebhookExpiredAt ? new Date(state.boundSessionWebhookExpiredAt).toISOString() : "未知"}）`);
     }
+    persistReplyChannel();
     writeStatus();
   }
 
@@ -803,9 +858,95 @@ export function createDingtalkBot(options = {}) {
     void dispatchInbound(info).catch((e) => log.warn(`入站转发失败（已忽略）：${truncateText(e && e.message ? e.message : e, 120)}`));
   }
 
-  /** 入站 → 会员闸 → 转发到 DSH 会话（尽力、可降级）。 */
+  /** 命令层：命中已回复返回 true（不转模型、不计额度；回复走三层回复通道）。 */
+  async function handleCommand(info) {
+    const text = String((info && info.text) || "");
+    if (!/^\s*\//.test(text)) return false;
+    const cmd = await executeImCommand({
+      text,
+      ctx: {
+        caps: capsNow(),
+        tier: tierNow(),
+        appUrl: String(options.appUrl || ""),
+        channelLabel: "钉钉",
+        sessions: async () => {
+          const sub = subscriber;
+          if (!sub) return [];
+          let rows = [];
+          try {
+            if (typeof sub.listSessions === "function") {
+              const r = await sub.listSessions();
+              rows = Array.isArray(r) ? r : (r && r.ok && Array.isArray(r.sessions) ? r.sessions : []);
+            }
+          } catch { rows = []; }
+          if ((!Array.isArray(rows) || rows.length === 0) && typeof sub.sessions === "function") {
+            try { rows = (sub.sessions() || []).map((id) => ({ sessionId: String(id) })); } catch { rows = []; }
+          }
+          return (Array.isArray(rows) ? rows : []).map((x) => ({
+            sessionId: String(x.sessionId || x.id || ""),
+            title: String(x.title || ""),
+            updatedAt: Number(x.updatedAt) || 0,
+            running: x.running === true
+          })).filter((x) => x.sessionId);
+        },
+        currentSessionId: () => {
+          const known = boundSessionId || lastSeenSessionId || "";
+          if (known) return known;
+          if (configuredSessionId && canCap("sessions")) return configuredSessionId;
+          const sub = subscriber;
+          try {
+            if (sub && typeof sub.sessions === "function") {
+              const ids = sub.sessions();
+              if (Array.isArray(ids) && ids.length) return String(ids[0]);
+            }
+          } catch { /* 忽略 */ }
+          return "";
+        },
+        currentSessionTitle: () => "",
+        cancelSession: async ({ sessionId }) => {
+          const sub = subscriber;
+          if (!sub || typeof sub.cancelSession !== "function") return { ok: false, message: "订阅器未就绪" };
+          try {
+            const r = await sub.cancelSession({ sessionId });
+            return r && typeof r === "object" ? r : { ok: Boolean(r) };
+          } catch (e) { return { ok: false, message: e && e.message ? e.message : String(e) }; }
+        },
+        switchSession: async ({ sessionId, title }) => {
+          const r = writeImBotsSession(relayDir, "dingtalk", { sessionId, sessionTitle: title });
+          if (r.ok) {
+            configuredSessionId = sessionId;
+            configuredSessionTitle = truncateText(title || "", 60);
+            boundSessionId = sessionId;
+            writeStatus();
+          }
+          return r;
+        },
+        unbind: async () => { clearReplyChannel(); return { ok: true }; },
+        statusSnapshot: async () => ({
+          connected: state.connected === true,
+          authenticated: state.authenticated === true,
+          state: state.phase,
+          lastError: state.lastError || "",
+          tier: tierNow(),
+          usage: { month: monthKey(), messages: usageThisMonth() },
+          messagesPerMonth: messageLimitNow(),
+          remainingMessages: messageLimitNow() ? Math.max(0, messageLimitNow() - usageThisMonth()) : null,
+          currentSessionId: boundSessionId || lastSeenSessionId || "",
+          currentSessionTitle: ""
+        })
+      }
+    });
+    if (!cmd || !cmd.handled) return false;
+    reply(info, cmd.text);
+    emitter.emit("command", { ...info, command: cmd.command, ok: cmd.ok === true, gated: cmd.gated === true });
+    log.info(`命令 ${cmd.command}${cmd.gated ? "（会员闸拦截）" : ""} 已回复（不转模型）`);
+    return true;
+  }
+
+  /** 入站 → 命令层 → 会员闸 → 转发到 DSH 会话（尽力、可降级）。 */
   async function dispatchInbound(info) {
     const sub = subscriber;
+    if (await handleCommand(info)) return;
     const gated = await membershipGate(info);
     if (gated) return;
     const sessionId = await resolveSessionId(sub);
@@ -947,42 +1088,114 @@ export function createDingtalkBot(options = {}) {
   }
 
   /**
-   * 发一条 markdown（通知/回答回传/确认文案统一入口）。
-   * 目标选择：① 最近一次入站的 sessionWebhook（未过期，最快、无需 token）
-   *           ② replyMode=openapi（或 webhook 不可用）且有 robotCode → OpenAPI
-   *           ③ 都没有 → 记日志跳过（不抛错）
+   * 当前可用的回复通道（**三层降级**）：
+   *   ① 缓存 sessionWebhook（未过期；被动回复，最快、不需要 token）
+   *   ② openapi（robotCode + senderStaffId/conversationId 都有）
+   *   ③ none（明确原因，面板提示"再发一条消息激活"）
    */
-  async function sendMarkdown(text, opts = {}) {
-    const title = opts.title || "";
-    const webhook = state.boundSessionWebhook;
-    const webhookOk = Boolean(webhook) && (!state.boundSessionWebhookExpiredAt || now() < state.boundSessionWebhookExpiredAt);
-    if (replyMode !== "openapi" && webhookOk) {
-      const r = await replySessionWebhook(webhook, { title, text });
-      if (r.ok) return r;
-      log.warn(`sessionWebhook 回复失败（${r.reason}），尝试 OpenAPI 兜底`);
+  function replyChannelNow() {
+    const expiresAt = Number(state.boundSessionWebhookExpiredAt) || 0;
+    const webhookUsable = Boolean(state.boundSessionWebhook) && (!expiresAt || now() < expiresAt);
+    if (webhookUsable) return { kind: "sessionWebhook", webhook: state.boundSessionWebhook, expiresAt, reason: "" };
+    if (robotCode && (state.boundUserId || state.boundConversationId)) {
+      return {
+        kind: "openapi",
+        webhook: "",
+        expiresAt: 0,
+        reason: state.boundSessionWebhook ? "sessionWebhook_expired" : "no_webhook"
+      };
     }
-    const fallback = await sendOpenapi(text, { title });
-    if (fallback.ok) return fallback;
-    const at = now();
-    if (at - lastNoTargetLogAt > 10 * 60 * 1000) {
-      lastNoTargetLogAt = at;
-      log.info(`没有可用的回复通道（sessionWebhook 未就绪 / openapi 未配置）：${truncateText(fallback.reason || "?", 60)}`);
-    }
-    return fallback;
+    return {
+      kind: "none",
+      webhook: "",
+      expiresAt,
+      reason: state.boundSessionWebhook ? "sessionWebhook_expired" : (robotCode ? "no_target_user" : "no_robot_code"),
+      lastError: NO_REPLY_CHANNEL_HINT
+    };
   }
 
-  /** 回复一句人话：优先 sessionWebhook（即时），失败/缺失时退回主动发。 */
-  function reply(info, text) {
-    const webhook = info && info.sessionWebhook ? info.sessionWebhook : state.boundSessionWebhook;
+  /** 状态文件里的 replyChannel 元数据（**绝不含 webhook 原值**）。 */
+  function replyChannelStatus() {
+    const ch = replyChannelNow();
+    return {
+      kind: ch.kind,
+      expiresAt: Number(ch.expiresAt) || 0,
+      lastError: truncateText(maskSecrets(state.replyChannelError || "", [clientSecret]), 160),
+      hasWebhook: Boolean(state.boundSessionWebhook)
+    };
+  }
+
+  function markReplyChannelError(detail) {
+    state.replyChannelError = truncateText(String(detail || ""), 160);
+    writeStatus();
+  }
+
+  /**
+   * 统一回复入口（回答回传/通知/命令回复都走这里）。
+   * ① 缓存 sessionWebhook → ② 失败/过期降级 openapi → ③ 都不可用：**明确日志 + 状态人话，绝不静默**。
+   */
+  async function sendViaReplyChannel(text, opts = {}) {
+    const title = opts.title || "";
+    const preferredWebhook = String(opts.webhook || "").trim();
+    const channel = replyChannelNow();
+    const webhook = preferredWebhook || (channel.kind === "sessionWebhook" ? channel.webhook : "");
     if (webhook) {
-      void replySessionWebhook(webhook, { text }).then((r) => {
-        if (r.ok) return;
-        log.warn(`回复失败（${r.reason}），尝试主动发兜底`);
-        void sendMarkdown(text).catch(() => {});
-      }).catch(() => {});
-      return;
+      const r = await replySessionWebhook(webhook, { title, text });
+      if (r.ok) {
+        if (state.replyChannelError) { state.replyChannelError = ""; writeStatus(); }
+        return { ...r, kind: "sessionWebhook" };
+      }
+      // JSDoc: 只记 host + 错误原因（整条 URL 带会话令牌，绝不外泄）
+      log.warn(`sessionWebhook 回复失败（host=${webhookHost(webhook)}，${truncateText(r.reason, 60)}）→ 尝试 OpenAPI 兜底`);
+      markReplyChannelError(`sessionWebhook 回复失败：${truncateText(r.reason, 80)}；${NO_REPLY_CHANNEL_HINT}`);
     }
-    void sendMarkdown(text).catch(() => {});
+    if (robotCode && (state.boundUserId || state.boundConversationId)) {
+      const fb = await sendOpenapi(text, { title });
+      if (fb.ok) return { ...fb, kind: "openapi" };
+      log.warn(`OpenAPI 兜底也失败：${truncateText(fb.reason, 80)}`);
+      markReplyChannelError(`OpenAPI 回复失败：${truncateText(fb.reason, 80)}；${NO_REPLY_CHANNEL_HINT}`);
+      return { ok: false, kind: "none", reason: "no_reply_channel", detail: fb.reason || "" };
+    }
+    // 缺 robotCode：给更具体的可操作错误（与能力降级口径一致，不是笼统的"没通道"）
+    if (!robotCode) {
+      const detail = "未配置 robotCode：openapi 主动发送不可用（接收消息与 sessionWebhook 回复不受影响）。"
+        + "请在插件「钉钉机器人」里补 robotCode。";
+      log.warn(`no_robot_code：${detail}`);
+      markReplyChannelError(`no_robot_code：${detail}`);
+      return { ok: false, kind: "none", reason: "no_robot_code", detail, capabilities: capabilitiesNow() };
+    }
+    const at = now();
+    if (at - lastNoTargetLogAt > 60_000) {
+      lastNoTargetLogAt = at;
+      log.warn(`no_reply_channel：${NO_REPLY_CHANNEL_HINT}（detail=${truncateText(channel.reason, 40)}，webhook=${state.boundSessionWebhook ? "expired" : "none"}，robotCode=${robotCode ? "有" : "无"}，userId=${state.boundUserId ? "有" : "无"}）`);
+    }
+    markReplyChannelError(`no_reply_channel：${NO_REPLY_CHANNEL_HINT}`);
+    return { ok: false, kind: "none", reason: "no_reply_channel", detail: NO_REPLY_CHANNEL_HINT };
+  }
+
+  /** 兼容旧入口：通知/回答回传/命令回复统一走三层回复通道。 */
+  async function sendMarkdown(text, opts = {}) {
+    return sendViaReplyChannel(text, opts);
+  }
+
+  /** 回复一句人话：优先本次入站的 webhook，再走三层降级；失败不抛。 */
+  function reply(info, text) {
+    const webhook = info && info.sessionWebhook ? info.sessionWebhook : "";
+    void sendViaReplyChannel(text, { webhook }).catch(() => {});
+  }
+
+  /** 解绑推送（/unbind 命令用）：清内存 + 删持久化回复通道 + 清状态绑定字段。 */
+  function clearReplyChannel() {
+    state.boundSessionWebhook = "";
+    state.boundSessionWebhookExpiredAt = 0;
+    state.boundUserId = "";
+    state.boundConversationId = "";
+    state.boundChatId = "";
+    state.replyChannelError = "";
+    if (relayDir) {
+      try { fs.rmSync(path.join(relayDir, REPLY_FILE), { force: true }); } catch { /* 忽略 */ }
+    }
+    writeStatus();
   }
 
   // ---------- DSH 事件订阅（通知 + 回答回传 + 活跃会话） ----------
@@ -1131,6 +1344,8 @@ export function createDingtalkBot(options = {}) {
       credentialSource,
       robotCodeConfigured: Boolean(robotCode),
       capabilities: capabilitiesNow(),
+      // 回复通道三层降级（面板显示「可用/需重新发一条消息激活」；不含 webhook 原值）
+      replyChannel: replyChannelStatus(),
       subscriptions: subscriptions.map((s) => String(s.topic || "")).filter(Boolean),
       messages: state.messages,
       gated: state.gated,
@@ -1192,6 +1407,8 @@ export function createDingtalkBot(options = {}) {
     status,
     replySessionWebhook,
     sendMarkdown,
+    sendViaReplyChannel,
+    clearReplyChannel,
     getAccessToken,
     on(event, listener) { emitter.on(event, listener); return () => emitter.off(event, listener); },
     once(event, listener) { emitter.once(event, listener); return () => emitter.off(event, listener); },

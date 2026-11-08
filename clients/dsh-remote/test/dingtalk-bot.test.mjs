@@ -49,6 +49,11 @@ const FAKE_CLIENT = "ding-fake-client-id";
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
+/** 读 JSON 文件（不存在/坏 JSON → null）。 */
+function readJson(file) {
+  try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return null; }
+}
+
 async function waitFor(fn, { label = "条件", timeout = 5000, interval = 20 } = {}) {
   const t0 = Date.now();
   for (;;) {
@@ -162,7 +167,7 @@ async function startWebhook(payload = { errcode: 0, errmsg: "ok" }, status = 200
 /** 最小 fake 订阅器（与 bridge 里 dsh-events 的对外接口同形）。 */
 function fakeSubscriber({ sessions = [{ sessionId: "session-live", running: true, title: "活跃会话" }], answer = "这是 agent 的最终回答" } = {}) {
   const emitter = new EventEmitter();
-  const calls = { prompt: [], listSessions: 0, lastAssistant: 0 };
+  const calls = { prompt: [], listSessions: 0, lastAssistant: 0, cancel: [] };
   return {
     on(evt, fn) { emitter.on(evt, fn); return this; },
     once(evt, fn) { emitter.once(evt, fn); return this; },
@@ -172,6 +177,7 @@ function fakeSubscriber({ sessions = [{ sessionId: "session-live", running: true
     sessions() { return sessions.map((s) => s.sessionId); },
     async listSessions() { calls.listSessions += 1; return { ok: true, sessions }; },
     async promptSession({ sessionId, text }) { calls.prompt.push({ sessionId, text }); return { ok: true }; },
+    async cancelSession({ sessionId } = {}) { calls.cancel.push({ sessionId }); return { ok: true }; },
     async lastAssistantText() { calls.lastAssistant += 1; return { ok: true, text: answer }; },
     calls
   };
@@ -553,6 +559,185 @@ test("controller：DSH_IM_BOTS=0 全关（env 优先）", async () => {
 
 // ─────────────────────────── 常量/默认值 ───────────────────────────
 
+// ─────────────────── 回复通道三层降级（2026-11-08 实测 bug：回答回传发不出） ───────────────────
+
+/** 包一层 fetch：把 openapi（accessToken / oToMessages / groupMessages）拦成本地假响应并记录。 */
+function makeOpenapiFetch() {
+  const calls = [];
+  const fetchImpl = (url, init) => {
+    const u = String(url);
+    if (u.includes("/oauth2/accessToken")) {
+      calls.push({ kind: "token", url: u, body: init && init.body });
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ accessToken: "tok-123", expireIn: 7200 }) });
+    }
+    if (u.includes("/robot/oToMessages/batchSend") || u.includes("/robot/groupMessages/send")) {
+      let body = null;
+      try { body = JSON.parse(init && init.body ? init.body : "{}"); } catch { body = null; }
+      calls.push({ kind: "send", url: u, body, headers: init && init.headers });
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ processQueryKey: "pq-1" }) });
+    }
+    return fetch(url, init);
+  };
+  return { fetchImpl, calls };
+}
+
+test("★ 回复通道①：入站缓存 sessionWebhook → 回答回传直接 POST 它（跨重启保持）", async () => {
+  const relayDir = tmpRelayDir();
+  const hook = await startWebhook();
+  const gateway = await startGateway();
+  const sub = fakeSubscriber({ answer: "重启后也要能回传答案" });
+  const botOptions = {
+    clientId: FAKE_CLIENT, clientSecret: FAKE_SECRET, robotCode: "ding-robot",
+    gatewayUrl: gateway.openUrl, relayDir, subscriber: sub,
+    logger: () => {}, reconnectBaseMs: 40, reconnectMaxMs: 160, tierDenyThrottleMs: 0
+  };
+  const bot1 = createDingtalkBot(botOptions);
+  try {
+    bot1.start();
+    await waitFor(() => bot1.status().connected, { label: "连接1" });
+    gateway.push({
+      type: "CALLBACK", headers: { messageId: "mid-c1", topic: TOPIC_ROBOT },
+      data: JSON.stringify({
+        conversationId: "cid-1", conversationType: "2", senderStaffId: "staff-9",
+        msgtype: "text", msgId: "m-c1", text: { content: "你好" },
+        sessionWebhook: hook.url, sessionWebhookExpiredTime: Date.now() + 5 * 60_000
+      })
+    });
+    await waitFor(() => hook.state.calls.length >= 1, { label: "被动回复" });
+    const st1 = bot1.status();
+    assert.equal(st1.replyChannel.kind, "sessionWebhook");
+    assert.equal(st1.replyChannel.hasWebhook, true);
+    await bot1.stop();
+  } finally {
+    await gateway.close();
+  }
+  // 重启（新进程语义）：只靠磁盘缓存也要能回传
+  const gateway2 = await startGateway();
+  const bot2 = createDingtalkBot({ ...botOptions, gatewayUrl: gateway2.openUrl });
+  try {
+    bot2.start();
+    await waitFor(() => bot2.status().connected, { label: "连接2" });
+    assert.equal(bot2.status().replyChannel.kind, "sessionWebhook", "★ 重启后回复通道来自持久化缓存");
+    const before = hook.state.calls.length;
+    const r = await bot2.sendMarkdown("重启后的回答回传");
+    assert.equal(r.ok, true);
+    assert.equal(r.kind, "sessionWebhook");
+    await waitFor(() => hook.state.calls.length > before, { label: "重启后回传到 webhook" });
+    assert.match(hook.last().body.markdown.text, /重启后的回答回传/);
+  } finally {
+    await bot2.stop();
+    await gateway2.close();
+    await hook.close();
+    fs.rmSync(relayDir, { recursive: true, force: true });
+  }
+});
+
+test("★ 回复通道②：sessionWebhook 过期 → 降级 openapi（userIds=[senderStaffId]）", async () => {
+  const relayDir = tmpRelayDir();
+  const gateway = await startGateway();
+  const hook = await startWebhook();
+  const api = makeOpenapiFetch();
+  const sub = fakeSubscriber({ answer: "x" });
+  const bot = createDingtalkBot({
+    clientId: FAKE_CLIENT, clientSecret: FAKE_SECRET, robotCode: "ding-robot",
+    gatewayUrl: gateway.openUrl, relayDir, subscriber: sub,
+    fetchImpl: api.fetchImpl, logger: () => {},
+    reconnectBaseMs: 40, reconnectMaxMs: 160, tierDenyThrottleMs: 0
+  });
+  try {
+    bot.start();
+    await waitFor(() => bot.status().connected, { label: "连接" });
+    gateway.push({
+      type: "CALLBACK", headers: { messageId: "mid-exp", topic: TOPIC_ROBOT },
+      data: JSON.stringify({
+        conversationId: "cid-exp", conversationType: "1", senderStaffId: "staff-exp",
+        msgtype: "text", msgId: "m-exp", text: { content: "hi" },
+        sessionWebhook: hook.url, sessionWebhookExpiredTime: Date.now() - 1000 // 已过期
+      })
+    });
+    await waitFor(() => bot.status().messages >= 1, { label: "入站" });
+    assert.equal(bot.status().replyChannel.kind, "openapi", "★ webhook 过期 → 显示 openapi 可用");
+    const hookCalls = hook.state.calls.length;
+    const r = await bot.sendMarkdown("降级 openapi 回答");
+    assert.equal(r.ok, true);
+    assert.equal(r.kind, "openapi");
+    const send = api.calls.filter((c) => c.kind === "send");
+    assert.equal(send.length, 1);
+    assert.deepEqual(send[0].body.userIds, ["staff-exp"], "★ 用缓存的 senderStaffId 发单聊");
+    assert.match(send[0].headers["x-acs-dingtalk-access-token"], /tok-123/);
+    assert.equal(hook.state.calls.length, hookCalls, "过期 webhook 不得再被调用");
+  } finally {
+    await bot.stop(); await gateway.close(); await hook.close();
+    fs.rmSync(relayDir, { recursive: true, force: true });
+  }
+});
+
+test("★ 回复通道③：webhook 与 openapi 都不可用 → 明确日志 no_reply_channel + 状态人话（不静默）", async () => {
+  const relayDir = tmpRelayDir();
+  const gateway = await startGateway();
+  const logs = [];
+  const bot = createDingtalkBot({
+    clientId: FAKE_CLIENT, clientSecret: FAKE_SECRET, robotCode: "", // 无 robotCode
+    gatewayUrl: gateway.openUrl, relayDir,
+    logger: (level, line) => logs.push(line),
+    reconnectBaseMs: 40, reconnectMaxMs: 160, tierDenyThrottleMs: 0
+  });
+  try {
+    bot.start();
+    await waitFor(() => bot.status().connected, { label: "连接" });
+    const r = await bot.sendMarkdown("发不出去的");
+    assert.equal(r.ok, false);
+    assert.match(String(r.reason), /no_reply_channel|no_robot_code|no_target_user|no_webhook/);
+    await waitFor(() => logs.join("\n").match(/no_reply_channel|no_robot_code/), { label: "明确日志" });
+    const st = bot.status();
+    assert.equal(st.replyChannel.kind, "none");
+    assert.ok(String(st.replyChannel.lastError || "").length > 0, "状态要有人话原因");
+    const stFile = readJson(path.join(relayDir, IM_BOT_STATUS_FILE));
+    assert.equal(stFile.dingtalk.replyChannel.kind, "none");
+    assert.match(String(stFile.dingtalk.replyChannel.lastError || ""), /回复通道|robotCode/, "面板可显示可操作原因（补 robotCode / 再发一条消息激活）");
+  } finally {
+    await bot.stop(); await gateway.close();
+    fs.rmSync(relayDir, { recursive: true, force: true });
+  }
+});
+
+test("★ 脱敏：日志/状态只出现 webhook host 与哈希，不含整条 webhook URL 或 secret", async () => {
+  const relayDir = tmpRelayDir();
+  const gateway = await startGateway();
+  const logs = [];
+  const sub = fakeSubscriber();
+  const bot = createDingtalkBot({
+    clientId: FAKE_CLIENT, clientSecret: FAKE_SECRET, robotCode: "ding-robot",
+    gatewayUrl: gateway.openUrl, relayDir, subscriber: sub,
+    logger: (level, line) => logs.push(line),
+    reconnectBaseMs: 40, reconnectMaxMs: 160, tierDenyThrottleMs: 0
+  });
+  try {
+    bot.start();
+    await waitFor(() => bot.status().connected, { label: "连接" });
+    const webhookUrl = "https://oapi.dingtalk.test/robot/sendBySession?session=TOKEN-SECRET-AAA";
+    gateway.push({
+      type: "CALLBACK", headers: { messageId: "mid-sec", topic: TOPIC_ROBOT },
+      data: JSON.stringify({
+        conversationId: "cid-sec", conversationType: "1", senderStaffId: "staff-sec",
+        msgtype: "text", msgId: "m-sec", text: { content: "hi" },
+        sessionWebhook: webhookUrl, sessionWebhookExpiredTime: Date.now() + 60_000
+      })
+    });
+    await waitFor(() => bot.status().messages >= 1, { label: "入站" });
+    await waitFor(() => logs.join("\n").includes("oapi.dingtalk.test"), { label: "host 日志" });
+    const joined = logs.join("\n");
+    assert.ok(!joined.includes("TOKEN-SECRET-AAA"), "★ 日志不得含 webhook 会话令牌");
+    assert.ok(!joined.includes(FAKE_SECRET), "★ 日志不得含 clientSecret");
+    const raw = fs.readFileSync(path.join(relayDir, IM_BOT_STATUS_FILE), "utf8");
+    assert.ok(!raw.includes("TOKEN-SECRET-AAA"), "★ 状态文件不得含 webhook 原值");
+    assert.ok(!raw.includes(FAKE_SECRET));
+  } finally {
+    await bot.stop(); await gateway.close();
+    fs.rmSync(relayDir, { recursive: true, force: true });
+  }
+});
+
 // ─────────────────── robotCode 可选（扫码一键创建机器人，2026-11-08） ───────────────────
 
 test("★ robotCode 可选：只给 clientId/clientSecret 也能启动、收/回消息；状态 capabilities 如实降级", async () => {
@@ -627,4 +812,36 @@ test("常量：默认 open 端点 / ticket 90s / 退避 1s→60s", () => {
   assert.equal(DINGTALK_OPEN_URL, "https://api.dingtalk.com/v1.0/gateway/connections/open");
   assert.equal(TICKET_TTL_MS, 90_000);
   assert.equal(TOPIC_ROBOT, "/v1.0/im/bot/messages/get");
+});
+
+// ─────────────────────── 命令层（2026-11-08：/ls 不再转给模型）───────────────────────
+
+test("★ 命令层：/help 回复、免费档 /ls 被拦（会员文案）、/stop 免费急停；命令不进 promptSession", async () => {
+  const rt = await setupBot();
+  try {
+    await rt.start();
+    const pushCmd = async (msgId, text) => {
+      rt.gateway.push({
+        type: "CALLBACK", headers: { messageId: `mid-${msgId}`, topic: TOPIC_ROBOT },
+        data: JSON.stringify({
+          conversationId: "cid-cmd", conversationType: "2", senderStaffId: "staff-cmd",
+          msgtype: "text", msgId: `m-${msgId}`, text: { content: text },
+          sessionWebhook: rt.hook.url, sessionWebhookExpiredTime: Date.now() + 60_000
+        })
+      });
+    };
+    pushCmd("help", "/help");
+    await waitFor(() => rt.hook.state.calls.find((c) => /可用命令/.test(c.body.markdown.text)), { label: "/help 回复" });
+    assert.equal(rt.sub.calls.prompt.length, 0, "★ 命令不得进模型");
+    pushCmd("ls", "/ls");
+    await waitFor(() => rt.hook.state.calls.find((c) => /会员功能/.test(c.body.markdown.text)), { label: "/ls 会员拦截" });
+    assert.equal(rt.sub.calls.prompt.length, 0);
+    pushCmd("stop", "/stop");
+    await waitFor(() => rt.hook.state.calls.find((c) => /已急停|没有正在运行/.test(c.body.markdown.text)), { label: "/stop 回复" });
+    assert.equal(rt.sub.calls.cancel.length, 1, "★ /stop 调 cancelSession");
+    assert.equal(rt.sub.calls.prompt.length, 0);
+    // 普通文本照旧转发
+    await rt.inbound({ text: "帮我看看日志", msgId: "m-normal-cmd" });
+    await waitFor(() => rt.sub.calls.prompt.length === 1, { label: "普通文本转发" });
+  } finally { await rt.close(); }
 });

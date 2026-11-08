@@ -81,6 +81,8 @@ import {
   APPROVAL_CARD_TTL_MS
 } from "./wecom-bot.mjs";
 import { formatForChannel } from "./im-format.mjs";
+// 命令层（2026-11-08）：/help /status /stop /ls /use /unbind 在进模型前拦下执行（三家共用）
+import { executeImCommand, writeImBotsSession } from "./im-commands.mjs";
 import {
   WECHAT_CAPABILITY_TABLE,
   WECHAT_TIER_LIMITS,
@@ -1233,6 +1235,16 @@ export function createFeishuBot({
       return r;
     },
 
+    /** 解绑接收人（/unbind 命令用）：清内存绑定 + 触发状态刷新；之后收到消息会自动重新绑定。 */
+    clearBinding() {
+      state.boundChatId = "";
+      state.boundChatType = "";
+      state.boundChatName = "";
+      state.boundSource = "";
+      emitStatus();
+      return { ok: true };
+    },
+
     /** 发审批卡片（返回值带 messageId，供回执后原地更新）。 */
     async sendCard(to, card, opts = {}) {
       if (!sender) return { ok: false, reason: "发送器未初始化（连接尚未建立）" };
@@ -1565,9 +1577,98 @@ export function createFeishuBotController(options = {}) {
   }
 
   // ── 入站 ────────────────────────────────────────────────────────────────
+  /** 入站命令层：命中返回 true（已回复，调用方直接 return）。 */
+  async function handleInboundCommand(msg) {
+    const text = String((msg && msg.text) || "");
+    if (!/^\s*\//.test(text)) return false;
+    const cmd = await executeImCommand({
+      text,
+      ctx: {
+        caps: capsNow(),
+        tier: tierNow(),
+        appUrl,
+        channelLabel: "飞书",
+        sessions: async () => {
+          const sub = subscriber;
+          if (!sub) return [];
+          let rows = [];
+          try {
+            if (typeof sub.listSessions === "function") {
+              const r = await sub.listSessions();
+              rows = Array.isArray(r) ? r : (r && r.ok && Array.isArray(r.sessions) ? r.sessions : []);
+            }
+          } catch { rows = []; }
+          if ((!Array.isArray(rows) || rows.length === 0) && typeof sub.sessions === "function") {
+            try { rows = (sub.sessions() || []).map((id) => ({ sessionId: String(id) })); } catch { rows = []; }
+          }
+          return (Array.isArray(rows) ? rows : []).map((x) => ({
+            sessionId: String(x.sessionId || x.id || ""),
+            title: String(x.title || ""),
+            updatedAt: Number(x.updatedAt) || 0,
+            running: x.running === true
+          })).filter((x) => x.sessionId);
+        },
+        currentSessionId: () => {
+          const cfgId = String((configNow && configNow.sessionId) || "");
+          if (cfgId) return cfgId;
+          const sub = subscriber;
+          try {
+            if (sub && typeof sub.sessions === "function") {
+              const ids = sub.sessions();
+              if (Array.isArray(ids) && ids.length) return String(ids[0]);
+            }
+          } catch { /* 忽略 */ }
+          return "";
+        },
+        currentSessionTitle: () => String((configNow && configNow.sessionTitle) || ""),
+        cancelSession: async ({ sessionId }) => {
+          const sub = subscriber;
+          if (!sub || typeof sub.cancelSession !== "function") return { ok: false, message: "订阅器未就绪" };
+          try {
+            const r = await sub.cancelSession({ sessionId });
+            return r && typeof r === "object" ? r : { ok: Boolean(r) };
+          } catch (e) { return { ok: false, message: e && e.message ? e.message : String(e) }; }
+        },
+        switchSession: async ({ sessionId, title }) => {
+          const r = writeImBotsSession(relayDir, "feishu", { sessionId, sessionTitle: title });
+          if (r.ok && configNow) configNow = { ...configNow, sessionId, sessionTitle: title || "" };
+          return r;
+        },
+        unbind: async () => {
+          try { if (bot && typeof bot.clearBinding === "function") bot.clearBinding(); } catch { /* 忽略 */ }
+          return { ok: true };
+        },
+        statusSnapshot: async () => {
+          const bs = bot && typeof bot.status === "function" ? bot.status() : null;
+          return {
+            connected: state.connected === true,
+            authenticated: state.authenticated === true,
+            state: state.state,
+            lastError: state.lastError || "",
+            tier: tierNow(),
+            usage: { month: monthKey(clock()), messages: usageThisMonth() },
+            messagesPerMonth: Number(limitsNow().messages_per_month || 0),
+            remainingMessages: Number(limitsNow().messages_per_month || 0) > 0
+              ? Math.max(0, Number(limitsNow().messages_per_month || 0) - usageThisMonth()) : null,
+            currentSessionId: String((configNow && configNow.sessionId) || (bs && bs.boundChatId) || ""),
+            currentSessionTitle: String((configNow && configNow.sessionTitle) || (bs && bs.boundChatName) || "")
+          };
+        }
+      }
+    });
+    if (!cmd || !cmd.handled) return false;
+    try {
+      await bot.sendText(msg.chatId, cmd.text, { receiveIdType: "chat_id" });
+    } catch { /* 回复失败不阻塞 */ }
+    log.info(`命令 ${cmd.command}${cmd.gated ? "（会员闸拦截）" : ""} 已回复（不转模型）`);
+    return true;
+  }
+
   async function onInboundMessage(msg) {
     if (!msg || !msg.text) return;
     const at = Number(clock()) || Date.now();
+    // ⓪ 命令层：命中即执行并回复，**绝不进模型**，也不计入额度（/stop、/unbind 永远免费）
+    if (await handleInboundCommand(msg)) return;
     // 白名单在 bot 层已过滤；这里做会员闸：派活要 assign.continue + 月度额度
     await refreshTier({ minIntervalMs: 30_000 });
     if (!canCap("assign.continue")) {

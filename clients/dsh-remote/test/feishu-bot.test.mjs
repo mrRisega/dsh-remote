@@ -152,7 +152,7 @@ function makeFetch({ tokenCode = 0, sendCode = 0, sendMsg = "", patchCode = 0 } 
 // ── 假事件订阅器 ──────────────────────────────────────────────────────────
 function makeSubscriber() {
   const emitter = new EventEmitter();
-  const calls = { sessions: [], prompts: [], started: 0, stopped: 0, listenSessions: 0 };
+  const calls = { sessions: [], prompts: [], cancels: [], started: 0, stopped: 0, listenSessions: 0 };
   return {
     calls,
     on: (evt, cb) => emitter.on(evt, cb),
@@ -161,7 +161,8 @@ function makeSubscriber() {
     stop() { calls.stopped += 1; },
     sessions() { return ["session-abc"]; },
     async listSessions() { calls.listenSessions += 1; return [{ sessionId: "session-abc", title: "t" }]; },
-    async promptSession(req) { calls.prompts.push(req); return { ok: true }; }
+    async promptSession(req) { calls.prompts.push(req); return { ok: true }; },
+    async cancelSession(req) { calls.cancels.push(req); return { ok: true }; }
   };
 }
 
@@ -1086,4 +1087,35 @@ test("向导：主路径只有两件事（填 App ID/Secret + 发一句话自动
   assert.match(FEISHU_SETUP_GUIDE.orderWarning, /长连接在线/);
   assert.match(FEISHU_SETUP_GUIDE.oneAppOnePc, /一台电脑/);
   assert.match(FEISHU_SETUP_GUIDE.docs.registerApp, /open\.feishu\.cn\/app/);
+});
+
+// ─────────────────────── 命令层（2026-11-08：/ls 不再转给模型）───────────────────────
+
+test("controller：命令层 — /help 直接回复、免费档 /ls 被拦、/stop 急停；命令绝不进模型", async () => {
+  const relayDir = mkRelayDir("ctl-cmd");
+  writeConfig(relayDir, { enabled: true, appId: APP_ID, appSecret: APP_SECRET, receiveId: "oc_chat_1", receiveIdType: "chat_id" });
+  const sub = makeSubscriber();
+  const { controller, fetchCalls } = startController(relayDir, { subscriber: sub, capsProvider: async () => "free" });
+  await controller.start();
+  const lastText = () => {
+    const rows = fetchCalls.filter((c) => c.url.includes("/im/v1/messages") && JSON.parse(c.body).msg_type === "text");
+    return rows.length ? JSON.parse(rows[rows.length - 1].body).content : "";
+  };
+  controller._bot()._dispatch("im.message.receive_v1", inboundText("/help"));
+  await waitFor(() => /可用命令/.test(lastText()));
+  assert.match(lastText(), /可用命令/);
+  assert.equal(sub.calls.prompts.length, 0, "★ 命令不得进模型");
+  controller._bot()._dispatch("im.message.receive_v1", inboundText("/ls"));
+  await waitFor(() => /会员功能/.test(lastText()));
+  assert.match(lastText(), /会员功能/, "免费档 /ls 必须被拦");
+  assert.equal(sub.calls.prompts.length, 0);
+  controller._bot()._dispatch("im.message.receive_v1", inboundText("/stop"));
+  await waitFor(() => /已急停|没有正在运行/.test(lastText()));
+  assert.equal(sub.calls.cancels.length, 1, "★ /stop 调 cancelSession");
+  assert.equal(sub.calls.prompts.length, 0, "★ 全部命令都不进模型");
+  // 普通文本照旧转发
+  controller._bot()._dispatch("im.message.receive_v1", inboundText("继续跑"));
+  await waitFor(() => sub.calls.prompts.length === 1);
+  assert.equal(sub.calls.prompts.length, 1);
+  await controller.stop();
 });
