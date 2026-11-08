@@ -611,3 +611,40 @@ test("诊断出口：__dshMaDiag / __dshMaRetryStats 暴露 retry / scrim / comp
   assert.equal(env.win.__dshMaDiag.compatOfficial.on, false, "锚点齐全的页面上不得误进 compat-official");
   assert.equal(env.win.__dshMaRetryStats, env.win.__dshMaDiag.retry, "mirror-diag 直接读 __dshMaRetryStats");
 });
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ⑦ 401 / 登录态被吊销：必须说"重新登录"，不能继续当"网络慢"干等
+//   真实事故（2026-11-08）：用户 token 被服务端吊销后，页面反复拿旧 token 请求 /api/me 拿 401，
+//   首屏等不到用户信息，被诊断记成 reason=slow（129 秒），用户完全不知道该干什么。
+// ══════════════════════════════════════════════════════════════════════════════
+
+test("★ 401：单独计数并在提示条上说明「登录已失效」，附「重新登录」入口", async () => {
+  const env = runScript(harness({
+    hostFeature: true,
+    fetch: () => Promise.resolve({ status: 401, headers: { get: () => null } }),
+  }));
+  env.win.fetch("/api/me");
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+  assert.equal(env.win.__dshMaDiag.load.authFails, 1, "401 必须单独计数（authFails）");
+  env.fireTimer(20000);                      // 12 秒看门狗 → 出提示条
+  const bar = env.findBar();
+  assert.ok(bar, "看门狗到点后提示条应出现");
+  const txt = bar.querySelector('[data-role="loadbar-txt"]').textContent;
+  assert.match(txt, /登录已失效/, "文案必须点明登录失效（而不是「网络较慢」）");
+  assert.doesNotMatch(txt, /网络较慢/, "不能把鉴权失败说成网络慢");
+  env.barBtn("loadbar-relogin").click();
+  assert.deepEqual(env.clicks.assign, ["/app/?relogin=1"], "「重新登录」应回到应用壳重新走登录");
+});
+
+test("401 之外的 5xx 仍归到「电脑端未连接」，两者不互相污染", async () => {
+  const env = runScript(harness({
+    hostFeature: true,
+    fetch: () => Promise.resolve({ status: 502, headers: { get: () => null } }),
+  }));
+  env.win.fetch("/api/session/list");
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+  assert.equal(env.win.__dshMaDiag.load.apiFails, 1, "502 计入 apiFails");
+  assert.equal(env.win.__dshMaDiag.load.authFails, 0, "502 不得计入 authFails");
+});

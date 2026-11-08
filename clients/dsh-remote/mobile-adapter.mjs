@@ -894,7 +894,11 @@ const SCRIPT = `(() => {
                       // 2026-10-20（C4）：镜像页里**唯一**可靠的"电脑端不可达"信号 ——
                       // 受保护的 /api/* 请求被回 5xx 或直接网络错误（presence 不在镜像页这条链路上；
                       // E2EE 死会话的 502 另带 x-dsh-e2ee-error，不算离线，见 maInstallNetSampler）。
-                      apiFails: 0, apiFailAt: 0, lastApiStatus: 0 };
+                      apiFails: 0, apiFailAt: 0, lastApiStatus: 0,
+                      // 2026-11-08：登录态被吊销（401）—— 和"电脑端不可达"完全两回事。
+                      // 生产实例：用户 token 被作废后，页面一直拿旧 token 请求 /api/me 拿到 401，
+                      // 首屏永远等不到用户信息，被我们自己的诊断记成 reason=slow（等了 129 秒）。
+                      authFails: 0, authAt: 0 };
   /* ===== 旧浏览器兼容提示条（2026-10-18）=====
      只有两种触发：① 注入体最前面的 maCompat 探测到"补不了的"（语法级不支持）；
      ② 页面脚本报出 SyntaxError / is not a function 这类典型兼容错误且界面还没就绪。
@@ -1048,7 +1052,8 @@ const SCRIPT = `(() => {
         compatOfficial: maCompatOfficial,
         scrim: maScrimStats,
         retry: maRetryStats,
-        load: { slow: maLoadWatch.slow, apiFails: maLoadWatch.apiFails, lastApiStatus: maLoadWatch.lastApiStatus },
+        load: { slow: maLoadWatch.slow, apiFails: maLoadWatch.apiFails, lastApiStatus: maLoadWatch.lastApiStatus,
+                authFails: maLoadWatch.authFails, authAt: maLoadWatch.authAt },
         // E2EE 死会话自动恢复 / 回前台重连（2026-10-23）：只作诊断，不参与任何判定。
         // var 提升在此处可能尚未赋值（maPublishDiag 在恢复层定义之前就会被调用一次）→ 用 typeof 兜住。
         resume: (typeof maResumeState !== "undefined" && maResumeState)
@@ -1292,6 +1297,8 @@ const SCRIPT = `(() => {
       var now = Date.now();
       /* 10 秒内的不可达证据才算：过期的失败不能把文案一直钉在"未连接"上（那正是 03 报告
          说的"文案归因错误"——截图 09 面板同时显示 95ms 顺畅）。 */
+      /* 401/吊销优先判定：它不是网络慢，也不是电脑端离线，重试一万次也不会好 —— 必须重新登录。 */
+      if ((maLoadWatch.authFails || 0) > 0 && now - (maLoadWatch.authAt || 0) < 60000) return "auth";
       if ((maLoadWatch.apiFails || 0) > 0 && now - (maLoadWatch.apiFailAt || 0) < 10000) return "offline";
       if (maRetry.resFails.length > 0) return "resource";
     } catch (e) { /* 落到 slow */ }
@@ -1313,6 +1320,17 @@ const SCRIPT = `(() => {
    * 而 03 报告里所有"电脑端未连接"的现场同时都伴随着 /api 的 502/504。
    * 只做计数与文案分档，绝不据此做任何重试/跳转。
    */
+  /** 401 = 登录态失效/被吊销：只做提示与"重新登录"入口，不自动跳转（避免打断正在输入的用户）。 */
+  function maNoteAuthFail(status) {
+    try {
+      maLoadWatch.authFails = (maLoadWatch.authFails || 0) + 1;
+      maLoadWatch.authAt = Date.now();
+      maLoadWatch.lastApiStatus = Number(status) || 401;
+      maPublishDiag();
+      if (maLoadWatch.slow) maLoadRenderBar();
+    } catch (e) { /* 纯诊断，失败忽略 */ }
+  }
+
   function maNotePresenceFail(status) {
     try {
       maLoadWatch.apiFails = (maLoadWatch.apiFails || 0) + 1;
@@ -1540,6 +1558,7 @@ const SCRIPT = `(() => {
     var sec = maLoadWaitedSec();
     var reason = maLoadReason();
     if (reason === "offline") return "电脑端可能未连接（已等待 " + sec + " 秒）";
+    if (reason === "auth") return "登录已失效，请重新登录（已等待 " + sec + " 秒）";
     if (reason === "resource") {
       if (maRetry.exhausted) return "页面资源加载失败，自动重试已用尽（已等待 " + sec + " 秒）";
       return "页面资源加载失败，正在重试…（已等待 " + sec + " 秒）";
@@ -1600,6 +1619,7 @@ const SCRIPT = `(() => {
         '<div class="dsh-ma-loadbar-txt" data-role="loadbar-txt"></div>' +
         '<div class="dsh-ma-loadbar-actions">' +
           '<button type="button" class="dsh-ma-loadbar-btn" data-role="loadbar-retry">重试</button>' +
+          '<button type="button" class="dsh-ma-loadbar-btn dsh-ma-loadbar-relogin" data-role="loadbar-relogin" hidden>重新登录</button>' +
           '<button type="button" class="dsh-ma-loadbar-btn" data-role="loadbar-back">返回设备列表</button>' +
           '<button type="button" class="dsh-ma-loadbar-btn" data-role="loadbar-copy">复制诊断信息</button>' +
         '</div>' +
@@ -1625,6 +1645,9 @@ const SCRIPT = `(() => {
           }
           if (role === "loadbar-retry") {
             maRetryNow();
+          } else if (role === "loadbar-relogin") {
+            // 回到应用壳（/app/）重新走登录；旧 token 已作废，重试本页无意义。
+            maLoadGoto("/app/?relogin=1");
           } else if (role === "loadbar-back") {
             maLoadGoto("/app/"); // 绝对路径：镜像页当前路径可能是 /remote/<deviceId>/…
           } else if (role === "loadbar-copy") {
@@ -1645,6 +1668,10 @@ const SCRIPT = `(() => {
       var bar = maLoadWatch.barEl || maLoadMountBar();
       if (!bar) return;
       if (maLoadWatch.barTxt) maLoadWatch.barTxt.textContent = maLoadBarText();
+      try {
+        var reloginBtn = bar.querySelector('[data-role="loadbar-relogin"]');
+        if (reloginBtn) reloginBtn.hidden = maLoadReason() !== "auth";
+      } catch (eR) { /* 忽略 */ }
       bar.hidden = false;
       if (!maLoadWatch.barTimer) {
         // 每秒刷新「已等待 N 秒」；同时复核"是不是其实早就好了"——好了就自动收起（不长期挂着）。
@@ -2723,7 +2750,8 @@ const SCRIPT = `(() => {
                   /* 5xx 且**没有** x-dsh-e2ee-error = 电脑端/隧道不可达；
                      E2EE 死会话的 502 另带那个头，它属于"会话失效"（C3 修的就是它），
                      和"电脑端离线"是两回事 —— 混在一起就又变成文案归因错误。 */
-                  if (st >= 500 && !maResHasE2eeError(res)) maNotePresenceFail(st);
+                  if (st === 401) maNoteAuthFail(st);
+                  else if (st >= 500 && !maResHasE2eeError(res)) maNotePresenceFail(st);
                   else maNoteRtt(maNowMs() - t0, url);
                 } catch (eS) { maNoteRtt(maNowMs() - t0, url); }
               }, (err) => {
