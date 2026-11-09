@@ -53,3 +53,12 @@ docs/internal/
 *diagnosis*.md
 *cohort*.md
 *prod-readonly*
+
+# 运行时产物（bridge 以仓库目录为 cwd 跑测试时会在根目录生成）
+/im-bot-status.json
+/im-bots.json
+/im-dingtalk-auth.json
+/im-dingtalk-auth-cmd.json
+/im-dingtalk-reply.json
+/.plugin-update-pending.json
+/pending-plugin/
