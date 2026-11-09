@@ -80,7 +80,12 @@ import {
   IM_BOT_STATUS_FILE,
   APPROVAL_CARD_TTL_MS
 } from "./wecom-bot.mjs";
-import { formatForChannel } from "./im-format.mjs";
+import {
+  SUMMARY_MAX_CHARS,
+  buildTurnNotification,
+  extractTurnSummary,
+  formatForChannel
+} from "./im-format.mjs";
 // 命令层（2026-11-08）：/help /status /stop /ls /use /unbind 在进模型前拦下执行（三家共用）
 import { executeImCommand, writeImBotsSession } from "./im-commands.mjs";
 import {
@@ -1542,6 +1547,26 @@ export function createFeishuBotController(options = {}) {
     }
     if (!notifyRateOk()) {
       log.warn("通知超过每分钟上限，已丢弃（防事件风暴）");
+      return;
+    }
+    // 任务完成/出错：**一条**消息 = 标题行 + 总结正文（同 turn 已去重；审批类不混入总结）
+    if (node.kind === NODE_KINDS.TURN_END || node.kind === NODE_KINDS.SESSION_ERROR) {
+      const key = notifyKey(node);
+      if (key && !rememberNotifyKey(key)) return;
+      let summary = { text: "", source: "none" };
+      try {
+        summary = await extractTurnSummary({ node, subscriber, sessionId: node.sessionId, maxChars: SUMMARY_MAX_CHARS });
+      } catch { summary = { text: "", source: "none" }; }
+      const text = buildTurnNotification({
+        node,
+        channel: "feishu",
+        summary: summary.text,
+        sessionTitle: String((configNow && configNow.sessionTitle) || ""),
+        maxChars: SUMMARY_MAX_CHARS
+      });
+      if (!text) return;
+      log.info(`任务通知 kind=${node.kind} reason=${node.reason || "?"} summary=${summary.source} len=${Array.from(summary.text).length}`);
+      await bot.sendText(target, text);
       return;
     }
     // 审批：优先卡片（可点按钮）

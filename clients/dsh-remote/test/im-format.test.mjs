@@ -11,7 +11,10 @@ import test from "node:test";
 
 import {
   CHANNEL_CAPS,
+  SUMMARY_MAX_CHARS,
   TRUNCATED_NOTE,
+  buildTurnNotification,
+  extractTurnSummary,
   convertMarkdownTable,
   displayWidth,
   formatForChannel,
@@ -226,4 +229,61 @@ test("wechat 分支：走现有特殊格式（本模块只做 plain 兜底、不
   const unknown = formatForChannel("mystery-channel", { text: "# 标题\n\n**粗**" });
   assert.ok(!unknown.includes("**"));
   assert.equal(unknown, "标题\n\n粗");
+});
+
+// ─────────────────────────── 任务总结（turn_done/turn_error 通知带正文）───────────────────────────
+
+test("★ extractTurnSummary：订阅器正文优先 → 事件字段降级 → 取不到为空（不报错）", async () => {
+  // ① 订阅器有正文
+  const sub = { lastAssistantText: async () => ({ ok: true, text: "订阅器里的总结" }) };
+  const a = await extractTurnSummary({ node: { kind: "turn-end", sessionId: "session-x" }, subscriber: sub, sessionId: "session-x" });
+  assert.deepEqual(a, { text: "订阅器里的总结", source: "assistant" });
+  // ② 订阅器取不到 → 事件字段（summary/message/detail/text）
+  const b = await extractTurnSummary({ node: { kind: "turn-end", sessionId: "session-x", message: "事件里的错误摘要" }, subscriber: { lastAssistantText: async () => ({ ok: false, code: "page-failed" }) }, sessionId: "session-x" });
+  assert.deepEqual(b, { text: "事件里的错误摘要", source: "node" });
+  // ③ 都没有 → 空（调用方降级仅标题）
+  const c = await extractTurnSummary({ node: { kind: "turn-end", sessionId: "session-x" }, subscriber: null });
+  assert.equal(c.text, "");
+  assert.equal(c.source, "none");
+  // ④ 订阅器抛错也不崩，继续降级
+  const d = await extractTurnSummary({ node: { kind: "turn-end", summary: "兜底" }, subscriber: { lastAssistantText: async () => { throw new Error("boom"); } }, sessionId: "s" });
+  assert.deepEqual(d, { text: "兜底", source: "node" });
+  // ⑤ 重试：ok 但空 → 第二次拿到（turn/end 瞬间正文可能还没落库）
+  let n = 0;
+  const retried = await extractTurnSummary({
+    node: { kind: "turn-end", sessionId: "s" },
+    subscriber: { lastAssistantText: async () => { n += 1; return n === 1 ? { ok: true, text: "" } : { ok: true, text: "重试后的总结" }; } },
+    sessionId: "s",
+    retryDelays: [0, 5]
+  });
+  assert.equal(retried.text, "重试后的总结");
+  assert.equal(n, 2);
+});
+
+test("★ buildTurnNotification：标题行 + 正文（1500 字上限/通道格式化/缺正文降级）；审批类返回 null", () => {
+  // completed：✅ 任务完成｜标题 + 正文
+  const done = buildTurnNotification({ node: { kind: "turn-end", reason: "completed" }, channel: "wecom", summary: "改了三个文件", sessionTitle: "修端口" });
+  assert.equal(done, "✅ 任务完成｜修端口\n\n改了三个文件");
+  // error / blocked / aborted
+  assert.match(buildTurnNotification({ node: { kind: "turn-end", reason: "error" }, channel: "wecom", summary: "报错摘要" }), /^❌ 出错了\n\n报错摘要$/);
+  assert.match(buildTurnNotification({ node: { kind: "turn-end", reason: "blocked" }, channel: "wecom", summary: "被拦原因" }), /^⛔ 被拦下了\n\n被拦原因$/);
+  assert.match(buildTurnNotification({ node: { kind: "turn-end", reason: "aborted" }, channel: "wecom" }), /^⏹ 已停止$/);
+  // session-error 也用 ❌ 出错了
+  assert.match(buildTurnNotification({ node: { kind: "session-error", message: "x" }, channel: "wecom" }), /^❌ 出错了/);
+  // 缺正文 → 仅标题（不留多余空段）
+  assert.equal(buildTurnNotification({ node: { kind: "turn-end", reason: "completed" }, channel: "wecom", summary: "" }), "✅ 任务完成");
+  // 审批类不混入总结（返回 null，仍走卡片）
+  assert.equal(buildTurnNotification({ node: { kind: "approval-request", toolName: "Bash" }, channel: "wecom", summary: "不该出现" }), null);
+  // 表格按通道转换（企微不支持表格 → 可读列表）
+  const table = "| 文件 | 改动 |\n|---|---|\n| a.mjs | 修端口 |";
+  const withTable = buildTurnNotification({ node: { kind: "turn-end", reason: "completed" }, channel: "wecom", summary: table });
+  assert.ok(!/\|\s*-{2,}/.test(withTable), "★ 通知里不得有裸表格分隔行");
+  assert.match(withTable, /• 文件：a\.mjs · 改动：修端口/);
+  // 1500 字上限（长正文截断 + 注明）
+  const long = "开头" + "长".repeat(3000);
+  const longNotice = buildTurnNotification({ node: { kind: "turn-end", reason: "completed" }, channel: "feishu", summary: long });
+  const body = longNotice.split("\n\n").slice(1).join("\n\n");
+  assert.ok(body.endsWith(TRUNCATED_NOTE), "超长正文要带截断提示");
+  assert.ok(Array.from(body).length <= SUMMARY_MAX_CHARS + Array.from(TRUNCATED_NOTE).length + 2, "正文不超过 1500 字（+提示）");
+  assert.ok(!body.includes("长".repeat(2000)), "明显截断");
 });

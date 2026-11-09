@@ -845,3 +845,82 @@ test("★ 命令层：/help 回复、免费档 /ls 被拦（会员文案）、/s
     await waitFor(() => rt.sub.calls.prompt.length === 1, { label: "普通文本转发" });
   } finally { await rt.close(); }
 });
+
+// ─────────────────────── 任务通知带总结（2026-11-10：只有"已完成"没有总结）───────────────────────
+
+test("★ 任务通知带总结（钉钉）：turn_done → 一条「✅ 任务完成 + 正文」（表格转列表）；同 turn 去重；正文不进日志", async () => {
+  const answer = "修复完成：\n\n| 文件 | 改动 |\n|---|---|\n| a.mjs | 修端口 |\n| b.mjs | 加缓存 |";
+  const rt = await setupBot({ subOptions: { answer } });
+  try {
+    await rt.start();
+    await rt.inbound({ text: "给我看改动", msgId: "sum-in-1" });
+    await waitFor(() => rt.sub.calls.prompt.length === 1, { label: "入站转发" });
+    const turn = { kind: "turn-end", sessionId: "session-live", turn: 1, seq: 41, reason: "completed", at: Date.now() };
+    rt.sub.emit("event", { ...turn });
+    const call = await waitFor(() => rt.hook.state.calls.find((c) => c.body.markdown.text.includes("任务完成")), { label: "任务通知" });
+    const text = call.body.markdown.text;
+    assert.match(text, /^✅ 任务完成/, "★ 通知带「任务完成」标题行");
+    assert.match(text, /\n\n修复完成：/, "★ 同一条消息带总结正文");
+    assert.match(text, /• 文件：a\.mjs · 改动：修端口/, "★ 表格转可读列表");
+    assert.ok(!/\|\s*-{2,}/.test(text), "★ 不得有裸表格");
+    // 同 turn 重复事件 → 去重
+    const before = rt.hook.state.calls.filter((c) => c.body.markdown.text.includes("任务完成")).length;
+    rt.sub.emit("event", { ...turn });
+    await sleep(60);
+    assert.equal(rt.hook.state.calls.filter((c) => c.body.markdown.text.includes("任务完成")).length, before, "★ 同 turn 只发一条");
+    // 正文不进日志（只打 len）
+    const logs = rt.logs.join("\n");
+    assert.ok(!logs.includes("修复完成"), "★ 总结正文绝不能进日志");
+    assert.ok(logs.split("\n").some((l) => /任务通知 .*len=\d+/.test(l)), "日志只记长度");
+  } finally { await rt.close(); }
+});
+
+test("★ 任务通知边界（钉钉）：缺正文降级仅标题；超长按 1500 字截断+注明；出错带错误摘要；审批不混入总结", async () => {
+  // ① 缺正文 → 仅标题
+  {
+    const rt = await setupBot({ subOptions: { answer: "" } });
+    try {
+      await rt.start();
+      await rt.inbound({ text: "hi", msgId: "sum-2" });
+      await waitFor(() => rt.sub.calls.prompt.length === 1, { label: "入站" });
+      rt.sub.emit("event", { kind: "turn-end", sessionId: "session-live", turn: 1, seq: 51, reason: "completed", at: Date.now() });
+      const call = await waitFor(() => rt.hook.state.calls.find((c) => c.body.markdown.text.includes("任务完成")), { label: "降级标题" });
+      assert.equal(call.body.markdown.text, "✅ 任务完成", "★ 取不到正文 → 仅标题（不多空段）");
+    } finally { await rt.close(); }
+  }
+  // ② 超长 → 截断 + 注明；出错 → ❌ + 摘要
+  {
+    const rt = await setupBot({ subOptions: { answer: "开头" + "长".repeat(3000) + "SECRET-TAIL" } });
+    try {
+      await rt.start();
+      await rt.inbound({ text: "hi", msgId: "sum-3" });
+      await waitFor(() => rt.sub.calls.prompt.length === 1, { label: "入站" });
+      rt.sub.emit("event", { kind: "turn-end", sessionId: "session-live", turn: 1, seq: 61, reason: "completed", at: Date.now() });
+      const call = await waitFor(() => rt.hook.state.calls.find((c) => c.body.markdown.text.includes("任务完成")), { label: "截断通知" });
+      const text = call.body.markdown.text;
+      assert.ok(text.endsWith("…(已截断，完整内容看电脑)"), "超长正文要带截断提示");
+      const body = text.split("\n\n").slice(1).join("\n\n");
+      assert.ok(Array.from(body).length <= 1500 + 20, "正文不超过 1500 字（+提示）");
+      assert.ok(!text.includes("SECRET-TAIL"));
+      assert.ok(!rt.logs.join("\n").includes("SECRET-TAIL"), "★ 正文不进日志");
+      // 出错：❌ 标题 + 摘要
+      rt.sub.emit("event", { kind: "turn-end", sessionId: "session-live", turn: 2, seq: 62, reason: "error", at: Date.now() });
+      const err = await waitFor(() => rt.hook.state.calls.find((c) => c.body.markdown.text.startsWith("❌ 出错了")), { label: "出错通知" });
+      assert.match(err.body.markdown.text, /\n\n开头/, "出错也要带错误摘要");
+    } finally { await rt.close(); }
+  }
+  // ③ 审批事件不混入总结（走普通通知，不是 ✅ 任务完成）——先入站绑定回复通道
+  {
+    const rt = await setupBot({ subOptions: { answer: "审批不该出现的总结" } });
+    try {
+      await rt.start();
+      await rt.inbound({ text: "准备审批", msgId: "sum-apr-bind" });
+      await waitFor(() => rt.sub.calls.prompt.length === 1, { label: "入站绑定" });
+      const before = rt.hook.state.calls.length;
+      rt.sub.emit("event", { kind: "approval-request", eventId: "apr_sum_1", toolName: "Bash", sessionId: "session-live" });
+      const call = await waitFor(() => rt.hook.state.calls.slice(before).find((c) => c.body.markdown.text.includes("拍板") || c.body.markdown.text.includes("审批")), { label: "审批通知" });
+      assert.ok(!/^✅ 任务完成/.test(call.body.markdown.text), "★ 审批类不得混入任务总结");
+      assert.ok(!call.body.markdown.text.includes("审批不该出现的总结"), "★ 审批通知不带总结正文");
+    } finally { await rt.close(); }
+  }
+});

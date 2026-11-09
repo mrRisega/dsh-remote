@@ -690,62 +690,56 @@ async function setupRelayBot(over = {}) {
   return { server, sub, bot, lines, sends, inbound, turnEnd, close: async () => { await bot.stop(); await server.close(); } };
 }
 
-test("★ 回答回传：入站后同会话 turn_done 发**回答正文**（不再发 ✅标题）；其它会话/已消费保持标题通知；取不到正文降级标题", async () => {
-  const rt = await setupRelayBot({ assistantText: { ok: true, text: "这是 agent 的最终回答" } });
+test("★ 任务通知带总结（企微）：turn_done → 一条「✅ 任务完成｜标题 + 正文」；同 turn 不重发；缺正文降级标题；正文不进日志", async () => {
+  const rt = await setupRelayBot({ assistantText: { ok: true, text: "这是 agent 的最终总结" } });
   try {
     rt.bot.start();
     await waitFor(() => rt.bot.status().authenticated, { label: "认证完成" });
     await rt.inbound("relay-1", "你好");
-
-    // ① 入站后同会话 turn/end → 只发正文，不发标题
     rt.turnEnd({ turn: 1, seq: 11 });
-    const first = await waitFor(() => rt.sends()[0], { label: "回答回传" });
-    assert.equal(first.body.chatid, "user-a", "回答必须发回最近入站的会话（boundChatId）");
+    const first = await waitFor(() => rt.sends()[0], { label: "任务通知" });
+    assert.equal(first.body.chatid, "user-a");
     assert.equal(first.body.msgtype, "markdown");
-    assert.equal(first.body.markdown.content, "这是 agent 的最终回答", "回答回传 = 正文本身（不带 ✅ 标题）");
-    assert.equal(rt.bot.status().answers, 1);
-    assert.deepEqual(rt.sub.lastAssistantCalls, [{ sessionId: "session-abc" }], "应通过 lastAssistantText 取正文");
+    const content = first.body.markdown.content;
+    assert.match(content, /^✅ 任务完成/, "★ 通知必须带「任务完成」标题行");
+    assert.match(content, /\n\n这是 agent 的最终总结$/, "★ 同一条消息里带总结正文（不是另发一条）");
+    assert.deepEqual(rt.sub.lastAssistantCalls[0], { sessionId: "session-abc" }, "正文通过 lastAssistantText 取");
     await sleep(120);
-    assert.equal(rt.sends().length, 1, "同一次对话不得再补一条「✅ 任务完成」");
+    assert.equal(rt.sends().length, 1, "★ 同一次 turn 只发一条（不得标题一条 + 正文一条）");
 
-    // ② 其它会话的 turn/end → 仍是标题通知
+    // 同 turn 重复事件 → 去重，不重发
+    rt.turnEnd({ turn: 1, seq: 11 });
+    await sleep(120);
+    assert.equal(rt.sends().length, 1, "★ 同 turn 重复事件去重");
+
+    // 其它会话的 turn/end 也带总结（订阅器能给到该会话正文）
     rt.sub.emit("event", { kind: NODE_KINDS.TURN_END, sessionId: "session-other", reason: "completed", turn: 1, seq: 12, at: Date.now() });
-    const other = await waitFor(() => rt.sends().find((f) => /任务完成/.test(f.body.markdown.content)), { label: "其它会话标题通知" });
+    const other = await waitFor(() => rt.sends().find((f) => f.body.markdown.content.includes("这是 agent 的最终总结") && f !== first), { label: "其它会话通知" });
     assert.match(other.body.markdown.content, /^✅ 任务完成/);
 
-    // ③ 同会话但已消费过一次 → 保持标题通知（不会重复回传正文）
-    rt.turnEnd({ turn: 2, seq: 13 });
-    const again = await waitFor(() => rt.sends().filter((f) => /任务完成/.test(f.body.markdown.content)).length >= 2, { label: "消费一次后的标题通知" });
-    assert.ok(again, "同一次入站只回传一次正文，之后回落到标题通知");
-
-    // ④ 取不到正文 → 降级标题通知（不丢消息、也不假装有正文）
+    // 取不到正文 → 降级仅标题（不丢消息、不报错）
     await rt.inbound("relay-2", "再问一句");
     rt.sub.assistantReply = { ok: false, code: "page-failed", text: "" };
     rt.turnEnd({ turn: 3, seq: 14 });
-    await waitFor(() => rt.lines.some((l) => /降级为标题通知/.test(l)), { label: "降级日志" });
-    const fallback = rt.sends().filter((f) => /任务完成/.test(f.body.markdown.content)).pop();
-    assert.match(fallback.body.markdown.content, /^✅ 任务完成/, "取不到正文时退回标题通知");
-
-    // ⑤ 重连快照补报的旧 turn（fromSnapshot）不得回传正文
-    await rt.inbound("relay-3", "第三句");
-    rt.sub.assistantReply = { ok: true, text: "来自快照的旧回答" };
-    const beforeSnapshot = rt.sends().length;
-    rt.turnEnd({ turn: 4, seq: 15, fromSnapshot: true });
-    await sleep(150);
-    assert.equal(rt.sends().length, beforeSnapshot + 1, "fromSnapshot 只走标题通知（一条），不触发正文回传");
-    assert.ok(!rt.sends().some((f) => f.body.markdown.content === "来自快照的旧回答"));
+    await waitFor(() => rt.sends().length >= 3, { label: "降级通知" });
+    const fallback = rt.sends()[rt.sends().length - 1];
+    assert.match(fallback.body.markdown.content, /^✅ 任务完成/, "★ 取不到正文时仅标题");
+    assert.ok(!fallback.body.markdown.content.includes("\n\n"), "无正文时不要多余空段");
+    // 正文绝不进日志（只打长度）
+    const allLogs = rt.lines.join("\n");
+    assert.ok(!allLogs.includes("这是 agent 的最终总结"), "★ 总结正文绝不能进日志");
+    assert.ok(allLogs.split("\n").some((l) => /任务通知 .*len=\d+/.test(l)), "日志只记长度");
   } finally {
     await rt.close();
   }
 });
 
-test("★ 回答回传：turn/end 瞬间正文还没落库 → 短重试后仍能回传（不是直接降级）", async () => {
+test("★ 任务通知：turn/end 瞬间正文还没落库 → 短重试后仍带总结（不是直接降级标题）", async () => {
   let call = 0;
   const rt = await setupRelayBot({
     assistantText: () => {
       call += 1;
-      // 第一次「ok 但空」（真实竞态），第二次拿到正文
-      return call === 1 ? { ok: true, text: "" } : { ok: true, text: "重试后拿到的回答" };
+      return call === 1 ? { ok: true, text: "" } : { ok: true, text: "重试后拿到的总结" };
     }
   });
   try {
@@ -753,68 +747,52 @@ test("★ 回答回传：turn/end 瞬间正文还没落库 → 短重试后仍�
     await waitFor(() => rt.bot.status().authenticated, { label: "认证完成" });
     await rt.inbound("retry-1", "你好");
     rt.turnEnd({ turn: 1, seq: 31 });
-    const send = await waitFor(() => rt.sends()[0], { label: "重试后的回答回传" });
-    assert.equal(send.body.markdown.content, "重试后拿到的回答", "ok 但空 → 补一次再发，不应直接降级");
+    const send = await waitFor(() => rt.sends()[0], { label: "重试后的通知" });
+    const content = send.body.markdown.content;
+    assert.match(content, /^✅ 任务完成/);
+    assert.match(content, /\n\n重试后拿到的总结$/);
     assert.equal(rt.sub.lastAssistantCalls.length, 2, "应恰好重试一次");
-    assert.equal(rt.bot.status().answers, 1);
   } finally {
     await rt.close();
   }
 });
 
-test("★ 回答回传边界：超过 TTL 不回传、超长截断+注明、正文绝不进日志、非 completed 带状态行", async () => {
-  // ① TTL：注入 40ms，入站后等过期再 turn/end → 只发标题通知
-  {
-    const rt = await setupRelayBot({ assistantText: { ok: true, text: "过期不该发的回答" }, bot: { answerRelayTtlMs: 40 } });
-    try {
-      rt.bot.start();
-      await waitFor(() => rt.bot.status().authenticated, { label: "认证完成" });
-      await rt.inbound("ttl-1", "你好");
-      await sleep(120); // 超过 40ms TTL
-      rt.turnEnd({ turn: 1, seq: 21, at: Date.now() });
-      const send = await waitFor(() => rt.sends()[0], { label: "超时后的标题通知" });
-      assert.match(send.body.markdown.content, /^✅ 任务完成/, "超过 10 分钟语义（测试缩放为 40ms）应回到标题通知");
-      assert.ok(!send.body.markdown.content.includes("过期不该发的回答"));
-    } finally {
-      await rt.close();
-    }
-  }
+test("★ 任务通知边界：超长正文按 1500 字截断+注明；出错带错误摘要；正文不进日志", async () => {
+  const longSummary = "开头" + "长".repeat(3000) + "SECRET-SUMMARY-TAIL";
+  const rt = await setupRelayBot({ assistantText: { ok: true, text: longSummary } });
+  try {
+    rt.bot.start();
+    await waitFor(() => rt.bot.status().authenticated, { label: "认证完成" });
+    await rt.inbound("trunc-1", "来点长的");
+    rt.turnEnd({ turn: 1, seq: 22 });
+    const send = await waitFor(() => rt.sends()[0], { label: "截断后的通知" });
+    const content = send.body.markdown.content;
+    assert.match(content, /^✅ 任务完成/);
+    assert.ok(content.endsWith(ANSWER_TRUNCATED_NOTE), `超长正文要以「${ANSWER_TRUNCATED_NOTE}」结尾`);
+    const bodyPart = content.split("\n\n").slice(1).join("\n\n");
+    assert.ok(Array.from(bodyPart).length <= 1500 + Array.from(ANSWER_TRUNCATED_NOTE).length + 2, "正文长度不得超过 1500 字（+截断提示）");
+    assert.ok(!content.includes("SECRET-SUMMARY-TAIL"));
+    const allLogs = rt.lines.join("\n");
+    assert.ok(!allLogs.includes("SECRET-SUMMARY-TAIL"), "★ 总结正文绝不能进日志");
+    assert.ok(!allLogs.includes("长".repeat(40)), "★ 正文片段也不能进日志");
+    assert.ok(allLogs.split("\n").some((l) => /任务通知 .* len=\d+/.test(l)), "日志只记长度");
 
-  // ② 截断 + 正文不进日志 + 非 completed 状态行
-  {
-    const longAnswer = "开头" + "长".repeat(300) + "SECRET-ANSWER-TAIL";
-    const rt = await setupRelayBot({
-      assistantText: { ok: true, text: longAnswer },
-      bot: { answerMaxChars: 50 }
-    });
-    try {
-      rt.bot.start();
-      await waitFor(() => rt.bot.status().authenticated, { label: "认证完成" });
-      await rt.inbound("trunc-1", "来点长的");
-      rt.turnEnd({ turn: 1, seq: 22 });
-      const send = await waitFor(() => rt.sends()[0], { label: "截断后的回答" });
-      const content = send.body.markdown.content;
-      assert.ok(content.endsWith(ANSWER_TRUNCATED_NOTE), `超长回答要以「${ANSWER_TRUNCATED_NOTE}」结尾`);
-      assert.equal(content.length, 50 + ANSWER_TRUNCATED_NOTE.length, "正文部分必须恰好截到 answerMaxChars");
-      assert.ok(!content.includes("SECRET-ANSWER-TAIL"));
-      assert.ok(content.startsWith("开头"));
-      // 日志只打长度，不打正文
-      const allLogs = rt.lines.join("\n");
-      assert.ok(!allLogs.includes("SECRET-ANSWER-TAIL"), "★ 回答正文绝不能进日志");
-      assert.ok(!allLogs.includes("长".repeat(40)), "★ 回答正文片段也不能进日志");
-      assert.ok(allLogs.split("\n").some((l) => /回答回传 .* len=\d+/.test(l)), "日志只记长度");
-      assert.ok(allLogs.split("\n").some((l) => /已截断/.test(l)), "日志要标出截断");
+    // 出错：❌ 标题 + 错误摘要（同一条消息）
+    rt.sub.assistantReply = { ok: true, text: "只跑了一半的结果" };
+    await rt.inbound("err-1", "再试");
+    rt.turnEnd({ turn: 2, seq: 23, reason: "error" });
+    const errSend = await waitFor(() => rt.sends().find((f) => f.body.markdown.content.includes("只跑了一半的结果")), { label: "出错通知" });
+    assert.match(errSend.body.markdown.content, /^❌ 出错了/);
+    assert.match(errSend.body.markdown.content, /\n\n只跑了一半的结果$/);
 
-      // ③ 非 completed：带一句状态行 + 正文（仍是一条消息）
-      rt.sub.assistantReply = { ok: true, text: "只跑了一半的结果" };
-      await rt.inbound("err-1", "再试");
-      rt.turnEnd({ turn: 2, seq: 23, reason: "error" });
-      const errSend = await waitFor(() => rt.sends().find((f) => f.body.markdown.content.includes("只跑了一半的结果")), { label: "出错时回传" });
-      assert.match(errSend.body.markdown.content, /^❌ 出错了/);
-      assert.ok(errSend.body.markdown.content.includes("只跑了一半的结果"), "同一条消息里既给状态也给正文");
-    } finally {
-      await rt.close();
-    }
+    // 被拦下（blocked）：状态行 + 总结
+    rt.sub.assistantReply = { ok: true, text: "被安全策略拦截的说明" };
+    await rt.inbound("block-1", "危险操作");
+    rt.turnEnd({ turn: 3, seq: 24, reason: "blocked" });
+    const blocked = await waitFor(() => rt.sends().find((f) => f.body.markdown.content.includes("被安全策略拦截的说明")), { label: "被拦通知" });
+    assert.match(blocked.body.markdown.content, /^⛔ 被拦下了/);
+  } finally {
+    await rt.close();
   }
 });
 

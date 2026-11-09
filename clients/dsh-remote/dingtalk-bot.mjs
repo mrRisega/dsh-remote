@@ -50,7 +50,12 @@ import { EventEmitter } from "node:events";
 import WebSocket from "ws";
 
 import { createEventSubscriber, NODE_KINDS } from "./dsh-events.mjs";
-import { formatForChannel } from "./im-format.mjs";
+import {
+  SUMMARY_MAX_CHARS,
+  buildTurnNotification,
+  extractTurnSummary,
+  formatForChannel
+} from "./im-format.mjs";
 // 命令层（2026-11-08）：/help /status /stop /ls /use /unbind 在进模型前拦下执行（三家共用）
 import { executeImCommand, writeImBotsSession } from "./im-commands.mjs";
 import {
@@ -1247,25 +1252,47 @@ export function createDingtalkBot(options = {}) {
     }
   }
 
+  /**
+   * 事件订阅 → 出站通知。
+   * · turn/end、session-error：**一条**消息 = 标题行 + 总结正文（同 turn 已去重）
+   * · 其它（审批/提问/简报…）：沿用 toMarkdownNotification（审批卡片由别处处理，不混入总结）
+   */
   function onEventNode(node) {
     if (!node || typeof node !== "object") return;
     if (typeof node.sessionId === "string" && node.sessionId) lastSeenSessionId = node.sessionId;
     if (stopped || !notifyAllowed || !state.authenticated) return;
-    // 回答回传：入站后的同一会话 turn/end → 把 agent 最终回答发回钉钉（与企微同语义）
-    if (shouldRelayAnswer(node)) {
-      const key = notifyKey(node);
+    const key = notifyKey(node);
+    if (node.kind === NODE_KINDS.TURN_END || node.kind === NODE_KINDS.SESSION_ERROR) {
       if (key && !rememberNotifyKey(key)) return;
-      const sid = node.sessionId;
+      if (!notifyRateOk()) { log.warn("通知超过每分钟上限，已丢弃（防止事件风暴刷屏）"); return; }
       lastInbound = { sessionId: "", at: 0 };
-      void relayAnswer(node, sid);
+      void sendTurnNotice(node).catch(() => {});
       return;
     }
     const markdown = toMarkdownNotification(node, { sessionTitle: options.sessionTitle });
     if (!markdown) return;
-    const key = notifyKey(node);
     if (key && !rememberNotifyKey(key)) return;
     if (!notifyRateOk()) { log.warn("通知超过每分钟上限，已丢弃（防止事件风暴刷屏）"); return; }
     void sendMarkdown(markdown).catch(() => {});
+  }
+
+  /** 任务完成/出错通知：标题 + 总结正文（优先订阅器 lastAssistantText；取不到降级仅标题）。日志只打长度。 */
+  async function sendTurnNotice(node) {
+    let summary = { text: "", source: "none" };
+    try {
+      summary = await extractTurnSummary({ node, subscriber, sessionId: node.sessionId, maxChars: SUMMARY_MAX_CHARS });
+    } catch { summary = { text: "", source: "none" }; }
+    if (stopped) return;
+    const text = buildTurnNotification({
+      node,
+      channel: "dingtalk",
+      summary: summary.text,
+      sessionTitle: "",
+      maxChars: SUMMARY_MAX_CHARS
+    });
+    if (!text) return;
+    log.info(`任务通知 kind=${node.kind} reason=${node.reason || "?"} summary=${summary.source} len=${Array.from(summary.text).length}`);
+    await sendMarkdown(text);
   }
 
   const notifiedKeys = new Map();
@@ -1292,30 +1319,6 @@ export function createDingtalkBot(options = {}) {
     notifyTimes.push(at);
     return true;
   }
-  function shouldRelayAnswer(node) {
-    if (node.kind !== NODE_KINDS.TURN_END) return false;
-    if (node.fromSnapshot === true) return false;
-    if (!lastInbound.sessionId || node.sessionId !== lastInbound.sessionId) return false;
-    if (now() - lastInbound.at >= 10 * 60 * 1000) return false;
-    if (Number.isFinite(node.at) && node.at > 0 && node.at < lastInbound.at - 5000) return false;
-    return true;
-  }
-  async function relayAnswer(node, sessionId) {
-    let text = "";
-    const sub = subscriber;
-    if (sub && typeof sub.lastAssistantText === "function") {
-      try {
-        const r = await sub.lastAssistantText({ sessionId });
-        if (r && r.ok && typeof r.text === "string") text = r.text.trim();
-      } catch { /* 忽略 */ }
-    }
-    const markdown = text || toMarkdownNotification(node, { sessionTitle: options.sessionTitle }) || "";
-    if (!markdown) return;
-    if (!notifyRateOk()) { log.warn("通知超过每分钟上限，已丢弃（防止事件风暴刷屏）"); return; }
-    const r = await sendMarkdown(markdown);
-    log.info(`回答回传 chat=${chatIdHash(state.boundChatId) || "?"} len=${markdown.length}${r && r.ok ? "" : ` 发送失败=${(r && r.reason) || "?"}`}`);
-  }
-
   // ---------- 对外 API ----------
 
   function shortSession(sessionId) {

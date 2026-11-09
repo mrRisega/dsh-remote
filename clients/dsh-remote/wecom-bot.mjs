@@ -52,7 +52,12 @@ import WebSocket from "ws";
 
 import { createEventSubscriber, NODE_KINDS } from "./dsh-events.mjs";
 // 通道感知格式化（2026-11-08：企微/钉钉 markdown 不支持表格，发前统一适配；飞书/微信各有分支）
-import { formatForChannel } from "./im-format.mjs";
+import {
+  SUMMARY_MAX_CHARS,
+  buildTurnNotification,
+  extractTurnSummary,
+  formatForChannel
+} from "./im-format.mjs";
 // 命令层（2026-11-08）：/help /status /stop /ls /use /unbind 在**进模型前**拦下执行；
 // 解析/文案/能力门禁三家共用（与会员升级文案同口径）。
 import { executeImCommand, writeImBotsSession } from "./im-commands.mjs";
@@ -2053,102 +2058,42 @@ export function createWecomBot(options = {}) {
   }
 
   /**
-   * 这个 turn/end 是不是「我们刚转发进去的那次对话」的收尾？
+   * 任务通知（完成/出错/被拦/停止）：**一条**消息 = 标题行 + 总结正文。
    *
-   * 判据（宁可不回传，也不要瞎回传）：
-   *   · 必须**实时** turn/end（`fromSnapshot` = 重连时补报的旧 turn，绝不能拿旧回答当新回答）；
-   *   · 会话必须是最近一次入站转发成功的那个；
-   *   · 距那次入站 < TTL（默认 10 分钟）—— 超时就当另一次对话，走原来的标题通知；
-   *   · 事件时间不能早于入站时间（给 5s 时钟/批处理余量）。
+   * 正文优先订阅器 `lastAssistantText({sessionId})`（turn/end 瞬间可能还没落库 → 沿用旧短重试），
+   * 取不到再用事件字段、再取不到降级"仅标题"；正文按企业微信通道渲染并限制 1500 字。
+   * **日志只打长度/来源，绝不打印正文**（可能有代码/密钥/隐私）。
    */
-  function shouldRelayAnswer(node) {
-    if (!answerRelayEnabled) return false;
-    if (node.kind !== NODE_KINDS.TURN_END) return false;
-    if (node.fromSnapshot === true) return false;
-    if (!lastInbound.sessionId || node.sessionId !== lastInbound.sessionId) return false;
-    const at = now();
-    if (at - lastInbound.at >= answerRelayTtlMs) return false;
-    if (Number.isFinite(node.at) && node.at > 0 && node.at < lastInbound.at - 5000) return false;
-    return true;
+  async function sendTurnNotice(node, target) {
+    let summary = { text: "", source: "none" };
+    try {
+      summary = await extractTurnSummary({
+        node,
+        subscriber: answerRelayEnabled ? subscriber : null,
+        sessionId: node.sessionId,
+        maxChars: SUMMARY_MAX_CHARS,
+        retryDelays: answerRelayEnabled ? ANSWER_FETCH_RETRY_DELAYS_MS : null
+      });
+    } catch { summary = { text: "", source: "none" }; }
+    if (stopped) return;
+    const text = buildTurnNotification({
+      node,
+      channel: "wecom",
+      summary: summary.text,
+      sessionTitle: titleOfSession(node.sessionId, ""),
+      maxChars: SUMMARY_MAX_CHARS
+    });
+    if (!text) return;
+    log.info(`任务通知 kind=${node.kind} reason=${node.reason || "?"} summary=${summary.source} len=${Array.from(summary.text).length}`);
+    sendMarkdown(target, text);
   }
 
   /**
-   * 回答回传：把 agent 的最终回答正文发回企微（不再发「✅ 任务完成｜标题」那条）。
-   *
-   * 取正文用事件订阅器的 `lastAssistantText({sessionId})`（dsh-events 已有，永不抛）；
-   * 取不到 → **降级退回原来的标题通知**（不丢消息，也不假装有正文）；
-   * 日志只打长度/会话短 id，**绝不打印正文**（回答里可能有代码/密钥/隐私）。
+   * 事件订阅 → 出站通知。
+   * · turn/end、session-error：**一条**消息 = 标题行 + 总结正文（sendTurnNotice；同 turn 已去重）
+   * · 审批/提问/计划：优先可点卡片（**不混入总结**），卡片失败退回文本
+   * · 其它（简报/额度/会员/故障）：沿用 toMarkdownNotification
    */
-  async function relayAnswer(node, sessionId) {
-    const target = state.boundChatId || targetChatId;
-    if (!target) {
-      const at = now();
-      if (at - lastNoTargetLogAt > 10 * 60 * 1000) {
-        lastNoTargetLogAt = at;
-        log.info("有回答要回传，但还没绑定接收方：请先在企业微信里给机器人发一句话（或在配置里填 targetChatId）");
-      }
-      return;
-    }
-    let text = "";
-    let why = "";
-    const sub = subscriber;
-    if (!sub || typeof sub.lastAssistantText !== "function") {
-      why = "no_subscriber";
-    } else {
-      for (const delay of ANSWER_FETCH_RETRY_DELAYS_MS) {
-        if (delay > 0) {
-          await sleepTimer(delay);
-          if (stopped) return; // 等待期间桥已退出：不再发
-        }
-        try {
-          const r = await sub.lastAssistantText({ sessionId });
-          if (r && r.ok && typeof r.text === "string" && r.text.trim()) {
-            text = r.text.trim();
-            break;
-          }
-          why = String((r && (r.code || r.message)) || "empty");
-          // 硬失败（page-failed / session-not-found）重试也没意义；只有「ok 但正文还没落库」才补一次
-          if (!(r && r.ok)) break;
-        } catch (e) {
-          why = truncateText(e && e.message ? e.message : e, 60);
-          break;
-        }
-      }
-    }
-
-    // 降级：拿不到正文 → 退回标题通知（与改动前的行为一致）
-    if (!text) {
-      const fallback = toMarkdownNotification(node, { sessionTitle: options.sessionTitle });
-      if (!fallback) return;
-      if (!notifyRateOk()) {
-        log.warn("通知超过每分钟上限，已丢弃（防止事件风暴刷屏）");
-        return;
-      }
-      state.notified += 1;
-      sendMarkdown(target, fallback);
-      log.info(`取不到回答正文（${truncateText(why || "empty", 60)}），已降级为标题通知`);
-      return;
-    }
-
-    const truncated = text.length > answerMaxChars;
-    let body = truncated ? `${text.slice(0, answerMaxChars)}${ANSWER_TRUNCATED_NOTE}` : text;
-    // 非正常结束（出错/被拦/中止）时保留一句状态行，避免"看到回答却不知道它不完整"
-    const reasonKind = String(node.reason || "");
-    if (reasonKind && reasonKind !== "completed") {
-      const status = toMarkdownNotification(node, { sessionTitle: options.sessionTitle });
-      if (status) body = `${status}\n\n${body}`;
-    }
-    if (!notifyRateOk()) {
-      log.warn("通知超过每分钟上限，已丢弃（防止事件风暴刷屏）");
-      return;
-    }
-    state.notified += 1;
-    state.answers += 1;
-    const sent = sendMarkdown(target, body);
-    // 只打长度与截断标记：正文绝不能进日志
-    log.info(`回答回传 chat=${chatIdHash(target)} len=${body.length}${truncated ? "（已截断）" : ""}${sent && sent.ok ? "" : ` 发送失败=${(sent && sent.reason) || "?"}`}`);
-  }
-
   function onEventNode(node) {
     if (!node || typeof node !== "object") return;
     if (typeof node.sessionId === "string" && node.sessionId) {
@@ -2156,19 +2101,31 @@ export function createWecomBot(options = {}) {
       scheduleSessionRefresh();
     }
     if (stopped || !notifyAllowed || !state.authenticated) return;
-    // ── 回答回传：入站后的同一会话 turn/end → 发回答正文（消费一次）──
-    if (shouldRelayAnswer(node)) {
-      const key = notifyKey(node);
+    const key = notifyKey(node);
+    // ── 任务完成/出错：标题 + 总结正文（一次 turn 只发一条）──
+    if (node.kind === NODE_KINDS.TURN_END || node.kind === NODE_KINDS.SESSION_ERROR) {
       if (key && !rememberNotifyKey(key)) return;
-      const sid = node.sessionId;
+      const target = state.boundChatId || targetChatId;
+      if (!target) {
+        const at = now();
+        if (at - lastNoTargetLogAt > 10 * 60 * 1000) {
+          lastNoTargetLogAt = at;
+          log.info("有任务通知要发，但还没绑定接收方：请先在企业微信里给机器人发一句话（或在配置里填 targetChatId）");
+        }
+        return;
+      }
+      if (!notifyRateOk()) {
+        log.warn("通知超过每分钟上限，已丢弃（防止事件风暴刷屏）");
+        return;
+      }
+      state.notified += 1;
       lastInbound = { sessionId: "", at: 0 }; // 同一次入站只回传一次
-      void relayAnswer(node, sid);
+      void sendTurnNotice(node, target);
       return;
     }
     // ── 审批类事件：优先发**可点按钮的卡片**（允许一次/拒绝），发不出去再退回 markdown ──
     if (node.kind === NODE_KINDS.APPROVAL_REQUEST) {
       const markdown = toMarkdownNotification(node, { sessionTitle: options.sessionTitle });
-      const key = notifyKey(node);
       if (key && !rememberNotifyKey(key)) return;
       const requestId = String(node.eventId || "");
       const target = state.boundChatId || targetChatId;
@@ -2200,11 +2157,9 @@ export function createWecomBot(options = {}) {
     }
     const markdown = toMarkdownNotification(node, { sessionTitle: options.sessionTitle });
     if (!markdown) return;
-    const key = notifyKey(node);
     if (key && !rememberNotifyKey(key)) return;
     const target = state.boundChatId || targetChatId;
     if (!target) {
-      // 首次使用：用户还没给机器人发过话，也没有配 targetChatId → 无处可推（如实记日志，不刷屏）
       const at = now();
       if (at - lastNoTargetLogAt > 10 * 60 * 1000) {
         lastNoTargetLogAt = at;
@@ -2232,7 +2187,6 @@ export function createWecomBot(options = {}) {
 
   function rememberNotifyKey(key) {
     const at = now();
-    // 有界 + TTL：Map 保插入序，超上限丢最旧
     for (const [k, t] of notifiedKeys) {
       if (at - t > 10 * 60 * 1000) notifiedKeys.delete(k);
       else break;

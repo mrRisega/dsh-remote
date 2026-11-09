@@ -150,10 +150,11 @@ function makeFetch({ tokenCode = 0, sendCode = 0, sendMsg = "", patchCode = 0 } 
 }
 
 // ── 假事件订阅器 ──────────────────────────────────────────────────────────
-function makeSubscriber() {
+function makeSubscriber({ answer = { ok: true, text: "" } } = {}) {
   const emitter = new EventEmitter();
-  const calls = { sessions: [], prompts: [], cancels: [], started: 0, stopped: 0, listenSessions: 0 };
+  const calls = { sessions: [], prompts: [], cancels: [], assistant: [], started: 0, stopped: 0, listenSessions: 0 };
   return {
+    lastAssistantText: async ({ sessionId } = {}) => { calls.assistant.push({ sessionId }); return answer; },
     calls,
     on: (evt, cb) => emitter.on(evt, cb),
     emit: (evt, arg) => emitter.emit(evt, arg),
@@ -1118,4 +1119,76 @@ test("controller：命令层 — /help 直接回复、免费档 /ls 被拦、/st
   await waitFor(() => sub.calls.prompts.length === 1);
   assert.equal(sub.calls.prompts.length, 1);
   await controller.stop();
+});
+
+// ─────────────────────── 任务通知带总结（2026-11-10：只有"已完成"没有总结）───────────────────────
+
+test("controller：任务通知带总结 — turn_end → 一条「✅ 任务完成 + 正文」；同 turn 去重；正文不进日志；缺正文降级", async () => {
+  const relayDir = mkRelayDir("ctl-summary");
+  writeConfig(relayDir, { enabled: true, appId: APP_ID, appSecret: APP_SECRET, receiveId: "ou_owner", receiveIdType: "open_id" });
+  const sub = makeSubscriber({ answer: { ok: true, text: "飞书总结正文" } });
+  const { controller, fetchCalls, logs } = startController(relayDir, { subscriber: sub });
+  await controller.start();
+  const texts = () => fetchCalls.filter((c) => c.url.includes("/im/v1/messages") && JSON.parse(c.body).msg_type === "text");
+  const contentOf = (row) => JSON.parse(JSON.parse(row.body).content).text;
+  const ev = { kind: "turn-end", sessionId: "session-abc", turn: 1, seq: 7, reason: "completed", at: NOW };
+  sub.emit("event", ev);
+  await waitFor(() => texts().some((t) => contentOf(t).includes("任务完成")));
+  const row = texts().find((t) => contentOf(t).includes("任务完成"));
+  const text = contentOf(row);
+  assert.match(text, /^✅ 任务完成/, "★ 通知带「任务完成」标题行");
+  assert.match(text, /\n\n飞书总结正文$/, "★ 同一条消息带总结正文");
+  const count = texts().filter((t) => contentOf(t).includes("任务完成")).length;
+  assert.equal(count, 1, "★ 同一次 turn 只发一条（不拆标题+正文两条）");
+  // 重复 turn/end → 去重
+  sub.emit("event", ev);
+  await new Promise((r) => setTimeout(r, 40));
+  assert.equal(texts().filter((t) => contentOf(t).includes("任务完成")).length, 1, "★ 同 turn 重复事件去重");
+  // 正文绝不进日志
+  assert.ok(!logs.join("\n").includes("飞书总结正文"), "★ 总结正文绝不能进日志");
+  assert.ok(logs.some((l) => /任务通知 .*len=\d+/.test(l)), "日志只记长度");
+  await controller.stop();
+});
+
+test("controller：任务通知 — 缺正文降级仅标题；超长按 1500 字截断；出错带错误摘要；审批仍走卡片不混入总结", async () => {
+  // ① 缺正文 → 仅标题
+  {
+    const relayDir = mkRelayDir("ctl-summary-none");
+    writeConfig(relayDir, { enabled: true, appId: APP_ID, appSecret: APP_SECRET, receiveId: "ou_owner", receiveIdType: "open_id" });
+    const sub = makeSubscriber(); // 默认 answer={ok:true,text:""}
+    const { controller, fetchCalls } = startController(relayDir, { subscriber: sub });
+    await controller.start();
+    const texts = () => fetchCalls.filter((c) => c.url.includes("/im/v1/messages") && JSON.parse(c.body).msg_type === "text");
+    const contentOf = (row) => JSON.parse(JSON.parse(row.body).content).text;
+    sub.emit("event", { kind: "turn-end", sessionId: "session-abc", turn: 1, seq: 8, reason: "completed", at: NOW });
+    await waitFor(() => texts().some((t) => contentOf(t).includes("任务完成")));
+    assert.equal(contentOf(texts().find((t) => contentOf(t).includes("任务完成"))), "✅ 任务完成", "★ 缺正文 → 仅标题");
+    await controller.stop();
+  }
+  // ② 超长 → 截断 + 注明；出错 → ❌ + 摘要
+  {
+    const relayDir = mkRelayDir("ctl-summary-long");
+    writeConfig(relayDir, { enabled: true, appId: APP_ID, appSecret: APP_SECRET, receiveId: "ou_owner", receiveIdType: "open_id" });
+    const sub = makeSubscriber({ answer: { ok: true, text: "开头" + "长".repeat(3000) + "SECRET-TAIL" } });
+    const { controller, fetchCalls, logs } = startController(relayDir, { subscriber: sub });
+    await controller.start();
+    const texts = () => fetchCalls.filter((c) => c.url.includes("/im/v1/messages") && JSON.parse(c.body).msg_type === "text");
+    const contentOf = (row) => JSON.parse(JSON.parse(row.body).content).text;
+    sub.emit("event", { kind: "turn-end", sessionId: "session-abc", turn: 1, seq: 9, reason: "completed", at: NOW });
+    await waitFor(() => texts().some((t) => contentOf(t).includes("任务完成")));
+    const text = contentOf(texts().find((t) => contentOf(t).includes("任务完成")));
+    assert.ok(text.endsWith("…(已截断，完整内容看电脑)"), "超长正文带截断提示");
+    assert.ok(!text.includes("SECRET-TAIL"));
+    assert.ok(!logs.join("\n").includes("SECRET-TAIL"), "★ 正文不进日志");
+    sub.emit("event", { kind: "turn-end", sessionId: "session-abc", turn: 2, seq: 10, reason: "error", at: NOW });
+    await waitFor(() => texts().some((t) => contentOf(t).startsWith("❌ 出错了")));
+    assert.match(contentOf(texts().find((t) => contentOf(t).startsWith("❌ 出错了"))), /^❌ 出错了\n\n开头/);
+    // ③ 审批事件：仍走 interactive 卡片（不混入任务总结）
+    sub.emit("event", { kind: "approval-request", eventId: "apr_sum_feishu", toolName: "Bash", sessionId: "session-abc" });
+    await waitFor(() => fetchCalls.some((c) => c.url.includes("/im/v1/messages") && JSON.parse(c.body).msg_type === "interactive"));
+    const card = fetchCalls.filter((c) => c.url.includes("/im/v1/messages") && JSON.parse(c.body).msg_type === "interactive").pop();
+    assert.ok(card, "★ 审批仍走卡片");
+    assert.ok(!JSON.parse(card.body).content.includes("任务完成"), "★ 卡片不混入总结");
+    await controller.stop();
+  }
 });

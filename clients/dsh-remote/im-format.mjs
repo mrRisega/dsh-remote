@@ -35,6 +35,8 @@ export const CHANNEL_CAPS = Object.freeze({
 
 /** 截断提示（与 wecom-bot 的 ANSWER_TRUNCATED_NOTE 同文，便于去重）。 */
 export const TRUNCATED_NOTE = "…(已截断，完整内容看电脑)";
+/** 完成/出错通知里「总结正文」的长度上限（2026-11-10 业主：只有标题没有总结）。 */
+export const SUMMARY_MAX_CHARS = 1500;
 
 /** 各通道默认字节上限（wecom 官方 4096；其它先给宽松值，留 maxBytes 覆盖）。 */
 const DEFAULT_MAX_BYTES = Object.freeze({
@@ -369,4 +371,107 @@ export function formatForChannel(channel, options = {}) {
     return preTruncated ? `${body}${TRUNCATED_NOTE}` : body;
   }
   return fitted;
+}
+
+
+// ===========================================================================
+// 任务总结（turn_done / turn_error / turn_blocked 通知带正文）
+// ===========================================================================
+
+function charsOf(text) { return Array.from(String(text == null ? "" : text)); }
+
+function truncateChars(text, maxChars) {
+  const chars = charsOf(text);
+  if (!Number.isFinite(maxChars) || maxChars <= 0 || chars.length <= maxChars) return String(text == null ? "" : text);
+  return `${chars.slice(0, Math.max(1, maxChars - 1)).join("")}…`;
+}
+
+/** 截断到 maxChars（含「已截断」提示；与 formatForChannel 的提示同文，避免重复）。 */
+function truncateCharsWithNote(text, maxChars) {
+  let body = String(text == null ? "" : text);
+  const hadNote = body.endsWith(TRUNCATED_NOTE);
+  if (hadNote) body = body.slice(0, -TRUNCATED_NOTE.length).replace(/\s+$/, "");
+  const chars = charsOf(body);
+  if (!Number.isFinite(maxChars) || maxChars <= 0) return hadNote ? `${body}${TRUNCATED_NOTE}` : body;
+  const noteChars = charsOf(TRUNCATED_NOTE).length + 1; // 换行 + 提示一起算进上限
+  if (chars.length + noteChars <= maxChars) return hadNote ? `${body}${TRUNCATED_NOTE}` : body;
+  const budget = Math.max(1, maxChars - noteChars);
+  return `${chars.slice(0, budget).join("").replace(/\s+$/, "")}\n${TRUNCATED_NOTE}`;
+}
+
+/** 事件里能当"摘要"的字段（订阅器取不到正文时的降级来源）。 */
+export function extractSummaryFromNode(node) {
+  if (!node || typeof node !== "object") return "";
+  for (const key of ["summary", "message", "detail", "text"]) {
+    const v = node[key];
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return "";
+}
+
+/**
+ * 提取一次 turn 的**总结正文**（优先级：订阅器 lastAssistantText → 事件字段 → 空）。
+ *
+ * · `subscriber.lastAssistantText({sessionId})` 是最准的（agent 最终回答原文）；
+ * · turn/end 瞬间正文可能还没落库 → 支持 `retryDelays`（如 [0,400]）短重试；
+ * · 都取不到 → 返回空 text（调用方降级"仅标题"，不报错）；
+ * · 返回值只含正文；**日志由调用方只打长度**（正文可能有代码/密钥/隐私）。
+ *
+ * @returns {Promise<{text:string, source:"assistant"|"node"|"none"}>}
+ */
+export async function extractTurnSummary({ node, subscriber, sessionId, maxChars = SUMMARY_MAX_CHARS, retryDelays = null } = {}) {
+  const sid = String(sessionId || (node && node.sessionId) || "");
+  const delays = Array.isArray(retryDelays) && retryDelays.length ? retryDelays : [0];
+  let lastEmpty = "";
+  if (subscriber && typeof subscriber.lastAssistantText === "function" && sid) {
+    for (const delay of delays) {
+      if (Number(delay) > 0) {
+        try { await new Promise((r) => setTimeout(r, Math.min(Number(delay) || 0, 5000))); } catch { /* 忽略 */ }
+      }
+      try {
+        const r = await subscriber.lastAssistantText({ sessionId: sid });
+        if (r && r.ok === true && typeof r.text === "string" && r.text.trim()) {
+          return { text: truncateCharsWithNote(r.text.trim(), maxChars), source: "assistant" };
+        }
+        lastEmpty = String((r && (r.code || r.message)) || "empty");
+      } catch { /* 下一次重试 */ }
+    }
+  }
+  const fallback = extractSummaryFromNode(node);
+  if (fallback) return { text: truncateCharsWithNote(fallback, maxChars), source: "node" };
+  return { text: "", source: "none", reason: lastEmpty };
+}
+
+/** 各 reason 的通知首行（与既有通知文案保持一致）。 */
+export function turnHeadline(node) {
+  if (!node || typeof node !== "object") return "";
+  const kind = String(node.kind || "");
+  if (kind === "session-error") return "❌ 出错了";
+  if (kind !== "turn-end") return "";
+  const reason = String(node.reason || "unknown");
+  if (reason === "completed") return "✅ 任务完成";
+  if (reason === "error" || reason === "max-tokens") return "❌ 出错了";
+  if (reason === "blocked") return "⛔ 被拦下了";
+  if (reason === "aborted" || reason === "interrupted") return "⏹ 已停止";
+  return "ℹ️ 任务结束";
+}
+
+/**
+ * 组装「任务完成/出错」通知：`✅ 任务完成｜<标题>\n\n<总结正文>`。
+ *
+ * · 正文为空 → 只返回标题行（降级，不报错）；
+ * · 正文按通道渲染（表格转可读列表、按通道字节上限截断），并限制 **1500 字**；
+ * · 非 turn/session-error 事件返回 null（审批类仍走卡片，不混入总结）。
+ *
+ * @returns {string|null}
+ */
+export function buildTurnNotification({ node, channel = "wecom", summary = "", sessionTitle = "", maxChars = SUMMARY_MAX_CHARS } = {}) {
+  const head = turnHeadline(node);
+  if (!head) return null;
+  const title = truncateChars(String(sessionTitle || "").replace(/\s+/g, " ").trim(), 40);
+  const line = title ? `${head}｜${title}` : head;
+  const raw = String(summary == null ? "" : summary).trim();
+  if (!raw) return line; // 取不到正文 → 保持"仅标题"
+  const formatted = formatForChannel(channel, { text: raw, maxChars });
+  return formatted ? `${line}\n\n${formatted}` : line;
 }
