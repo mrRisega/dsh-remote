@@ -2950,7 +2950,31 @@ window.__ModuleLoader__.load({
         setSelfMsg(null);
         setCxMsg(null);
         post("/dsh-remote/self/update", {}).then(function (b) {
-          if (b && b.ok) {
+          if (b && b.ok && b.mode === "live") {
+            // 0.8.1：插件半已经下载并换版（不再暂存给"下次打开"）。等宿主 HMR 热加载完成后自动刷新。
+            var liveTarget = String(b.toVersion || "");
+            setSelfMsg({ kind: "ok", text: "新版本" + (liveTarget ? " " + liveTarget : "") + " 已下载并换版，正在热加载…（不需要退出应用）" });
+            setUpdating(true);
+            var liveTries = 0;
+            var livePoll = setInterval(function () {
+              liveTries += 1;
+              api("/dsh-remote/self").then(function (s) {
+                if (s && s.ok && liveTarget && String(s.version) === liveTarget) {
+                  clearInterval(livePoll);
+                  setSelfMsg({ kind: "ok", text: "已升级到 " + liveTarget + "，页面即将自动刷新…" });
+                  setUpdating(false);
+                  setTimeout(function () { try { location.reload(); } catch (e) { /* 忽略 */ } }, 600);
+                } else if (liveTries >= 40) {
+                  clearInterval(livePoll);
+                  setUpdating(false);
+                  setSelfMsg({ kind: "err", text: "文件已更新，但热加载未在 40 秒内完成：请点「重启 dsh web」或重新打开应用后再试一次。" });
+                }
+              }).catch(function () {
+                if (liveTries >= 40) { clearInterval(livePoll); setUpdating(false); }
+              });
+            }, 1000);
+            logTimer();
+          } else if (b && b.ok) {
             setSelfMsg({ kind: "ok", text: "更新已在后台开始，正在下载安装…（本页会实时显示进度日志、已用时与通道）" });
             setUpdating(true);
             logTimer();

@@ -27,6 +27,7 @@ import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { buildFixPrompt, REPORT_TITLE, REPORT_FORMAT, REPORT_KEYS } from "./fix-prompt.js";
+import { prepareLiveUpdate, reconcilePluginLive, readPluginPackage as readLivePluginPackage, restoreFromBackup } from "./live-update.js";
 
 /** 本插件在 host 侧的服务依赖。 */
 export const inject = ["webServer"];
@@ -3162,11 +3163,36 @@ function writeRestartState(relayDir, state) {
  * 标记「需要用户动一下」的状态。kind = refresh(插件被运行时改写,刷新页面即可)。
  * 历史 kind(first-install / update)已废弃:热加载落地后,装插件与在线更新都不再需要重启 harness。
  */
-/** 桌面端「暫存插件更新」marker（dsh-setup 在应用运行时暂存；bridge 在应用退出后自动安装）。 */
-function readDesktopUpdatePending(relayDir) {
+/** 当前已装插件半的版本（读 profile 里那份 package.json；读不到返回空串）。 */
+function installedPluginVersion() {
   try {
-    const m = JSON.parse(readFileSync(join(relayDir, ".plugin-update-pending.json"), "utf8"));
-    return { version: String(m.version || ""), stagedAt: Number(m.stagedAt) || 0 };
+    const pkg = readLivePluginPackage(join(pluginProfileDir(), "dsh-remote-web-plugin"));
+    return pkg ? String(pkg.version || "") : "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * 桌面端「暂存插件更新」marker（dsh-setup 在应用运行时暂存；bridge 在应用退出后自动安装）。
+ *
+ * 0.8.1 修正（2026-11-11 真机事故）：marker 从不与已装版本比较，导致
+ *   ① 0.8.0 已经装好了，面板仍永久提示「新版本 0.8.0 已下载，退出后生效」；
+ *   ② 陈旧 marker 还可能让 bridge 把已升到的版本再"应用"一次（无版本比较 → 静默降级）。
+ * 现在：marker 版本 ≤ 已装版本 → 视为陈旧，删 marker 并返回 null。
+ */
+function readDesktopUpdatePending(relayDir) {
+  const markerPath = join(relayDir, ".plugin-update-pending.json");
+  try {
+    const m = JSON.parse(readFileSync(markerPath, "utf8"));
+    const version = String(m.version || "");
+    const installed = installedPluginVersion();
+    const cmp = version && installed ? compareVersions(version, installed) : null;
+    if (cmp !== null && cmp <= 0) {
+      try { rmSync(markerPath, { force: true }); } catch { /* ignore */ }
+      return null;
+    }
+    return { version, stagedAt: Number(m.stagedAt) || 0 };
   } catch {
     return null;
   }
@@ -4636,6 +4662,74 @@ async function resolveUpdateTarget() {
   } catch {
     return { tag: UPDATE_TAG, version: "", why: "无法读取 npm 通道信息，按当前通道执行" };
   }
+}
+
+/* ── 0.8.1：插件半「立即升级」（换文件 + 宿主 HMR 重新 import，不再等"下次打开"） ──────────────
+ *
+ * 为什么必须新增这条路（2026-11-11 真机审计，见 dsh-relay-internal/.../09-升级失败根因与改造点.md）：
+ *   旧链路在桌面端只会把新插件暂存到 `~/.dsh-remote/pending-plugin`，唯一落地者是 bridge 的 15s
+ *   watcher，而它要求「应用已经关掉 ≥30s」；应用一直开着 → marker 永远不清、用户只能退出后再 npx。
+ *   宿主本身有活体通道：`hmr.reconcileProfile()` 会按 ino:size:mtime 比对已加载模块、驱逐 ESM 缓存
+ *   并用磁盘新文件重新 import；所以正确做法是「逐文件原子换版 + reconcile」，而不是整目录 rename
+ *   （整目录会被判成 package-moved → 要求重启应用），更不能原地写半成品（HMR 重新 import 时炸掉
+ *   宿主子进程，Electron 弹「启动失败」＝用户看到的闪退）。
+ */
+
+/** 准备插件半升级：下载（镜像优先）→ 备份 → 逐文件原子替换。不触发 HMR。 */
+async function runLivePluginUpdate(relayDir) {
+  const target = await resolveUpdateTarget();
+  const profileDir = pluginProfileDir();
+  const prep = await prepareLiveUpdate({
+    relayDir,
+    profileDir,
+    tag: target.tag,
+    version: target.version,
+  });
+  if (!prep.ok) {
+    appendLogLine(relayDir, UPDATE_LOG,
+      `[update] 插件半立即升级未执行：${prep.code || "UNKNOWN"} ${prep.detail || ""}`.trim());
+    return prep;
+  }
+  appendLogLine(relayDir, UPDATE_LOG,
+    `[update] 插件半已原子换版 ${prep.fromVersion} → ${prep.toVersion}（源 ${prep.registry || "?"}；${prep.files} 文件；${prep.ms}ms；备份 ${prep.backupDir}）`);
+  return prep;
+}
+
+/**
+ * 响应之后异步触发 HMR 重新加载；成功则无需重启应用（页面刷新即可看到新版本）。
+ * 失败时回滚文件并尽量把旧版重新挂上（保证"升不上去也不会把插件弄挂"）。
+ */
+function scheduleLiveReconcile(ctx, relayDir, prep) {
+  const timer = setTimeout(async () => {
+    const r = await reconcilePluginLive(ctx);
+    if (r.applied) {
+      appendLogLine(relayDir, UPDATE_LOG, `[update] 宿主 HMR 已重新加载插件 ${prep.toVersion}（无需重启应用）`);
+      telemetryRecord(relayDir, "update_applied_live");
+      try { settleRestartState(relayDir); } catch { /* ignore */ }
+      // 运行环境/桥半仍按原链路更新（独立进程，不阻塞面板；失败不影响已生效的插件半）
+      try { runOnlineUpdate(relayDir).catch(() => {}); } catch { /* ignore */ }
+      return;
+    }
+    const installed = installedPluginVersion();
+    if (r.restartReason) {
+      const reason = `插件 ${prep.toVersion} 已就位，需要重启 DeepSeek Harness 生效（${r.restartReason}）`;
+      markRestartPending(relayDir, "restart-app", reason);
+      appendLogLine(relayDir, UPDATE_LOG, `[update] 文件已更新，但宿主要求重启：${r.restartReason}`);
+      return;
+    }
+    // 兜底：回滚文件 → 再 reconcile 一次，让旧版回到运行态
+    try {
+      restoreFromBackup(prep.backupDir, join(pluginProfileDir(), "dsh-remote-web-plugin"));
+      appendLogLine(relayDir, UPDATE_LOG, `[update] 热加载失败，已回滚 ${prep.toVersion} → ${installed || prep.fromVersion}`);
+    } catch (e) {
+      appendLogLine(relayDir, UPDATE_LOG, `[update] 热加载失败且回滚失败：${e.message}`);
+    }
+    noteUpdateFailure(relayDir, `新版本已下载但热加载失败：${r.error || "未知"}（可重试；必要时重启应用）`, "hmr_reconcile_failed");
+    telemetryRecord(relayDir, "update_failed", { fail_code: "hmr_reconcile_failed" });
+    try { await reconcilePluginLive(ctx); } catch { /* ignore */ }
+  }, 250);
+  if (timer && typeof timer.unref === "function") timer.unref();
+  return timer;
 }
 
 /**
@@ -8349,7 +8443,39 @@ function registerRoutes(ctx, relayDir, opts = {}) {
       method: "POST",
       path: "/dsh-remote/self/update",
       handler: async (_req, res) => {
-        sendJson(res, 200, { ok: true, ...(await runOnlineUpdate(relayDir)) });
+        // 0.8.1：先走「立即升级」——下载（镜像优先）+ 逐文件原子换版，再让宿主 HMR 重新 import。
+        // 成功：不需要退出应用、不需要 npx；页面轮询到新版本后自动刷新。
+        const live = await runLivePluginUpdate(relayDir)
+          .catch((e) => ({ ok: false, code: "LIVE_UPDATE_ERROR", detail: String((e && e.message) || e) }));
+        if (live.ok) {
+          telemetryRecord(relayDir, "update_started");
+          scheduleLiveReconcile(ctx, relayDir, live);
+          sendJson(res, 200, {
+            ok: true,
+            mode: "live",
+            fromVersion: live.fromVersion,
+            toVersion: live.toVersion,
+            requiresReload: true,
+            registry: live.registry || "",
+            detail: `已换版 ${live.fromVersion} → ${live.toVersion}（${live.registry || "registry"}），宿主正在热加载`,
+          });
+          return;
+        }
+        // 立即升级走不通（已是最新 / 网络失败 / 无 HMR / 拒绝降级）→ 记录后回退原 npx 链路，行为与旧版一致
+        appendLogLine(relayDir, UPDATE_LOG,
+          `[update] 立即升级未成功（${live.code || "UNKNOWN"}: ${live.detail || ""}），回退在线安装链路`.trim());
+        // 已是最新（或要装的是更低版本）：不要为了"做事"再去跑一遍 npx —— 那会把同版本重装一次，还可能触发暂存。
+        if (live.code === "VERSION_UNCHANGED" || live.code === "DOWNGRADE_REFUSED") {
+          sendJson(res, 200, { ok: true, mode: "current", detail: live.detail || "已是最新版本", liveCode: live.code });
+          return;
+        }
+        sendJson(res, 200, {
+          ok: true,
+          ...(await runOnlineUpdate(relayDir)),
+          liveFallback: true,
+          liveCode: live.code || "",
+          liveDetail: live.detail || "",
+        });
       },
     },
     {
