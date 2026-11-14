@@ -6,7 +6,7 @@ All notable changes to dsh-remote are documented here. This project follows
 > 写法约定：每条只写**用户能看到的变化**（1~8 行），分点陈述；
 > 不列 commit、不写排查过程、内部路径/标识/事件编号，也不写"我们怎么发现的"。
 
-## [0.8.2-beta.1] - 2026-11-14
+## [0.8.2-beta.2] - 2026-11-14
 
 **手机端登录过期时，直接告诉你「去重新登录」，不再让你干等。**
 
