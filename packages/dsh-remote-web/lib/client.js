@@ -2071,7 +2071,7 @@ window.__ModuleLoader__.load({
     //   注意：被邀请人**没有任何额外奖励**（trial_days = 0），所以禁止任何「双方都得」的写法。
     var INVITE_RULE_FALLBACK = { n: 1, days: 3 };
     // ── 套餐约定：**先读线上真形状** ─────────────────────────────────────────
-    // 线上实测（GET https://n.risegao.cn:13443/relay-api/api/public-config）：
+    // 线上实测（GET https://dsh.ruichengai.com:13443/relay-api/api/public-config）：
     //   plans.free    = { max_mbps: 1,  monthly_gb: 1 }
     //   plans.pro     = { max_mbps: 5,  monthly_gb: 20, devices: 1,  monthly_resets: 5 }
     //   plans.pro_max = { max_mbps: 10, monthly_gb: 60, devices: 10, online: 3 }
@@ -2549,7 +2549,7 @@ window.__ModuleLoader__.load({
           var acct = (b && b.ok && b.account) ? b.account : null;
           if (!acct || !acct.invite_code) { setPopupInvite({ code: "" }); return; }
           api("/dsh-remote/remote-url").then(function (u) {
-            var base = (u && u.remoteUrl) || "https://n.risegao.cn:13443/app/";
+            var base = (u && u.remoteUrl) || "https://dsh.ruichengai.com:13443/app/";
             // 特性检测：public-config 里带了 invite_rule 就用服务端数值；没带 → 0 = 不显示具体数字。
             // 🔒 用 firstNum 只判「缺没缺」：`n/days` 配成 0 是合法的「活动关闭」态，
             //    不能被 `> 0` 这样写吃掉再回落成 1/3（后端 `|| 3 / || 15` 的同款坑）。
@@ -5413,7 +5413,7 @@ window.__ModuleLoader__.load({
         var ruleDays = inv.days;
         var trialDays = Number(pub && pub.trial_days) > 0 ? Number(pub.trial_days) : 0; // 注册送礼（关闭时不下发/为 0）
         var code = (account && account.invite_code) || "";
-        var base = (st && st.remoteUrl) || (pub && pub.app_url) || "https://n.risegao.cn:13443/app/";
+        var base = (st && st.remoteUrl) || (pub && pub.app_url) || "https://dsh.ruichengai.com:13443/app/";
         var link = code ? base.replace(/\/+$/, "") + "/?invite=" + encodeURIComponent(code) : "";
         var loggedInSaaS = !!(st && st.config && st.config.phone);
         var records = (inviteData && inviteData.records) || [];

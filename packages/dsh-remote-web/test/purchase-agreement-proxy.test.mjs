@@ -21,7 +21,9 @@ import { apply, DEFAULT_PURCHASE_AGREEMENT_URL, purchaseAgreementUrlFrom } from 
 const FALLBACK = DEFAULT_PURCHASE_AGREEMENT_URL;
 
 test("兜底常量就是业主约定的正式兜底地址（企业端 /api/purchase-agreement 的 302/200 入口）", () => {
-  assert.equal(FALLBACK, "https://n.risegao.cn:13443/relay-api/api/purchase-agreement");
+  // 2026-11-14 企业域名迁移：兜底地址随官方域名一起迁到 dsh.ruichengai.com
+  // （同一套企业端后端，路径不变；旧域名在过渡期仍在服役，但不再是"约定地址"）
+  assert.equal(FALLBACK, "https://dsh.ruichengai.com:13443/relay-api/api/purchase-agreement");
 });
 
 test("纯函数：public-config.agreement_url 优先；非 http(s)/相对/缺失一律回兜底", () => {

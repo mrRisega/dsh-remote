@@ -908,7 +908,7 @@ const SCRIPT = `(() => {
   void 0;
 
 
-  /* —— 主机门解除(2026-09):镜像页(如 n.risegao.cn)经设备流认证回连同一台 127.0.0.1:3080,
+  /* —— 主机门解除(2026-09):镜像页(如 n.risegao.cn / dsh.ruichengai.com)经设备流认证回连同一台 127.0.0.1:3080,
      桥已把 Host 回环化并剥 Origin(不扩大信任面)。官方客户端以 transport.ownsHost 判定
      「自有主机」,非回环域名下不置 true 会把设置页置为 memory(不可用)镜像 →
      模型/提供方设置无法加载(“Settings are unavailable in this browser”)。

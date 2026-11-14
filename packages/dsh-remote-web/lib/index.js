@@ -92,9 +92,43 @@ const DEFAULT_RELAY_DIR = process.env.DSH_RELAY_DIR || join(homedir(), ".dsh-rem
 // DSH_RELAY_DEFAULT_API 只改「配置里根本没写 api_url」时的兜底：测试脚本把它指向本地死端口，
 // 这样任何**在临时目录被拆掉之后**才跑到的后台请求（如装机上报的重试）都不会打生产。
 // 真实故障形态见 test/wechat-bind-telemetry.test.mjs 的注释：用例拆目录 → 读到空配置 → 回落生产。
+//
+// 【2026-11-14 企业域名迁移】官方 SaaS 入口从 n.risegao.cn 迁到 dsh.ruichengai.com。
+// 这里只改「新装默认值」；存量用户配置由 migrateOfficialUrl() 在装载/启动时一次性改写。
+// 两个域名在 NAS 上是**并存**的（同一套后端、各自证书），所以迁移期间谁都不会断。
 const DEFAULT_API = String(process.env.DSH_RELAY_DEFAULT_API || "").trim()
-  || "https://n.risegao.cn:13443/relay-api";
-const DEFAULT_APP_URL = "https://n.risegao.cn:13443/app/";
+  || "https://dsh.ruichengai.com:13443/relay-api";
+const DEFAULT_APP_URL = "https://dsh.ruichengai.com:13443/app/";
+
+/**
+ * 官方云端的「旧域名 → 新域名」映射（2026-11-14）。
+ *
+ * 为什么需要它：存量用户 `.dsh-config.json` 里写死的是
+ * `https://n.risegao.cn:13443/relay-api`。只改默认值的话，**老用户永远还在连旧域名**，
+ * 而产品预期是「升级上去就用新域名」。所以装载时做一次幂等改写。
+ *
+ * 边界（故意收得很窄，别扩大）：
+ *   · 只认 **hostname 精确等于**旧官方域名；自建/自定义地址一律原样返回；
+ *   · 端口、路径、查询串全部保留（内网自建用户即便解析到同名 host 也不受影响）；
+ *   · 非法 URL 原样返回，绝不抛错。
+ */
+const OFFICIAL_HOST_MIGRATION = new Map([["n.risegao.cn", "dsh.ruichengai.com"]]);
+
+/** 把官方旧域名改写成新域名（保留端口/路径），其它地址原样返回。纯函数，便于单测。 */
+export function migrateOfficialUrl(raw) {
+  const s = String(raw == null ? "" : raw).trim();
+  if (!s) return s;
+  let u;
+  try {
+    u = new URL(s);
+  } catch {
+    return s;
+  }
+  const to = OFFICIAL_HOST_MIGRATION.get(u.hostname);
+  if (!to) return s;
+  u.hostname = to;
+  return u.toString().replace(/\/+$/, "");
+}
 
 // ---------- 上游 dsh web 地址（bridge/watcher 都要连它，绝不写死 3080） ----------
 //
@@ -772,9 +806,39 @@ function saveConfig(relayDir, cfg) {
 function applySaaSMode(cfg) {
   delete cfg.local_key;
   delete cfg.server;
-  cfg.api_url = String(cfg.api_url || DEFAULT_API).replace(/\/+$/, "");
+  // 2026-11-14 企业域名迁移：存量配置里的官方旧域名顺手改写（幂等，自建地址不动）
+  const api = migrateOfficialUrl(String(cfg.api_url || DEFAULT_API).replace(/\/+$/, ""));
+  cfg.api_url = api || DEFAULT_API;
   cfg.tunnel_url = cfg.api_url.replace(/\/relay-api\/?$/, "").replace(/^https/, "wss");
   return cfg;
+}
+
+/**
+ * 装载时的一次性域名迁移（2026-11-14 企业域名迁移）。
+ *
+ * 与 applySaaSMode 里的改写互补：那条只在「登录 / 启动桥」时跑，本条让**插件一装载**
+ * 就把配置摆正，避免刷新页面后仍有一段时间打旧域名。
+ * 幂等：已迁移过就什么都不做；自建模式（有 local_key）与自定义地址一律不动。
+ */
+function migrateLegacyConfigAtBoot(relayDir, ctx) {
+  try {
+    const cfg = loadConfig(relayDir);
+    if (!cfg || !cfg.api_url || cfg.local_key) return false;
+    const next = migrateOfficialUrl(cfg.api_url);
+    if (!next || next === cfg.api_url) return false;
+    cfg.api_url = next;
+    // 隧道地址只在它**也指向官方旧域名**时才改写：自建用户可能留着自定义 tunnel_url，
+    // 没有 local_key 的老配置也不能被顺手改掉（那会让桥连到别人的服务器）。
+    if (cfg.tunnel_url) {
+      const tunnel = migrateOfficialUrl(cfg.tunnel_url);
+      if (tunnel) cfg.tunnel_url = tunnel;
+    }
+    saveConfig(relayDir, cfg);
+    ctx?.logger?.info?.("dsh-remote-web: 云端地址已迁移到企业域名 dsh.ruichengai.com");
+    return true;
+  } catch {
+    return false; // 迁移失败绝不影响装载
+  }
 }
 
 // ---------- 安装/配对自检 + 配对信息备份（2026-10-17 事故） ----------
@@ -3826,7 +3890,7 @@ async function communityInfo(relayDir) {
  * 软着陆：public-config 不可达 / 非对象 / 字段缺失全部回兜底并 `ok:true`。
  * 协议链接**永远不该**成为购买流程的故障点（打不开也不影响旁边的「升级 / 续费」按钮）。
  */
-export const DEFAULT_PURCHASE_AGREEMENT_URL = "https://n.risegao.cn:13443/relay-api/api/purchase-agreement";
+export const DEFAULT_PURCHASE_AGREEMENT_URL = "https://dsh.ruichengai.com:13443/relay-api/api/purchase-agreement";
 
 /** 从 public-config 解析协议 URL（纯函数，便于单测：优先级 + 安全过滤 + 降级一次看完）。 */
 export function purchaseAgreementUrlFrom(publicConfig) {
@@ -9662,6 +9726,9 @@ export function apply(ctx, config = {}) {
   // 记住宿主 ctx：上游地址要问 dsh web 自己的监听端口（见 upstreamUrl）。
   // 存 ctx 而不是当场取端口：apply 可能早于 webServer.listen 完成，端口那时还是 0/undefined。
   webServerCtx = ctx;
+  // 2026-11-14 企业域名迁移：存量配置里的官方旧域名（n.risegao.cn）一次性改写到
+  // dsh.ruichengai.com。幂等；自建模式（有 local_key）一律不动。
+  migrateLegacyConfigAtBoot(relayDir, ctx);
   // 上游地址落盘（0.6.12）：系统自启拉起的守护没有本进程的 env，只认这个文件。
   publishUpstream(relayDir);
   // 【0.6.15】问不到自己监听端口时（飞牛/NAS 实测就是这种情况）主动发现一次并固化：

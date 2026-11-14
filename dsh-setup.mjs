@@ -44,9 +44,29 @@ const CONFIG_DIR = process.env.DSH_RELAY_DIR || path.join(os.homedir(), ".dsh-re
 const CONFIG_PATH = path.join(CONFIG_DIR, ".dsh-config.json");
 // 默认云端服务地址（服务商 SaaS 入口；自建用户用 --server/--key 指向自己的 router）
 // DSH_RELAY_DEFAULT_API 可覆盖（测试脚本指向本地死端口，避免兜底路径打到生产）。
+// 【2026-11-14 企业域名迁移】官方 SaaS 入口 → dsh.ruichengai.com（旧域名仍在服役，双域名并存）
 const DEFAULT_API = String(process.env.DSH_RELAY_DEFAULT_API || "").trim()
-  || "https://n.risegao.cn:13443/relay-api";
-const DEFAULT_APP_URL = "https://n.risegao.cn:13443/app/";
+  || "https://dsh.ruichengai.com:13443/relay-api";
+const DEFAULT_APP_URL = "https://dsh.ruichengai.com:13443/app/";
+
+/** 官方云端「旧域名 → 新域名」映射。只认 hostname 精确匹配，自建地址原样返回。 */
+const OFFICIAL_HOST_MIGRATION = new Map([["n.risegao.cn", "dsh.ruichengai.com"]]);
+
+/** 把官方旧域名改写成新域名（保留端口/路径）；其它地址原样返回。与插件半同规则。 */
+function migrateOfficialUrl(raw) {
+  const s = String(raw == null ? "" : raw).trim();
+  if (!s) return s;
+  let u;
+  try {
+    u = new URL(s);
+  } catch {
+    return s;
+  }
+  const to = OFFICIAL_HOST_MIGRATION.get(u.hostname);
+  if (!to) return s;
+  u.hostname = to;
+  return u.toString().replace(/\/+$/, "");
+}
 const REPO_URL = "https://github.com/mrRisega/dsh-remote";
 
 // ---------- 平台（0.6.7 起支持 Windows） ----------
@@ -538,7 +558,9 @@ function deriveTunnelUrl(apiUrl) {
 function applySaaSMode(cfg) {
   delete cfg.local_key;
   delete cfg.server; // 旧字段兜底
-  cfg.api_url = String(cfg.api_url || DEFAULT_API).replace(/\/+$/, "");
+  // 2026-11-14 企业域名迁移：存量配置里的官方旧域名顺手改写（幂等，自建地址不动）
+  const api = migrateOfficialUrl(String(cfg.api_url || DEFAULT_API).replace(/\/+$/, ""));
+  cfg.api_url = api || DEFAULT_API;
   cfg.tunnel_url = deriveTunnelUrl(cfg.api_url);
   return cfg;
 }

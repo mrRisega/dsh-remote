@@ -189,7 +189,7 @@ let UPSTREAM = (() => {
 // 微信机器人通道总开关:DSH_WECHAT=0 关闭(默认开启)。控制面只 bind 回环,且必须带 bridge_secret。
 const WECHAT_DISABLED = String(process.env.DSH_WECHAT || "") === "0";
 // 默认云端服务地址（dsh-remote setup 会显式传入；自建模式无需账号 API）
-const API_BASE = (process.env.DSH_BRIDGE_API || "https://n.risegao.cn:13443/relay-api").replace(/\/+$/, "");
+const API_BASE = (process.env.DSH_BRIDGE_API || "https://dsh.ruichengai.com:13443/relay-api").replace(/\/+$/, "");
 const EMAIL = process.env.DSH_BRIDGE_EMAIL || "";
 // 手机号优先;兼容旧的 DSH_BRIDGE_EMAIL(过渡期)
 const PHONE = process.env.DSH_BRIDGE_PHONE || EMAIL;
