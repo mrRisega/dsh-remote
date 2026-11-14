@@ -11,8 +11,10 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
-import { migrateOfficialUrl } from "../lib/index.js";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { apply, migrateOfficialUrl } from "../lib/index.js";
 
 const NEW = "dsh.ruichengai.com";
 
@@ -82,4 +84,77 @@ test("装载期迁移确实接在 apply() 上（否则老用户永远不迁移�
   assert.match(src, /OFFICIAL_HOST_MIGRATION = new Map\(\[\s*\["n\.risegao\.cn", "dsh\.ruichengai\.com"\]/, "迁移映射必须存在");
   // 自建模式不能被动：有 local_key 时必须直接返回
   assert.match(src, /if \(!cfg \|\| !cfg\.api_url \|\| cfg\.local_key\) return false;/, "自建模式必须跳过迁移");
+});
+
+/** 最小宿主 ctx：只提供 apply() 会用到的东西（与 community-qr-ui.test.mjs 同一套做法）。 */
+function fakeHost() {
+  return {
+    webServer: { register() { return () => {}; } },
+    effect(reg) { return typeof reg === "function" ? reg() : () => {}; },
+    logger: { info() {}, warn() {} },
+  };
+}
+
+/**
+ * 隔离器：`apply()` 会做系统操作与 profile 路径推导，必须同时压住
+ *   · DSH_RELAY_SKIP_SERVICE=1（绝不碰 launchd/systemd/npx）
+ *   · HOME 指向临时目录（绝不动真实 ~/.dsh / ~/Library/LaunchAgents）
+ * 仓库的 setup-output.test.mjs 对这条有静态护栏，别改成 delete 而不伪造 HOME。
+ */
+function isolateHostEnv(home) {
+  const saved = { HOME: process.env.HOME, SKIP: process.env.DSH_RELAY_SKIP_SERVICE };
+  process.env.HOME = home;
+  process.env.DSH_RELAY_SKIP_SERVICE = "1";
+  return () => {
+    if (saved.HOME === undefined) delete process.env.HOME;
+    else process.env.HOME = saved.HOME;
+    if (saved.SKIP === undefined) process.env.DSH_RELAY_SKIP_SERVICE = "1"; // 保持隔离，不强求 unset
+    else process.env.DSH_RELAY_SKIP_SERVICE = saved.SKIP;
+  };
+}
+
+async function withConfig(cfg) {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "dsh-domain-mig-"));
+  const file = path.join(dir, ".dsh-config.json");
+  await writeFile(file, JSON.stringify(cfg, null, 2));
+  return { dir, file, cleanup: () => rm(dir, { recursive: true, force: true }) };
+}
+
+test("装载期迁移（端到端）：存量旧域名配置被改写并落盘", async () => {
+  const t = await withConfig({
+    phone: "13800000000", password: "pw", device_id: "dev-x",
+    api_url: "https://n.risegao.cn:13443/relay-api",
+    tunnel_url: "wss://n.risegao.cn",
+  });
+  const restore = isolateHostEnv(t.dir);
+  try {
+    apply(fakeHost(), { relayDir: t.dir });
+    const cfg = JSON.parse(await readFile(t.file, "utf8"));
+    assert.equal(cfg.api_url, "https://dsh.ruichengai.com:13443/relay-api");
+    assert.equal(cfg.tunnel_url, "wss://dsh.ruichengai.com");
+    // 其它字段必须原样保留（迁移只动地址）
+    assert.equal(cfg.phone, "13800000000");
+    assert.equal(cfg.device_id, "dev-x");
+  } finally {
+    restore();
+    t.cleanup();
+  }
+});
+
+test("装载期迁移（端到端）：自建模式与自定义地址一律不动", async () => {
+  const t = await withConfig({
+    phone: "13800000000", password: "pw",
+    local_key: "lk", tunnel_url: "wss://relay.example.com",
+    api_url: "https://n.risegao.cn:13443/relay-api",
+  });
+  const restore = isolateHostEnv(t.dir);
+  try {
+    apply(fakeHost(), { relayDir: t.dir });
+    const cfg = JSON.parse(await readFile(t.file, "utf8"));
+    assert.equal(cfg.api_url, "https://n.risegao.cn:13443/relay-api", "自建模式不得被改写");
+    assert.equal(cfg.tunnel_url, "wss://relay.example.com");
+  } finally {
+    restore();
+    t.cleanup();
+  }
 });
