@@ -5576,9 +5576,13 @@ function bindFailSignatureOf(bindError) {
   return [bindError.code || "", bindError.device_id || "", bindError.message || ""].join("|");
 }
 
-/** 是否是「永久性」登记失败（硬上限；用户不解绑就不会自愈，必须指数退避而不是每 10s 重试）。 */
+/** 是否是「永久性」登记失败（用户不解绑就不会自愈，必须指数退避而不是每 10s 重试）。
+ *  · device_bind_cap：按套餐/防滥用硬上限，已绑定条数满了；
+ *  · machine_already_bound（2026-11-14）：同一台电脑上已有一份实例在线（先到先得），
+ *    后装的这份注册不上来 —— 必须由用户在手机端「管理电脑」解绑后才会自愈。 */
 function isPermanentBindFailure(bindError) {
-  return Boolean(bindError && typeof bindError === "object" && bindError.code === "device_bind_cap");
+  if (!bindError || typeof bindError !== "object") return false;
+  return bindError.code === "device_bind_cap" || bindError.code === "machine_already_bound";
 }
 
 /** 第 step 次（从 1 开始）拉起后的退避时长：10s→1min→5min→15min，之后封顶 30min。 */

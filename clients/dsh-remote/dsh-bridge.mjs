@@ -2531,12 +2531,21 @@ async function registerDeviceInAccount(token) {
         ...(Number.isFinite(Number(d.error?.limit ?? policy.limit)) ? { limit: Number(d.error?.limit ?? policy.limit) } : {}),
         ...(d.error?.upgrade_to || policy.upgrade_to ? { upgrade_to: d.error?.upgrade_to || policy.upgrade_to } : {})
       };
-      if (code === "device_bind_cap") {
-        // 防滥用硬上限：永久性失败 → 专用退出码，watcher 按指数退避重拉（契约 §6.3/§6.4）
+      if (code === "device_bind_cap" || code === "machine_already_bound") {
+        // 永久性失败（用户不解绑就不会自愈）→ 专用退出码，watcher 按指数退避重拉（契约 §6.3/§6.4）：
+        //   · device_bind_cap       = 按套餐/防滥用硬上限，已绑定条数满了；
+        //   · machine_already_bound = 同一台电脑上已有另一份实例占位（2026-11-14 先到先得），
+        //                            必须由用户在手机端「管理电脑」解绑后才轮到这份登记。
         persistBindError({ code, status: 409, message, ...details });
-        console.error(`[bridge] 设备绑定已达上限：${message}`);
-        console.error("[bridge] 这是按套餐设定的防滥用硬上限（不是网络问题），本机不会反复空撞接口。");
-        console.error("[bridge] 请在手机端「管理电脑」解绑不再使用的设备；守护会按指数退避自动重试，解绑后自动恢复。");
+        if (code === "machine_already_bound") {
+          console.error(`[bridge] 这台电脑已有另一份 dsh-remote 在运行，本实例注册不上来：${message}`);
+          console.error("[bridge] 若要用这一份：先关掉另一份实例，并在手机端「管理电脑」解绑那台设备后再重试。");
+          console.error("[bridge] 这是服务端的「先到先得」策略，不是网络问题；守护会按指数退避自动重试，解绑后自动恢复。");
+        } else {
+          console.error(`[bridge] 设备绑定已达上限：${message}`);
+          console.error("[bridge] 这是按套餐设定的防滥用硬上限（不是网络问题），本机不会反复空撞接口。");
+          console.error("[bridge] 请在手机端「管理电脑」解绑不再使用的设备；守护会按指数退避自动重试，解绑后自动恢复。");
+        }
         process.exit(DEVICE_BIND_CAP_EXIT_CODE);
       }
       if (code === "device_limit_exceeded" || code === "device_locked") {
