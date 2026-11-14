@@ -810,3 +810,79 @@ test("★ W3 诊断串：page/res 拆分、exhausted、挂起时长、最后失�
   assert.match(line, /挂起 518 秒/, "挂起时长");
   assert.ok(line.length <= 400, `单行 ≤400 字符（实际 ${line.length}）`);
 });
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ⑦ 会话过期（token 过期）的**可识别性**（2026-11-14 生产现场）
+//
+// 现场：dev-f9b47a20d23a 手机端干等 27 秒，诊断串 原因=resource、首屏资源失败=12、自动重试=8。
+// 根因：会话过期时中继对**页面导航**回 302（外壳有提示），对 <script>/<link> 子资源回 401 JSON ——
+//      浏览器只报 resource error，拿不到状态码；适配层只观察 fetch，于是 8 次重试全打在 401 上，
+//      用户看不到任何「请重新登录」。
+// 修法：首屏资源失败时**节流探一次 /_quota**，401 → 判定登录态失效 → 弹「去重新登录」+ 停自动重试。
+// ══════════════════════════════════════════════════════════════════════════════
+
+/** 造一个"探针会拿到 401"的 fetch（其它请求一律 200）。 */
+function authProbeFetch(probeStatus, probeRejects) {
+  const calls = { quota: 0 };
+  const fetchImpl = (input) => {
+    const u = String(input);
+    if (u.indexOf("/_quota") >= 0) {
+      calls.quota += 1;
+      if (probeRejects) return Promise.reject(new Error("network down"));
+      return Promise.resolve({ ok: probeStatus === 200, status: probeStatus, headers: { get: () => null } });
+    }
+    return Promise.resolve({ ok: true, status: 200, headers: { get: () => null } });
+  };
+  return { fetchImpl, calls };
+}
+
+test("★ 首屏资源失败 + /_quota 探到 401 → 弹「去重新登录」，并停掉自动重试", async () => {
+  const probe = authProbeFetch(401, false);
+  const env = runScript(harness({ fetch: probe.fetchImpl }));
+  const el = failingScript("/assets/index-abc.js", "module");
+  env.body.appendChild(el);
+  env.fireWindowEvent("error", { target: el });
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal(probe.calls.quota, 1, "首屏资源失败应触发一次 /_quota 登录态探测");
+  const overlay = env.body.children.find((c) => c.attrs && c.attrs.id === "dsh-ma-auth-expired");
+  assert.ok(overlay, "★ 必须弹出可点的「去重新登录」浮层（旧实现只会说「资源加载失败，正在重试…」）");
+  assert.equal(env.win.__dshMaDiag.authExpired, true, "诊断出口要标出 authExpired（客服一看就知道是登录态）");
+
+  // 判定失效后，后续资源失败不再排队重试（否则继续吃 401、继续制造 499）
+  const before = env.countTimers(2000);
+  const el2 = failingScript("/assets/vendor-xyz.js", "module");
+  env.body.appendChild(el2);
+  env.fireWindowEvent("error", { target: el2 });
+  assert.equal(env.countTimers(2000), before, "auth 失效后不得再排新的资源重试");
+  assert.equal(probe.calls.quota, 1, "同一页最多一次探测（8 秒节流 + 已经判定就不再探）");
+});
+
+test("探针拿到 200（资源失败但不是登录问题）→ 不误报，照常重试", async () => {
+  const probe = authProbeFetch(200, false);
+  const env = runScript(harness({ fetch: probe.fetchImpl }));
+  const el = failingScript("/assets/index-abc.js", "module");
+  env.body.appendChild(el);
+  env.fireWindowEvent("error", { target: el });
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal(probe.calls.quota, 1, "仍应探测（只是结论不是登录态）");
+  const overlay = env.body.children.find((c) => c.attrs && c.attrs.id === "dsh-ma-auth-expired");
+  assert.equal(overlay, undefined, "不是 401 就绝不提示「请重新登录」（会把人引到错误动作）");
+  assert.equal(env.win.__dshMaDiag.authExpired, false);
+  assert.equal(env.countTimers(2000) >= 1, true, "资源重试照常排队");
+});
+
+test("探针网络错误（不是 401）→ 不误报", async () => {
+  const probe = authProbeFetch(0, true);
+  const env = runScript(harness({ fetch: probe.fetchImpl }));
+  const el = failingScript("/assets/index-abc.js", "module");
+  env.body.appendChild(el);
+  env.fireWindowEvent("error", { target: el });
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal(probe.calls.quota, 1);
+  const overlay = env.body.children.find((c) => c.attrs && c.attrs.id === "dsh-ma-auth-expired");
+  assert.equal(overlay, undefined, "网络错误不等于登录过期");
+  assert.equal(env.win.__dshMaDiag.authExpired, false);
+});

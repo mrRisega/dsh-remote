@@ -1281,6 +1281,8 @@ const SCRIPT = `(() => {
         compatOfficial: maCompatOfficial,
         scrim: maScrimStats,
         retry: maRetryStats,
+        /* 登录态失效（2026-11-14）：只读镜像页自己的判定结果，供"复制诊断信息"与排障使用。 */
+        authExpired: maAuthExpired === true,
         load: { slow: maLoadWatch.slow, progress: maLoadWatch.progress, apiFails: maLoadWatch.apiFails,
                 lastApiStatus: maLoadWatch.lastApiStatus,
                 activeMs: (typeof maLoadActiveMs === "function") ? maLoadActiveMs() : -1,
@@ -1447,12 +1449,100 @@ const SCRIPT = `(() => {
       /* 界面已经就绪 = 这次失败没有卡住首屏。此时重建元素可能让模块/插件**再执行一遍**
          （官方模块加载器是队列式），风险大于收益 —— 只记录、不重试。 */
       if (maLoadReadyNow()) return false;
+      /* 已经判定登录态失效 → 再重建元素也只会再吃一个 401，不再排队重试（省一条 499）。 */
+      if (maAuthExpired) return false;
+      /* 首屏没就绪时才值得怀疑"是不是登录态过期了"（见下方 maProbeAuthOnce 的长注释）。 */
+      maProbeAuthOnce();
       if (n >= MA_RES_RETRY_MAX) { maRetry.exhausted = true; return false; }
       maRetry.perUrl[key] = n + 1;
       var delay = MA_RES_RETRY_BASE_MS * Math.pow(2, n); // 2s → 4s（指数退避）
       maSchedule(function () { maRetryBootResource(el, key, tag); }, delay);
       return true;
     } catch (e) { return false; }
+  }
+
+  /* ===== 会话过期探测：让"登录失效"自己说出来（2026-11-14）=====
+     为什么需要（生产现场 dev-f9b47a20d23a）：
+       · 会话(dsh_token)过期时，中继对**页面导航**回 302 到 /app/?reason=expired（外壳有提示）；
+       · 但 <script>/<link> 这类**子资源**拿的是 401 JSON —— 浏览器把它当 JS 解析失败，只触发
+         resource error，页面上看不到任何状态码；
+       · 适配层既有的"会话过期条"只观察 fetch（且只认 401），**看不见子资源的状态码**。
+     结果：首屏 12 个资源失败、自动重试 8 次全部打空（重试还是 401），用户干等 27 秒，
+     只看到"资源加载失败"，完全不知道该重新登录 —— 这就是"token 过期提醒不友好"。
+     做法：首屏资源失败且界面还没就绪时，**节流地**探一次 /_quota（同源、需登录态、极轻）。
+       拿到 401 → 判定登录态失效（不是资源/网络问题）→ 弹一条可点的「去重新登录」，
+       并把自动重试停掉（再刷也是 401，只会制造 499）。
+     纪律：只读探测；不动任何业务请求；不新增上报字段（诊断里只多一个 authExpired 布尔）。 */
+  var maAuthExpired = false;
+  var maAuthProbe = { at: 0, inflight: false };
+  var AUTH_PROBE_MIN_MS = 8000;
+
+  /** 弹出极简"会话过期"浮层（幂等；不依赖菜单是否已建出来）。 */
+  function maShowAuthOverlay() {
+    try {
+      var D = (typeof document !== "undefined" && document)
+        || (window && window.document)
+        || null;
+      if (!D) return;
+      if (D.getElementById && D.getElementById("dsh-ma-auth-expired")) return;
+      var box = D.createElement("div");
+      box.id = "dsh-ma-auth-expired";
+      try { box.setAttribute("id", "dsh-ma-auth-expired"); } catch (eId) { /* 老实现只有属性反射时兜底 */ }
+      box.setAttribute("style",
+        "position:fixed;left:0;right:0;bottom:0;z-index:2147483000;padding:14px 16px;"
+        + "background:#1b1f24;color:#e6edf3;border-top:1px solid #30363d;"
+        + "font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
+        + "display:flex;gap:10px;align-items:center;flex-wrap:wrap");
+      var msg = D.createElement("span");
+      msg.setAttribute("style", "flex:1 1 200px;min-width:0");
+      msg.textContent = "登录状态已过期，需要重新登录后才能进入。";
+      var btn = D.createElement("button");
+      btn.type = "button";
+      btn.textContent = "去重新登录";
+      btn.setAttribute("style",
+        "flex:0 0 auto;padding:8px 14px;border-radius:8px;border:0;background:#2f81f7;color:#fff;font-weight:600");
+      btn.onclick = function () {
+        try { window.location.assign("/app/?reason=expired&from=mirror-auth"); }
+        catch (e1) { try { window.location.href = "/app/?reason=expired&from=mirror-auth"; } catch (e2) { /* 忽略 */ } }
+      };
+      box.appendChild(msg);
+      box.appendChild(btn);
+      var host = D.body || D.documentElement;
+      if (host) host.appendChild(box);
+    } catch (e) { /* 浮层坏了也绝不影响页面 */ }
+  }
+
+  /** 判定登录态失效：停自动重试 + 出浮层 + 诊断字符串换档（原因=auth）。 */
+  function maOnAuthExpired(why) {
+    try {
+      if (maAuthExpired) return;
+      maAuthExpired = true;
+      /* 停掉自动重试：401 不是"再试一次就好"的失败，重试只会继续制造 499 与白屏时间。 */
+      maRetry.manual = true;
+      maRetry.exhausted = true;
+      maShowAuthOverlay();
+      try { maBumpRetryStats("auth:" + String(why || "")); } catch (e0) { /* 忽略 */ }
+      try { maPublishDiag(); } catch (e1) { /* 忽略 */ }
+    } catch (e) { /* 忽略 */ }
+  }
+
+  /** 节流探测登录态（只认 401；网络错误/5xx 一律按未知处理，不误报"请重新登录"）。 */
+  function maProbeAuthOnce() {
+    try {
+      if (maAuthExpired) return;
+      if (typeof window === "undefined" || typeof window.fetch !== "function") return;
+      var now = Date.now();
+      if (maAuthProbe.inflight) return;
+      if (now - (maAuthProbe.at || 0) < AUTH_PROBE_MIN_MS) return;
+      maAuthProbe.at = now;
+      maAuthProbe.inflight = true;
+      var p = window.fetch("/_quota", { credentials: "same-origin", cache: "no-store" });
+      if (!p || typeof p.then !== "function") { maAuthProbe.inflight = false; return; }
+      p.then(function (r) {
+        maAuthProbe.inflight = false;
+        if (r && r.status === 401) maOnAuthExpired("probe401");
+      }, function () { maAuthProbe.inflight = false; });
+    } catch (e) { maAuthProbe.inflight = false; }
   }
 
   /** 整页受控重试：仅当"官方界面还没就绪 + 没被用户手动接管 + 每标签页额度没用完"。 */
@@ -1534,6 +1624,9 @@ const SCRIPT = `(() => {
          说的"文案归因错误"——截图 09 面板同时显示 95ms 顺畅）。
          W3：窗口改用**活跃时间**——挂起 8 分钟回来不该把"10 秒内有过 5xx"直接判成过期。 */
       var act = (typeof maLoadActiveMs === "function") ? maLoadActiveMs() : Date.now();
+      /* 登录态失效优先于"资源/网络"：否则用户看到的永远是"资源加载失败，正在重试…"，
+         而真实动作是「去重新登录」（2026-11-14：12 个首屏资源 401、8 次重试全空转）。 */
+      if (maAuthExpired) return "auth";
       if ((maLoadWatch.apiFails || 0) > 0 && act - (maLoadWatch.apiFailAt || 0) < 10000) return "offline";
       if (maRetry.resFails.length > 0) return "resource";
     } catch (e) { /* 落到 slow */ }
@@ -2022,6 +2115,7 @@ const SCRIPT = `(() => {
     var tail = maLoadHiddenSuffix();
     /* W3：12s（活跃时间）起先给中性进度——"正在准备界面…"不是故障判定，不吓人。 */
     if (!maLoadWatch.slow) return "正在准备界面…（已等待 " + sec + " 秒" + tail + "）";
+    if (reason === "auth") return "登录状态已过期，请重新登录（已等待 " + sec + " 秒" + tail + "）";
     if (reason === "offline") return "电脑端可能未连接（已等待 " + sec + " 秒" + tail + "）";
     if (reason === "resource") {
       if (maRetry.exhausted) return "页面资源加载失败，自动重试已用尽（已等待 " + sec + " 秒" + tail + "）";
