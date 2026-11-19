@@ -17,6 +17,7 @@ commercial license.
 
 ## Getting a commercial license
 
-Contact the maintainer through the GitHub repository
+Email **feiyue@ruichengai.cn** (business inquiries / commercial licensing), or
+contact the maintainer through the GitHub repository
 (https://github.com/mrRisega/dsh-remote) — issues or the security reporting flow
 work for license inquiries as well.
